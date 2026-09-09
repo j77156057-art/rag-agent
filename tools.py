@@ -383,10 +383,28 @@ def _resolve_in_root(path):
     return target, root_abs
 
 
+def _clean_symbol(p):
+    """从混入自然语言的输入里提取首个「代码标识符」token。
+
+    弱模型常把工具输入写成「seekTo 进行进度跳转」这种「符号 + 中文描述」的形式，
+    直接当正则/检索词会匹配失败。这里在检测到中文时只取第一个 ASCII 标识符
+    （如 seekTo）；纯 ASCII 输入（可能是合法正则）原样保留。
+    """
+    p = (p or "").strip()
+    if not p:
+        return p
+    if re.search(r"[\u4e00-\u9fff]", p):
+        m = re.search(r"[A-Za-z_]\w*", p)
+        if m:
+            return m.group(0)
+    return p
+
+
 def search_code(query):
     """在已索引的源代码/配置中检索相关函数、类、配置片段。"""
     if not _get_code_root():
         return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录后再问代码相关问题。"
+    query = _clean_symbol(query)
     emb = _get_emb().embed([query])[0]
     res = vs_query(emb, k=TOP_K, collection=CODE_COLLECTION_NAME)
     docs = (res.get("documents") or [[]])[0]
@@ -440,6 +458,7 @@ def grep(pattern):
     root = _get_code_root()
     if not root:
         return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    pattern = _clean_symbol(pattern)
     try:
         rx = re.compile(pattern)
     except re.error as e:

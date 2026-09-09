@@ -291,34 +291,60 @@ def load_code_file(path):
         return f.read()
 
 
-def ingest_code_file(path, root, emb=None, collection=CODE_COLLECTION_NAME):
-    """摄取单个代码文件，返回切片数量。"""
-    emb = emb or EmbeddingClient()
+def _code_file_records(path, root, emb):
+    """构建单个代码文件的 (chunks, embeddings, metas, ids)；无内容返回 None。"""
     text = load_code_file(path)
     chunks = chunk_code(text, path)
     if not chunks:
-        return 0
+        return None
     rel = os.path.relpath(path, root).replace("\\", "/")
     ext = os.path.splitext(path)[1].lower()
     lang = _LANG_BY_EXT.get(ext, "text")
-    imports = _extract_imports(text, ext)
-    imports_str = ", ".join(imports) if imports else "none"
-    embeddings = emb.embed([c for c, _ in chunks])
+    imports_str = ", ".join(_extract_imports(text, ext)) or "none"
+    texts = [c for c, _ in chunks]
+    embeddings = emb.embed(texts)
     # 每块带语言标记与 import 边，便于检索排序、展示与"符号从哪来"追踪
     metas = [
         {"source": rel, "symbol": sym, "kind": "code", "lang": lang, "imports": imports_str}
         for _, sym in chunks
     ]
     ids = [uuid.uuid4().hex for _ in chunks]
-    add_documents([c for c, _ in chunks], embeddings, metas, ids, collection=collection)
-    return len(chunks)
+    return texts, embeddings, metas, ids
+
+
+def ingest_code_file(path, root, emb=None, collection=CODE_COLLECTION_NAME):
+    """摄取单个代码文件，返回切片数量。"""
+    emb = emb or EmbeddingClient()
+    rec = _code_file_records(path, root, emb)
+    if not rec:
+        return 0
+    texts, embeddings, metas, ids = rec
+    add_documents(texts, embeddings, metas, ids, collection=collection)
+    return len(texts)
+
+
+# 目录级索引的「单次写入」批次上限：把切片累积到一定量后一次性 add。
+# chroma 1.x 每次 add 都会重写索引，若按「每文件一次 add」做大量增量写入会极慢甚至卡死；
+# 累积成较大的批次再 add 可避免该问题，同时限制大工程的内存占用。
+_CODE_ADD_BATCH = 2000
 
 
 def ingest_code_directory(root, emb=None, collection=CODE_COLLECTION_NAME):
-    """遍历代码根目录，索引所有受支持的文件；返回总切片数。"""
+    """遍历代码根目录，索引所有受支持的文件；返回总切片数。
+
+    所有切片先在内存中累积，按 _CODE_ADD_BATCH 批量写入向量库（而非每文件一次 add）。
+    """
     emb = emb or EmbeddingClient()
     root = os.path.abspath(root)
     total = 0
+    texts_buf, embs_buf, metas_buf, ids_buf = [], [], [], []
+
+    def _flush():
+        nonlocal texts_buf, embs_buf, metas_buf, ids_buf
+        if texts_buf:
+            add_documents(texts_buf, embs_buf, metas_buf, ids_buf, collection=collection)
+        texts_buf, embs_buf, metas_buf, ids_buf = [], [], [], []
+
     for dp, dns, fns in os.walk(root):
         dns[:] = [d for d in dns if d not in _SKIP_DIRS]
         for fn in sorted(fns):
@@ -328,9 +354,19 @@ def ingest_code_directory(root, emb=None, collection=CODE_COLLECTION_NAME):
             try:
                 if os.path.getsize(fp) > _MAX_CODE_FILE:
                     continue
-                total += ingest_code_file(fp, root, emb, collection)
+                rec = _code_file_records(fp, root, emb)
+                if rec:
+                    texts, embeddings, metas, ids = rec
+                    texts_buf.extend(texts)
+                    embs_buf.extend(embeddings)
+                    metas_buf.extend(metas)
+                    ids_buf.extend(ids)
+                    total += len(texts)
+                    if len(texts_buf) >= _CODE_ADD_BATCH:
+                        _flush()
             except Exception as e:  # 单个文件失败不影响其他
                 print(f"[ingest_code] 跳过 {fn}: {e}")
+    _flush()
     return total
 
 
