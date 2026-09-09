@@ -11,6 +11,8 @@ import urllib.request
 import urllib.error
 import uuid
 
+from typing import Optional
+
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,11 +28,18 @@ from config import (
     CODE_ROOT,
     set_runtime,
     get_runtime,
+    edit_confirm_enabled,
 )
 from ingest import ingest_file, ingest_code_directory, load_project_rules
 from vectorstore import reset_collection, list_sources, count
 from llm import LLMClient
-from tools import set_embedding_provider
+from tools import (
+    set_embedding_provider,
+    list_pending_edits,
+    confirm_edit as apply_pending_edit,
+    reject_edit as drop_pending_edit,
+    clear_read_files,
+)
 from pydantic import BaseModel
 
 from config import PROJECT_WEB_DIR
@@ -131,6 +140,7 @@ class ConfigReq(BaseModel):
     api_key: str = ""
     model: str = ""
     embedding_provider: str = ""
+    edit_confirm: Optional[bool] = None
 
 
 @app.get("/api/config")
@@ -156,6 +166,7 @@ async def get_config():
         "code_root": get_runtime("code_root") or CODE_ROOT,
         "code_sources": count(CODE_COLLECTION_NAME),
         "project_rules_loaded": bool(get_runtime("project_rules")),
+        "edit_confirm": edit_confirm_enabled(),
     }
 
 
@@ -232,6 +243,10 @@ async def set_config(req: ConfigReq):
             reset_collection()
             warnings.append("已切换检索向量模型，旧文档向量已清空，请重新上传文档以保证检索准确。")
 
+    # 写工具是否「人工确认」：可选开关（None 表示不改动）
+    if req.edit_confirm is not None:
+        set_runtime("edit_confirm", bool(req.edit_confirm))
+
     # 需要 key 但未提供
     if req.provider in ("qwen", "deepseek"):
         envk = PROVIDERS[req.provider]["api_key_env"]
@@ -249,6 +264,38 @@ async def set_config(req: ConfigReq):
         "ingested_files": sorted(_INGESTED),
         "warnings": warnings,
     }
+
+
+@app.post("/api/reset_code")
+async def reset_code():
+    """清空代码集合并解除代码库配置（重新索引前调用，避免旧切片累积）。"""
+    reset_collection(CODE_COLLECTION_NAME)
+    set_runtime("code_root", "")
+    set_runtime("project_rules", "")
+    clear_read_files()
+    agent.history = []
+    return {"ok": True, "code_sources": count(CODE_COLLECTION_NAME)}
+
+
+@app.get("/api/pending_edits")
+async def pending_edits():
+    return {"pending": list_pending_edits(), "edit_confirm": edit_confirm_enabled()}
+
+
+class PendingId(BaseModel):
+    id: str
+
+
+@app.post("/api/confirm_edit")
+async def confirm_edit(req: PendingId):
+    ok, msg = apply_pending_edit(req.id)
+    return {"ok": ok, "message": msg}
+
+
+@app.post("/api/reject_edit")
+async def reject_edit(req: PendingId):
+    removed = drop_pending_edit(req.id)
+    return {"ok": removed, "message": "已拒绝并丢弃该修改。" if removed else f"未找到待确认修改 #{req.id}。"}
 
 
 app.mount("/static", StaticFiles(directory=PROJECT_WEB_DIR), name="static")

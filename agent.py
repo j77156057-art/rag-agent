@@ -34,6 +34,7 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
   · 没有配置代码库时（search_code 提示未配置），可改用 python_exec 在本地读取文件做兜底，但优先引导用户先用 /api/ingest_code 索引代码目录。
   · 需要【修改】代码库中的文件时，使用 apply_edit。无论哪种用法，都请先 read_file 看清当前内容再动手：能用 old_text 精确局部替换就用它（最安全，能避免误改）；只有确实需要整体重写且已 read_file 过该文件时，才用不带 old_text 的重写模式。修改成功后可用 read_file 复查确认变更。apply_edit 只能改已存在文件，不要指望它创建新文件或越界写。
   · 需要【新建】文件/模块（例如为项目新增一个分区目录与源文件）时，使用 create_file；它不能覆盖已有文件（覆盖请用 apply_edit）。新建前务必先用 search_code/grep 确认没有重复实现，避免堆叠；父目录不存在时会自动创建（仍在代码根目录内）。新建 .py 文件会通过语法校验。
+  · 若 apply_edit / create_file 返回「待人工确认 #id」，说明写操作已暂存、等待用户在界面确认后才会真正写入；此时你应在 Final Answer 中如实转述 diff 内容并提示用户确认，不要再继续其它写操作，也不要声称已经写入。
   · 改完代码后需要【验证】改动是否破坏构建/测试时，使用 run_command 跑 pytest / npm run build 等命令（命令在代码根目录内执行，危险操作会被拦截）。这是"改完即验证"的闭环关键一步。
 - 调用 python_exec 时，Action Input 必须是完整、可直接执行的 Python 代码（用 print 输出结果）；
   不要加 ``` 代码围栏，也不要只写 "python" 等语言名。

@@ -8,10 +8,11 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import urllib.request
 import urllib.parse
 
-from config import TOP_K, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime
+from config import TOP_K, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime, edit_confirm_enabled
 from embeddings import EmbeddingClient
 from vectorstore import query as vs_query, pretty_source
 from ingest import _CODE_EXT, _SKIP_DIRS
@@ -532,6 +533,105 @@ def _diff_summary(a, b):
     return "Diff:\n" + "\n".join(body)
 
 
+# ---------------------------------------------------------------------------
+# 待确认修改暂存：当「人工确认」模式开启时，apply_edit / create_file 不直接写盘，
+# 而是校验通过后暂存到内存，返回 pending id + diff，由人工在界面上确认/拒绝。
+# ---------------------------------------------------------------------------
+_PENDING_EDITS = {}       # id -> {kind, target, rel, old_content, new_content, diff}
+_PENDING_LOCK = threading.Lock()
+_pending_seq = [0]
+
+
+def _edit_confirm_on():
+    return edit_confirm_enabled()
+
+
+def stage_edit(kind, target, rel, old_content, new_content, diff):
+    """暂存一次已校验但未落盘的修改，返回 pending id。"""
+    with _PENDING_LOCK:
+        _pending_seq[0] += 1
+        pid = str(_pending_seq[0])
+        _PENDING_EDITS[pid] = {
+            "kind": kind,            # "apply_edit" | "create_file"
+            "target": target,        # 绝对路径
+            "rel": rel,
+            "old_content": old_content,
+            "new_content": new_content,
+            "diff": diff,
+        }
+        return pid
+
+
+def list_pending_edits():
+    with _PENDING_LOCK:
+        return [
+            {
+                "id": pid,
+                "kind": e["kind"],
+                "path": e["rel"],
+                "diff": e["diff"],
+                "size": len(e["new_content"].encode("utf-8", "ignore")),
+            }
+            for pid, e in _PENDING_EDITS.items()
+        ]
+
+
+def confirm_edit(pid):
+    """落盘一次已暂存的修改；成功返回 (True, 摘要)，失败返回 (False, 原因)。
+
+    若失败原因是「暂存内容已失效」（文件被改动/删除/已被创建），会同时丢弃该待确认项，
+    避免界面残留一个永远无法确认的条目；仅「写入 I/O 错误」会保留以便重试。
+    """
+    with _PENDING_LOCK:
+        e = _PENDING_EDITS.get(pid)
+    if not e:
+        return False, f"未找到待确认修改 #{pid}（可能已确认/拒绝或重启后失效）。"
+    target, kind = e["target"], e["kind"]
+
+    def _discard(reason):
+        with _PENDING_LOCK:
+            _PENDING_EDITS.pop(pid, None)
+        return False, reason
+
+    try:
+        if kind == "create_file":
+            if os.path.exists(target):
+                return _discard(f"目标文件已存在：{e['rel']}（暂存后文件被创建，为避免覆盖已取消）。")
+            parent = os.path.dirname(target)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+        else:  # apply_edit
+            if not os.path.isfile(target):
+                return _discard(f"目标文件已不存在：{e['rel']}")
+            # 防「暂存后被改动」：内容不一致则拒绝，避免覆盖他人在暂存期间的修改
+            try:
+                with open(target, encoding="utf-8", errors="ignore") as f:
+                    cur = f.read()
+            except Exception as ex:  # noqa: BLE001
+                return False, f"读取目标失败: {ex}"
+            if cur != e["old_content"]:
+                return _discard("目标文件在暂存后被修改，内容已变化；请重新 read_file 后再改。")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(e["new_content"])
+        _READ_FILES.add(os.path.normcase(target))
+    except Exception as ex:  # noqa: BLE001
+        return False, f"写入失败: {ex}"
+    with _PENDING_LOCK:
+        _PENDING_EDITS.pop(pid, None)
+    nbytes = len(e["new_content"].encode("utf-8", "ignore"))
+    return True, f"已应用修改 {e['rel']}（{nbytes} 字节）。"
+
+
+def reject_edit(pid):
+    with _PENDING_LOCK:
+        return bool(_PENDING_EDITS.pop(pid, None))
+
+
+def clear_read_files():
+    """清空「已读文件」记录（重置代码库时调用，避免旧项目的读记录跨项目残留）。"""
+    _READ_FILES.clear()
+
+
 def apply_edit(arg):
     """受控修改代码库中的【已存在】文件。详见 _parse_edit_input 的输入格式。
 
@@ -606,6 +706,15 @@ def apply_edit(arg):
             if tmp and os.path.exists(tmp):
                 os.remove(tmp)
 
+    rel = os.path.relpath(target, root_abs)
+    nbytes = len(new_content.encode("utf-8", "ignore"))
+    summary = _diff_summary(old_content, new_content)
+
+    # 「人工确认」模式：只暂存，不落盘，返回 diff 等人工批准
+    if _edit_confirm_on():
+        pid = stage_edit("apply_edit", target, rel, old_content, new_content, summary)
+        return f"待人工确认 #{pid}（未写入）。确认后才会真正修改文件。\n{summary}"
+
     # 写回
     try:
         with open(target, "w", encoding="utf-8") as f:
@@ -613,9 +722,6 @@ def apply_edit(arg):
     except Exception as e:  # noqa: BLE001
         return f"写入失败: {e}"
 
-    rel = os.path.relpath(target, root_abs)
-    nbytes = len(new_content.encode("utf-8", "ignore"))
-    summary = _diff_summary(old_content, new_content)
     return f"已写入 {rel}（{nbytes} 字节，路径沙箱校验通过）。\n{summary}"
 
 
@@ -659,13 +765,6 @@ def create_file(arg):
     if os.path.exists(target):
         return f"文件已存在：{path}（create_file 不覆盖已有文件；要修改请用 apply_edit）。"
 
-    parent = os.path.dirname(target)
-    if parent and not os.path.isdir(parent):
-        try:
-            os.makedirs(parent, exist_ok=True)
-        except Exception as e:  # noqa: BLE001
-            return f"创建目录失败: {e}"
-
     if len(content.encode("utf-8", "ignore")) > _APPLY_MAX_BYTES:
         return f"拒绝写入：新文件大小超过上限（{_APPLY_MAX_BYTES // 1024}KB）。"
 
@@ -688,14 +787,28 @@ def create_file(arg):
             if tmp and os.path.exists(tmp):
                 os.remove(tmp)
 
+    rel = os.path.relpath(target, root_abs)
+    nbytes = len(content.encode("utf-8", "ignore"))
+    preview = content if len(content) <= 2000 else content[:2000] + "\n…（已截断，完整内容 %d 字节）" % nbytes
+
+    # 「人工确认」模式：只暂存，不落盘
+    if _edit_confirm_on():
+        pid = stage_edit("create_file", target, rel, None, content, "新建文件：\n" + preview)
+        return f"待人工确认 #{pid}（未写入）。确认后才会真正创建文件。\n新建文件：\n{preview}"
+
+    parent = os.path.dirname(target)
+    if parent and not os.path.isdir(parent):
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception as e:  # noqa: BLE001
+            return f"创建目录失败: {e}"
+
     try:
         with open(target, "w", encoding="utf-8") as f:
             f.write(content)
     except Exception as e:  # noqa: BLE001
         return f"写入失败: {e}"
 
-    rel = os.path.relpath(target, root_abs)
-    nbytes = len(content.encode("utf-8", "ignore"))
     # 自己刚创建的文件，视为已"确认内容"，允许后续整体重写而无需再 read_file
     _READ_FILES.add(os.path.normcase(target))
     return f"已创建 {rel}（{nbytes} 字节，路径沙箱校验通过）。"
@@ -706,18 +819,67 @@ def create_file(arg):
 # 护栏：cwd 锁 code_root；危险命令黑名单拦截；超时 12s（同 python_exec）；
 # stdout+stderr 合并截断 1500 字。
 # ---------------------------------------------------------------------------
-_DANGEROUS = (
-    "rm -rf /", "rm -rf ~", "rm -rf ..", "rm -rf .", "rm -r /",
-    "del /s", "rmdir /s", "format c:", "format d:", "shutdown",
-    "mkfs", ":(){", "dd if=", "> /dev/sd", "sudo ",
+# 命令护栏：结构化黑名单（按可执行词）+ 可选白名单（RUN_COMMAND_ALLOW）。
+# 仅为启发式防护，非 OS 级沙箱；真正的隔离需外部容器/沙箱。
+_BLOCKED_CMDS = {
+    # 破坏性文件/系统命令
+    "rm", "del", "erase", "rd", "rmdir", "format", "shutdown", "restart", "reboot",
+    "mkfs", "fdisk", "diskpart", "dd", "chkdsk", "chown", "chmod", "cacls", "icacls",
+    "shred", "wipe", "cipher",
+    # 网络外联 / 下载（防数据外带）
+    "curl", "wget", "invoke-webrequest", "iwr", "invoke-restmethod", "irm",
+    "nc", "netcat", "ncat", "telnet", "ssh", "scp", "sftp", "ftp", "certutil",
+    # 脚本解释器 / 子 shell / 系统操控（可执行任意命令，绕过黑名单）
+    "powershell", "pwsh", "bash", "sh", "zsh", "cmd", "reg", "wmic", "mshta",
+    "rundll32", "schtasks", "wsl", "taskkill", "net",
+}
+# 危险子串/参数模式（命令+参数级，比单一可执行词更细）
+_DANGEROUS_PATTERNS = (
+    "rm -rf", "rm -r ", "rm -fr", "del /s", "del /q", "rd /s", "rmdir /s",
+    "format ", "shutdown", "mkfs", "dd if=", "> /dev/sd", "> /dev/null",
+    "git clean", "git reset --hard", "git push -f", "git push --force",
+    "chmod -r", "chmod 777", "chmod 666", ":(){", "fork bomb",
+    "python -c", "py -c", "python3 -c", "node -e", "node --eval",
+    "npm install -g", "npm i -g", "pip install", "rmdir /q",
 )
+
+
+def _first_command_token(low):
+    """提取命令首个「可执行词」（去引号/前缀/环境变量），取 basename 用于黑/白名单匹配。"""
+    s = low.strip()
+    s = re.sub(r"^(?:cmd(?:\.exe)?\s+/[ck]\s+)", "", s)    # cmd /c ...
+    s = re.sub(r"^(?:[a-z_][a-z0-9_]*=[^ ]*\s+)+", "", s)   # VAR=value 前缀
+    s = re.sub(r"^call\s+", "", s)
+    m = re.match(r'"?([^"\s]+)"?', s)
+    if not m:
+        return ""
+    tok = os.path.basename(m.group(1)).lower()
+    return tok[:-4] if tok.endswith(".exe") else tok
+
+
+def _cmd_is_blocked(cmd):
+    """返回 (True, 原因) 表示应拦截；否则 (False, '')。"""
+    low = re.sub(r"\s+", " ", cmd.lower()).strip()
+    for pat in _DANGEROUS_PATTERNS:
+        if pat in low:
+            return True, pat
+    first = _first_command_token(low)
+    if first in _BLOCKED_CMDS:
+        return True, first
+    allow = (get_runtime("run_command_allow") or os.getenv("RUN_COMMAND_ALLOW", "")).strip()
+    if allow:
+        allowed = {a.strip().lower() for a in allow.split(",") if a.strip()}
+        if first not in allowed:
+            return True, f"{first}（不在白名单内）"
+    return False, ""
 
 
 def run_command(cmd):
     """在代码库根目录内执行 shell 命令（如 pytest / npm run build），返回合并输出（截断 1500 字，超时 12s）。
 
-    用于跑构建、跑测试、执行项目内命令来验证改动或查看结果。命令在 code_root 内执行，
-    危险操作（rm -rf /、format、shutdown 等）会被拦截以防误删/破坏。
+    用于跑构建、跑测试、执行项目内命令来验证改动或查看结果。命令在 code_root 内执行。
+    护栏：结构化黑名单（破坏性命令 / 网络外联 / 脚本解释器）+ 可选白名单（RUN_COMMAND_ALLOW）。
+    说明：这是启发式防护，非 OS 级沙箱；真正的隔离需外部容器/沙箱。
     """
     cmd = (cmd or "").strip().strip("'\"")
     if not cmd:
@@ -725,10 +887,9 @@ def run_command(cmd):
     root = _get_code_root()
     if not root:
         return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
-    low = cmd.lower()
-    for d in _DANGEROUS:
-        if d in low:
-            return f"拒绝执行：命令含危险操作「{d.strip()}」，已拦截以防误删/破坏。"
+    blocked, why = _cmd_is_blocked(cmd)
+    if blocked:
+        return f"拒绝执行：命令被安全策略拦截（命中「{why}」）。"
     try:
         proc = subprocess.run(
             cmd, shell=True, cwd=os.path.normpath(root),

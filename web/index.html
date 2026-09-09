@@ -301,6 +301,11 @@
         <option value="qwen" data-page-node-id="VfYE0eiOQe61YmG81zCzM6">qwen（语义更准，需 Key）</option>
       </select>
 
+      <label style="margin-top:14px;display:flex;align-items:center;gap:8px;color:var(--txt-dim);">
+        <input type="checkbox" id="cfgEditConfirm" style="width:auto;">
+        <span>写操作需人工确认（改前出 diff，确认后才写入）</span>
+      </label>
+
       <div class="modal-actions" data-page-node-id="cuUVEirIG7BMvicFlM8JEC">
         <button class="btn" id="saveCfg" data-page-node-id="UZCTJG9vMQFUB8iBj09TDA">保存并切换</button>
         <span class="cfg-msg" id="cfgMsg" data-page-node-id="oIAJcawbCiudvbgQ0a53zt"></span>
@@ -408,6 +413,7 @@
         }
       }
     }
+    loadPending();
     chat.scrollTop = chat.scrollHeight;
   }
 
@@ -465,6 +471,69 @@
     }
   };
 
+  $("resetCodeBtn").onclick = async () => {
+    if (!confirm("确定清空代码库索引并解除代码库配置？")) return;
+    const r = await fetch("/api/reset_code", { method: "POST" });
+    const j = await r.json();
+    status.textContent = j.ok ? "已重置代码库。" : "重置失败";
+    loadConfig();
+    loadPending();
+  };
+
+  async function loadPending() {
+    const card = $("pendingCard");
+    const list = $("pendingList");
+    try {
+      const r = await fetch("/api/pending_edits");
+      const j = await r.json();
+      const items = j.pending || [];
+      $("pendingCount").textContent = items.length;
+      if (!items.length) { card.style.display = "none"; return; }
+      card.style.display = "";
+      list.innerHTML = "";
+      for (const p of items) {
+        const el = document.createElement("div");
+        el.className = "src";
+        el.style.flexDirection = "column";
+        el.style.alignItems = "stretch";
+        const head = document.createElement("div");
+        head.style.fontSize = "12px";
+        head.textContent = "#" + p.id + " " + (p.kind === "create_file" ? "新建" : "修改") + " " + p.path;
+        const diff = document.createElement("div");
+        diff.style.cssText = "white-space:pre-wrap;font-family:Consolas,monospace;font-size:11px;max-height:130px;overflow:auto;background:rgba(8,12,24,.5);border:1px solid var(--line);border-radius:8px;padding:6px 8px;margin-top:6px;color:#c7d4e8;";
+        diff.textContent = p.diff;
+        const actions = document.createElement("div");
+        actions.style.cssText = "display:flex;gap:6px;margin-top:7px;";
+        const okBtn = document.createElement("button");
+        okBtn.className = "btn sm";
+        okBtn.textContent = "确认写入";
+        okBtn.onclick = async () => {
+          const rr = await fetch("/api/confirm_edit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: p.id }) });
+          const jj = await rr.json();
+          status.textContent = jj.ok ? ("已应用修改 #" + p.id) : ("确认失败：" + jj.message);
+          loadPending();
+        };
+        const noBtn = document.createElement("button");
+        noBtn.className = "btn ghost sm";
+        noBtn.textContent = "拒绝";
+        noBtn.onclick = async () => {
+          const rr = await fetch("/api/reject_edit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: p.id }) });
+          await rr.json();
+          status.textContent = "已拒绝修改 #" + p.id;
+          loadPending();
+        };
+        actions.appendChild(okBtn);
+        actions.appendChild(noBtn);
+        el.appendChild(head);
+        el.appendChild(diff);
+        el.appendChild(actions);
+        list.appendChild(el);
+      }
+    } catch (e) {
+      card.style.display = "none";
+    }
+  }
+
   async function loadConfig() {
     try {
       const r = await fetch("/api/config");
@@ -472,6 +541,7 @@
       $("cfgProvider").value = c.llm_provider;
       $("cfgEmbed").value = c.embedding_provider;
       $("cfgModel").value = c.llm_model || "";
+      $("cfgEditConfirm").checked = !!c.edit_confirm;
       const codeInput = $("codeRoot");
       if (codeInput && document.activeElement !== codeInput && c.code_root) codeInput.value = c.code_root;
 
@@ -513,6 +583,7 @@
     } catch (e) {
       status.textContent = "读取配置失败：" + e;
     }
+    loadPending();
   }
 
   $("saveCfg").onclick = async () => {
@@ -521,6 +592,7 @@
       api_key: $("cfgKey").value,
       model: $("cfgModel").value,
       embedding_provider: $("cfgEmbed").value,
+      edit_confirm: $("cfgEditConfirm").checked,
     };
     const cfgMsg = $("cfgMsg");
     cfgMsg.className = "cfg-msg"; cfgMsg.textContent = "保存中...";

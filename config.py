@@ -76,6 +76,7 @@ TOP_K = int(os.getenv("TOP_K", "4"))
 MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "5"))
 CODE_ROOT = os.getenv("CODE_ROOT", "")  # 代码问答模式的代码库根目录；为空表示未配置
 CODE_CHUNK = int(os.getenv("CODE_CHUNK", "1200"))  # 单个代码切片的最大字符数
+EDIT_CONFIRM = os.getenv("EDIT_CONFIRM", "0") == "1"  # 写工具是否需要人工确认（改前出 diff）
 
 # ---- 运行时覆盖（由前端 /api/config 动态设置，优先级高于 .env）----
 # 仅存于内存，进程重启后恢复 .env 默认值。用于页面内"免重启切换模型"。
@@ -88,3 +89,11 @@ def set_runtime(key, value):
 
 def get_runtime(key, default=None):
     return _RUNTIME.get(key, default)
+
+
+def edit_confirm_enabled():
+    """写工具是否处于「人工确认」模式：运行时覆盖优先，其次 .env EDIT_CONFIRM。"""
+    v = get_runtime("edit_confirm")
+    if v is not None:
+        return bool(v)
+    return EDIT_CONFIRM
