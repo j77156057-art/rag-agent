@@ -1,0 +1,30 @@
+# ===== Python =====
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== 向量库（本地数据，不入库）=====
+.chroma/
+
+# ===== 运行产生的临时上传文件 =====
+uploads/
+
+# ===== 打包产物与日志（PyInstaller / 运行时）=====
+build/
+dist/
+*.log
+
+# ===== 会话临时脚本（本地 git 辅助 / 输出，不入库）=====
+_git*.py
+_report*.txt
+git_report.txt
+
+# ===== 环境变量（含 API Key，严禁提交！）=====
+.env
+
+# ===== 系统 / 编辑器 =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
