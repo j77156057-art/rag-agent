@@ -94,6 +94,8 @@ _CODE_EXT = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".cs", ".java", ".cpp", ".cc", ".c",
     ".h", ".hpp", ".go", ".rs", ".lua", ".rb", ".php", ".swift", ".kt", ".scala",
     ".sh", ".json", ".yaml", ".yml", ".toml",
+    # Godot：GDScript 脚本、着色器、文本场景/资源与工程配置（二进制 .scn/.res 天然排除）
+    ".gd", ".gdshader", ".tscn", ".tres", ".godot",
 }
 # 遍历时跳过的目录（依赖/构建产物/版本控制/虚拟环境/向量库自身/归档备份）
 _SKIP_DIRS = {
@@ -113,6 +115,8 @@ _LANG_BY_EXT = {
     ".lua": "lua", ".rb": "ruby", ".php": "php", ".swift": "swift", ".kt": "kotlin",
     ".scala": "scala", ".sh": "shell", ".json": "json", ".yaml": "yaml",
     ".yml": "yaml", ".toml": "toml",
+    ".gd": "gdscript", ".gdshader": "gdshader", ".tscn": "godot-scene",
+    ".tres": "godot-resource", ".godot": "ini",
 }
 
 # 顶层/类型定义行的启发式前缀（用于非 Python 语言的切分）
