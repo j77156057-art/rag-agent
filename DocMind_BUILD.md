@@ -1,13 +1,35 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第十二次重建（P2 选区 AI：解释 / Review / 提问走 RAG agent，改写走直连快通道）」；历史构建清单保留在下文。
+> 最新构建见下方「第十三次重建（P3：Git 历史/一键回滚、AI 改写 diff 预览、分区治理可视化）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 18.5 MB，控制台模式，启动时自动开浏览器）
 - 整体体积：约 663.4 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB）
-- **当前构建时间：`2026-09-12 00:32:23`（第十二次重建，P2 选区 AI，exe 19,405,162 字节）**
-- 上一版：`2026-09-11 23:17:51`（第十一次重建，P1 调用边，exe 19,401,970 字节）
+- **当前构建时间：`2026-09-12 03:24:52`（第十三次重建，P3 三件套，exe 19,408,724 字节）**
+- 上一版：`2026-09-12 00:32:23`（第十二次重建，P2 选区 AI，exe 19,405,162 字节）
+
+---
+
+## 第十三次重建：P3 — Git 历史/回滚 + 改写 diff 预览 + 分区可视化（2026-09-12 03:24）
+
+### 改动
+- **Git 历史版本与一键回滚**：
+  - 后端 `workbench_fs.py` 新增 4 端点：`GET /api/fs/gitlog`（文件级提交历史）、`POST /api/fs/revert`（放弃该文件全部未提交改动，含已暂存，`reverted=false/reason=clean` 幂等）、`GET /api/fs/git-show`（任意 ref 文件内容）、`POST /api/fs/restore-at`（恢复历史版本并按既有保存链重索引）；文件树节点补充 `tracked`/`dirty` 字段。
+  - 前端新增 `GitHistoryDialog.vue`：提交列表（哈希/作者/相对时间/消息）、历史版本与当前对照预览、恢复任意版本；顶栏「历史」「回滚」按钮与右键菜单均按 tracked/dirty 状态禁用；回滚有二次确认。
+- **AI 改写字级 diff 预览**：新增零依赖行级 LCS `diff.ts`（返回 same/del/add 行 + 统计，边界用例已验证）；「替换选区」改为先弹 `RewriteDiffDialog.vue`——双行号（旧/新，按选区起始行偏移）、+N/−N/未变统计、完全一致时禁用接受、Esc/遮罩/取消均可放弃；**接受才写编辑器**，复用 P2 陈旧坐标/只读护栏，仍不自动保存。
+- **分区治理可视化**：顶栏「分区治理」药丸（span→button）打开 `RegionMapDialog.vue`：① 依赖方向 DAG（dep→依赖方）按依赖深度分列的 SVG 布局，7 条贝塞尔箭头带 marker；② 每区状态卡（文件数/独立 git/分支/脏标记/依赖 chip/导出/校验器，missing 区虚线不可点）；③ 契约校验横幅（`/api/verify_contracts` 的 ok/errors）；点卡片在文件树定位该分区，点 DAG 节点高亮并滚动到卡片。
+  - `api.ts` 新增 `regionsApi`；契约失败是 HTTP 200 + `{ok:false}` 的正常业务结果，**独立 fetch 实现**，不走会把 `body.ok===false` 抛错的通用 `request()`。
+  - **修复实测抓出的 DAG 分列 bug**：初始调用误把节点自身放入环检测栈（`depthOf(k, new Set([k]))`），入口守卫立即命中导致所有节点深度恒 0、全挤第一列；改为初始空栈（环检测只在递归下钻时由祖先触发），Node 复现确认后修复。
+- 规范化 `SelectionAiPanel.vue` 中 P2 遗留的 2 个**字面 NUL 字节**（markdown 代码块占位符本意是 `\0` 转义），git 不再把该文件识别为二进制；渲染行为不变。
+- 业务 chunk 97.27 KB（gzip 36.24K，102,873 字节）、CSS 52.83 KB；vendor 三分包哈希全部不变（vendor-codemirror-B2ERf4YJ / vendor-vue-2seagieN / vendor-misc-CEfHfS6C）；构建前已手动清空 `web/assets/` 全部历史 workbench hash。
+
+### 验证
+- 单测：全量 `unittest discover` **73/73 通过**（MinGit 在 PATH，git 用例无跳过）；其中 `tests/test_workbench_fs.py` 31 例覆盖沙箱/树/回滚/恢复与分区元数据。
+- dev 生产态浏览器实测（:8000/workbench，qwen3.6:35b-a3b 真实 SSE 两轮）：① 改写 diff——5 删 5 增双行号、统计栏、取消后编辑器不动、真实 Esc 关闭、接受后选区写为 AI 结果且 turn 状态「已替换」、Ctrl+S 才落盘，随后用本版「回滚」按钮恢复 HEAD，regions 复查 dirty=false；② 分区面板——8 节点正确分列（values/assets/bugs 在 x=10，behaviors/levels/ui/audio/net 在 x=254），7 箭头从被依赖区跨列指向依赖方，契约横幅报 2 个问题（缺 manifest.json/balance.schema.json），卡片点击定位文件树、DAG 节点点击高亮卡片；console 无应用错误，测试后样例仓 git 干净。
+- 冻结态（最小 PATH 仅 System32，DOCMIND_SERVER_ONLY=1，PyInstaller 退出码 0）：冷启动 1s `/workbench/` 200；`build_time=2026-09-12 03:24:52` 确认新版；空 code_root 时 `/api/fs/tree` 返 400；新业务 JS 200（102,873 字节）与源一致；表单 POST `/api/ingest_code` 索引样例 **19 切片**；symbol-map 7 文件/21 符号、relation-graph 7 节点/4 边（3 inherits+1 calls）；**P3 回归**——regions 8 区/3 存在、verify_contracts ok=false/2 错误、最小 PATH 下 gitlog 200 返回 3 条提交（随包 MinGit 自足）。前端 6 文件 SHA-256 全一致；包内无 python*.exe/.env/状态文件；MinGit 89.5 MB/365 文件。
+- **冒烟后新增清理动作**：冒烟的 ingest 在冻结默认 local 嵌入下改写了包内 `_internal/.chroma`（mtime 03:26），已用源 `.chroma` `robocopy /MIR` 镜像还原（148 文件逐一 SHA-256 一致），并删除 `_internal/.docmind_state.json`；进程结束、端口释放。
+- 源码对应提交：`4889dcd feat(workbench): P3 git history/rollback, rewrite diff preview, region map`（12 文件 +1849−9）。
 
 ---
 
