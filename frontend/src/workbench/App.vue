@@ -6,12 +6,15 @@ import CodeView from './components/CodeView.vue'
 import EditorTabs from './components/EditorTabs.vue'
 import ContextMenu from './components/ContextMenu.vue'
 import AppDialog from './components/AppDialog.vue'
+import SymbolOutline from './components/SymbolOutline.vue'
+import SymbolMap from './components/SymbolMap.vue'
 import { useWorkbench } from './composables/workbench'
 import { regionColor } from './theme'
 
 const {
   tree, treeLoading, treeError, loadTree,
   tabs, activeTab, selectedPath, openNode, saveActive,
+  openSymbolMap,
 } = useWorkbench()
 
 const dirtyCount = computed(() => tabs.value.filter((t) => t.dirty).length)
@@ -54,6 +57,20 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
       </div>
       <div class="wb-topbar-right">
         <button
+          v-if="tree"
+          class="wb-map-btn"
+          title="查看全项目符号语义地图"
+          @click="openSymbolMap"
+        >
+          <svg width="13" height="13" viewBox="0 0 13 13">
+            <circle cx="3.4" cy="3.4" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
+            <circle cx="9.6" cy="3" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
+            <circle cx="8.2" cy="10" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
+            <path d="M4.6 4.2 L8.4 3.6 M4.3 4.6 L7.3 9 M9 4.4 L8.5 8.6" stroke="currentColor" stroke-width="0.8" />
+          </svg>
+          符号地图
+        </button>
+        <button
           v-if="activeTab"
           class="wb-save-btn"
           :disabled="activeTab.saving || !activeTab.writable"
@@ -85,7 +102,10 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
 
         <main class="wb-main">
           <EditorTabs />
-          <CodeView :tab="activeTab" />
+          <div class="wb-editor-row">
+            <CodeView :tab="activeTab" />
+            <SymbolOutline />
+          </div>
           <footer class="wb-statusbar">
             <span v-if="selectedPath" class="wb-status-path">{{ selectedPath }}</span>
             <span v-else class="wb-status-faint">未选择文件</span>
@@ -108,5 +128,6 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
 
     <ContextMenu />
     <AppDialog />
+    <SymbolMap />
   </div>
 </template>

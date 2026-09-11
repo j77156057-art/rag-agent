@@ -614,6 +614,13 @@ def _clean_search_query(q):
     return q
 
 
+# 符号种类 -> 检索结果标签动词（function 按语言再区分 def/func）
+_SYMBOL_KW = {
+    "class": "class", "signal": "signal", "enum": "enum",
+    "const": "const", "var": "var",
+}
+
+
 def search_code(query):
     """在已索引的源代码/配置中检索相关函数、类、配置片段。"""
     if not _get_code_root():
@@ -630,9 +637,18 @@ def search_code(query):
         src = m.get("source", "?")
         sym = m.get("symbol", "")
         lang = m.get("lang", "")
+        kind = m.get("kind", "code")
+        doc = m.get("doc", "")
         sl, el = m.get("start_line"), m.get("end_line")
         loc = f"{src}:L{sl}" + (f"-L{el}" if el and el != sl else "") if sl else src
-        label = f"{loc} › {sym}" if sym else loc
+        kw = _SYMBOL_KW.get(kind)
+        verb = ("def" if lang == "python" else "func") if kind == "function" else kw
+        if sym and verb:
+            label = f"{loc} › {verb} {sym}"
+        elif sym:
+            label = f"{loc} › {sym}"
+        else:
+            label = loc
         if lang:
             label += f" ({lang})"
         shown = d if len(d) <= 600 else d[:600].rstrip() + "\n…（下略）"
@@ -645,6 +661,8 @@ def search_code(query):
                 else:
                     numbered.append(f"{sl + i:>5}| {ln}")
             shown = "\n".join(numbered)
+        if doc:
+            shown = f"# 文档: {doc.splitlines()[0]}\n" + shown
         out.append(f"[{label}]\n{shown}")
     return "\n---\n".join(out)
 

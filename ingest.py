@@ -320,35 +320,168 @@ def chunk_code(text, path):
 
 def load_code_file(path):
     with open(path, encoding="utf-8", errors="ignore") as f:
-        return f.read()
+        text = f.read()
+    if text.startswith("\ufeff"):
+        text = text[1:]  # Godot 默认 UTF-8 BOM，剥掉避免污染首块
+    return text
+
+
+# ---------------------------------------------------------------------------
+# 符号级切片（P1）：.gd/.py 走 symbols.extract 的精确符号表——
+# 每个函数/类一个向量片段（过大再切），连续的 var/const/signal/enum 合并为
+# 「声明批」片段；类头/文件头与未覆盖代码补 file/code 片段。检索可精确命中符号。
+# 任何异常由调用方回退到 chunk_code 启发式切片，绝不因解析器问题丢索引。
+# ---------------------------------------------------------------------------
+
+_BLOCK_KINDS = {"class", "function"}
+# 可合并成一个「声明批」片段的叶子符号
+_LEAF_KINDS = {"const", "var", "signal", "enum", "group"}
+_LEAF_BATCH_MAX_LINES = 60
+_LEAF_BATCH_MAX_GAP = 3   # 两符号间隔超过 2 个空行则分批
+_LEAF_BATCH_MAX_NAMES = 6
+
+
+def _symbol_segments(symbols, line_count):
+    """把符号表转成互斥/可嵌套的 (lo, hi, symbol, kind, signature, doc) 段。
+
+    lo/hi 为 0 基半开行区间。类段可嵌套方法段（有意重复索引，沿用 Python 旧行为）。
+    """
+    segs = []
+    leaf_run = []  # 当前连续叶子符号
+
+    def flush_leaf(run):
+        if not run:
+            return
+        lo = run[0]["start"] - 1
+        hi = max(s["end"] for s in run)
+        names = [s["name"] for s in run if s["kind"] != "group"]
+        if len(names) > _LEAF_BATCH_MAX_NAMES:
+            sym = ", ".join(names[:_LEAF_BATCH_MAX_NAMES]) + f" …(+{len(names)-_LEAF_BATCH_MAX_NAMES})"
+        else:
+            sym = ", ".join(names)
+        segs.append((lo, hi, sym, "decl", "", ""))
+
+    for s in sorted(symbols, key=lambda x: (x["start"], x["end"])):
+        lo, hi = s["start"] - 1, s["end"]
+        if s["kind"] in _BLOCK_KINDS:
+            flush_leaf(leaf_run)
+            leaf_run = []
+            segs.append((lo, hi, s["name"], s["kind"], s.get("signature", ""), s.get("doc", "")))
+        elif s["kind"] in _LEAF_KINDS:
+            if leaf_run:
+                prev = leaf_run[-1]
+                too_far = lo - (prev["end"] - 1) > _LEAF_BATCH_MAX_GAP
+                too_big = (max(s["end"] for s in leaf_run + [s]) - leaf_run[0]["start"] + 1
+                           > _LEAF_BATCH_MAX_LINES)
+                diff_parent = s.get("parent", "") != leaf_run[0].get("parent", "")
+                if too_far or too_big or diff_parent:
+                    flush_leaf(leaf_run)
+                    leaf_run = []
+            leaf_run.append(s)
+        # 其它种类（node/section 等）不进结构化切片
+    flush_leaf(leaf_run)
+    segs.sort(key=lambda x: x[0])
+    return segs
+
+
+def _emit_span(lines, lo, hi, sym, kind, signature, doc):
+    """把一段源码按 CODE_CHUNK 切成 (text, sym, sl, el, kind, sig, doc) 七元组。"""
+    raw = "\n".join(lines[lo:hi])
+    if not raw.strip():
+        return []
+    base_line = lo + 1
+    out = []
+    for piece, p_sym, sl, el in _pieces_with_lines(raw, base_line, sym,
+                                                   _split_big(raw.strip(), CODE_CHUNK)):
+        out.append((piece, p_sym, sl, el, kind, signature, doc))
+    return out
+
+
+def _symbol_code_chunks(text, path):
+    """结构化符号切片；不支持的类型/无符号返回 None（调用方回退启发式）。"""
+    import symbols as _symbols
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _symbols.STRUCTURED_CODE_EXT:
+        return None
+    env = _symbols.extract(text, path)
+    syms = env.get("symbols") or []
+    if not syms:
+        return None
+    lines = text.split("\n")
+    segs = _symbol_segments(syms, len(lines))
+    if not segs:
+        return None
+
+    out = []
+    pos = 0
+    header_sym = env.get("class_name") or ""
+    for lo, hi, sym, kind, sig, doc in segs:
+        if lo < pos:
+            # 嵌套段（如类内方法）：与外层段有意重叠，不重复补间隙
+            pass
+        elif lo > pos:
+            gap_raw = "\n".join(lines[pos:lo])
+            if gap_raw.strip():
+                out.extend(_emit_span(lines, pos, lo, header_sym if pos == 0 else "",
+                                      "file" if pos == 0 else "code", "", ""))
+        out.extend(_emit_span(lines, lo, hi, sym, kind, sig, doc))
+        pos = max(pos, hi)
+    if pos < len(lines):
+        tail_raw = "\n".join(lines[pos:])
+        if tail_raw.strip():
+            out.extend(_emit_span(lines, pos, len(lines), "", "code", "", ""))
+    return out or None
 
 
 def _code_file_records(path, root, emb):
     """构建单个代码文件的 (chunks, embeddings, metas, ids)；无内容返回 None。"""
     text = load_code_file(path)
-    chunks = chunk_code(text, path)
+    ext = os.path.splitext(path)[1].lower()
+    lang = _LANG_BY_EXT.get(ext, "text")
+    structured = None
+    try:
+        structured = _symbol_code_chunks(text, path)
+    except Exception as e:
+        print(f"[ingest_code] 符号切片失败，回退启发式 {path}: {e}")
+    chunks = structured if structured is not None else chunk_code(text, path)
     if not chunks:
         return None
     rel = os.path.relpath(path, root).replace("\\", "/")
-    ext = os.path.splitext(path)[1].lower()
-    lang = _LANG_BY_EXT.get(ext, "text")
     imports_str = ", ".join(_extract_imports(text, ext)) or "none"
-    texts = [c for c, _, _, _ in chunks]
-    embeddings = emb.embed(texts)
-    # 每块带语言标记、import 边与起止行号，便于检索排序、精确定位与"符号从哪来"追踪
+
+    rows = []
+    if structured is not None:
+        for piece, sym, sl, el, kind, sig, doc in chunks:
+            rows.append((piece, sym, sl, el, kind, sig or "", doc or ""))
+    else:
+        for piece, sym, sl, el in chunks:
+            rows.append((piece, sym, sl, el, "code", "", ""))
+
+    texts = [r[0] for r in rows]
+    # 嵌入输入：把符号文档注释前置进向量文本（中文语义检索的关键，如「暴击怎么算」），
+    # 但入库文档仍用原文，行号锚点不受影响
+    emb_inputs = [
+        ((r[6] + "\n" + r[0]) if r[6] else r[0])
+        for r in rows
+    ]
+    embeddings = emb.embed(emb_inputs)
+    # 每块带语言/import 边/起止行/符号种类/签名/文档，检索可精确到符号并解释其语义
     metas = [
         {
             "source": rel,
             "symbol": sym,
-            "kind": "code",
+            "kind": kind,
             "lang": lang,
             "imports": imports_str,
             "start_line": sl,
             "end_line": el,
+            "signature": signature,
+            "doc": doc,
         }
-        for _, sym, sl, el in chunks
+        for _, sym, sl, el, kind, signature, doc in rows
     ]
-    ids = [uuid.uuid4().hex for _ in chunks]
+    ids = [uuid.uuid4().hex for _ in rows]
     return texts, embeddings, metas, ids
 
 

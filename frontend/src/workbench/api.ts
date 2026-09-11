@@ -72,6 +72,52 @@ export interface RenameResp {
   reindex_warnings: string[]
 }
 
+/** P1：符号（func/class/const/var/signal/enum/node ...） */
+export interface SymbolInfo {
+  name: string
+  kind: string
+  start: number
+  end: number
+  parent: string
+  signature: string
+  doc: string
+  detail: string
+}
+
+export interface SymbolsResp {
+  ok: boolean
+  path: string
+  lang: string
+  class_name: string
+  extends: string
+  doc: string
+  symbols: SymbolInfo[]
+}
+
+export interface SymbolMapFile {
+  rel: string
+  lang: string
+  region: string
+  region_name: string
+  class_name: string
+  extends: string
+  doc: string
+  symbols: SymbolInfo[]
+}
+
+export interface SymbolMapResp {
+  ok: boolean
+  code_root: string
+  regions_enabled: boolean
+  files: SymbolMapFile[]
+  stats: {
+    files: number
+    symbols: number
+    by_kind: Record<string, number>
+    skipped: number
+  }
+}
+
 /** 业务/HTTP 错误；status=0 表示网络层失败（服务未启动） */
 export class FsApiError extends Error {
   status: number
@@ -144,5 +190,11 @@ export const fsApi = {
   },
   delete(path: string, recursive = false, force = false): Promise<DeleteResp> {
     return postJson<DeleteResp>('/api/fs/delete', { path, recursive, force })
+  },
+  symbols(path: string): Promise<SymbolsResp> {
+    return request<SymbolsResp>(`/api/fs/symbols?path=${encodeURIComponent(path)}`)
+  },
+  symbolMap(): Promise<SymbolMapResp> {
+    return request<SymbolMapResp>('/api/fs/symbol-map')
   },
 }

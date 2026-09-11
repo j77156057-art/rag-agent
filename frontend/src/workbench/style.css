@@ -120,6 +120,7 @@ button { font-family: inherit; }
 .wb-body { flex: 1; display: flex; min-height: 0; }
 
 .wb-main { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
+.wb-editor-row { flex: 1; display: flex; min-height: 0; }
 
 /* ---------- 文件树 ---------- */
 .ft-panel {
@@ -413,6 +414,20 @@ button { font-family: inherit; }
 
 /* ---------- 顶栏保存按钮 ---------- */
 .wb-topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.wb-map-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 27px;
+  padding: 0 10px;
+  border-radius: 5px;
+  border: 1px solid var(--border-strong);
+  background: #121925;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.wb-map-btn:hover { color: #cfe0f4; border-color: #3f5573; background: #16202e; }
 .wb-save-btn {
   position: relative;
   display: inline-flex;

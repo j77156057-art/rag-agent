@@ -24,7 +24,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from config import get_runtime, CODE_ROOT
-from ingest import _CODE_EXT, _SKIP_DIRS
+from ingest import _CODE_EXT, _SKIP_DIRS, _MAX_CODE_FILE
+import symbols as symlib
 from regions import load_region_config, _git
 
 # ---------------------------------------------------------------------------
@@ -638,6 +639,82 @@ def git_log(root, rel, limit: int = 20) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# P1：符号语义地图
+# ---------------------------------------------------------------------------
+SYMBOL_MAP_MAX_FILES = 1000
+
+
+def file_symbols(root, rel):
+    """单文件符号信封（路径走沙箱解析）。"""
+    target, rel_n = _resolve(root, rel, must_exist=True)
+    if os.path.isdir(target):
+        raise FsError(400, f"不是文件：{rel_n}")
+    env = symlib.file_symbols(target)
+    if env is None:
+        raise FsError(404, f"读取失败：{rel_n}")
+    env = dict(env)
+    env["ok"] = True
+    env["path"] = rel_n
+    return env
+
+
+def build_symbol_map(root):
+    """遍历代码库构建全项目符号地图：files[].symbols 扁平表 + 分区归属 + 统计。"""
+    root_abs = _require_root(root)
+    rdirs = _region_dirs(root_abs)
+    files, skipped = [], 0
+    by_kind: dict = {}
+
+    for dp, dns, fns in os.walk(root_abs):
+        dns[:] = [d for d in dns if d not in _SKIP_DIRS and not d.startswith(".")]
+        for fn in sorted(fns):
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in _CODE_EXT:
+                continue
+            if len(files) >= SYMBOL_MAP_MAX_FILES:
+                skipped += 1
+                continue
+            fp = os.path.join(dp, fn)
+            try:
+                if os.path.getsize(fp) > _MAX_CODE_FILE:
+                    continue
+                env = symlib.file_symbols(fp)
+                if env is None:
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            rel = os.path.relpath(fp, root_abs).replace("\\", "/")
+            rmeta = _region_of(rel, rdirs)
+            syms = env.get("symbols") or []
+            for s in syms:
+                by_kind[s["kind"]] = by_kind.get(s["kind"], 0) + 1
+            files.append({
+                "rel": rel,
+                "lang": env.get("lang", ""),
+                "region": rmeta["key"] if rmeta else "",
+                "region_name": rmeta["name"] if rmeta else "",
+                "class_name": env.get("class_name", ""),
+                "extends": env.get("extends", ""),
+                "doc": env.get("doc", ""),
+                "symbols": syms,
+            })
+
+    files.sort(key=lambda f: f["rel"])
+    return {
+        "ok": True,
+        "code_root": root_abs,
+        "regions_enabled": bool(rdirs),
+        "files": files,
+        "stats": {
+            "files": len(files),
+            "symbols": sum(by_kind.values()),
+            "by_kind": by_kind,
+            "skipped": skipped,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # HTTP 层
 # ---------------------------------------------------------------------------
 router = APIRouter(prefix="/api/fs", tags=["workbench-fs"])
@@ -732,5 +809,23 @@ def delete_ep(req: DeleteReq):
 def gitlog_ep(path: str, limit: int = 20):
     try:
         return git_log(_runtime_root(), path, limit=limit)
+    except FsError as e:
+        return _err(e)
+
+
+@router.get("/symbols")
+def symbols_ep(path: str):
+    """单文件符号大纲。"""
+    try:
+        return file_symbols(_runtime_root(), path)
+    except FsError as e:
+        return _err(e)
+
+
+@router.get("/symbol-map")
+def symbol_map_ep():
+    """全项目符号语义地图（符号扁平表 + 分区归属 + 统计）。"""
+    try:
+        return build_symbol_map(_runtime_root())
     except FsError as e:
         return _err(e)

@@ -1,13 +1,38 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第八次重建（code_root 持久化 + 前端分包）」；历史构建清单保留在下文。
+> 最新构建见下方「第九次重建（P1 符号语义地图：符号提取 + 文件大纲 + 全局地图 + 符号级检索）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
-- 入口：`DocMind.exe`（约 19.4 MB，控制台模式，启动时自动开浏览器）
-- 整体体积：约 663 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB）
-- **当前构建时间：`2026-09-11 19:11:58`（第八次重建，code_root 持久化 + 前端分包）**
-- 上一版：`2026-09-11 18:53:13`（第七次重建，随包 MinGit）
+- 入口：`DocMind.exe`（约 18.5 MB，控制台模式，启动时自动开浏览器）
+- 整体体积：约 663.7 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB）
+- **当前构建时间：`2026-09-11 20:05:58`（第九次重建，P1 符号语义地图）**
+- 上一版：`2026-09-11 19:11:58`（第八次重建，code_root 持久化 + 前端分包）
+
+---
+
+## 第九次重建：P1 符号语义地图（2026-09-11 20:05）
+
+### 改动
+- **零依赖符号提取器 `symbols.py`（新增，约 640 行）**：离线环境装不了 tree-sitter，采用手写行级/ast 解析。
+  - GDScript：行级状态机（func/static func/inner class/class_name/extends/signal/跨行 enum/const/var/@export/@onready/@export_group/`##` 文档注释归属/块结束行），踩平 UTF-8 BOM、`@export var` 纯注解误跳过、`var x := {}` 推断语法（占位符归一化）等坑。
+  - Python 走标准库 `ast`；`.tscn/.tres` 解析 node/ext_resource/sub_resource/section（属性顺序不定，改为整段属性分别 search）；其它语言（JS/TS/Java/C/Lua…）正则 + 大括号配平 + Lua `end`。
+  - 统一信封 `{lang, class_name, extends, doc, symbols[]}`，符号含 name/kind/start/end（1 基含端点）/parent/signature/doc/detail；`file_symbols()` 用 utf-8-sig 读盘 + `(mtime_ns, size)` 缓存；`.json/.yaml/.toml/.godot` 等数据文件返回空信封。
+- **符号级语义检索（`ingest.py`）**：切片从「启发式等长块」升级为符号感知——class/function 独立成段，叶子声明（const/var/signal/enum/group）按间隔/行数/数量合并为 decl 批，未覆盖间隙补 file/code 段；异常自动回退旧切块。入库文档仍为原文（行号锚点不变），但 **embedding 输入前置符号 doc**，中文 `##` 文档注释参与语义向量。样例库重建后 19 → 18 切片，中文查询函数块可独立命中。`load_code_file` 同步剥 BOM。
+- **搜索结果标签（`tools.py` search_code）**：按符号 kind 显示 func/def/class/const/var/signal/enum，并以 `# 文档:` 展示 doc 首行。
+- **新 API（`workbench_fs.py`）**：`GET /api/fs/symbols?path=`（单文件符号信封）、`GET /api/fs/symbol-map`（全库遍历，上限 1000 文件，附 region/region_name/class_name/extends/doc 与 stats by_kind）；沙箱解析、路径安全不变。
+- **前端导航三件套**：
+  - `SymbolOutline.vue`（新）：编辑器右侧 208px 大纲，类卡（class_name/extends/文档）+ 符号列表（kind 色标/parent 缩进/行号），可折叠；切标签与保存后自动重拉。
+  - `SymbolMap.vue`（新）：全屏符号地图，多词 AND 搜索（名称/签名/文档/细节/路径/类名/继承/文件级文档）+ kind 动态 chips + 按分区→文件分组，点击符号跨文件打开并居中定位，Esc/遮罩关闭。
+  - 顶栏新增「符号地图」按钮；`composables/workbench.ts` 新增 `jumpToLine()`（经 `window.__docmind_cm` 单例桥，等 view 就绪后选区 + scrollIntoView y:center）；`api.ts`/`theme.ts`（kind→色标/字母）配套；App.vue 布局在主区加一行 flex 容纳编辑器与大纲。
+  - 业务包 workbench chunk 29.9 → 41.9 KB（gzip 12 → 16K），vendor 分包哈希不受影响。
+- 样例仓 `godot_sample` 三个脚本在 `## 类说明` 与首个 `@export` 间补空行（Godot 约定：注释紧贴声明=成员文档），让类文档正确归属文件头（样例仓独立提交）。
+
+### 验证
+- 单测：新增 `tests/test_symbols.py` 15 例（BOM、头部文档归属、inner class 父级、局部变量排除、跨行 enum/dict、字符串内 #、tscn、JS、Lua、mtime 缓存等）；全量 `unittest discover` **40/40 通过（4 skip）**，py_compile 全过。
+- dev 浏览器实测（http://127.0.0.1:8000/workbench）：crit.gd 大纲类卡 CritConfig + 3 常量 + crit_damage，点击光标定位 L8；地图 7 文件 18 符号、4 个分区组（未分区/角色行为/数值/UI·HUD）、kind chips（函数 6/常量 6/变量 6）、搜索 crit 与中文「暴击」均正确收敛、函数过滤 6 项；点 enemy.gd `_physics_process` 跨文件打开并定位 L9（`func _physics_process(_delta: float)`）；Esc/遮罩关闭、保存后大纲刷新；**console 零错误**。
+- 冻结态（最小 PATH 仅 System32，DOCMIND_SERVER_ONLY=1）：冷启动首启 code_root 空（400 提示正确）→ 表单方式 POST `/api/ingest_code` 索引样例 **18 切片** → symbol-map 返回 7 文件/18 符号/by_kind 正确，crit.gd 信封 class=CritConfig、doc=「暴击数值表（数值区）」、4 符号行号正确；`/workbench` HTTP 200。冒烟后已删 `_internal/.docmind_state.json`。
+- 产物 663.7 MB；打包前已停 :8000（第八版教训：SQLite 锁致 COLLECT 失败）。
 
 ---
 

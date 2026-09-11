@@ -58,3 +58,21 @@ export function gitState(tracked: boolean | null | undefined, dirty: boolean | n
   if (tracked) return { dot: 'clean', title: '已纳入 git，无改动' }
   return { dot: 'none', title: '该项目未启用 git 版本管理' }
 }
+
+/** P1 符号种类的中文标签 / 角标 / 颜色（大纲面板与符号地图共用） */
+const SYMBOL_KINDS: Record<string, { label: string; mark: string; color: string }> = {
+  function: { label: '函数', mark: 'ƒ', color: '#bc8cff' },
+  class: { label: '类', mark: 'C', color: '#58a6ff' },
+  signal: { label: '信号', mark: '~', color: '#f072b6' },
+  enum: { label: '枚举', mark: 'E', color: '#e3a83a' },
+  const: { label: '常量', mark: 'K', color: '#45c98c' },
+  var: { label: '变量', mark: 'x', color: '#2ec4b6' },
+  node: { label: '节点', mark: '▣', color: '#f0883e' },
+  resource: { label: '资源', mark: 'R', color: '#8b97a7' },
+  section: { label: '配置段', mark: '§', color: '#8b97a7' },
+  group: { label: '导出分组', mark: '▼', color: '#7d8590' },
+}
+
+export function symbolKind(kind: string): { label: string; mark: string; color: string } {
+  return SYMBOL_KINDS[kind] ?? { label: kind, mark: '·', color: '#7d8590' }
+}

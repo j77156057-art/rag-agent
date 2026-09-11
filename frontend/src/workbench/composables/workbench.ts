@@ -1,6 +1,7 @@
 // 工作台共享状态（模块级单例）：文件树、多标签编辑、保存/冲突、新建/改名/删除流程、
 // 对话框与右键菜单。组件只负责渲染与转发事件。
 import { computed, ref, shallowRef } from 'vue'
+import { EditorView } from '@codemirror/view'
 import { fsApi, FsApiError } from '../api'
 import type { TreeNode, TreeResp } from '../api'
 
@@ -255,6 +256,51 @@ async function openPath(path: string, preferWritable?: boolean) {
 
 function openNode(node: TreeNode) {
   if (node.type === 'file') void openPath(node.path, node.writable)
+}
+
+// ---------------------------------------------------------------- P1：符号跳转 / 地图开关
+
+const symbolMapOpen = ref(false)
+
+function openSymbolMap() {
+  symbolMapOpen.value = true
+}
+function closeSymbolMap() {
+  symbolMapOpen.value = false
+}
+
+/** 打开文件（必要时等待异步加载与 CM 挂载）并把光标定位/滚动到指定行。 */
+async function jumpToLine(path: string, line: number): Promise<void> {
+  await openPath(path)
+  const target = Math.max(1, line | 0)
+  await new Promise<void>((resolve) => {
+    const t0 = Date.now()
+    const tick = () => {
+      const view = (window as unknown as { __docmind_cm?: EditorView }).__docmind_cm
+      const tab = activeTab.value
+      if (view && tab && tab.path === path && !tab.loading && !tab.error) {
+        // view 单例：确认它已切换到该标签的 doc（新标签内容加载完成后才 setState）
+        const ready = tab.savedContent !== '' || view.state.doc.lines > 0
+        if (ready && view.state.doc.lines >= target - 1) {
+          const ln = Math.min(target, view.state.doc.lines)
+          const pos = view.state.doc.line(ln).from
+          view.focus()
+          view.dispatch({
+            selection: { anchor: pos },
+            effects: EditorView.scrollIntoView(pos, { y: 'center' }),
+          })
+          resolve()
+          return
+        }
+      }
+      if (Date.now() - t0 > 5000) {
+        resolve()
+        return
+      }
+      setTimeout(tick, 50)
+    }
+    tick()
+  })
 }
 
 function activateTab(id: number) {
@@ -554,6 +600,8 @@ export function useWorkbench() {
     dialog, ctxMenu,
     // tree
     loadTree, openNode, openPath,
+    // P1 符号地图 / 行跳转
+    jumpToLine, symbolMapOpen, openSymbolMap, closeSymbolMap,
     // tabs
     activateTab, closeTab, saveTab, saveActive, registerContentGetter,
     // fs ops
