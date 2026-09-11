@@ -1,13 +1,33 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第十一次重建（P1 调用边：项目内高置信调用关系）」；历史构建清单保留在下文。
+> 最新构建见下方「第十二次重建（P2 选区 AI：解释 / Review / 提问走 RAG agent，改写走直连快通道）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 18.5 MB，控制台模式，启动时自动开浏览器）
-- 整体体积：约 663.3 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB）
-- **当前构建时间：`2026-09-11 23:17:51`（第十一次重建，P1 调用边，exe 19,401,970 字节）**
-- 上一版：`2026-09-11 21:08:54`（第十次重建，P1 关系图，exe 19,397,582 字节）
+- 整体体积：约 663.4 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB）
+- **当前构建时间：`2026-09-12 00:32:23`（第十二次重建，P2 选区 AI，exe 19,405,162 字节）**
+- 上一版：`2026-09-11 23:17:51`（第十一次重建，P1 调用边，exe 19,401,970 字节）
+
+---
+
+## 第十二次重建：P2 选区 AI（2026-09-12 00:32）
+
+### 改动
+- **编辑器选中代码即弹出 AI 工具条**（fixed 浮条锚定选区末端，滚动/缩放 RAF 刷新坐标，贴近底沿自动上翻）：四个动作——解释 / Review / 提问 / 改写；只读文件（契约名单）不显示「改写」。
+- **双通道设计**（用户拍板）：
+  - 解释 / Review / 自由提问 → 复用 `POST /api/chat` ReAct agent，把文件、语言、起止行、选区全文与任务指令拼成上下文，可 search_code / read_file / grep 检索并引用文件:行号；右侧 392px 面板渲染流式 markdown（标题/列表/行内与围栏代码），检索思考过程折叠在「检索 / 思考过程」里。
+  - 改写 → **新增 `POST /api/selection_ai`**：绕过 agent 单轮直连 `LLMClient`，system 强约束「只输出替换选区的纯代码、无围栏无解释、不改对外签名」，SSE 逐 token；答案可一键**替换原选区**（不自动保存，仍走 Ctrl+S 与 409/422 护栏），另有复制、停止（AbortController）、清空。
+- **替换安全护栏**：异步返回后必须当前标签仍是目标文件、文件可写、且原 `from/to` 范围文本与发起时逐字一致（陈旧坐标检测，防覆盖往返期间的手动修改）。
+- **实测抓出并修的两个真问题**：① agent 每轮 ReAct 都转发 token（含 `Thought:/Action:` 草稿），面板最初把草稿当答案累加——改为 agent 通道只在 `final` 渲染干净答案，仅直连快通道逐字显示；② 选区已附完整代码，agent 仍逐文件浏览耗尽 29 次工具步数——提示词收紧为「优先基于已贴代码作答、工具调用≤2 次、拿到必要信息立即收尾」，复测 Review 8 次检索正常收尾。
+- 长度护栏：选区 40,000 字符、文件上下文 60,000、指令 4,000；空选区 400、超长 413、mock/无 key 409、ollama 不可达走既有引导流。
+- 业务 chunk 73.93 KB（gzip 28.77K），CSS 38.10 KB；vendor-vue 因引入 nextTick 等哈希变为 `vendor-vue-2seagieN`，codemirror/misc 不变。
+
+### 验证
+- 单测：新增 `tests/test_selection_ai.py` 10 例（强约束 system/定位信息/自定义指令/文件上下文/空语言回退/未知行号 + 400/413/422 护栏），全量 `unittest discover` **67/67 通过（4 skip）**。
+- dev 生产态浏览器实测（:8000/workbench，qwen3.6:35b-a3b 驻留）：浮条元信息（行号/行数/字符数）与 4 按钮；改写 8s 返回纯 GDScript 并替换选区（doc 变更、dirty 角标、「已替换·Ctrl+S 保存」、未自动落盘）；只读 regions.json 选中后无改写按钮；Review 返回 1409 字报告（4 个代码块、精确引用 player.gd:11/12 与 hud.gd:6、按严重级排序、无 ReAct 草稿污染）；提问输入框 Enter 发送/问题透传/生成中可停止（状态「已停止」）；console 零错误。
+- 冻结态（最小 PATH 仅 System32，DOCMIND_SERVER_ONLY=1，PyInstaller 退出码 0，构建约 75s）：冷启动 0.5s `/workbench/` 200；`build_time=2026-09-12 00:32:23` 确认新版；新业务 JS 200（78,134 字节）与源一致；`/api/selection_ai` 空选区 400 / 超长 413 / 缺字段 422；**真实改写 SSE 端到端**（最小 PATH、随包环境，3.2s，36 token + final + done）——指令「amount 改名 damage 并加生命值下限」产出纯代码 `func take_damage(damage: int)` + `max_hp = max(0, max_hp)`，无 markdown 围栏；ingest 19 切片、symbol-map 7 文件/21 符号、relation-graph 7 节点/4 边（3 inherits+1 calls）；最小 PATH 下 gitlog 200（样例仓 head 已为用户提交的 90db41b）。前端 6 文件 SHA-256 全一致；包内无 python*.exe/.env；MinGit 89.5 MB/365 文件；冒烟后已删 `_internal/.docmind_state.json`，进程结束端口释放。
+- 源码对应提交：`da70800 feat(ai): P2 selection AI — grounded explain/review/ask + direct rewrite channel`（8 文件 +801−2，无 BOM 提交信息字节复验通过）。
 
 ---
 
