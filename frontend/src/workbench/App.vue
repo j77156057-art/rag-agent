@@ -9,6 +9,8 @@ import AppDialog from './components/AppDialog.vue'
 import SymbolOutline from './components/SymbolOutline.vue'
 import SymbolMap from './components/SymbolMap.vue'
 import RelationGraph from './components/RelationGraph.vue'
+import SelectionToolbar from './components/SelectionToolbar.vue'
+import SelectionAiPanel from './components/SelectionAiPanel.vue'
 import { useWorkbench } from './composables/workbench'
 import { regionColor } from './theme'
 
@@ -16,6 +18,7 @@ const {
   tree, treeLoading, treeError, loadTree,
   tabs, activeTab, selectedPath, openNode, saveActive,
   openSymbolMap, openRelationGraph,
+  aiPanelOpen,
 } = useWorkbench()
 
 const dirtyCount = computed(() => tabs.value.filter((t) => t.dirty).length)
@@ -119,6 +122,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
           <EditorTabs />
           <div class="wb-editor-row">
             <CodeView :tab="activeTab" />
+            <SelectionAiPanel v-if="aiPanelOpen" />
             <SymbolOutline />
           </div>
           <footer class="wb-statusbar">
@@ -145,5 +149,6 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
     <AppDialog />
     <SymbolMap />
     <RelationGraph />
+    <SelectionToolbar />
   </div>
 </template>

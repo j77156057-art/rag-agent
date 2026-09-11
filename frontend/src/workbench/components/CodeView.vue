@@ -19,12 +19,53 @@ import { regionColor, formatMtime, gitState } from '../theme'
 
 const props = defineProps<{ tab: EditorTab | null }>()
 
-const { saveActive, closeTab, tabs, registerContentGetter } = useWorkbench()
+const { saveActive, closeTab, tabs, registerContentGetter, setSelection } = useWorkbench()
 
 const host = ref<HTMLElement | null>(null)
 let view: EditorView | null = null
 const states = new Map<number, EditorState>()
 const readOnlyComp = new Compartment()
+
+// ---- P2：把当前非空选区上报给选区 AI（含视口坐标，供浮条定位） ----
+function publishSelection(v: EditorView, tab: EditorTab) {
+  const main = v.state.selection.main
+  const text = v.state.sliceDoc(main.from, main.to)
+  if (main.empty || !text.trim()) {
+    setSelection(null)
+    return
+  }
+  const coords = v.coordsAtPos(main.to)
+  if (!coords) {
+    setSelection(null)
+    return
+  }
+  setSelection({
+    path: tab.path,
+    name: tab.name,
+    lang: tab.lang,
+    writable: tab.writable,
+    text,
+    from: main.from,
+    to: main.to,
+    startLine: v.state.doc.lineAt(main.from).number,
+    endLine: v.state.doc.lineAt(main.to).number,
+    x: coords.right,
+    y: coords.bottom,
+  })
+}
+
+let rafPending = false
+function scheduleRepublish() {
+  if (rafPending) return
+  rafPending = true
+  requestAnimationFrame(() => {
+    rafPending = false
+    if (view && props.tab && !props.tab.loading && !props.tab.error) publishSelection(view, props.tab)
+  })
+}
+function onEditorScrollOrResize() {
+  scheduleRepublish()
+}
 
 function langExtension(lang: string) {
   switch (lang) {
@@ -62,6 +103,8 @@ function buildState(tab: EditorTab): EditorState {
         // CM6 state 不可变：dispatch 后是全新 state 对象，必须回写 Map，
         // 否则非活动标签/保存时 contentGetter 取到的还是旧引用。
         states.set(tab.id, u.state)
+        // P2：选区或文档变化时刷新选区快照（文档替换后变光标则隐藏浮条）
+        if (u.selectionSet || u.docChanged) publishSelection(u.view, tab)
         if (!u.docChanged) return
         const t = tabs.value.find((x) => x.id === tab.id)
         if (t) t.dirty = u.state.doc.toString() !== t.savedContent
@@ -87,6 +130,8 @@ function ensureState(tab: EditorTab): EditorState {
 
 function syncView() {
   if (!view) return
+  // 切换标签 / 进入加载或错误态：旧选区不再有效，隐藏选区浮条
+  setSelection(null)
   if (props.tab && !props.tab.loading && !props.tab.error) {
     // 切走前把旧标签的最终 state 落回 Map（listener 已逐次回写，这里兜底）
     const curId = (view as unknown as { __tabId?: number }).__tabId
@@ -104,9 +149,15 @@ onMounted(() => {
   // 编辑器桥：DevTools / 后续选区 AI（P2）经此读取当前 EditorView。
   // view 单例不变，切标签只替换其 state。
   ;(window as unknown as { __docmind_cm?: EditorView }).__docmind_cm = view
+  // 选区浮条是 fixed 定位：编辑器滚动或窗口缩放时刷新锚点坐标
+  view.scrollDOM.addEventListener('scroll', onEditorScrollOrResize, { passive: true })
+  window.addEventListener('resize', onEditorScrollOrResize)
 })
 
 onBeforeUnmount(() => {
+  view?.scrollDOM.removeEventListener('scroll', onEditorScrollOrResize)
+  window.removeEventListener('resize', onEditorScrollOrResize)
+  setSelection(null)
   if ((window as unknown as { __docmind_cm?: unknown }).__docmind_cm === view) {
     delete (window as unknown as { __docmind_cm?: EditorView }).__docmind_cm
   }

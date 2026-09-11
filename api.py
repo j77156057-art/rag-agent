@@ -451,6 +451,117 @@ async def enhance_prompt_ep(req: EnhancePromptReq):
     return {"ok": True, "mode": "local", "enhanced": _local_enhance(draft), "note": note}
 
 
+# ---------------------------------------------------------------- P2：选区 AI（直连快通道）
+class SelectionAiReq(BaseModel):
+    path: str
+    lang: str = "text"
+    start_line: int = 0
+    end_line: int = 0
+    selection: str
+    instruction: str = ""
+    file_context: str = ""
+    mode: str = "rewrite"
+
+
+SELECTION_MAX_CHARS = 40_000
+SELECTION_CTX_MAX_CHARS = 60_000
+SELECTION_INSTR_MAX_CHARS = 4_000
+
+
+def _selection_rewrite_messages(req: SelectionAiReq) -> list[dict]:
+    """构造"只输出替换代码"的强约束对话。选区代码是焦点，文件全文仅作上下文参考。"""
+    lang = (req.lang or "text").strip() or "text"
+    instr = (req.instruction or "").strip() or "在不改变对外行为的前提下优化这段代码、修正明显问题。"
+    sys_p = (
+        f"你是资深 {lang} 工程师，正在 IDE 中协助用户就地改写选中的代码片段。严格遵守：\n"
+        "1. 只输出用于【替换选中片段】的完整代码本身；不要 markdown 代码围栏、不要解释、"
+        "不要任何前后缀文字、不要输出选区之外的文件代码。\n"
+        "2. 保持该语言与原片段一致的缩进与命名风格；除非用户明确要求，不要改动选区对外暴露的"
+        "类名/函数名/签名/公共类型。\n"
+        "3. 即使需求牵涉更大范围，也只给出替换该片段所需的代码，不输出任何说明。"
+    )
+    loc = f"第 {req.start_line}–{req.end_line} 行" if req.start_line and req.end_line else "行号未知"
+    parts = [
+        f"文件：{req.path}",
+        f"语言：{lang}",
+        f"选区位置：{loc}",
+    ]
+    ctx = (req.file_context or "").strip()
+    if ctx:
+        parts.append(
+            "文件内容参考（仅帮助理解上下文，禁止原样输出选区之外的部分）：\n"
+            f"```{lang}\n{ctx}\n```"
+        )
+    parts.append("选中的代码：\n" + f"```{lang}\n{req.selection}\n```")
+    parts.append("改写要求：" + instr)
+    return [
+        {"role": "system", "content": sys_p},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
+
+
+@app.post("/api/selection_ai")
+async def selection_ai_ep(req: SelectionAiReq):
+    """P2 选区"改写"快通道：直连 LLM 单轮流式，强约束只产出可替换的纯代码。
+    解释/Review/自由提问仍走 /api/chat（ReAct agent，可检索项目并引用行号）。"""
+    if not (req.selection or "").strip():
+        return JSONResponse({"ok": False, "error": "选区为空，请先在编辑器中选中代码。"}, status_code=400)
+    if len(req.selection) > SELECTION_MAX_CHARS:
+        return JSONResponse(
+            {"ok": False, "error": f"选区过长（{len(req.selection)} 字符），上限 {SELECTION_MAX_CHARS} 字符。"},
+            status_code=413,
+        )
+    if len(req.file_context or "") > SELECTION_CTX_MAX_CHARS:
+        return JSONResponse({"ok": False, "error": "文件上下文过长，请缩小选区后重试。"}, status_code=413)
+    if len(req.instruction or "") > SELECTION_INSTR_MAX_CHARS:
+        return JSONResponse({"ok": False, "error": "改写指令过长。"}, status_code=413)
+
+    # 进入 SSE 前做可用性预检，错误才能以 JSON 直接返回（与 /api/chat 的图片校验同理）
+    provider = get_runtime("llm_provider") or LLM_PROVIDER
+    if provider == "mock":
+        return JSONResponse(
+            {"ok": False, "error": "当前为离线演示（mock）模式，未配置可用模型；请到「⚙ 模型设置」选择模型后再用选区 AI。"},
+            status_code=409,
+        )
+    envk = PROVIDERS.get(provider, {}).get("api_key_env", "")
+    if envk:
+        key = get_runtime("llm_api_key") or LLM_API_KEY or os.getenv(envk, "")
+        if not key:
+            return JSONResponse(
+                {"ok": False, "error": f"当前供应商 {provider} 未配置 API Key；请到「⚙ 模型设置」填写。"},
+                status_code=409,
+            )
+    if provider == "ollama":
+        try:
+            _ol = await run_in_threadpool(check_ollama)
+        except Exception:  # noqa: BLE001
+            _ol = None
+        if _ol is not None and not _ol["reachable"]:
+            return StreamingResponse(_ollama_down_stream(_ol["guidance"]), media_type="text/event-stream")
+
+    req.selection = req.selection.replace("\r\n", "\n").rstrip("\n")
+    messages = _selection_rewrite_messages(req)
+
+    def event_stream():
+        try:
+            client = LLMClient()
+            acc: list[str] = []
+            for tok in client.chat(messages, stream=True, temperature=0.2):
+                if not tok:
+                    continue
+                acc.append(tok)
+                yield f"data: {json.dumps({'type': 'token', 'text': tok}, ensure_ascii=False)}\n\n"
+            text = "".join(acc).strip()
+            yield f"data: {json.dumps({'type': 'final', 'text': text}, ensure_ascii=False)}\n\n"
+        except Exception as e:  # noqa: BLE001
+            err_msg = f"{type(e).__name__}: {e}"
+            print(f"[selection_ai] LLM stream failed: {err_msg}", flush=True)
+            yield f"data: {json.dumps({'type': 'final', 'text': f'模型无响应：{err_msg[:300]}。请到「⚙ 模型设置」换一个能加载的模型再试。'}, ensure_ascii=False)}\n\n"
+        yield 'data: {"type":"done"}\n\n'
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 @app.get("/")
 async def index():
     return FileResponse(os.path.join(PROJECT_WEB_DIR, "index.html"))
