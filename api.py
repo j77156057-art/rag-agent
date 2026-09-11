@@ -34,6 +34,7 @@ from config import (
     CODE_ROOT,
     set_runtime,
     get_runtime,
+    save_state,
     edit_confirm_enabled,
     API_TOKEN,
     DOCMIND_CORS_ORIGINS,
@@ -259,6 +260,7 @@ async def ingest_code(root: str = Form(...)):
         n = ingest_code_directory(root)
         abs_root = os.path.abspath(root)
         set_runtime("code_root", abs_root)
+        save_state("code_root", abs_root)  # 跨重启记住上次选择，启动时由 config 恢复
         # 读项目规则文件（若有），注入 Agent 系统消息，让分区约定随项目生效
         rules = load_project_rules(abs_root)
         set_runtime("project_rules", rules)
@@ -905,6 +907,7 @@ async def reset_code():
     """清空代码集合并解除代码库配置（重新索引前调用，避免旧切片累积）。"""
     reset_collection(CODE_COLLECTION_NAME)
     set_runtime("code_root", "")
+    save_state("code_root", "")  # 同步清除持久化选择，避免重启后又恢复
     set_runtime("project_rules", "")
     clear_read_files()
     agent.history = []

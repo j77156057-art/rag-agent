@@ -1,13 +1,31 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第七次重建（随包 MinGit + git 脏标记修复 + Godot 索引）」；历史构建清单保留在下文。
+> 最新构建见下方「第八次重建（code_root 持久化 + 前端分包）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 19.4 MB，控制台模式，启动时自动开浏览器）
-- 整体体积：约 662 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB）
-- **当前构建时间：`2026-09-11 18:53:13`（第七次重建，随包 MinGit）**
-- 上一版：`2026-09-11 15:45:03`（第六次重建，工作台前端脚手架，P0 任务 1）
+- 整体体积：约 663 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB）
+- **当前构建时间：`2026-09-11 19:11:58`（第八次重建，code_root 持久化 + 前端分包）**
+- 上一版：`2026-09-11 18:53:13`（第七次重建，随包 MinGit）
+
+---
+
+## 第八次重建：code_root 持久化 + 前端 vendor 分包（2026-09-11 19:11）
+
+### 改动
+- **代码库选择跨重启保持**：此前 code_root 只是内存态，每次重启应用都要重新索引选择。
+  - `config.py`：新增 `STATE_FILE`（`<BASE_DIR>/.docmind_state.json`，开发=源码根、冻结=`_internal`）与 `save_state()`；import config 时 `_apply_persisted_state()` 自动恢复，**目标目录不存在则静默忽略**（U盘/网盘卸载不会报错）；写入失败静默回落内存态。
+  - `api.py`：`/api/ingest_code` 成功后 `save_state("code_root", abs_root)`；`/api/reset_code` 同步写空串，避免重置后重启又被恢复。
+  - `.docmind_state.json` 已加 .gitignore；spec 不打包该文件，**冻结包冒烟后必须从 `dist/DocMind/_internal/` 删掉本机选择再分发**。
+- **前端 manualChunks 分包**（`frontend/vite.config.ts`）：`vendor-codemirror`（652KB/gzip 228K）/ `vendor-vue`（66KB）/ `vendor-misc`（6.6KB）/ 业务 `workbench`（29.9KB/gzip 12K）。业务代码高频改动不再使 vendor 哈希失效；总体积与单块时持平。构建前先手动删 `web/assets/` 旧 workbench-*（emptyOutDir:false 会累积旧 hash）。
+- 后端无其它改动。
+
+### 验证
+- 源码态：删状态文件冷启动 code_root 为空 → 选库后状态文件落盘 → **再次重启自动恢复** code_root 与 code_sources=19（向量库本就持久化，二者各自恢复，无需重索引）；失效路径单测不恢复；reset_code 后状态清空。
+- 冻结态（最小 PATH 仅 System32，DOCMIND_SERVER_ONLY=1）：首启 code_root 空 → 包内选库写入 `_internal/.docmind_state.json` → 二次冷启动自动恢复、文件树正常、MinGit 两次启动均生效；浏览器分包页面挂载正常、徽标正确、console 零错误；冒烟后已删包内状态文件。
+- 回归 25/25；产物 662.9 MB，无 .env / python\*.exe / 本机状态文件泄漏。
+- **构建教训**：源码实例正在运行时 PyInstaller 会因源 `.chroma` 的 SQLite 文件被占用而中途失败（COLLECT 已清空旧 dist 才报错，表现为 exe 时间戳不变、web/assets 被清空）。**打包前必须先停掉 :8000 实例**。
 
 ---
 

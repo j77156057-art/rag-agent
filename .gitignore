@@ -6,6 +6,7 @@ __pycache__/
 
 # ===== 向量库（本地数据，不入库）=====
 .chroma/
+.docmind_state.json
 
 # ===== 运行产生的临时上传文件 =====
 uploads/

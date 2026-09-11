@@ -1,4 +1,5 @@
 """DocMind 配置中心：从 .env 读取，集中管理模型 / 路径 / 参数。"""
+import json
 import os
 import sys
 
@@ -127,7 +128,7 @@ CHAT_IMAGE_MAX_BYTES = int(os.getenv("CHAT_IMAGE_MAX_BYTES", str(10 * 1024 * 102
 CHAT_IMAGE_ALLOWED_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
 # ---- 运行时覆盖（由前端 /api/config 动态设置，优先级高于 .env）----
-# 仅存于内存，进程重启后恢复 .env 默认值。用于页面内"免重启切换模型"。
+# 模型类切换仅存于内存（重启恢复 .env）；code_root 例外，经 STATE_FILE 跨重启恢复。
 _RUNTIME = {}
 
 
@@ -137,6 +138,43 @@ def set_runtime(key, value):
 
 def get_runtime(key, default=None):
     return _RUNTIME.get(key, default)
+
+
+# ---- 跨重启持久化的少量本地状态（当前仅 code_root）----
+# 与 .chroma 同目录（开发=源码根；冻结=_internal），只存路径类非敏感数据，
+# 避免重启后必须重新选择代码库。写入失败一律静默回落内存态，不影响主流程。
+STATE_FILE = os.path.join(BASE_DIR, ".docmind_state.json")
+
+
+def save_state(key, value):
+    try:
+        data = {}
+        if os.path.isfile(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (ValueError, OSError):
+                data = {}
+        data[key] = value
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _apply_persisted_state():
+    """进程启动（import config）时恢复上次的本地选择；路径失效自动忽略。"""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    root = data.get("code_root")
+    if isinstance(root, str) and root and os.path.isdir(root):
+        _RUNTIME["code_root"] = root
+
+
+_apply_persisted_state()
 
 
 def edit_confirm_enabled():
