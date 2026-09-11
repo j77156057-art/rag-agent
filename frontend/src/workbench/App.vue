@@ -8,13 +8,14 @@ import ContextMenu from './components/ContextMenu.vue'
 import AppDialog from './components/AppDialog.vue'
 import SymbolOutline from './components/SymbolOutline.vue'
 import SymbolMap from './components/SymbolMap.vue'
+import RelationGraph from './components/RelationGraph.vue'
 import { useWorkbench } from './composables/workbench'
 import { regionColor } from './theme'
 
 const {
   tree, treeLoading, treeError, loadTree,
   tabs, activeTab, selectedPath, openNode, saveActive,
-  openSymbolMap,
+  openSymbolMap, openRelationGraph,
 } = useWorkbench()
 
 const dirtyCount = computed(() => tabs.value.filter((t) => t.dirty).length)
@@ -69,6 +70,20 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
             <path d="M4.6 4.2 L8.4 3.6 M4.3 4.6 L7.3 9 M9 4.4 L8.5 8.6" stroke="currentColor" stroke-width="0.8" />
           </svg>
           符号地图
+        </button>
+        <button
+          v-if="tree"
+          class="wb-map-btn"
+          title="查看类继承与场景挂载关系图"
+          @click="openRelationGraph"
+        >
+          <svg width="13" height="13" viewBox="0 0 13 13">
+            <circle cx="3.2" cy="3.6" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
+            <circle cx="10" cy="3.6" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
+            <circle cx="6.6" cy="10" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
+            <path d="M4.4 4.2 L8.8 4.2 M4 4.8 L5.8 8.8 M9.2 4.8 L7.4 8.8" stroke="currentColor" stroke-width="0.85" />
+          </svg>
+          关系图
         </button>
         <button
           v-if="activeTab"
@@ -129,5 +144,6 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
     <ContextMenu />
     <AppDialog />
     <SymbolMap />
+    <RelationGraph />
   </div>
 </template>

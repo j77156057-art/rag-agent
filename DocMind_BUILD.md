@@ -1,13 +1,31 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第九次重建（P1 符号语义地图：符号提取 + 文件大纲 + 全局地图 + 符号级检索）」；历史构建清单保留在下文。
+> 最新构建见下方「第十次重建（P1 关系图：继承边 + 场景挂载组成边）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 18.5 MB，控制台模式，启动时自动开浏览器）
-- 整体体积：约 663.7 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB）
-- **当前构建时间：`2026-09-11 20:05:58`（第九次重建，P1 符号语义地图）**
-- 上一版：`2026-09-11 19:11:58`（第八次重建，code_root 持久化 + 前端分包）
+- 整体体积：约 663.3 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB）
+- **当前构建时间：`2026-09-11 21:08:54`（第十次重建，P1 关系图）**
+- 上一版：`2026-09-11 20:05:58`（第九次重建，P1 符号语义地图）
+
+---
+
+## 第十次重建：P1 关系图（2026-09-11 21:08）
+
+### 改动
+- **后端关系图构建（`workbench_fs.py`）**：新增纯函数 `build_relation_graph(root)` 与 `GET /api/fs/relation-graph`，复用符号信封与遍历护栏（1000 文件上限、500KB 单文件、mtime 缓存）。
+  - **继承边 inherits**（子 → 父）：GDScript `extends`（含 `extends "res://x.gd"` 路径形式与 `class_name` 解析）、Python class bases（`ast` detail 串按顶层逗号切分，`Dict[str, int]` 泛型内层逗号不产生噪声；`object`/隐式 RefCounted 不出边）。项目内类直连，引擎/第三方基类聚合为虚线外部节点（同名只建一个）。
+  - **挂载边 mounts**（场景 → 脚本，虚线橙色）：解析 .tscn 的 `[ext_resource type="Script" id=...]` 与节点段 `script = ExtResource("id")`；同脚本挂多节点去重；PackedScene 资源与缺失脚本目标不出边。
+  - 节点 schema：`{id,label,sub,kind,rel,line,region,region_name,external,doc}`，kind∈class/script/scene/engine/external；stats 含 user/external 节点数与 edges_by_kind。
+- **前端 `RelationGraph.vue`（新）**：零第三方依赖手写力导向（斥力 + 弹簧 + 矩形碰撞 + 中心引力，260 次预迭代收敛、rAF 余温），SVG 渲染；滚轮以指针为焦点缩放、背景拖拽平移、节点可拖动、矩形边界收进的箭头端点；继承/挂载/外部基类三个开关、搜索高亮节点及其直接邻居、适应窗口；点用户节点关闭图并 jumpToLine 到定义行；Esc/遮罩关闭。顶栏新增「关系图」按钮；`api.ts` 类型与 client、`theme.ts` graphNodeStyle、composable 的 relationGraphOpen 开关配套。
+- 业务包 workbench chunk 57.45 KB（gzip 21.8K），vendor 分包哈希全部不变；构建后手动清理 `web/assets/` 上一版 workbench 旧 hash（emptyOutDir:false 会累积）。
+- **范围决策**：调用边（谁调用了谁）因正则噪声大本轮不做；样例仓不新增演示场景（用户选择），样例数据为 5 用户节点 + 2 外部节点 + 3 继承边，挂载边由单测覆盖。
+
+### 验证
+- 单测：新增 `tests/test_relation_graph.py` 9 例（空项目、项目内继承、引擎基类聚合、无 extends 不出边、res:// 继承、Python 多继承/object 省略/泛型逗号、场景挂载去重、缺失目标跳过、节点 schema/stats）；全量 `unittest discover` **49/49 通过（4 skip）**，py_compile 与 IDE 诊断干净。
+- dev 浏览器实测（两轮自动化）：统计文案「5 个类/脚本/场景 · 2 个外部基类 · 3 继承 · 0 挂载」、7 节点 3 边与虚线外部节点、三开关联动（隐藏外部基类时相关边一并消失）、搜索 crit 高亮 CritConfig 直接关系其余 dim、适应按钮、点 enemy 节点关闭图并把光标定位到 behaviors/enemy.gd 第 1 行、Esc 关闭；**console 零错误**，接口 200。
+- 冻结态（最小 PATH 仅 System32，DOCMIND_SERVER_ONLY=1，53s 构建）：冷启动 code_root 空时 relation-graph 返 400；`build_time=2026-09-11 21:08:54` 确认新版；POST `/api/ingest_code` 重建样例 **18 切片**；冻结环境 relation-graph 返回 7 节点/5 用户/2 外部/3 继承，symbol-map 7 文件/18 符号/by_kind 正确；`/workbench` 200（657 字节）、新业务 JS 200（57447 字节）。冻结前端 6 个文件与源码 SHA-256 全一致；包内无 python*.exe/.env/状态文件；MinGit 随包；冒烟后已删 `_internal/.docmind_state.json`，进程结束端口释放。
 
 ---
 

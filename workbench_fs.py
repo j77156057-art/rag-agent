@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import time
 from datetime import datetime
@@ -715,6 +716,293 @@ def build_symbol_map(root):
 
 
 # ---------------------------------------------------------------------------
+# P1：关系图（继承边 + 场景挂载组成边；调用边噪声大，留待后续）
+# ---------------------------------------------------------------------------
+
+_GD_RES_PATH = re.compile(r'^"?res://(.+?)"?$')
+_TSCN_EXT_LINE = re.compile(r"^\[ext_resource\s+(.*?)\]\s*$")
+_TSCN_NODE_LINE = re.compile(r'^\[node\b')
+_TSCN_SCRIPT_REF = re.compile(r'^\s*script\s*=\s*ExtResource\(\s*"([^"]+)"\s*\)')
+_ATTR_PATH_RE = re.compile(r'path="([^"]*)"')
+_ATTR_TYPE_RE = re.compile(r'type="([^"]*)"')
+
+
+def _base_simple_name(base: str) -> str:
+    """Foo / pkg.mod.Foo / Foo[T] -> Foo（用于和项目内类名匹配）。"""
+    b = base.strip()
+    b = b.split("[", 1)[0]
+    return b.split(".")[-1].strip()
+
+
+def _split_top_commas(s: str):
+    """按顶层逗号切分 Python bases 串（泛型参数里的逗号不切）。"""
+    parts, depth, cur = [], 0, []
+    for ch in s:
+        if ch in "[(<":
+            depth += 1
+        elif ch in "])>":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _scene_script_refs(text: str):
+    """解析 .tscn：返回 [(node 段内 script 赋值行号(1 基), 目标 rel)]。
+
+    仅取 ext_resource（type=Script 或路径像脚本）声明的 id→res 路径映射，
+    再在各 [node] 段内找 ``script = ExtResource("id")`` 赋值。
+    """
+    refs = {}  # ext_resource id -> rel
+    edges = []  # (line, rel)
+    cur_node_line = 0
+    for i, ln in enumerate(text.split("\n"), start=1):
+        s = ln.strip()
+        m = _TSCN_EXT_LINE.match(s)
+        if m:
+            attrs = m.group(1)
+            mp = _ATTR_PATH_RE.search(attrs)
+            mt = _ATTR_TYPE_RE.search(attrs)
+            if not mp:
+                continue
+            path = mp.group(1)
+            typ = mt.group(1) if mt else ""
+            if not path.startswith("res://"):
+                continue
+            mid = re.search(r'id="([^"]*)"', attrs)
+            if not mid:
+                continue
+            ext = os.path.splitext(path)[1].lower()
+            if typ == "Script" or ext in (".gd", ".cs"):
+                refs[mid.group(1)] = path[len("res://"):].replace("\\", "/")
+            continue
+        if s.startswith("["):
+            cur_node_line = i if _TSCN_NODE_LINE.match(s) else 0
+            continue
+        if cur_node_line:
+            m = _TSCN_SCRIPT_REF.match(ln)
+            if m:
+                rel = refs.get(m.group(1))
+                if rel:
+                    edges.append((i, rel))
+    return edges
+
+
+def build_relation_graph(root):
+    """全项目关系图：用户节点（类/匿名脚本/场景）+ 引擎/外部基类节点 + 两类边。
+
+    - inherits：GDScript ``extends`` / Python class bases（项目内类直连，
+      引擎与第三方基类聚合成 external 节点；隐式 RefCounted/object 不出边）；
+    - mounts：.tscn 场景节点经 ExtResource 挂载脚本的组成边。
+    """
+    root_abs = _require_root(root)
+    rdirs = _region_dirs(root_abs)
+
+    nodes = []          # 用户节点 + 外部节点，按稳定顺序
+    edges = []
+    node_index = {}     # 节点 id -> 在 nodes 中的下标
+    user_by_name = {}   # 项目内类名 -> 节点 id（gd class_name / py 顶层类）
+    gd_by_rel = {}      # .gd rel -> 节点 id（含匿名脚本，res:// 继承与挂载都指向它）
+    py_classes = []     # (节点 id, bases detail 串)
+    scene_rels = set()
+    skipped = 0
+
+    def add_node(node):
+        nid = node["id"]
+        if nid in node_index:
+            return node_index[nid]
+        node_index[nid] = len(nodes)
+        nodes.append(node)
+        return node_index[nid]
+
+    def external_id(kind, label):
+        return f"ext:{kind}:{label}"
+
+    def ensure_external(kind, label, sub=""):
+        nid = external_id(kind, label)
+        if nid not in node_index:
+            add_node({
+                "id": nid, "label": label, "sub": sub, "kind": kind,
+                "rel": "", "line": 0, "region": "", "region_name": "",
+                "external": True, "doc": "",
+            })
+        return nid
+
+    def add_edge(source, target, kind, label, line=0):
+        edges.append({
+            "source": source, "target": target, "kind": kind,
+            "label": label, "line": line,
+        })
+
+    # ---- 第一遍：建用户节点 ----
+    walked = []  # (rel, ext, abs_path)
+    for dp, dns, fns in os.walk(root_abs):
+        dns[:] = [d for d in dns if d not in _SKIP_DIRS and not d.startswith(".")]
+        for fn in sorted(fns):
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in _CODE_EXT:
+                continue
+            if len(walked) >= SYMBOL_MAP_MAX_FILES:
+                skipped += 1
+                continue
+            fp = os.path.join(dp, fn)
+            try:
+                if os.path.getsize(fp) > _MAX_CODE_FILE:
+                    continue
+            except OSError:
+                continue
+            walked.append((os.path.relpath(fp, root_abs).replace("\\", "/"), ext, fp))
+
+    for rel, ext, fp in walked:
+        if ext not in (".gd", ".py", ".tscn"):
+            continue
+        rmeta = _region_of(rel, rdirs)
+        region = rmeta["key"] if rmeta else ""
+        region_name = rmeta["name"] if rmeta else ""
+        try:
+            env = symlib.file_symbols(fp)
+        except Exception:  # noqa: BLE001
+            env = None
+        if env is None:
+            continue
+
+        if ext == ".gd":
+            cn = (env.get("class_name") or "").strip()
+            doc = env.get("doc", "")
+            label = cn or os.path.splitext(os.path.basename(rel))[0]
+            nid = f"gd:{rel}"
+            add_node({
+                "id": nid, "label": label,
+                "sub": "" if cn else rel,
+                "kind": "class" if cn else "script",
+                "rel": rel, "line": 1, "region": region,
+                "region_name": region_name, "external": False, "doc": doc,
+            })
+            gd_by_rel[rel] = nid
+            if cn and cn not in user_by_name:
+                user_by_name[cn] = nid
+
+        elif ext == ".py":
+            for s in env.get("symbols") or []:
+                if s.get("kind") != "class":
+                    continue
+                nid = f"py:{rel}:{s['name']}"
+                add_node({
+                    "id": nid, "label": s["name"], "sub": rel,
+                    "kind": "class", "rel": rel, "line": s["start"],
+                    "region": region, "region_name": region_name,
+                    "external": False, "doc": s.get("doc", ""),
+                })
+                py_classes.append((nid, s.get("detail", "")))
+                user_by_name.setdefault(s["name"], nid)
+
+        elif ext == ".tscn":
+            nid = f"scene:{rel}"
+            add_node({
+                "id": nid,
+                "label": os.path.splitext(os.path.basename(rel))[0],
+                "sub": rel, "kind": "scene", "rel": rel, "line": 1,
+                "region": region, "region_name": region_name,
+                "external": False, "doc": "",
+            })
+            scene_rels.add(rel)
+
+    # ---- 第二遍：继承边 ----
+    for rel, ext, fp in walked:
+        if ext == ".gd":
+            source = gd_by_rel.get(rel)
+            if not source:
+                continue
+            env = symlib.file_symbols(fp) or {}
+            ref = (env.get("extends") or "").strip()
+            if not ref:
+                continue  # 隐式 RefCounted/Object 不画
+            mr = _GD_RES_PATH.match(ref)
+            if mr:
+                target_rel = mr.group(1).replace("\\", "/")
+                target = gd_by_rel.get(os.path.normpath(target_rel).replace("\\", "/"))
+                if target:
+                    add_edge(source, target, "inherits", "extends")
+                continue
+            simple = ref.split(".")[-1]
+            target = user_by_name.get(simple)
+            if target:
+                add_edge(source, target, "inherits", "extends")
+            else:
+                add_edge(source, ensure_external("engine", ref),
+                         "inherits", "extends")
+
+        elif ext == ".py":
+            env = symlib.file_symbols(fp) or {}
+            class_lines = {s["name"]: s["start"] for s in (env.get("symbols") or [])
+                           if s.get("kind") == "class"}
+            for nid, detail in py_classes:
+                if not nid.startswith("py:" + rel + ":"):
+                    continue
+                cls_name = nid.rsplit(":", 1)[-1]
+                for base in _split_top_commas(detail):
+                    simple = _base_simple_name(base)
+                    if not simple or simple == "object":
+                        continue
+                    target = user_by_name.get(simple)
+                    if target:
+                        add_edge(nid, target, "inherits", "bases",
+                                 line=class_lines.get(cls_name, 0))
+                    else:
+                        add_edge(nid, ensure_external("external", simple, "python"),
+                                 "inherits", "bases",
+                                 line=class_lines.get(cls_name, 0))
+
+    # ---- 第三遍：场景挂载边 ----
+    for rel in sorted(scene_rels):
+        fp = os.path.join(root_abs, *rel.split("/"))
+        try:
+            with open(fp, encoding="utf-8-sig", errors="ignore") as f:
+                text = f.read()
+        except OSError:
+            continue
+        source = f"scene:{rel}"
+        seen = set()
+        for line, target_rel in _scene_script_refs(text):
+            target = gd_by_rel.get(target_rel)
+            if not target:
+                continue
+            key = (source, target, "mounts")
+            if key in seen:
+                continue
+            seen.add(key)
+            add_edge(source, target, "mounts", "挂载", line=line)
+
+    by_kind_edges = {}
+    for e in edges:
+        by_kind_edges[e["kind"]] = by_kind_edges.get(e["kind"], 0) + 1
+    user_count = sum(1 for n in nodes if not n["external"])
+
+    return {
+        "ok": True,
+        "code_root": root_abs,
+        "regions_enabled": bool(rdirs),
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {
+            "files": len(walked),
+            "nodes": len(nodes),
+            "user_nodes": user_count,
+            "external_nodes": len(nodes) - user_count,
+            "edges": len(edges),
+            "edges_by_kind": by_kind_edges,
+            "skipped": skipped,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # HTTP 层
 # ---------------------------------------------------------------------------
 router = APIRouter(prefix="/api/fs", tags=["workbench-fs"])
@@ -827,5 +1115,14 @@ def symbol_map_ep():
     """全项目符号语义地图（符号扁平表 + 分区归属 + 统计）。"""
     try:
         return build_symbol_map(_runtime_root())
+    except FsError as e:
+        return _err(e)
+
+
+@router.get("/relation-graph")
+def relation_graph_ep():
+    """全项目关系图（继承边 + 场景挂载组成边）。"""
+    try:
+        return build_relation_graph(_runtime_root())
     except FsError as e:
         return _err(e)

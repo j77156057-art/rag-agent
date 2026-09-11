@@ -269,6 +269,15 @@ function closeSymbolMap() {
   symbolMapOpen.value = false
 }
 
+const relationGraphOpen = ref(false)
+
+function openRelationGraph() {
+  relationGraphOpen.value = true
+}
+function closeRelationGraph() {
+  relationGraphOpen.value = false
+}
+
 /** 打开文件（必要时等待异步加载与 CM 挂载）并把光标定位/滚动到指定行。 */
 async function jumpToLine(path: string, line: number): Promise<void> {
   await openPath(path)
@@ -602,6 +611,7 @@ export function useWorkbench() {
     loadTree, openNode, openPath,
     // P1 符号地图 / 行跳转
     jumpToLine, symbolMapOpen, openSymbolMap, closeSymbolMap,
+    relationGraphOpen, openRelationGraph, closeRelationGraph,
     // tabs
     activateTab, closeTab, saveTab, saveActive, registerContentGetter,
     // fs ops

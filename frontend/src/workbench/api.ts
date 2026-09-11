@@ -118,6 +118,46 @@ export interface SymbolMapResp {
   }
 }
 
+/** P1：关系图节点（class/script/scene/external） */
+export interface RelationNode {
+  id: string
+  label: string
+  sub: string
+  kind: 'class' | 'script' | 'scene' | 'engine' | 'external' | string
+  rel: string
+  line: number
+  region: string
+  region_name: string
+  external: boolean
+  doc: string
+}
+
+export interface RelationEdge {
+  source: string
+  target: string
+  /** inherits=继承（子→父）；mounts=场景挂载脚本 */
+  kind: 'inherits' | 'mounts' | string
+  label: string
+  line: number
+}
+
+export interface RelationGraphResp {
+  ok: boolean
+  code_root: string
+  regions_enabled: boolean
+  nodes: RelationNode[]
+  edges: RelationEdge[]
+  stats: {
+    files: number
+    nodes: number
+    user_nodes: number
+    external_nodes: number
+    edges: number
+    edges_by_kind: Record<string, number>
+    skipped: number
+  }
+}
+
 /** 业务/HTTP 错误；status=0 表示网络层失败（服务未启动） */
 export class FsApiError extends Error {
   status: number
@@ -196,5 +236,8 @@ export const fsApi = {
   },
   symbolMap(): Promise<SymbolMapResp> {
     return request<SymbolMapResp>('/api/fs/symbol-map')
+  },
+  relationGraph(): Promise<RelationGraphResp> {
+    return request<RelationGraphResp>('/api/fs/relation-graph')
   },
 }

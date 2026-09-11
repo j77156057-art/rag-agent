@@ -76,3 +76,25 @@ const SYMBOL_KINDS: Record<string, { label: string; mark: string; color: string 
 export function symbolKind(kind: string): { label: string; mark: string; color: string } {
   return SYMBOL_KINDS[kind] ?? { label: kind, mark: '·', color: '#7d8590' }
 }
+
+/** P1 关系图节点外观（类 / 匿名脚本 / 场景 / 引擎与第三方基类） */
+export interface GraphNodeStyle {
+  fill: string
+  stroke: string
+  text: string
+  mark: string
+  dashed: boolean
+  label: string
+}
+
+const GRAPH_NODE_STYLES: Record<string, GraphNodeStyle> = {
+  class: { fill: 'rgba(88,166,255,0.14)', stroke: '#58a6ff', text: '#d6e7ff', mark: 'C', dashed: false, label: '命名类' },
+  script: { fill: 'rgba(46,196,182,0.12)', stroke: '#2ec4b6', text: '#c9f3ef', mark: 'S', dashed: false, label: '脚本（无 class_name）' },
+  scene: { fill: 'rgba(240,136,62,0.13)', stroke: '#f0883e', text: '#ffe0c4', mark: '▣', dashed: false, label: '场景' },
+  engine: { fill: 'rgba(139,151,167,0.06)', stroke: '#6b7686', text: '#a6b1bf', mark: '⌂', dashed: true, label: '引擎基类' },
+  external: { fill: 'rgba(139,151,167,0.06)', stroke: '#6b7686', text: '#a6b1bf', mark: '{}', dashed: true, label: '第三方基类' },
+}
+
+export function graphNodeStyle(kind: string): GraphNodeStyle {
+  return GRAPH_NODE_STYLES[kind] ?? GRAPH_NODE_STYLES.external
+}
