@@ -2,8 +2,8 @@
 // 对话框与右键菜单。组件只负责渲染与转发事件。
 import { computed, ref, shallowRef } from 'vue'
 import { EditorView } from '@codemirror/view'
-import { aiApi, fsApi, FsApiError } from '../api'
-import type { TreeNode, TreeResp } from '../api'
+import { aiApi, fsApi, regionsApi, FsApiError } from '../api'
+import type { TreeNode, TreeResp, GitCommit, RegionInfo, ContractsResp } from '../api'
 
 // ---------------------------------------------------------------- 标签页
 export interface EditorTab {
@@ -98,6 +98,17 @@ const ctxMenu = ref<MenuPos | null>(null)
 
 /** tab.id -> 取当前编辑器文本（由 CodeView 注册，保存时取最新内容） */
 const contentGetters = new Map<number, () => string>()
+
+/**
+ * tab.id -> 整文档替换器（由 CodeView 注册）。
+ * P3 git 回滚/历史恢复后，磁盘内容在编辑器之外被改写：活动标签走 view.dispatch，
+ * 非活动标签要直接替换其留存的 EditorState，否则切回去还是旧文本。
+ */
+const docReplacers = new Map<number, (content: string) => void>()
+
+export function registerDocReplacer(id: number, fn: (content: string) => void) {
+  docReplacers.set(id, fn)
+}
 
 const activeTab = computed<EditorTab | null>(
   () => tabs.value.find((t) => t.id === activeId.value) ?? null,
@@ -332,6 +343,7 @@ async function closeTab(id: number) {
     if (!ok) return
   }
   contentGetters.delete(id)
+  docReplacers.delete(id)
   const next = tabs.value.filter((t) => t.id !== id)
   tabs.value = next
   if (activeId.value === id) {
@@ -580,6 +592,17 @@ function openNodeMenu(ev: MouseEvent, node: TreeNode) {
       ]
     : [
         { label: node.writable ? '打开' : '只读打开', run: () => openNode(node) },
+        {
+          label: '放弃未提交修改',
+          separatorBefore: true,
+          disabled: !(node.tracked === true && node.dirty === true),
+          run: () => revertPath(node.path, node.name),
+        },
+        {
+          label: '历史版本…',
+          disabled: node.tracked !== true,
+          run: () => openHistory(node.path, node.name),
+        },
         { label: '重命名', separatorBefore: true, run: () => renameNode(node) },
         { label: '删除', danger: true, run: () => deleteNode(node) },
       ]
@@ -599,6 +622,146 @@ function openRootMenu(ev: MouseEvent) {
 
 function closeContextMenu() {
   ctxMenu.value = null
+}
+
+// ================================================================ P3：git 回滚 + 历史版本
+/** git 改写磁盘后，把最新内容同步回可能已打开的标签（活动/非活动标签都要换）。 */
+async function resyncTabAfterGit(path: string, mtime: number): Promise<void> {
+  const tab = tabs.value.find((t) => t.path === path)
+  if (!tab) return
+  const f = await fsApi.read(path)
+  tab.mtime = mtime || f.mtime
+  tab.savedContent = f.content
+  tab.tracked = f.tracked
+  tab.gitDirty = f.dirty
+  tab.dirty = false
+  tab.savedAt = Date.now()
+  tab.reindexWarn = null
+  docReplacers.get(tab.id)?.(f.content)
+}
+
+/** P3：放弃单个文件的全部未提交改动（含暂存与编辑器未保存内容），恢复到 HEAD。 */
+async function revertPath(path: string, name?: string): Promise<void> {
+  const label = name ?? path.split('/').pop() ?? path
+  const tab = tabs.value.find((t) => t.path === path)
+  const ok = await askConfirm({
+    title: `放弃「${label}」的未提交修改？`,
+    message: '文件将恢复到上次提交（HEAD）时的内容。',
+    detail: [
+      tab?.dirty ? '· 编辑器里尚未保存的改动也会一并丢弃。' : '',
+      '· 已暂存（git add）的改动同样撤销。',
+      '· 只影响这一个文件，提交历史不受影响。',
+    ].filter(Boolean).join('\n'),
+    confirmText: '回滚',
+    danger: true,
+  })
+  if (!ok) return
+  try {
+    const r = await fsApi.revert(path)
+    if (!r.reverted) {
+      await askAlert({ title: '无需回滚', message: '该文件没有未提交改动，内容与上次提交一致。' })
+      return
+    }
+    await resyncTabAfterGit(path, r.mtime)
+    await loadTree(path)
+  } catch (e) {
+    const err = e as FsApiError
+    await askAlert({
+      title: '回滚失败',
+      message: err.message,
+      detail: err.status === 403
+        ? '契约文件/受保护文件禁止在工作台回滚。'
+        : err.status ? `HTTP ${err.status}` : undefined,
+    })
+  }
+}
+
+export interface HistoryState {
+  path: string
+  name: string
+  loading: boolean
+  error: string | null
+  commits: GitCommit[]
+  selected: GitCommit | null
+  previewLoading: boolean
+  previewError: string | null
+  preview: string
+  restoring: boolean
+}
+const history = ref<HistoryState | null>(null)
+
+async function openHistory(path: string, name?: string): Promise<void> {
+  history.value = {
+    path, name: name ?? path.split('/').pop() ?? path,
+    loading: true, error: null, commits: [],
+    selected: null, previewLoading: false, previewError: null, preview: '', restoring: false,
+  }
+  try {
+    const r = await fsApi.gitlog(path, 50)
+    if (!history.value || history.value.path !== path) return
+    history.value.commits = r.commits
+    history.value.loading = false
+  } catch (e) {
+    const err = e as FsApiError
+    if (history.value) {
+      history.value.loading = false
+      history.value.error = err.message
+    }
+  }
+}
+
+function closeHistory(): void {
+  history.value = null
+}
+
+async function selectHistoryVersion(c: GitCommit): Promise<void> {
+  const h = history.value
+  if (!h || h.restoring) return
+  h.selected = c
+  h.previewLoading = true
+  h.previewError = null
+  try {
+    const r = await fsApi.gitShow(h.path, c.full_hash)
+    // 异步往返期间用户可能点了别的提交/关了弹窗
+    if (history.value !== h || h.selected?.full_hash !== c.full_hash) return
+    h.preview = r.content
+  } catch (e) {
+    const err = e as FsApiError
+    if (history.value === h && h.selected?.full_hash === c.full_hash) {
+      h.previewError = err.message
+    }
+  } finally {
+    if (history.value === h) h.previewLoading = false
+  }
+}
+
+async function restoreSelectedVersion(): Promise<void> {
+  const h = history.value
+  if (!h || !h.selected || h.restoring) return
+  const c = h.selected
+  const ok = await askConfirm({
+    title: '恢复为该历史版本？',
+    message: `「${h.name}」将恢复为提交 ${c.hash} 时的内容。`,
+    detail: '只改写工作区文件，不会改动提交历史；恢复后仍是未提交状态，不满意可再点「回滚」撤销。',
+    confirmText: '恢复此版本',
+    danger: true,
+  })
+  if (!ok) return
+  h.restoring = true
+  try {
+    const r = await fsApi.restoreAt(h.path, c.full_hash)
+    await resyncTabAfterGit(h.path, r.mtime)
+    await loadTree(h.path)
+    history.value = null
+  } catch (e) {
+    const err = e as FsApiError
+    await askAlert({
+      title: err.status === 422 ? '语法校验未通过，恢复已取消' : '恢复历史版本失败',
+      message: err.message,
+      detail: err.status ? `HTTP ${err.status}` : undefined,
+    })
+    h.restoring = false
+  }
 }
 
 // ================================================================ P2：选区 AI
@@ -870,6 +1033,109 @@ async function copyAnswer(turn: AiTurn): Promise<boolean> {
   }
 }
 
+// ================================================================ P3：AI 改写字级 diff 预览
+export interface RewriteDiffState {
+  turn: AiTurn
+  name: string
+  /** 改写要求（可能为空） */
+  instruction: string
+  /** 编辑器中的原选区文本 */
+  oldCode: string
+  /** 去围栏后的 AI 结果 */
+  newCode: string
+  startLine: number
+  endLine: number
+}
+
+const rewriteDiff = ref<RewriteDiffState | null>(null)
+
+function openRewriteDiff(turn: AiTurn) {
+  const newCode = stripCodeFence(turn.answer)
+  if (!newCode.trim()) return
+  rewriteDiff.value = {
+    turn,
+    name: turn.origin.path.split('/').pop() || turn.origin.path,
+    instruction: turn.instruction,
+    oldCode: turn.origin.selection,
+    newCode,
+    startLine: turn.origin.startLine,
+    endLine: turn.origin.endLine,
+  }
+}
+
+function closeRewriteDiff() {
+  rewriteDiff.value = null
+}
+
+/** 接受差异：复用 applyRewrite 的陈旧坐标/只读护栏；成功关闭弹窗，失败返回原因。 */
+function acceptRewriteDiff(): string | null {
+  const st = rewriteDiff.value
+  if (!st) return null
+  const reason = applyRewrite(st.turn)
+  if (!reason) rewriteDiff.value = null
+  return reason
+}
+
+// ================================================================ P3：分区可视化
+export interface RegionMapState {
+  loading: boolean
+  error: string | null
+  codeRoot: string
+  regions: RegionInfo[]
+  /** 契约校验结果；独立请求，失败时为 null（不影响分区状态展示） */
+  contracts: ContractsResp | null
+  contractsError: string | null
+}
+
+const regionMapOpen = ref(false)
+const regionMap = ref<RegionMapState>({
+  loading: false,
+  error: null,
+  codeRoot: '',
+  regions: [],
+  contracts: null,
+  contractsError: null,
+})
+
+async function openRegionMap() {
+  regionMapOpen.value = true
+  regionMap.value = {
+    loading: true, error: null,
+    codeRoot: regionMap.value.codeRoot,
+    regions: regionMap.value.regions,
+    contracts: regionMap.value.contracts,
+    contractsError: regionMap.value.contractsError,
+  }
+  try {
+    const r = await regionsApi.list()
+    regionMap.value.codeRoot = r.code_root
+    regionMap.value.regions = r.regions
+    regionMap.value.error = null
+  } catch (e) {
+    regionMap.value.error = (e as FsApiError).message || '分区信息加载失败。'
+  }
+  // 契约校验单独失败不拖垮整块面板
+  try {
+    regionMap.value.contracts = await regionsApi.contracts()
+    regionMap.value.contractsError = null
+  } catch (e) {
+    regionMap.value.contracts = null
+    regionMap.value.contractsError = (e as FsApiError).message || '契约校验不可用。'
+  } finally {
+    regionMap.value.loading = false
+  }
+}
+
+function closeRegionMap() {
+  regionMapOpen.value = false
+}
+
+/** 点击分区卡片：在文件树中选中该分区目录（分区均为顶层目录，默认展开）并关闭面板。 */
+function locateRegion(dir: string) {
+  selectedPath.value = dir
+  regionMapOpen.value = false
+}
+
 export function useWorkbench() {
   return {
     // state
@@ -882,7 +1148,9 @@ export function useWorkbench() {
     jumpToLine, symbolMapOpen, openSymbolMap, closeSymbolMap,
     relationGraphOpen, openRelationGraph, closeRelationGraph,
     // tabs
-    activateTab, closeTab, saveTab, saveActive, registerContentGetter,
+    activateTab, closeTab, saveTab, saveActive, registerContentGetter, registerDocReplacer,
+    // P3 git 回滚 / 历史版本
+    revertPath, history, openHistory, closeHistory, selectHistoryVersion, restoreSelectedVersion,
     // fs ops
     createAt, renameNode, deleteNode,
     // menus / dialogs
@@ -892,5 +1160,9 @@ export function useWorkbench() {
     aiPanelOpen, openAiPanel, closeAiPanel, clearTurns,
     turns, aiStreaming, askComposing, startAskCompose,
     runAi, stopAi, applyRewrite, copyAnswer,
+    // P3 改写 diff 预览
+    rewriteDiff, openRewriteDiff, closeRewriteDiff, acceptRewriteDiff,
+    // P3 分区可视化
+    regionMapOpen, regionMap, openRegionMap, closeRegionMap, locateRegion,
   }
 }

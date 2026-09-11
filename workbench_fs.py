@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import subprocess
 import time
 import ast
 from datetime import datetime
@@ -28,7 +29,7 @@ from pydantic import BaseModel
 from config import get_runtime, CODE_ROOT
 from ingest import _CODE_EXT, _SKIP_DIRS, _MAX_CODE_FILE
 import symbols as symlib
-from regions import load_region_config, _git
+from regions import load_region_config, _git, _git_missing_hint
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -641,6 +642,115 @@ def git_log(root, rel, limit: int = 20) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# P3：git 一键回滚（文件级）+ 历史版本读取/恢复
+# ---------------------------------------------------------------------------
+# 只接受提交哈希（gitlog 返回值），拒绝任意 ref 表达式/选项注入
+_GIT_REF_RE = re.compile(r"^[0-9a-fA-F]{4,40}$")
+
+
+def _find_repo_bounded(root_abs: str, target: str):
+    """从 target（目录取自身/文件取父目录）向上、止于 code_root，找最近的 .git。"""
+    root_real = os.path.realpath(root_abs)
+    cur = os.path.realpath(target if os.path.isdir(target) else os.path.dirname(target))
+    while True:
+        if os.path.isdir(os.path.join(cur, ".git")):
+            return cur
+        if cur == root_real:
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur or not cur.startswith(root_real + os.sep):
+            break
+        cur = parent
+    return None
+
+
+def _git_file_ctx(root, rel):
+    """回滚类操作的统一解析与护栏：返回 (target, rel_n, repo, in_repo_posix)。"""
+    target, rel_n = _resolve(root, rel, must_exist=True)
+    _ensure_writable(rel_n)  # 契约文件 / .git 等 403
+    if os.path.isdir(target):
+        raise FsError(400, f"不是文件：{rel_n}（回滚只支持单个文件）。")
+    repo = _find_repo_bounded(os.path.abspath(str(root)), target)
+    if not repo:
+        raise FsError(400, "该文件不在任何 git 仓库内（分区尚未初始化 git），无法回滚。")
+    in_repo = os.path.relpath(target, repo).replace("\\", "/")
+    return target, rel_n, repo, in_repo
+
+
+def revert_file(root, rel) -> dict:
+    """放弃单个已跟踪文件的全部未提交改动（含暂存区），恢复为 HEAD 版本。
+
+    语义对齐用户「AI 改坏了一键回滚」：checkout HEAD -- <path> 同时重置
+    index 与工作区。未跟踪新文件 HEAD 中不存在，拒绝并引导走删除。
+    """
+    target, rel_n, repo, in_repo = _git_file_ctx(root, rel)
+    # 破坏性操作不走 5 秒状态缓存，直接实时查 git（ls-files/status 均为本地只读命令）
+    ok_tr, _ = _git(["ls-files", "--error-unmatch", "--", in_repo], cwd=repo)
+    if not ok_tr:
+        raise FsError(409, "该文件还未纳入 git（是新文件），无法用 git 回滚；不需要它请直接删除。")
+    # 已 git add 但 HEAD 中不存在的「新增暂存」也不能 checkout HEAD
+    ok_head, _ = _git(["cat-file", "-e", f"HEAD:{in_repo}"], cwd=repo)
+    if not ok_head:
+        raise FsError(409, "该文件是本次新增的（HEAD 提交中不存在），无法回滚到 HEAD；不需要它请直接删除。")
+    ok_st, st = _git(["status", "--porcelain", "-z", "--", in_repo], cwd=repo)
+    if not (ok_st and st):
+        return {"ok": True, "path": rel_n, "reverted": False, "reason": "clean",
+                "mtime": os.path.getmtime(target)}
+    ok, err = _git(["checkout", "-q", "HEAD", "--", in_repo], cwd=repo)
+    if not ok:
+        raise FsError(400, f"git 回滚失败：{err[:300]}")
+    invalidate_status(root)
+    return {"ok": True, "path": rel_n, "reverted": True,
+            "mtime": os.path.getmtime(target)}
+
+
+def _git_show_blob(repo: str, spec: str) -> str:
+    """git show 原样取 blob 文本：不能走 regions._git（它会 rstrip 掉末尾换行）。"""
+    try:
+        proc = subprocess.run(
+            ["git", "show", spec], cwd=repo, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
+        )
+    except FileNotFoundError:
+        raise FsError(400, _git_missing_hint())
+    except Exception as e:  # noqa: BLE001
+        raise FsError(400, f"无法执行 git：{e}")
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip()
+        raise FsError(404, f"该提交中不存在此文件，或提交无效：{msg[:200]}")
+    return proc.stdout
+
+
+def git_show_at(root, rel, ref) -> dict:
+    """读取文件在某次提交时的内容（git show <hash>:<path>），仅供文本可编辑类型。"""
+    target, rel_n, repo, in_repo = _git_file_ctx(root, rel)
+    ref = str(ref or "").strip().lower()
+    if not _GIT_REF_RE.match(ref):
+        raise FsError(400, "ref 只能是 git 提交哈希（4-40 位十六进制）。")
+    ext = os.path.splitext(target)[1].lower()
+    if ext not in WB_EDIT_EXTS:
+        raise FsError(403, "历史版本仅支持可编辑的文本文件。")
+    out = _git_show_blob(repo, f"{ref}:{in_repo}")
+    if len(out.encode("utf-8")) > WB_MAX_FILE_BYTES:
+        raise FsError(413, f"该历史版本超过上限（{WB_MAX_FILE_BYTES // 1024}KB），无法在工作台恢复。")
+    return {"ok": True, "path": rel_n, "ref": ref, "content": out,
+            "size": len(out.encode("utf-8"))}
+
+
+def restore_file_at(root, rel, ref, reindex: bool = True) -> dict:
+    """把文件恢复成某次提交时的内容：只写工作区，不动 HEAD 与提交历史。
+
+    取 git show 内容后复用 save_file 的全部写护栏（白名单/大小/.py 语法校验/
+    mtime 强制覆盖/增量索引），恢复后表现为一次普通未提交修改，可再次回滚。
+    """
+    shown = git_show_at(root, rel, ref)
+    saved = save_file(root, rel, shown["content"], None, reindex=reindex)
+    saved["ref"] = ref
+    saved["restored"] = True
+    return saved
+
+
+# ---------------------------------------------------------------------------
 # P1：符号语义地图
 # ---------------------------------------------------------------------------
 SYMBOL_MAP_MAX_FILES = 1000
@@ -1217,6 +1327,16 @@ class DeleteReq(BaseModel):
     force: bool = False
 
 
+class RevertReq(BaseModel):
+    path: str
+
+
+class RestoreReq(BaseModel):
+    path: str
+    ref: str
+    reindex: bool = True
+
+
 @router.get("/tree")
 def tree_ep(depth: int = 4):
     try:
@@ -1269,6 +1389,33 @@ def delete_ep(req: DeleteReq):
 def gitlog_ep(path: str, limit: int = 20):
     try:
         return git_log(_runtime_root(), path, limit=limit)
+    except FsError as e:
+        return _err(e)
+
+
+@router.post("/revert")
+def revert_ep(req: RevertReq):
+    """P3：放弃该文件全部未提交改动，恢复为 HEAD 版本。"""
+    try:
+        return revert_file(_runtime_root(), req.path)
+    except FsError as e:
+        return _err(e)
+
+
+@router.get("/git-show")
+def git_show_ep(path: str, ref: str):
+    """P3：读取文件在某次提交时的内容（历史版本预览）。"""
+    try:
+        return git_show_at(_runtime_root(), path, ref)
+    except FsError as e:
+        return _err(e)
+
+
+@router.post("/restore-at")
+def restore_at_ep(req: RestoreReq):
+    """P3：把文件恢复成某次提交时的内容（只写工作区，不动提交历史）。"""
+    try:
+        return restore_file_at(_runtime_root(), req.path, req.ref, reindex=req.reindex)
     except FsError as e:
         return _err(e)
 

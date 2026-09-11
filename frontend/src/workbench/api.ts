@@ -72,6 +72,45 @@ export interface RenameResp {
   reindex_warnings: string[]
 }
 
+/** P3：git 提交记录（/gitlog） */
+export interface GitCommit {
+  hash: string
+  full_hash: string
+  time: number | null
+  time_raw: string
+  author: string
+  message: string
+}
+export interface GitLogResp {
+  ok: boolean
+  path: string
+  commits: GitCommit[]
+}
+
+/** P3：文件级回滚响应；reverted=false 且 reason='clean' 表示本就无改动 */
+export interface RevertResp {
+  ok: boolean
+  path: string
+  reverted: boolean
+  reason?: string
+  mtime: number
+}
+
+/** P3：某文件某次提交时的历史内容 */
+export interface GitShowResp {
+  ok: boolean
+  path: string
+  ref: string
+  content: string
+  size: number
+}
+
+/** P3：恢复到历史版本（响应体同 save，另带 ref/restored） */
+export interface RestoreResp extends SaveResp {
+  ref: string
+  restored: boolean
+}
+
 /** P1：符号（func/class/const/var/signal/enum/node ...） */
 export interface SymbolInfo {
   name: string
@@ -240,6 +279,82 @@ export const fsApi = {
   },
   relationGraph(): Promise<RelationGraphResp> {
     return request<RelationGraphResp>('/api/fs/relation-graph')
+  },
+  gitlog(path: string, limit = 20): Promise<GitLogResp> {
+    return request<GitLogResp>(
+      `/api/fs/gitlog?path=${encodeURIComponent(path)}&limit=${limit}`,
+    )
+  },
+  revert(path: string): Promise<RevertResp> {
+    return postJson<RevertResp>('/api/fs/revert', { path })
+  },
+  gitShow(path: string, ref: string): Promise<GitShowResp> {
+    return request<GitShowResp>(
+      `/api/fs/git-show?path=${encodeURIComponent(path)}&ref=${encodeURIComponent(ref)}`,
+    )
+  },
+  restoreAt(path: string, ref: string, reindex = true): Promise<RestoreResp> {
+    return postJson<RestoreResp>('/api/fs/restore-at', { path, ref, reindex })
+  },
+}
+
+/** P3：分区状态（GET /api/regions → regions.list_regions） */
+export interface RegionInfo {
+  key: string
+  name: string
+  dir: string
+  desc: string
+  access: string
+  depends_on: string[]
+  exports: string[]
+  verify: string
+  exists: boolean
+  /** 该分区目录是否为独立 git 仓库 */
+  git: boolean
+  branch: string
+  dirty: boolean
+  files: number
+}
+export interface RegionsResp {
+  code_root: string
+  regions: RegionInfo[]
+}
+export interface ContractsResp {
+  ok: boolean
+  errors: string[]
+  /** key → 依赖的 key 列表（DAG） */
+  graph: Record<string, string[]>
+}
+
+export const regionsApi = {
+  list(): Promise<RegionsResp> {
+    return request<RegionsResp>('/api/regions')
+  },
+  /**
+   * 注意：契约校验失败是正常业务结果（HTTP 200 + {ok:false,errors}），
+   * 不能走通用 request（它会把 body.ok===false 当错误抛出）。
+   */
+  async contracts(): Promise<ContractsResp> {
+    let res: Response
+    try {
+      res = await fetch('/api/verify_contracts')
+    } catch {
+      throw new FsApiError(0, '无法连接本地服务（127.0.0.1:8000），请确认 DocMind 已启动。')
+    }
+    let body: ContractsResp | null = null
+    try {
+      body = (await res.json()) as ContractsResp
+    } catch {
+      /* 非 JSON */
+    }
+    if (!res.ok) {
+      throw new FsApiError(res.status, body?.errors?.join('；') || `请求失败（HTTP ${res.status}）`)
+    }
+    return {
+      ok: !!body?.ok,
+      errors: body?.errors || [],
+      graph: body?.graph || {},
+    }
   },
 }
 

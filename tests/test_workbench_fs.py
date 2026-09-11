@@ -339,5 +339,89 @@ class TestCreateRenameDelete(unittest.TestCase):
         self.assertEqual(cm.exception.status, 404)
 
 
+@unittest.skipUnless(have_git(), "无 git")
+class GitRevertTests(WbTestBase):
+    """P3：文件级回滚 + 历史版本恢复。"""
+
+    def _commit(self, repo, msg):
+        git(["add", "-A"], cwd=repo)
+        git(["commit", "-q", "-m", msg], cwd=repo)
+
+    def test_revert_dirty_file(self):
+        repo = self.init_repo(".")
+        self.write("a.gd", "var v = 1\n")
+        self._commit(repo, "c1")
+        self.write("a.gd", "var v = 2\n")
+        r = wb.revert_file(self.root, "a.gd")
+        self.assertTrue(r["reverted"])
+        with open(os.path.join(repo, "a.gd"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "var v = 1\n")
+        # 含暂存区改动也一并回滚
+        self.write("a.gd", "var v = 3\n")
+        git(["add", "a.gd"], cwd=repo)
+        r2 = wb.revert_file(self.root, "a.gd")
+        self.assertTrue(r2["reverted"])
+        with open(os.path.join(repo, "a.gd"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "var v = 1\n")
+
+    def test_revert_clean_is_noop(self):
+        repo = self.init_repo(".")
+        self.write("a.gd", "var v = 1\n")
+        self._commit(repo, "c1")
+        r = wb.revert_file(self.root, "a.gd")
+        self.assertFalse(r["reverted"])
+        self.assertEqual(r["reason"], "clean")
+
+    def test_revert_untracked_rejected(self):
+        self.init_repo(".")
+        self.write("new.gd", "var x\n")
+        with self.assertRaises(wb.FsError) as cm:
+            wb.revert_file(self.root, "new.gd")
+        self.assertEqual(cm.exception.status, 409)
+
+    def test_revert_outside_repo_rejected(self):
+        self.write("a.gd", "var v = 1\n")
+        with self.assertRaises(wb.FsError) as cm:
+            wb.revert_file(self.root, "a.gd")
+        self.assertEqual(cm.exception.status, 400)
+
+    def test_revert_protected_contract(self):
+        repo = self.init_repo(".")
+        self.write("regions.json", "{}\n")
+        self._commit(repo, "c1")
+        self.write("regions.json", '{"x":1}\n')
+        with self.assertRaises(wb.FsError) as cm:
+            wb.revert_file(self.root, "regions.json")
+        self.assertEqual(cm.exception.status, 403)
+
+    def test_show_and_restore_history(self):
+        repo = self.init_repo(".")
+        self.write("a.gd", "var v = 1\n")
+        self._commit(repo, "c1")
+        old = wb.git_log(self.root, "a.gd")["commits"][0]["full_hash"]
+        self.write("a.gd", "var v = 2\n")
+        self._commit(repo, "c2")
+
+        shown = wb.git_show_at(self.root, "a.gd", old)
+        self.assertEqual(shown["content"], "var v = 1\n")
+
+        with self.assertRaises(wb.FsError) as cm:
+            wb.git_show_at(self.root, "a.gd", "--evil")
+        self.assertEqual(cm.exception.status, 400)
+        with self.assertRaises(wb.FsError) as cm2:
+            wb.git_show_at(self.root, "a.gd", old + "^{tree}")
+        self.assertEqual(cm2.exception.status, 400)
+
+        r = wb.restore_file_at(self.root, "a.gd", old, reindex=False)
+        self.assertTrue(r["restored"])
+        with open(os.path.join(repo, "a.gd"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "var v = 1\n")
+        # 恢复后只是未提交修改，HEAD 仍是 c2，可再次一键回滚
+        back = wb.revert_file(self.root, "a.gd")
+        self.assertTrue(back["reverted"])
+        with open(os.path.join(repo, "a.gd"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "var v = 2\n")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

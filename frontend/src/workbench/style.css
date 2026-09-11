@@ -108,8 +108,16 @@ button { font-family: inherit; }
   font-size: 11.5px;
   color: #9fc3ee;
   white-space: nowrap;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 999px;
+  padding: 2px 10px;
+  cursor: pointer;
+  font-family: inherit;
 }
+.wb-region-pill:hover { border-color: #2c4a6b; background: #58a6ff0d; }
 .wb-region-pill.off { color: var(--text-faint); }
+.wb-region-pill.off:hover { border-color: #2b3543; background: #1a2230; }
 .wb-region-dot {
   width: 6px; height: 6px; border-radius: 50%;
   background: var(--green);
@@ -445,6 +453,19 @@ button { font-family: inherit; }
 }
 .wb-save-btn:hover:not(:disabled) { filter: brightness(1.18); border-color: #3d74b3; }
 .wb-save-btn:disabled { opacity: .45; cursor: default; }
+/* P3：历史版本（中性描边）/ 回滚（警示琥珀色） */
+.wb-history-btn {
+  border-color: #33415a;
+  background: #121925;
+  color: var(--text-muted);
+}
+.wb-history-btn:hover:not(:disabled) { filter: none; border-color: #3f5573; background: #16202e; }
+.wb-revert-btn {
+  border-color: #8f5a2b;
+  background: linear-gradient(180deg, #5e3a1c, #4f3015);
+  color: #ffd9b0;
+}
+.wb-revert-btn:hover:not(:disabled) { filter: brightness(1.2); border-color: #b3743d; }
 .wb-save-btn kbd {
   font-family: var(--font-mono);
   font-size: 9.5px;

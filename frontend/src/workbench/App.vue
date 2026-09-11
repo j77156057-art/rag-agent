@@ -11,6 +11,9 @@ import SymbolMap from './components/SymbolMap.vue'
 import RelationGraph from './components/RelationGraph.vue'
 import SelectionToolbar from './components/SelectionToolbar.vue'
 import SelectionAiPanel from './components/SelectionAiPanel.vue'
+import GitHistoryDialog from './components/GitHistoryDialog.vue'
+import RewriteDiffDialog from './components/RewriteDiffDialog.vue'
+import RegionMapDialog from './components/RegionMapDialog.vue'
 import { useWorkbench } from './composables/workbench'
 import { regionColor } from './theme'
 
@@ -18,10 +21,18 @@ const {
   tree, treeLoading, treeError, loadTree,
   tabs, activeTab, selectedPath, openNode, saveActive,
   openSymbolMap, openRelationGraph,
+  revertPath, openHistory,
+  openRegionMap,
   aiPanelOpen,
 } = useWorkbench()
 
 const dirtyCount = computed(() => tabs.value.filter((t) => t.dirty).length)
+/** 当前标签可回滚：已纳入 git 且磁盘或编辑器存在改动 */
+const canRevertActive = computed(() => {
+  const t = activeTab.value
+  return !!t && t.writable && t.tracked === true && (t.gitDirty === true || t.dirty)
+})
+const canHistoryActive = computed(() => activeTab.value?.tracked === true)
 
 function beforeUnload(e: BeforeUnloadEvent) {
   if (dirtyCount.value > 0) {
@@ -54,10 +65,15 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
           <svg width="12" height="12" viewBox="0 0 12 12" class="wb-root-icon"><path d="M1 3 Q1 2.2 1.8 2.2 H4.6 L5.6 3.2 H10.2 Q11 3.2 11 4 V9 Q11 9.8 10.2 9.8 H1.8 Q1 9.8 1 9 Z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
           {{ tree.code_root }}
         </span>
-        <span class="wb-region-pill" :class="{ off: !tree.regions_enabled }">
+        <button
+          class="wb-region-pill"
+          :class="{ off: !tree.regions_enabled }"
+          :title="tree.regions_enabled ? '查看分区依赖图与各区状态' : '查看分区状态'"
+          @click="openRegionMap"
+        >
           <span class="wb-region-dot" />
           {{ tree.regions_enabled ? `分区治理 · ${tree.regions.length} 区` : '分区未启用' }}
-        </span>
+        </button>
       </div>
       <div class="wb-topbar-right">
         <button
@@ -87,6 +103,31 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
             <path d="M4.4 4.2 L8.8 4.2 M4 4.8 L5.8 8.8 M9.2 4.8 L7.4 8.8" stroke="currentColor" stroke-width="0.85" />
           </svg>
           关系图
+        </button>
+        <button
+          v-if="activeTab && canHistoryActive"
+          class="wb-save-btn wb-history-btn"
+          title="查看该文件的提交历史，可恢复为任意历史版本"
+          @click="openHistory(activeTab.path, activeTab.name)"
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12">
+            <circle cx="4" cy="3" r="1.1" fill="none" stroke="currentColor" stroke-width="1" />
+            <circle cx="4" cy="9" r="1.1" fill="none" stroke="currentColor" stroke-width="1" />
+            <circle cx="9" cy="6" r="1.1" fill="none" stroke="currentColor" stroke-width="1" />
+            <path d="M4 4.1 V7.9 M5 3.6 C7 3.6 7.6 5 8.2 5.5 M5 8.4 C7 8.4 7.6 7 8.2 6.5" fill="none" stroke="currentColor" stroke-width="0.85" />
+          </svg>
+          历史
+        </button>
+        <button
+          v-if="activeTab && canRevertActive"
+          class="wb-save-btn wb-revert-btn"
+          title="放弃该文件全部未提交修改（含未保存与已暂存），恢复到上次提交"
+          @click="revertPath(activeTab.path, activeTab.name)"
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12">
+            <path d="M2.2 5.4 A3.8 3.8 0 1 1 2.2 8.4 M2.2 2.8 V5.4 H4.8" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          回滚
         </button>
         <button
           v-if="activeTab"
@@ -147,6 +188,9 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
 
     <ContextMenu />
     <AppDialog />
+    <GitHistoryDialog />
+    <RewriteDiffDialog />
+    <RegionMapDialog />
     <SymbolMap />
     <RelationGraph />
     <SelectionToolbar />

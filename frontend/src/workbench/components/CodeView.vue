@@ -19,7 +19,8 @@ import { regionColor, formatMtime, gitState } from '../theme'
 
 const props = defineProps<{ tab: EditorTab | null }>()
 
-const { saveActive, closeTab, tabs, registerContentGetter, setSelection } = useWorkbench()
+const { saveActive, closeTab, tabs, registerContentGetter, registerDocReplacer, setSelection } =
+  useWorkbench()
 
 const host = ref<HTMLElement | null>(null)
 let view: EditorView | null = null
@@ -83,6 +84,15 @@ function langExtension(lang: string) {
   }
 }
 
+/**
+ * CRLF 归一化比较：Windows 仓库（core.autocrlf=true）git checkout 落盘为 CRLF，
+ * 而 CodeMirror 建 state 时会把所有换行统一存成 \n，直接逐字符比较会误判 dirty。
+ */
+function isDocDirty(docText: string, saved: string): boolean {
+  const norm = (s: string) => s.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  return norm(docText) !== norm(saved)
+}
+
 function buildState(tab: EditorTab): EditorState {
   return EditorState.create({
     doc: tab.savedContent,
@@ -107,7 +117,7 @@ function buildState(tab: EditorTab): EditorState {
         if (u.selectionSet || u.docChanged) publishSelection(u.view, tab)
         if (!u.docChanged) return
         const t = tabs.value.find((x) => x.id === tab.id)
-        if (t) t.dirty = u.state.doc.toString() !== t.savedContent
+        if (t) t.dirty = isDocDirty(u.state.doc.toString(), t.savedContent)
       }),
       EditorView.theme({
         '&': { height: '100%', fontSize: '12.5px' },
@@ -124,8 +134,28 @@ function ensureState(tab: EditorTab): EditorState {
     st = buildState(tab)
     states.set(tab.id, st)
     registerContentGetter(tab.id, () => states.get(tab.id)!.doc.toString())
+    registerDocReplacer(tab.id, (content) => replaceTabDoc(tab.id, content))
   }
   return st
+}
+
+/**
+ * P3：git 回滚/历史恢复后整文档替换。
+ * 注意 EditorState.update() 返回的是 Transaction（新状态在 .state 上），不是 State。
+ * 活动标签直接 view.dispatch（listener 会自动回写 states）；
+ * 非活动标签换 Map 里留存的 EditorState，切回去即为新内容。
+ */
+function replaceTabDoc(tabId: number, content: string) {
+  const old = states.get(tabId)
+  if (!old) return
+  if (view && (view as unknown as { __tabId?: number }).__tabId === tabId && view.state === old) {
+    view.dispatch({ changes: { from: 0, to: old.doc.length, insert: content } })
+    return
+  }
+  states.set(
+    tabId,
+    old.update({ changes: { from: 0, to: old.doc.length, insert: content } }).state,
+  )
 }
 
 function syncView() {
@@ -171,7 +201,7 @@ watch(() => [props.tab?.id, props.tab?.loading, props.tab?.error], syncView)
 watch(() => props.tab?.savedContent, () => {
   if (!props.tab) return
   const st = states.get(props.tab.id)
-  if (st) props.tab.dirty = st.doc.toString() !== props.tab.savedContent
+  if (st) props.tab.dirty = isDocDirty(st.doc.toString(), props.tab.savedContent)
 })
 
 // 标签关闭后回收 state
