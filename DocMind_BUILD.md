@@ -1,13 +1,34 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第十次重建（P1 关系图：继承边 + 场景挂载组成边）」；历史构建清单保留在下文。
+> 最新构建见下方「第十一次重建（P1 调用边：项目内高置信调用关系）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 18.5 MB，控制台模式，启动时自动开浏览器）
 - 整体体积：约 663.3 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB）
-- **当前构建时间：`2026-09-11 21:08:54`（第十次重建，P1 关系图）**
-- 上一版：`2026-09-11 20:05:58`（第九次重建，P1 符号语义地图）
+- **当前构建时间：`2026-09-11 23:17:51`（第十一次重建，P1 调用边，exe 19,401,970 字节）**
+- 上一版：`2026-09-11 21:08:54`（第十次重建，P1 关系图，exe 19,397,582 字节）
+
+---
+
+## 第十一次重建：P1 调用边（2026-09-11 23:17）
+
+### 改动
+- **后端第四遍扫描：高置信调用边 calls（`workbench_fs.build_relation_graph`）**，只连「能解析到项目内已定义类、且目标类确实定义了该方法」的调用，从源头压制噪声；裸调用、引擎 API、`.new()`、自调用、字符串/注释中的伪调用一律不出边。
+  - GDScript：扫描前用 `_mask_gdscript` 状态机把字符串与注释逐字符掩码（保长、保行号，支持引号转义）；规则 A=接收者标识符命中项目 `class_name`（`CritConfig.method(`），规则 B=类型化类成员/局部变量/函数参数（类型来自 `var x: T`、`@onready var x: T`、参数注解）。
+  - Python：`ast.Call`+`Attribute`，结合 `import`/`from ... import ... as` 别名、`import m; m.Cls.x()` 模块限定、字段/局部/参数类型注解解析接收者；第三方模块不出边。
+  - 边形态：同 source/target 聚合成一条 calls 边（label「调用」），`methods` 为按首次出现序去重的方法名列表，`line` 取首个调用点，自环丢弃；自动计入 `stats.edges_by_kind.calls`。
+- **前端 `RelationGraph.vue`**：新增第 4 个开关「调用」（绿色实线箭头 `#4f9e6a`，弹簧理想长 170），统计文案增加「N 调用」，边悬停 `<title>` 显示「调用：method()…（首个调用点第 N 行）」；`api.ts` 的 `RelationEdge` 增加 `'calls'` 与可选 `methods`。业务 chunk 58.41 KB（gzip 22.05K），vendor 三哈希不变。
+- **审查阶段修复的两个真 bug**（原实现未构建未实测）：
+  1. GD 类成员类型预扫描用 `^\s*var` 误收函数体内缩进局部变量，导致局部类型跨函数泄漏、给其他函数的未定义接收者造假边；改为预扫描只收列 0 声明，局部 var 在逐行扫描进入函数后注册。
+  2. calls 过滤条件被错放在 `Array.filter` 的第二参数（thisArg 位），生产构建里自由变量求值抛异常，**全部边静默不渲染**；已并入回调条件链。另删除死代码 `file_envs`。
+- 样例仓新增真实演示链（样例仓独立提交）：`ui/hud.gd` 加 `class_name HUD`，`behaviors/player.gd` 加 `@onready var hud: HUD` 与 `take_damage()` 调 `hud.show_hp()`；图上呈现 player → HUD 一条调用边。
+
+### 验证
+- 单测：`tests/test_relation_graph.py` 新增 8 例（静态类调用+同方法去重、类型化字段/参数调用、引擎 API/字符串/注释/裸自调用排除、Python 项目内调用+第三方/缺失方法排除、局部类型跨函数泄漏回归、self/同类名自环、多方法合并保首行、Python module 限定调用）；全量 `unittest discover` **57/57 通过（4 skip）**。
+- dev 生产态浏览器实测（:8000/workbench）：关系图 4 边全渲染（3 继承 + 1 绿色调用边 player→HUD），边 tooltip「调用：show_hp()（首个调用点第 12 行）」，调用开关关闭后边数 4→3、重开恢复，调用开关图标为绿色，console 零错误，tree/relation-graph 接口 200。
+- 冻结态（最小 PATH 仅 System32，DOCMIND_SERVER_ONLY=1，PyInstaller 退出码 0）：冷启动 0.5s `/workbench/` 200；`build_time=2026-09-11 23:17:51` 确认新版；空 code_root 时 relation-graph 返 400；新业务 JS 200（60,965 字节）、CSS 200（30,082 字节）与源文件字节一致；表单 POST `/api/ingest_code` 索引样例 **19 切片**（新增调用链代码后较第十版的 18 增 1）；symbol-map 7 文件/**21 符号**；relation-graph **7 节点/4 边 = 3 inherits + 1 calls**（`gd:behaviors/player.gd → gd:ui/hud.gd`，line=12，methods=show_hp）；最小 PATH 下 gitlog 200（2 条提交）、tree 中 player.gd/hud.gd `tracked=true dirty=true`（随包 MinGit 自足）。前端 6 文件与源码 SHA-256 全一致；包内无 python*.exe/.env；MinGit 89.5 MB/365 文件；冒烟后已删 `_internal/.docmind_state.json`，进程结束端口释放。
+- 源码对应提交：`a28d69d feat(graph): P1 call edges — high-confidence project-internal calls`（4 文件 +367−14，无 BOM 提交信息字节复验通过）。
 
 ---
 
