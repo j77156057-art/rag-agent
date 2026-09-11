@@ -202,6 +202,168 @@ class RelationGraphTests(unittest.TestCase):
                  "region_name", "external", "doc"},
             )
 
+    def test_gd_static_class_call_and_method_dedup(self):
+        _write(self.root, "values/crit.gd", (
+            "class_name CritConfig\n"
+            "func crit_damage(base: float, mult: float) -> float:\n"
+            "\treturn base * mult\n"
+        ))
+        _write(self.root, "behaviors/player.gd", (
+            "extends CharacterBody3D\n"
+            "func hit() -> void:\n"
+            "\tCritConfig.crit_damage(1.0, 2.0)\n"
+            "\tCritConfig.crit_damage(2.0, 2.0)\n"
+        ))
+        g = wb.build_relation_graph(self.root)
+        calls = [e for e in g["edges"] if e["kind"] == "calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0]["source"], calls[0]["target"]),
+                         ("gd:behaviors/player.gd", "gd:values/crit.gd"))
+        self.assertEqual(calls[0]["methods"], ["crit_damage"])
+        self.assertEqual(calls[0]["line"], 3)
+        self.assertEqual(g["stats"]["edges_by_kind"]["calls"], 1)
+
+    def test_gd_typed_field_and_parameter_calls(self):
+        _write(self.root, "ui/hud.gd", (
+            "class_name HUD\n"
+            "func show_hp(hp: int, maximum: int) -> void:\n"
+            "\tpass\n"
+        ))
+        _write(self.root, "values/crit.gd", (
+            "class_name CritConfig\n"
+            "func crit_damage() -> void:\n"
+            "\tpass\n"
+        ))
+        _write(self.root, "behaviors/player.gd", (
+            "extends CharacterBody3D\n"
+            "@onready var hud: HUD = $HUD\n"
+            "func take_damage(cfg: CritConfig) -> void:\n"
+            "\thud.show_hp(1, 2)\n"
+            "\tcfg.crit_damage()\n"
+        ))
+        g = wb.build_relation_graph(self.root)
+        calls = {(e["source"], e["target"], e["line"]) for e in g["edges"] if e["kind"] == "calls"}
+        self.assertIn(("gd:behaviors/player.gd", "gd:ui/hud.gd", 4), calls)
+        self.assertIn(("gd:behaviors/player.gd", "gd:values/crit.gd", 5), calls)
+
+    def test_gd_call_noise_and_self_call_are_excluded(self):
+        _write(self.root, "values/cfg.gd", (
+            "class_name Cfg\n"
+            "func ping() -> void:\n"
+            "\tpass\n"
+        ))
+        _write(self.root, "behaviors/player.gd", (
+            "class_name Player\n"
+            "func ping() -> void:\n"
+            "\tmove_and_slide()\n"
+            "\tprint(\"Cfg.ping()\")\n"
+            "\t# Cfg.ping()\n"
+            "\tping()\n"
+        ))
+        g = wb.build_relation_graph(self.root)
+        self.assertEqual([e for e in g["edges"] if e["kind"] == "calls"], [])
+
+    def test_python_project_call_and_external_or_missing_method_excluded(self):
+        _write(self.root, "models.py", (
+            "class Target:\n"
+            "    def run(self):\n"
+            "        pass\n"
+        ))
+        _write(self.root, "logic.py", (
+            "from models import Target\n"
+            "import os\n"
+            "class Source:\n"
+            "    def go(self, target: Target):\n"
+            "        target.run()\n"
+            "        target.missing()\n"
+            "        os.path.join('a', 'b')\n"
+        ))
+        g = wb.build_relation_graph(self.root)
+        calls = [e for e in g["edges"] if e["kind"] == "calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0]["source"], calls[0]["target"], calls[0]["methods"]),
+                         ("py:logic.py:Source", "py:models.py:Target", ["run"]))
+
+    def test_gd_local_var_type_does_not_leak_across_functions(self):
+        # 回归：函数内缩进的局部 var 不能被收进类成员映射，
+        # 否则后续函数里同名的未定义接收者会造出假调用边。
+        _write(self.root, "values/a.gd", (
+            "class_name A\n"
+            "func foo() -> void:\n"
+            "\tpass\n"
+            "func bar() -> void:\n"
+            "\tpass\n"
+        ))
+        _write(self.root, "behaviors/x.gd", (
+            "class_name X\n"
+            "var shared: A\n"
+            "func one() -> void:\n"
+            "\tvar a: A\n"
+            "\ta.foo()\n"
+            "func two() -> void:\n"
+            "\ta.bar()\n"
+            "\tshared.bar()\n"
+        ))
+        g = wb.build_relation_graph(self.root)
+        calls = [e for e in g["edges"] if e["kind"] == "calls"]
+        # 第 5 行局部变量边 + 第 8 行成员边聚合成一条；第 7 行未定义接收者无假边
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0]["source"], calls[0]["target"]),
+                         ("gd:behaviors/x.gd", "gd:values/a.gd"))
+        self.assertEqual(calls[0]["line"], 5)
+        self.assertEqual(calls[0]["methods"], ["foo", "bar"])
+
+    def test_gd_self_and_same_class_calls_are_self_loops_excluded(self):
+        _write(self.root, "behaviors/player.gd", (
+            "class_name Player\n"
+            "func ping() -> void:\n"
+            "\tself.ping()\n"
+            "\tPlayer.ping()\n"
+        ))
+        g = wb.build_relation_graph(self.root)
+        self.assertEqual([e for e in g["edges"] if e["kind"] == "calls"], [])
+
+    def test_gd_multiple_methods_merge_keep_first_line(self):
+        _write(self.root, "values/crit.gd", (
+            "class_name CritConfig\n"
+            "func a() -> void:\n"
+            "\tpass\n"
+            "func b() -> void:\n"
+            "\tpass\n"
+        ))
+        _write(self.root, "behaviors/player.gd", (
+            "extends Node\n"
+            "func f() -> void:\n"
+            "\tCritConfig.b()\n"
+            "\tCritConfig.a()\n"
+            "\tCritConfig.b()\n"
+        ))
+        g = wb.build_relation_graph(self.root)
+        calls = [e for e in g["edges"] if e["kind"] == "calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["methods"], ["b", "a"])  # 按首次出现顺序
+        self.assertEqual(calls[0]["line"], 3)             # 首个调用点
+
+    def test_python_module_qualified_call(self):
+        # import models 后 models.Target.run() 经模块别名解析到项目内类
+        _write(self.root, "models.py", (
+            "class Target:\n"
+            "    def run(self):\n"
+            "        pass\n"
+        ))
+        _write(self.root, "logic.py", (
+            "import models\n"
+            "class Source:\n"
+            "    def go(self):\n"
+            "        models.Target.run()\n"
+            "        models.Target()\n"
+        ))
+        g = wb.build_relation_graph(self.root)
+        calls = [e for e in g["edges"] if e["kind"] == "calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0]["source"], calls[0]["target"], calls[0]["methods"]),
+                         ("py:logic.py:Source", "py:models.py:Target", ["run"]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// P1：关系图。全项目类/脚本/场景节点 + 两类有向边：
-//   inherits（子 → 父：GDScript extends / Python bases）、mounts（场景 → 挂载脚本）。
+// P1：关系图。全项目类/脚本/场景节点 + 三类有向边：
+//   inherits（子 → 父）、mounts（场景 → 挂载脚本）、calls（项目内调用）。
 // 零第三方依赖：手写力导向布局（预迭代收敛 + rAF 余温），SVG 渲染，滚轮缩放/拖拽平移/节点拖动。
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { fsApi } from '../api'
@@ -18,6 +18,7 @@ const query = ref('')
 const showExternal = ref(true)
 const showInherits = ref(true)
 const showMounts = ref(true)
+const showCalls = ref(true)
 const svgEl = ref<SVGSVGElement | null>(null)
 
 interface Sim {
@@ -97,7 +98,7 @@ function onKey(e: KeyboardEvent) {
 }
 
 // 切换过滤项：保留旧坐标重建
-watch([showExternal, showInherits, showMounts], () => {
+watch([showExternal, showInherits, showMounts, showCalls], () => {
   if (!data.value || !ready.value) return
   buildLayout()
   nextTick(() => syncDom())
@@ -120,7 +121,8 @@ const viewEdges = computed<RelationEdge[]>(() => {
       ids.has(e.source) &&
       ids.has(e.target) &&
       (e.kind !== 'inherits' || showInherits.value) &&
-      (e.kind !== 'mounts' || showMounts.value),
+      (e.kind !== 'mounts' || showMounts.value) &&
+      (e.kind !== 'calls' || showCalls.value),
   )
 })
 
@@ -270,7 +272,8 @@ function step(a: number) {
     const dx = sb.x - sa.x
     const dy = sb.y - sa.y
     const d = Math.sqrt(dx * dx + dy * dy) || 0.01
-    const ideal = e.kind === 'mounts' ? IDEAL_MNT : IDEAL_INH
+    const IDEAL_CALL = 170
+    const ideal = e.kind === 'mounts' ? IDEAL_MNT : e.kind === 'calls' ? IDEAL_CALL : IDEAL_INH
     const f = (d - ideal) * SPRING * (0.25 + 0.75 * a)
     const ux = dx / d
     const uy = dy / d
@@ -517,7 +520,8 @@ const colorOf = regionColor
           <h2>关系图</h2>
           <span v-if="stats" class="rg-stats">
             {{ stats.user_nodes }} 个类/脚本/场景 · {{ stats.external_nodes }} 个外部基类 ·
-            {{ stats.edges_by_kind.inherits || 0 }} 继承 · {{ stats.edges_by_kind.mounts || 0 }} 挂载
+            {{ stats.edges_by_kind.inherits || 0 }} 继承 · {{ stats.edges_by_kind.mounts || 0 }} 挂载 ·
+            {{ stats.edges_by_kind.calls || 0 }} 调用
           </span>
         </div>
         <button class="rg-iconbtn" title="重新布局" @click="reload">
@@ -541,6 +545,9 @@ const colorOf = regionColor
           <button :class="['rg-toggle', { off: !showMounts }]" @click="showMounts = !showMounts">
             <i class="rg-tg-line mnt" />场景挂载
           </button>
+          <button :class="['rg-toggle', { off: !showCalls }]" @click="showCalls = !showCalls">
+            <i class="rg-tg-line call" />调用
+          </button>
           <button :class="['rg-toggle', { off: !showExternal }]" @click="showExternal = !showExternal">
             <i class="rg-tg-ext" />引擎/外部基类
           </button>
@@ -561,8 +568,8 @@ const colorOf = regionColor
         <div v-else-if="ready && viewNodes.length === 0" class="rg-state">
           <p class="rg-faint">当前过滤条件下没有可显示的节点。</p>
         </div>
-        <div v-else-if="ready && viewEdges.length === 0 && (!showInherits && !showMounts)" class="rg-state">
-          <p class="rg-faint">两类边都已隐藏，打开上方开关查看关系。</p>
+        <div v-else-if="ready && viewEdges.length === 0 && (!showInherits && !showMounts && !showCalls)" class="rg-state">
+          <p class="rg-faint">关系边都已隐藏，打开上方开关查看关系。</p>
         </div>
 
         <svg
@@ -582,6 +589,10 @@ const colorOf = regionColor
                     markerWidth="9" markerHeight="9" orient="auto-start-reverse">
               <path d="M0 0 L9 5 L0 10 Z" fill="#f0883e" />
             </marker>
+            <marker id="rg-arrow-call" viewBox="0 0 10 10" refX="8.5" refY="5"
+                    markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+              <path d="M0 0 L9 5 L0 10 Z" fill="#4f9e6a" />
+            </marker>
           </defs>
 
           <g :transform="viewport">
@@ -589,16 +600,19 @@ const colorOf = regionColor
               <g v-for="e in viewEdges" :key="edgeKey(e)"
                  :ref="(el) => setEdgeRef(el, edgeKey(e))"
                  :class="['rg-edge-g', { dim: edgeDim(e) }]">
+                <title v-if="e.kind === 'calls'">调用：{{ (e.methods || []).map((m) => m + '()').join('、') }}（首个调用点第 {{ e.line }} 行）</title>
+                <title v-else>{{ e.label }}{{ e.line ? `（第 ${e.line} 行）` : '' }}</title>
                 <line
                   class="rg-line"
                   :class="e.kind"
                   :x1="edgePos(e, 'x1')" :y1="edgePos(e, 'y1')"
                   :x2="edgePos(e, 'x2')" :y2="edgePos(e, 'y2')"
-                  :marker-end="e.kind === 'mounts' ? 'url(#rg-arrow-mnt)' : 'url(#rg-arrow-inh)'"
+                  :marker-end="e.kind === 'mounts' ? 'url(#rg-arrow-mnt)' : e.kind === 'calls' ? 'url(#rg-arrow-call)' : 'url(#rg-arrow-inh)'"
                 />
                 <g class="rg-elabel" :transform="`translate(${edgePos(e, 'x1')}, ${edgePos(e, 'y1')})`">
                   <rect x="-26" y="-8" width="52" height="13" rx="3" class="rg-elabel-bg-inh" v-if="e.kind === 'inherits'" />
-                  <rect x="-20" y="-8" width="40" height="13" rx="3" class="rg-elabel-bg-mnt" v-else />
+                  <rect x="-20" y="-8" width="40" height="13" rx="3" class="rg-elabel-bg-mnt" v-else-if="e.kind === 'mounts'" />
+                  <rect x="-20" y="-8" width="40" height="13" rx="3" class="rg-elabel-bg-call" v-else />
                   <text text-anchor="middle" y="2" :class="['rg-elabel-tx', e.kind]">{{ e.label }}</text>
                 </g>
               </g>
@@ -763,6 +777,7 @@ const colorOf = regionColor
 .rg-toggle.off { opacity: 0.42; }
 .rg-tg-line { width: 14px; height: 0; border-top: 2px solid #7fa3d0; display: inline-block; }
 .rg-tg-line.mnt { border-top: 2px dashed #f0883e; }
+.rg-tg-line.call { border-top: 2px solid #4f9e6a; }
 .rg-tg-ext {
   width: 11px; height: 9px;
   border: 1.5px dashed #8b97a7;
@@ -798,12 +813,15 @@ const colorOf = regionColor
 .rg-line { fill: none; stroke-width: 1.3; }
 .rg-line.inherits { stroke: #5f7fa6; }
 .rg-line.mounts { stroke: #c9762f; stroke-dasharray: 6 4; }
+.rg-line.calls { stroke: #4f9e6a; }
 .rg-edge-g.dim { opacity: 0.10; }
 .rg-elabel-bg-inh { fill: var(--bg); stroke: #5f7fa655; stroke-width: 0.8; }
 .rg-elabel-bg-mnt { fill: var(--bg); stroke: #c9762f55; stroke-width: 0.8; }
+.rg-elabel-bg-call { fill: var(--bg); stroke: #4f9e6a66; stroke-width: 0.8; }
 .rg-elabel-tx { font-size: 8.5px; }
 .rg-elabel-tx.inherits { fill: #9ec2ea; }
 .rg-elabel-tx.mounts { fill: #f0a868; }
+.rg-elabel-tx.calls { fill: #7dcc91; }
 
 .rg-node { cursor: default; }
 .rg-node.clickable { cursor: pointer; }

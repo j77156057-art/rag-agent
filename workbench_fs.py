@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import time
+import ast
 from datetime import datetime
 
 from fastapi import APIRouter
@@ -716,7 +717,7 @@ def build_symbol_map(root):
 
 
 # ---------------------------------------------------------------------------
-# P1：关系图（继承边 + 场景挂载组成边；调用边噪声大，留待后续）
+# P1：关系图（继承边 + 场景挂载边 + 高置信调用边）
 # ---------------------------------------------------------------------------
 
 _GD_RES_PATH = re.compile(r'^"?res://(.+?)"?$')
@@ -794,8 +795,34 @@ def _scene_script_refs(text: str):
     return edges
 
 
+def _mask_gdscript(text: str) -> str:
+    """Blank strings and comments while preserving length/newlines for line offsets."""
+    out = list(text)
+    quote = None
+    escaped = False
+    for i, ch in enumerate(text):
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            elif ch != "\n":
+                out[i] = " "
+        elif ch in ("'", '"'):
+            quote = ch
+            out[i] = " "
+        elif ch == "#":
+            j = i
+            while j < len(text) and text[j] != "\n":
+                out[j] = " "
+                j += 1
+    return "".join(out)
+
+
 def build_relation_graph(root):
-    """全项目关系图：用户节点（类/匿名脚本/场景）+ 引擎/外部基类节点 + 两类边。
+    """全项目关系图：用户节点（类/匿名脚本/场景）+ 高置信关系边。
 
     - inherits：GDScript ``extends`` / Python class bases（项目内类直连，
       引擎与第三方基类聚合成 external 节点；隐式 RefCounted/object 不出边）；
@@ -808,7 +835,11 @@ def build_relation_graph(root):
     edges = []
     node_index = {}     # 节点 id -> 在 nodes 中的下标
     user_by_name = {}   # 项目内类名 -> 节点 id（gd class_name / py 顶层类）
+    gd_user_by_name = {}
+    py_user_by_name = {}
     gd_by_rel = {}      # .gd rel -> 节点 id（含匿名脚本，res:// 继承与挂载都指向它）
+    py_by_rel_name = {} # (rel, class name) -> node id
+    methods_by_node = {}  # node id -> 顶层方法名
     py_classes = []     # (节点 id, bases detail 串)
     scene_rels = set()
     skipped = 0
@@ -887,6 +918,12 @@ def build_relation_graph(root):
             gd_by_rel[rel] = nid
             if cn and cn not in user_by_name:
                 user_by_name[cn] = nid
+            if cn:
+                gd_user_by_name.setdefault(cn, nid)
+            methods_by_node[nid] = {
+                s.get("name") for s in (env.get("symbols") or [])
+                if s.get("kind") == "function" and not s.get("parent")
+            }
 
         elif ext == ".py":
             for s in env.get("symbols") or []:
@@ -901,6 +938,12 @@ def build_relation_graph(root):
                 })
                 py_classes.append((nid, s.get("detail", "")))
                 user_by_name.setdefault(s["name"], nid)
+                py_user_by_name.setdefault(s["name"], nid)
+                py_by_rel_name[(rel, s["name"])] = nid
+                methods_by_node[nid] = {
+                    child.get("name") for child in (env.get("symbols") or [])
+                    if child.get("kind") == "function" and child.get("parent") == s["name"]
+                }
 
         elif ext == ".tscn":
             nid = f"scene:{rel}"
@@ -978,6 +1021,135 @@ def build_relation_graph(root):
                 continue
             seen.add(key)
             add_edge(source, target, "mounts", "挂载", line=line)
+
+    # ---- 第四遍：调用边（仅能解析到项目内类和已定义方法的调用）----
+    # 节点粒度图中，相同源/目标的多次调用合并成一条边，保留首行与方法列表。
+    call_edges = {}
+
+    def add_call(source, target, method, line):
+        if not source or not target or source == target:
+            return
+        if method not in methods_by_node.get(target, set()):
+            return
+        key = (source, target, "calls")
+        edge = call_edges.get(key)
+        if edge is None:
+            edge = {
+                "source": source, "target": target, "kind": "calls",
+                "label": "调用", "line": line, "methods": [method],
+            }
+            call_edges[key] = edge
+            edges.append(edge)
+        elif method not in edge["methods"]:
+            edge["methods"].append(method)
+
+    gd_var_type = re.compile(
+        r"^\s*(?:@[\w.]+(?:\([^\n]*\))?\s*)*(?:static\s+)?var\s+"
+        r"(\w+)\s*:\s*([A-Za-z_]\w*)\b"
+    )
+    gd_func = re.compile(r"^\s*(?:static\s+)?func\s+\w+\s*\((.*?)\)")
+    gd_param = re.compile(r"(?:^|,)\s*(\w+)\s*:\s*([A-Za-z_]\w*)\b")
+    gd_call = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(")
+
+    for rel, ext, fp in walked:
+        if ext == ".gd":
+            source = gd_by_rel.get(rel)
+            if not source:
+                continue
+            try:
+                with open(fp, encoding="utf-8-sig", errors="ignore") as f:
+                    raw = f.read()
+            except OSError:
+                continue
+            masked = _mask_gdscript(raw)
+            # 类成员映射只收列 0 声明：缩进的局部 var 不能进全局映射，
+            # 否则其类型会泄漏到其他函数，给未定义接收者造出假调用边。
+            field_types = {}
+            for ln in masked.splitlines():
+                if ln[:1] in (" ", "\t"):
+                    continue
+                m = gd_var_type.match(ln)
+                if m and m.group(2) in gd_user_by_name:
+                    field_types[m.group(1)] = m.group(2)
+            active_types = dict(field_types)
+            for line_no, ln in enumerate(masked.splitlines(), start=1):
+                m = gd_func.match(ln)
+                if m:
+                    active_types = dict(field_types)
+                    for pm in gd_param.finditer(m.group(1)):
+                        if pm.group(2) in gd_user_by_name:
+                            active_types[pm.group(1)] = pm.group(2)
+                m = gd_var_type.match(ln)
+                if m and m.group(2) in gd_user_by_name:
+                    active_types[m.group(1)] = m.group(2)
+                for cm in gd_call.finditer(ln):
+                    receiver, method = cm.groups()
+                    target = gd_user_by_name.get(receiver)
+                    if target is None:
+                        target = gd_user_by_name.get(active_types.get(receiver, ""))
+                    if target:
+                        add_call(source, target, method, line_no)
+
+        elif ext == ".py":
+            try:
+                with open(fp, encoding="utf-8-sig", errors="ignore") as f:
+                    tree = ast.parse(f.read(), filename=fp)
+            except (OSError, SyntaxError):
+                continue
+
+            def annotation_name(node):
+                try:
+                    return _base_simple_name(ast.unparse(node))
+                except Exception:  # noqa: BLE001
+                    return ""
+
+            imported = {}
+            module_aliases = {}
+            for item in tree.body:
+                if isinstance(item, ast.ImportFrom):
+                    for alias in item.names:
+                        target_name = alias.name.split(".")[-1]
+                        if target_name in py_user_by_name:
+                            imported[alias.asname or target_name] = target_name
+                elif isinstance(item, ast.Import):
+                    for alias in item.names:
+                        module_aliases[alias.asname or alias.name.split(".")[-1]] = alias.name
+
+            for cls in (n for n in tree.body if isinstance(n, ast.ClassDef)):
+                source = py_by_rel_name.get((rel, cls.name))
+                if not source:
+                    continue
+                fields = {}
+                for child in cls.body:
+                    if isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+                        typ = annotation_name(child.annotation)
+                        if typ in py_user_by_name:
+                            fields[child.target.id] = typ
+                for fn in (n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
+                    var_types = dict(fields)
+                    for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
+                        if arg.annotation:
+                            typ = annotation_name(arg.annotation)
+                            if typ in py_user_by_name:
+                                var_types[arg.arg] = typ
+                    for node in ast.walk(fn):
+                        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                            typ = annotation_name(node.annotation)
+                            if typ in py_user_by_name:
+                                var_types[node.target.id] = typ
+                        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                            continue
+                        receiver = node.func.value
+                        target = None
+                        if isinstance(receiver, ast.Name):
+                            target = py_user_by_name.get(imported.get(receiver.id, receiver.id))
+                            if target is None:
+                                target = py_user_by_name.get(var_types.get(receiver.id, ""))
+                        elif (isinstance(receiver, ast.Attribute) and isinstance(receiver.value, ast.Name)
+                              and receiver.value.id in module_aliases):
+                            target = py_user_by_name.get(receiver.attr)
+                        if target:
+                            add_call(source, target, node.func.attr, node.lineno)
 
     by_kind_edges = {}
     for e in edges:

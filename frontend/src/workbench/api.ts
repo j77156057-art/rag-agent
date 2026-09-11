@@ -135,10 +135,11 @@ export interface RelationNode {
 export interface RelationEdge {
   source: string
   target: string
-  /** inherits=继承（子→父）；mounts=场景挂载脚本 */
-  kind: 'inherits' | 'mounts' | string
+  /** inherits=继承；mounts=场景挂载脚本；calls=项目内调用 */
+  kind: 'inherits' | 'mounts' | 'calls' | string
   label: string
   line: number
+  methods?: string[]
 }
 
 export interface RelationGraphResp {
