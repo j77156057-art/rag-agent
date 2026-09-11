@@ -3,6 +3,7 @@
 # 用法：.venv\Scripts\python.exe -m PyInstaller docmind.spec
 # 产物：dist\DocMind\DocMind.exe + 依赖 DLL（文件夹分发；启动更快、索引可持久化）
 import os
+import shutil
 from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
@@ -91,3 +92,33 @@ coll = COLLECT(
     upx_exclude=[],
     name="DocMind",
 )
+
+# ---------------------------------------------------------------------------
+# 随包携带 MinGit（Git for Windows 官方便携版）：用户机器无需安装 git，
+# 分区初始化/提交/回滚与工作台文件树脏标记即可用。desktop.py 在 frozen
+# 启动时把 <exe目录>/MinGit/cmd 前置进 PATH。
+# 源目录解析顺序：环境变量 MINGIT_DIR → vendor/MinGit → 用户级便携安装。
+# 不放进 _internal（PyInstaller 数据目录），而与 exe 同级，便于核对与整体替换。
+# ---------------------------------------------------------------------------
+def _resolve_mingit():
+    candidates = [
+        os.environ.get("MINGIT_DIR", ""),
+        os.path.join(SPECPATH, "vendor", "MinGit"),
+        os.path.expanduser(r"~\.local\bin\MinGit"),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(os.path.join(c, "cmd", "git.exe")):
+            return c
+    raise SystemExit(
+        "未找到 MinGit（需要 cmd\\git.exe）。请从 "
+        "https://registry.npmmirror.com/-/binary/git-for-windows/ 下载 "
+        "MinGit-*-64-bit.zip 解压到 vendor\\MinGit，或设置环境变量 MINGIT_DIR。"
+    )
+
+
+_mingit_src = _resolve_mingit()
+_mingit_dst = os.path.join(DISTPATH, "DocMind", "MinGit")
+if os.path.isdir(_mingit_dst):
+    shutil.rmtree(_mingit_dst)
+shutil.copytree(_mingit_src, _mingit_dst)
+print("[docmind.spec] MinGit bundled: %s -> %s" % (_mingit_src, _mingit_dst))

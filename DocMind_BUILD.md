@@ -1,13 +1,32 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第六次重建（工作台前端脚手架）」；14:30 第五次构建的改动清单保留在下文。
+> 最新构建见下方「第七次重建（随包 MinGit + git 脏标记修复 + Godot 索引）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
-- 入口：`DocMind.exe`（19.3 MB，控制台模式，启动时自动开浏览器）
-- 整体体积：约 570 MB（主要是 chromadb / onnxruntime / webview 运行时）
-- **当前构建时间：`2026-09-11 15:45:03`（第六次重建，工作台前端脚手架，P0 任务 1）**
-- 上一版：`2026-09-11 14:30:40`（第五次重建，模型显存开关）
+- 入口：`DocMind.exe`（约 19.4 MB，控制台模式，启动时自动开浏览器）
+- 整体体积：约 662 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB）
+- **当前构建时间：`2026-09-11 18:53:13`（第七次重建，随包 MinGit）**
+- 上一版：`2026-09-11 15:45:03`（第六次重建，工作台前端脚手架，P0 任务 1）
+
+---
+
+## 第七次重建：随包 MinGit + git 脏标记修复 + Godot 索引（2026-09-11 18:53）
+
+### 改动
+- **MinGit 随包分发**：`dist/DocMind/MinGit/`（Git for Windows 官方便携版 2.55，89.5 MB / 365 文件，含 cmd+mingw64+usr，自足无外部依赖），用户机器无需安装 Git。
+  - `docmind.spec`：COLLECT 后把 MinGit 复制到与 exe 同级目录；源目录解析顺序 `MINGIT_DIR` 环境变量 → `vendor/MinGit` → `%USERPROFILE%\.local\bin\MinGit`，都找不到时构建明确报错。换机构建请把 `MinGit-*-64-bit.zip` 解压到 `vendor/MinGit`（vendor/ 已 gitignore，二进制不入库）。
+  - `desktop.py`：frozen 启动时把 `<exe目录>/MinGit/cmd` 前置进进程 PATH（`_ensure_bundled_git`），所有裸 `git` 子进程（文件树状态、分区初始化/提交/回滚）自动命中；日志打印「已启用随包 Git（MinGit）」。
+  - `regions.py`：缺 git 提示区分 frozen/源码——分发包里若 MinGit 目录被杀软删除，提示恢复目录或重新获取完整分发包，而非让用户去装 Git。
+- **git 脏标记修复**（同包带走）：`_git()` 对输出 `.strip()` 会吃掉 `status --porcelain -z` 首条记录的状态列空格，导致最常见的「未暂存修改」永不亮脏点；改为 `.rstrip()`，并显式 UTF-8 解码（中文路径不再错码）。
+- **Godot 资产可索引**：`ingest.py` 白名单补 `.gd/.gdshader/.tscn/.tres/.godot`（二进制 .scn/.res 天然排除），lang 元数据 gdscript 等；之前 .gd 不进代码集合，问答看不到游戏脚本。
+- 前端无改动，沿用既有 workbench 资源（JS `workbench-CC3MjeAJ.js`，含无 git 中性文案）。
+
+### 验证（冻结包实测）
+- 用**不含任何 git 的最小 PATH**（仅 System32）冷启动 `DocMind.exe`（DOCMIND_SERVER_ONLY=1，CODE_ROOT=样例 Godot 项目）：~16s 服务就绪，日志确认「已启用随包 Git（MinGit）」。
+- 文件树三态：修改过的 level.gd → tracked=true/dirty=true；新增 boss.gd → tracked=false/dirty=true；干净文件 → tracked=true/dirty=false。浏览器徽标「已修改/未跟踪/已跟踪」全部正确，console 零错误。
+- 产物自检：MinGit 365 文件完整、`git --version` 2.55；web/workbench 资源哈希与源码构建一致；无 .env、无 python\*.exe；总体积 661.6 MB。
+- 源码侧回归 25/25；GDScript 语义索引 19 切片、4 个中文查询精准命中；端到端问答（暴击公式）Agent 主动 search_code 且回答与 crit.gd 一致。
 
 ---
 
@@ -138,6 +157,6 @@
 - **启用外部调用 DocMind API**：设置环境变量 `DOCMIND_API_TOKEN=<你的令牌>`（启用后 `/api/*` 需带 `x-docmind-token` 或 `Authorization: Bearer`）；如需浏览器跨域调用，设 `DOCMIND_CORS_ORIGINS=https://你的前端域名`（默认 `*` 允许任意来源）。
 - **启用 Agent 调外部 API**：必须设置 `EXTERNAL_API_ALLOWLIST`，否则 `dev_http_request` 一律拒绝——这是防 SSRF 的安全闸门，非空不可放行。写法：`api.example.com`（精确匹配且含其子域）、`*.example.com`（仅子域，不含裸域）、`*`（任意 host，协议仍限 http/https）；30x 重定向的每一跳都会重新校验白名单。
 - **端口占用提示**：启动器含单实例保护——若 8000 端口已被旧 `DocMind.exe` 占用，新实例会直接打开浏览器而不重复启动；如遇旧进程卡死占用端口，需先结束旧进程再启动。
-- **Git 前置依赖**：分区工作台的初始化/提交/回滚基于每个分区独立 git 仓库，运行机器需安装 Git 并加入 PATH（未安装时初始化会在写文件前给出明确安装提示，不产生半成品）。
+- **Git 前置依赖**：第七次构建起分发包**自带 MinGit**（`DocMind/MinGit/`，frozen 启动自动加入 PATH），用户机器无需安装 Git；仅源码运行（.venv / dev）仍需系统装有 git。分区工作台的初始化/提交/回滚基于每个分区独立 git 仓库；git 不可用时初始化会在写文件前给出明确提示，不产生半成品。
 - **分发版不含 Python 解释器**：分区 `builtin:py` 校验在进程内做语法编译检查（exe/源码均可用）；但 pytest/unittest 试玩（playtest auto）与 cProfile 剖析需要真实 Python 环境，请在源码 `.venv` 中运行，exe 内会直接返回明确提示而不会静默失败。
-- 临时构建用 spec 与日志已清理，原 `docmind.spec` 保持不变。
+- 第七次构建起 `docmind.spec` 含 MinGit 随包步骤（见上文）；早期「临时构建 spec 已清理」的说明不再适用。

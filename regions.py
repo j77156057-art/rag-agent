@@ -235,6 +235,16 @@ _GIT_MISSING_HINT = (
     "“Git from the command line and also from 3rd-party software”），"
     "安装后重新打开 DocMind 再试。"
 )
+_GIT_MISSING_HINT_FROZEN = (
+    "未能启动随包附带的 Git（MinGit）。分发版应在程序目录的 MinGit\\cmd 下自带 git，"
+    "请检查该目录是否被杀毒软件删除或隔离；恢复后重新打开 DocMind，"
+    "或重新获取完整的 DocMind 分发包。"
+)
+
+
+def _git_missing_hint():
+    import sys
+    return _GIT_MISSING_HINT_FROZEN if getattr(sys, "frozen", False) else _GIT_MISSING_HINT
 
 
 def _git_available():
@@ -243,7 +253,7 @@ def _git_available():
         subprocess.run(["git", "--version"], capture_output=True, timeout=15)
         return True, ""
     except FileNotFoundError:
-        return False, _GIT_MISSING_HINT
+        return False, _git_missing_hint()
     except Exception as e:  # noqa: BLE001
         return False, f"无法执行 git：{e}。请确认 Git 已安装并加入 PATH。"
 
@@ -257,7 +267,7 @@ def _git(args, cwd):
         )
     except FileNotFoundError:
         # 裸 shell 里没有 git 时 subprocess 抛 WinError 2，给出可操作提示而非晦涩系统错误
-        return False, _GIT_MISSING_HINT
+        return False, _git_missing_hint()
     except Exception as e:  # noqa: BLE001
         return False, str(e)
     if proc.returncode != 0:

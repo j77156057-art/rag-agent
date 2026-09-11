@@ -37,6 +37,23 @@ else:
 LOG = os.path.join(BASE, "docmind_desktop.log")
 
 
+def _ensure_bundled_git():
+    """分发版随包携带 MinGit（<exe目录>/MinGit/cmd/git.exe）。
+
+    前置进 PATH 后，所有裸 `git` 子进程（regions.workbench_fs 的版本状态、
+    分区初始化/提交/回滚）都能命中，用户机器无需自行安装 Git。
+    源码运行或包内缺目录时不做任何处理（回落到系统 PATH）。
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    git_cmd_dir = os.path.join(BASE, "MinGit", "cmd")
+    if os.path.isfile(os.path.join(git_cmd_dir, "git.exe")):
+        os.environ["PATH"] = git_cmd_dir + os.pathsep + os.environ.get("PATH", "")
+        _log("已启用随包 Git（MinGit）")
+    else:
+        _log("未找到随包 MinGit，分区 Git 功能需要系统已安装 Git")
+
+
 def _log(msg: str):
     try:
         with open(LOG, "a", encoding="utf-8") as f:
@@ -108,6 +125,7 @@ def _emit_ollama_guidance():
 
 
 def main():
+    _ensure_bundled_git()
     if os.getenv("DOCMIND_SERVER_ONLY"):
         _log("服务模式启动")
         _emit_ollama_guidance()
