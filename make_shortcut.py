@@ -14,7 +14,7 @@ Then verify the result by parsing the bytes back.
 import os
 import struct
 
-BASE = r"C:\Users\h'h'h\WorkBuddy\2026-09-08-14-46-20\rag-agent"
+BASE = os.path.dirname(os.path.abspath(__file__))
 EXE = os.path.join(BASE, "dist", "DocMind", "DocMind.exe")
 WORKDIR = os.path.join(BASE, "dist", "DocMind")
 ICON = os.path.join(BASE, "docmind.ico")

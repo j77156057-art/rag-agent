@@ -1,0 +1,27 @@
+{
+  "screen": {
+    "width": 800,
+    "height": 600,
+    "fps": 60
+  },
+  "player": {
+    "speed": 320,
+    "size": 28,
+    "hp": 3,
+    "fire_interval": 0.25,
+    "invincible_time": 1.5,
+    "bullet_speed": 520
+  },
+  "enemy": {
+    "spawn_interval": 1.2,
+    "speed_min": 60,
+    "speed_max": 160,
+    "size": 30,
+    "score_chaser": 100,
+    "score_shooter": 250,
+    "wave_size_base": 4
+  },
+  "combo": {
+    "timeout": 2.0
+  }
+}

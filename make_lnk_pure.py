@@ -153,7 +153,7 @@ def verify_lnk(lnk_path: str, expect_target: str):
 
 
 if __name__ == "__main__":
-    base = r"C:\Users\h'h'h\WorkBuddy\2026-09-08-14-46-20\rag-agent"
+    base = os.path.dirname(os.path.abspath(__file__))
     target = os.path.join(base, "dist", "DocMind", "DocMind.exe")
     workdir = os.path.join(base, "dist", "DocMind")
     icon = target  # 用 exe 内嵌图标（spec 已 icon=docmind.ico 打进 exe）

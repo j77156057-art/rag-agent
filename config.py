@@ -46,6 +46,11 @@ PROVIDERS = {
         "api_key_env": "",
         "default_model": "qwen2.5:7b",
     },
+    "llamacpp": {
+        "base_url": "http://localhost:8080/v1",
+        "api_key_env": "",
+        "default_model": "qwen3.6-35b-a3b",
+    },
     "mock": {
         "base_url": "",
         "api_key_env": "",
@@ -57,8 +62,12 @@ LLM_MODEL = os.getenv("LLM_MODEL", "")  # 为空则用 provider 默认
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")  # 直接指定可覆盖环境变量
 
 # ---- Embedding ----
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")  # qwen / local
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v3")
+# 可选: qwen(通义千问 text-embedding-v3, 需 key) / ollama(本机 Ollama nomic-embed-text, 零 Key) / local(本地哈希占位, 仅离线演示)
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "bge-m3" if EMBEDDING_PROVIDER == "ollama" else "text-embedding-v3",
+)
 LOCAL_EMBED_DIM = 256  # 本地兜底向量维度（仅离线演示用，非语义向量）
 
 # ---- 路径 / 参数 ----
@@ -73,10 +82,49 @@ CODE_COLLECTION_NAME = os.getenv("CODE_COLLECTION_NAME", "docmind_code")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "80"))
 TOP_K = int(os.getenv("TOP_K", "4"))
-MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "5"))
+MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "8"))
+# ---- Agent 上下文预算（防止长系统提示 + 多轮观察 + 思考模型 reasoning 撑爆 n_ctx）----
+AGENT_HISTORY_TURNS = int(os.getenv("AGENT_HISTORY_TURNS", "3"))  # 多轮记忆最多回放的问答对数
+OBS_MAX_CHARS = int(os.getenv("OBS_MAX_CHARS", "1200"))  # 单条工具观察回填给模型前的截断长度
+HISTORY_ANSWER_CHARS = int(os.getenv("HISTORY_ANSWER_CHARS", "700"))  # 回放历史回答时的单条截断长度
+TRAIL_ASSISTANT_CHARS = int(os.getenv("TRAIL_ASSISTANT_CHARS", "1000"))  # trail 中保留的模型单轮决策上限
+# 每轮送模型前，整段 prompt 的 token 预算（llamacpp 走 /tokenize 精算；
+# 16384 n_ctx 下 11000 给 prompt、约 5000 留给思考+回答）
+PROMPT_TOKEN_BUDGET = int(os.getenv("PROMPT_TOKEN_BUDGET", "11000"))
+# 单次补全上限（含思考型模型的 reasoning）：防止模型不按格式收尾时无限生成，
+# 到顶后 finish_reason=length，Agent 会自动 nudge 要求直接给简短 Final Answer。
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "3072"))
+# 是否允许思考型模型把预算花在 reasoning_content 上。ReAct 工具路由不需要长思考，
+# 实测关思考后同类请求 55 token/4s 给出 Action（开思考时偶发烧满 3072 token 不行动）。
+# 仅对本地 OpenAI 兼容服务（llamacpp/ollama）透传 chat_template_kwargs。
+LLM_ENABLE_THINKING = os.getenv("LLM_ENABLE_THINKING", "0") == "1"
 CODE_ROOT = os.getenv("CODE_ROOT", "")  # 代码问答模式的代码库根目录；为空表示未配置
 CODE_CHUNK = int(os.getenv("CODE_CHUNK", "1200"))  # 单个代码切片的最大字符数
 EDIT_CONFIRM = os.getenv("EDIT_CONFIRM", "0") == "1"  # 写工具是否需要人工确认（改前出 diff）
+API_TOKEN = os.getenv("DOCMIND_API_TOKEN", "").strip()  # 为空保持本机免鉴权
+
+# ---- 外部接入 DocMind API 的 CORS ----
+# 逗号分隔的允许来源（如 https://app.example.com,http://localhost:3000）；
+# 设为 * 表示允许任意来源（默认）。仅在「外部网页/前端要调用本服务」时需要。
+DOCMIND_CORS_ORIGINS = [
+    o.strip() for o in os.getenv("DOCMIND_CORS_ORIGINS", "*").split(",") if o.strip()
+] or ["*"]
+
+# ---- Agent 调用外部业务 API 的白名单 ----
+# 逗号分隔，支持三种写法：api.example.com（精确匹配且含其子域）、
+# *.example.com（仅子域，不含裸 example.com）、*（任意 host，协议仍限 http/https）。
+# 命中其一才允许发起请求，防止 Agent 被诱导对内网/元数据地址做 SSRF
+# （30x 重定向的每一跳也会重新过此白名单）。为空则禁止使用 dev_http_request。
+EXTERNAL_API_ALLOWLIST = [
+    h.strip().lower()
+    for h in os.getenv("EXTERNAL_API_ALLOWLIST", "").split(",")
+    if h.strip()
+]
+
+# ---- 聊天图片输入（视觉模型，如 qwen3.6 系列）----
+CHAT_IMAGE_MAX_FILES = int(os.getenv("CHAT_IMAGE_MAX_FILES", "4"))  # 单条消息最多图片数
+CHAT_IMAGE_MAX_BYTES = int(os.getenv("CHAT_IMAGE_MAX_BYTES", str(10 * 1024 * 1024)))  # 单图大小上限（压缩前）
+CHAT_IMAGE_ALLOWED_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
 # ---- 运行时覆盖（由前端 /api/config 动态设置，优先级高于 .env）----
 # 仅存于内存，进程重启后恢复 .env 默认值。用于页面内"免重启切换模型"。

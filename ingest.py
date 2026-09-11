@@ -95,11 +95,12 @@ _CODE_EXT = {
     ".h", ".hpp", ".go", ".rs", ".lua", ".rb", ".php", ".swift", ".kt", ".scala",
     ".sh", ".json", ".yaml", ".yml", ".toml",
 }
-# 遍历时跳过的目录（依赖/构建产物/版本控制/虚拟环境）
+# 遍历时跳过的目录（依赖/构建产物/版本控制/虚拟环境/向量库自身/归档备份）
 _SKIP_DIRS = {
     ".git", "node_modules", "__pycache__", ".venv", "venv", "build", "dist",
     "bin", "obj", "Library", "Temp", ".idea", ".vscode", "target", "out",
     ".mypy_cache", ".ruff_cache",
+    ".chroma", "_archived_builds", "uploads",  # 索引自身/归档备份/上传临时目录，避免污染代码集合
 }
 # 单个代码文件超过此体积（字节）则跳过，避免把巨型生成文件/压缩包塞进索引
 _MAX_CODE_FILE = 500_000
@@ -229,8 +230,28 @@ def _split_big(text, size):
     return [c for c in chunks if c.strip()] or [text]
 
 
+def _pieces_with_lines(raw, base_line, sym, pieces):
+    """把 _split_big 产出的片段按其在 raw 中的位置换算成 1 基起止行号。
+
+    返回 (片段, 符号名, 起始行, 结束行) 四元组；片段顺序出现，用游标定位，
+    重复文本也不会错位。
+    """
+    out = []
+    cursor = 0
+    for piece in pieces:
+        idx = raw.find(piece, cursor)
+        if idx < 0:
+            idx = cursor
+        offset = raw.count("\n", 0, idx)
+        start = base_line + offset
+        end = start + piece.count("\n")
+        out.append((piece, sym, start, end))
+        cursor = idx + len(piece)
+    return out
+
+
 def _chunk_python(text):
-    """用 ast 精确切分 Python 文件为（片段, 符号名）列表；失败返回 None。"""
+    """用 ast 精确切分 Python 文件为（片段, 符号名, 起始行, 结束行）列表；失败返回 None。"""
     try:
         tree = ast.parse(text)
     except SyntaxError:
@@ -247,21 +268,24 @@ def _chunk_python(text):
     chunks = []
     # 文件头（imports / 模块 docstring / 注释）作为一段 preamble
     if nodes:
-        pre = "\n".join(lines[: nodes[0].lineno - 1]).strip()
-        if pre:
-            chunks.append((pre, ""))
+        pre_raw = "\n".join(lines[: nodes[0].lineno - 1])
+        if pre_raw.strip():
+            chunks.extend(
+                _pieces_with_lines(pre_raw, 1, "", _split_big(pre_raw.strip(), CODE_CHUNK))
+            )
     for n in nodes:
         start = n.lineno - 1
         end = getattr(n, "end_lineno", n.lineno)
-        block = "\n".join(lines[start:end]).strip()
+        raw = "\n".join(lines[start:end])
         sym = n.name if hasattr(n, "name") else ""
-        for piece in _split_big(block, CODE_CHUNK):
-            chunks.append((piece, sym))
+        chunks.extend(
+            _pieces_with_lines(raw, n.lineno, sym, _split_big(raw.strip(), CODE_CHUNK))
+        )
     return chunks or None
 
 
 def chunk_code(text, path):
-    """把一段源代码切成（片段, 符号名）列表；优先用 ast（Python），否则正则启发式。"""
+    """把源代码切成（片段, 符号名, 起始行, 结束行）列表；优先 ast（Python），否则正则启发式。"""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".py":
         py = _chunk_python(text)
@@ -271,18 +295,22 @@ def chunk_code(text, path):
     idxs = [i for i, ln in enumerate(lines) if _DEF_RE.match(ln)]
     chunks = []
     if idxs and idxs[0] > 0:
-        pre = "\n".join(lines[: idxs[0]]).strip()
-        if pre:
-            chunks.append((pre, ""))
+        pre_raw = "\n".join(lines[: idxs[0]])
+        if pre_raw.strip():
+            chunks.extend(
+                _pieces_with_lines(pre_raw, 1, "", _split_big(pre_raw.strip(), CODE_CHUNK))
+            )
     for k, s in enumerate(idxs):
         e = idxs[k + 1] if k + 1 < len(idxs) else len(lines)
-        block = "\n".join(lines[s:e]).strip()
+        raw = "\n".join(lines[s:e])
         sym = _symbol_name(lines[s], ext)
-        for piece in _split_big(block, CODE_CHUNK):
-            chunks.append((piece, sym))
+        chunks.extend(
+            _pieces_with_lines(raw, s + 1, sym, _split_big(raw.strip(), CODE_CHUNK))
+        )
     if not chunks:
-        for piece in _split_big(text, CODE_CHUNK):
-            chunks.append((piece, ""))
+        chunks.extend(
+            _pieces_with_lines(text, 1, "", _split_big(text.strip() or text, CODE_CHUNK))
+        )
     return chunks
 
 
@@ -301,12 +329,20 @@ def _code_file_records(path, root, emb):
     ext = os.path.splitext(path)[1].lower()
     lang = _LANG_BY_EXT.get(ext, "text")
     imports_str = ", ".join(_extract_imports(text, ext)) or "none"
-    texts = [c for c, _ in chunks]
+    texts = [c for c, _, _, _ in chunks]
     embeddings = emb.embed(texts)
-    # 每块带语言标记与 import 边，便于检索排序、展示与"符号从哪来"追踪
+    # 每块带语言标记、import 边与起止行号，便于检索排序、精确定位与"符号从哪来"追踪
     metas = [
-        {"source": rel, "symbol": sym, "kind": "code", "lang": lang, "imports": imports_str}
-        for _, sym in chunks
+        {
+            "source": rel,
+            "symbol": sym,
+            "kind": "code",
+            "lang": lang,
+            "imports": imports_str,
+            "start_line": sl,
+            "end_line": el,
+        }
+        for _, sym, sl, el in chunks
     ]
     ids = [uuid.uuid4().hex for _ in chunks]
     return texts, embeddings, metas, ids

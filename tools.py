@@ -12,7 +12,7 @@ import threading
 import urllib.request
 import urllib.parse
 
-from config import TOP_K, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime, edit_confirm_enabled
+from config import TOP_K, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime, edit_confirm_enabled, EXTERNAL_API_ALLOWLIST
 from embeddings import EmbeddingClient
 from vectorstore import query as vs_query, pretty_source
 from ingest import _CODE_EXT, _SKIP_DIRS
@@ -108,6 +108,171 @@ def web_search(query):
     return "\n".join(lines)
 
 
+_ALLOWED_URL_SCHEMES = ("http", "https")
+
+
+def _url_scheme_ok(url):
+    """只允许 http/https：白名单配 * 时也要阻止 file:// 读本地文件、gopher/ftp 等协议。"""
+    try:
+        scheme = (urllib.parse.urlparse(url).scheme or "").lower()
+    except Exception:
+        return False, ""
+    return scheme in _ALLOWED_URL_SCHEMES, scheme
+
+
+def _host_allowed(url):
+    """按 EXTERNAL_API_ALLOWLIST 校验 url 的 host（防 SSRF）。空白名单一律拒绝。
+
+    支持三种写法（与文档一致）：
+      *                          放行任意 host（scheme 仍限 http/https）
+      api.example.com            精确匹配，同时匹配其子域
+      *.example.com              仅匹配子域（含多级，如 a.b.example.com），不含裸 example.com
+    """
+    if not EXTERNAL_API_ALLOWLIST:
+        return False, "未配置 EXTERNAL_API_ALLOWLIST，dev_http_request 已禁用（请在启动环境设置白名单，如 EXTERNAL_API_ALLOWLIST=api.example.com,*.example.com）。"
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except Exception:
+        return False, f"无法解析 URL：{url}"
+    host = host.lower()
+    for raw in EXTERNAL_API_ALLOWLIST:
+        pat = (raw or "").strip().lower()
+        if not pat:
+            continue
+        if pat == "*":
+            return True, ""
+        if pat.startswith("*."):
+            suffix = pat[1:]  # ".example.com"
+            if host.endswith(suffix) and len(host) > len(suffix):
+                return True, ""
+            continue
+        if host == pat or host.endswith("." + pat):
+            return True, ""
+    return False, f"目标 host「{host}」不在 EXTERNAL_API_ALLOWLIST 白名单内，已拒绝（当前白名单：{', '.join(EXTERNAL_API_ALLOWLIST)}）。"
+
+
+class _GuardRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """30x 跳转时对每一跳重新做 scheme + host 白名单校验。
+
+    urllib 默认自动跟随重定向且不重新校验目标，白名单域若存在开放重定向，
+    一跳即可访问 127.0.0.1 / 169.254.169.254 / 内网甚至跳到 file://，
+    把响应内容回显给 Agent，等于绕过 SSRF 白名单。
+    """
+
+    # 301/303/307 在基类里都是 http_error_302 的别名；子类里重新绑定，确保全部走守卫
+    def http_error_302(self, req, fp, code, msg, hdrs):
+        # 注意：Python 3.13 起基类在调用 redirect_request 之前就会自行拒绝非 http(s)
+        # 跳转（抛 HTTPError），这里提前校验是为了拿到统一、可读的拦截原因，
+        # 并保证所有 3xx 状态码都先过本方法。
+        loc = hdrs.get("location") or hdrs.get("uri") or ""
+        newurl = urllib.parse.urljoin(req.full_url, loc)
+        scheme_ok, _ = _url_scheme_ok(newurl)
+        if not scheme_ok:
+            raise urllib.error.URLError(f"重定向目标协议不允许（仅 http/https）：{newurl}")
+        allowed, why = _host_allowed(newurl)
+        if not allowed:
+            raise urllib.error.URLError(f"重定向目标未通过白名单：{why}")
+        return super().http_error_302(req, fp, code, msg, hdrs)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_302
+
+    def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+        # 纵深防御：即便未来 Python 版本改变 302 处理链，这里仍逐跳复核
+        scheme_ok, _ = _url_scheme_ok(newurl)
+        if not scheme_ok:
+            raise urllib.error.URLError(f"重定向目标协议不允许（仅 http/https）：{newurl}")
+        allowed, why = _host_allowed(newurl)
+        if not allowed:
+            raise urllib.error.URLError(f"重定向目标未通过白名单：{why}")
+        return super().redirect_request(req, fp, code, msg, hdrs, newurl)
+
+
+def dev_http_request(arg):
+    """让 Agent 调用你自己的外部业务 API（REST/JSON）。
+
+    受 EXTERNAL_API_ALLOWLIST 域名白名单约束（防止对内网/元数据地址做 SSRF），
+    未配置白名单时本工具拒绝任何请求。输入（多行 key: value）：
+        url: <必填，完整 URL>
+        method: <GET|POST|PUT|PATCH|DELETE，默认 GET>
+        timeout: <秒，默认 15>
+        headers: <可选，单行 JSON 对象，如 {"Authorization":"Bearer x"}>
+        body: <可选，请求体；与 method 配合，POST/PUT/PATCH 常用；可多行>
+    返回：HTTP 状态码 + 响应头(部分) + 截断后的响应体（前 4000 字）。网络/解析错误会说明原因。
+    """
+    arg = (arg or "").lstrip("\n")
+    keys = ["url", "method", "timeout", "headers", "body"]
+    spans = []
+    for key in keys:
+        for m in re.finditer(r"^\s*" + key + r"\s*:\s*", arg, re.M):
+            spans.append((m.start(), m.end(), key))
+    spans.sort()
+    fields = {}
+    for i, (s, e, key) in enumerate(spans):
+        val_end = spans[i + 1][0] if i + 1 < len(spans) else len(arg)
+        val = arg[e:val_end]
+        if val.startswith("\n"):
+            val = val[1:]
+        if val_end < len(arg):
+            val = val.rstrip("\n")
+        fields[key] = val
+
+    url = (fields.get("url") or "").strip()
+    if not url:
+        return "参数缺失：请提供 url: <完整 URL>。"
+    scheme_ok, scheme = _url_scheme_ok(url)
+    if not scheme_ok:
+        return f"安全拦截：仅允许 http/https 协议，拒绝「{scheme or '未知'}」。"
+    ok, why = _host_allowed(url)
+    if not ok:
+        return f"安全拦截：{why}"
+
+    method = (fields.get("method") or "GET").strip().upper()
+    if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+        return f"不支持的 HTTP 方法：{method}。"
+    try:
+        timeout = float((fields.get("timeout") or "15").strip())
+    except ValueError:
+        return "timeout 参数不是合法数字（秒）。"
+    timeout = max(1.0, min(timeout, 60.0))
+
+    headers = {}
+    raw_h = (fields.get("headers") or "").strip()
+    if raw_h:
+        try:
+            headers = json.loads(raw_h)
+            if not isinstance(headers, dict):
+                return "headers 必须是 JSON 对象（如 {\"Authorization\":\"Bearer x\"}）。"
+        except Exception as e:  # noqa: BLE001
+            return f"headers 解析失败（需单行 JSON 对象）：{e}"
+
+    body = fields.get("body")
+    data = None
+    if body is not None and body != "" and method in ("POST", "PUT", "PATCH"):
+        data = body.encode("utf-8")
+        headers.setdefault("Content-Type", "application/json")
+
+    try:
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        # 使用带跳转守卫的 opener：302 每一跳都重过 scheme + host 白名单
+        opener = urllib.request.build_opener(_GuardRedirectHandler)
+        with opener.open(req, timeout=timeout) as r:
+            status = r.status
+            resp_body = r.read().decode("utf-8", "replace")
+            ctype = r.headers.get("content-type", "")
+    except urllib.error.HTTPError as e:
+        try:
+            resp_body = e.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            resp_body = ""
+        return f"HTTP {e.code} {e.reason}\n{resp_body[:4000]}"
+    except Exception as e:  # noqa: BLE001
+        return f"请求失败: {type(e).__name__}: {e}"
+
+    preview = resp_body[:4000]
+    tail = "" if len(resp_body) <= 4000 else f"\n…（截断，共 {len(resp_body)} 字）"
+    return f"HTTP {status}  content-type: {ctype}\n{preview}{tail}"
+
+
 def python_exec(code):
     """在受限子进程中执行 Python 代码，返回 stdout/stderr（截断到 1500 字）。
 
@@ -122,6 +287,10 @@ def python_exec(code):
     code = code.strip().strip("`").strip()
     if not code:
         return "未提供有效代码。"
+    # 打包版 sys.executable 是 DocMind.exe（onedir 内无 python.exe），
+    # 不能拿它当解释器跑代码（只会再启动一个应用实例）。
+    if getattr(sys, "frozen", False):
+        return "分发版（DocMind.exe）未内置 Python 解释器，python_exec 仅在源码/venv 环境可用。"
     try:
         proc = subprocess.run(
             [sys.executable, "-c", code],
@@ -365,9 +534,35 @@ def _get_code_root():
     return (get_runtime("code_root") or CODE_ROOT or "").strip()
 
 
+def _region_write_allowed(target):
+    """When regions are configured, ordinary write tools cannot bypass region tools."""
+    if get_runtime("region_edit_context"):
+        return True
+    root = _get_code_root()
+    if not root or not os.path.isfile(os.path.join(root, "regions.json")):
+        return True
+    try:
+        from regions import get_region_map
+        target = os.path.realpath(target)
+        for meta in get_region_map(root).values():
+            base = os.path.realpath(os.path.join(root, meta["dir"]))
+            if target == base or target.startswith(base + os.sep):
+                return False
+    except Exception:
+        return False
+    return True
+
+
 # 记录 Agent 本次会话内已用 read_file 读过的文件（绝对路径，normcase 归一），
 # 用于 apply_edit 的"先读后写"安全护栏：未确认过内容的文件不允许整体重写。
 _READ_FILES = set()
+_REGION_LOCKS = {}
+_REGION_LOCKS_GUARD = threading.Lock()
+
+
+def _region_lock(key):
+    with _REGION_LOCKS_GUARD:
+        return _REGION_LOCKS.setdefault(key, threading.RLock())
 
 
 def _resolve_in_root(path):
@@ -400,11 +595,30 @@ def _clean_symbol(p):
     return p
 
 
+def _clean_search_query(q):
+    """语义检索 query 只"剥壳"、不抽符号：保留多词自然语言/中英混合的完整语义。
+
+    _clean_symbol 会把「collision 碰撞检测逻辑」缩成单个标识符，那是给 grep 正则用的；
+    语义向量检索需要完整 query（如「score combo high score save」是合法英文短句）。
+    这里仅去掉弱模型常误带的 query:/path:/关键词: 前缀与成对围栏、引号。
+    """
+    q = (q or "").strip()
+    q = re.sub(
+        r"^(?:query|q|path|关键词|检索词|搜索词)\s*[:：]\s*",
+        "",
+        q,
+        flags=re.IGNORECASE,
+    ).strip()
+    if len(q) >= 2 and q[0] == q[-1] and q[0] in "`'\"":
+        q = q[1:-1].strip()
+    return q
+
+
 def search_code(query):
     """在已索引的源代码/配置中检索相关函数、类、配置片段。"""
     if not _get_code_root():
         return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录后再问代码相关问题。"
-    query = _clean_symbol(query)
+    query = _clean_search_query(query)
     emb = _get_emb().embed([query])[0]
     res = vs_query(emb, k=TOP_K, collection=CODE_COLLECTION_NAME)
     docs = (res.get("documents") or [[]])[0]
@@ -416,11 +630,22 @@ def search_code(query):
         src = m.get("source", "?")
         sym = m.get("symbol", "")
         lang = m.get("lang", "")
-        label = f"{src} › {sym}" if sym else src
+        sl, el = m.get("start_line"), m.get("end_line")
+        loc = f"{src}:L{sl}" + (f"-L{el}" if el and el != sl else "") if sl else src
+        label = f"{loc} › {sym}" if sym else loc
         if lang:
             label += f" ({lang})"
-        text = d if len(d) <= 600 else d[:600].rstrip() + "…"
-        out.append(f"[{label}]\n{text}")
+        shown = d if len(d) <= 600 else d[:600].rstrip() + "\n…（下略）"
+        # 给片段逐行标行号（锚定 start_line），模型可直接引用精确行
+        if sl:
+            numbered = []
+            for i, ln in enumerate(shown.split("\n")):
+                if ln == "…（下略）":
+                    numbered.append(ln)
+                else:
+                    numbered.append(f"{sl + i:>5}| {ln}")
+            shown = "\n".join(numbered)
+        out.append(f"[{label}]\n{shown}")
     return "\n---\n".join(out)
 
 
@@ -675,6 +900,8 @@ def apply_edit(arg):
     target, root_abs = _resolve_in_root(path)
     if target is None:
         return f"拒绝写入：{path} 不在代码根目录内（禁止越界写）。"
+    if not _region_write_allowed(target):
+        return "拒绝写入：该路径属于已配置分区，请使用 dev_region_edit 以确保分区边界和先读后写护栏。"
     if not os.path.isfile(target):
         return f"文件不存在：{path}（apply_edit 只修改已存在文件，不会新建文件）。"
 
@@ -781,6 +1008,8 @@ def create_file(arg):
     target, root_abs = _resolve_create_path(path)
     if target is None:
         return f"拒绝写入：{path} 不在代码根目录内（禁止越界写）。"
+    if not _region_write_allowed(target):
+        return "拒绝写入：该路径属于已配置分区，请使用 dev_region_edit 以确保分区边界和先读后写护栏。"
     if os.path.exists(target):
         return f"文件已存在：{path}（create_file 不覆盖已有文件；要修改请用 apply_edit）。"
 
@@ -876,6 +1105,41 @@ def _first_command_token(low):
     return tok[:-4] if tok.endswith(".exe") else tok
 
 
+# git 写操作子命令：必须走分区审批门禁（dev_commit / dev_commit_all / dev_rollback），
+# 不能经 run_command 直接执行——否则 Agent 可绕过审批、变更集台账与回滚链，
+# push 还会把代码外带，与黑名单"防数据外带"的初衷矛盾。只读子命令（status/log/diff/show 等）放行。
+_GIT_OPTS_WITH_VALUE = {
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace",
+    "--exec-path", "--super-prefix", "--list-submodules",
+}
+_GIT_WRITE_SUBCMDS = {
+    "commit", "push", "merge", "rebase", "revert", "reset", "clean",
+    "checkout", "switch", "apply", "cherry-pick", "stash", "am",
+    "update-ref", "worktree",
+}
+
+
+def _git_subcommand(low):
+    """从 `git ... <sub>` 命令中解析真正的子命令，跳过 -C <path> 等带值选项。
+
+    识别不了（如自定义 alias git co）时返回 ''，由调用方按默认策略处理。
+    """
+    toks = re.sub(r"\s+", " ", low).strip().split(" ")
+    if not toks or _first_command_token(low) != "git":
+        return ""
+    i = 1
+    while i < len(toks):
+        t = toks[i]
+        if t in _GIT_OPTS_WITH_VALUE:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        return t
+    return ""
+
+
 def _cmd_is_blocked(cmd):
     """返回 (True, 原因) 表示应拦截；否则 (False, '')。"""
     low = re.sub(r"\s+", " ", cmd.lower()).strip()
@@ -883,6 +1147,12 @@ def _cmd_is_blocked(cmd):
         if pat in low:
             return True, pat
     first = _first_command_token(low)
+    # git 写操作门禁优先于可选白名单：即使用户把 git 加进 RUN_COMMAND_ALLOW 也不放行
+    if first == "git":
+        sub = _git_subcommand(low)
+        if sub in _GIT_WRITE_SUBCMDS:
+            return True, (f"git {sub}（git 写操作受分区审批门禁保护，"
+                          "请改用 dev_commit / dev_commit_all / dev_rollback）")
     if first in _BLOCKED_CMDS:
         return True, first
     allow = (get_runtime("run_command_allow") or os.getenv("RUN_COMMAND_ALLOW", "")).strip()
@@ -926,6 +1196,747 @@ def run_command(cmd):
     return combined[:1500] + ("…" if len(combined) > 1500 else "")
 
 
+def init_regions_tool(arg):
+    """初始化「分区开发」结构：在代码库根目录建 assets/values/bugs/behaviors 四个独立子目录，
+    各 git init 独立仓库，并生成 DEV_INDEX.md 与 DOCMIND_RULES.md（分区契约，会被注入 Agent 系统提示）。
+    用于游戏等分工开发，防止代码堆叠。输入留空即可。"""
+    from regions import init_regions
+    ok, msg = init_regions()
+    return msg
+
+
+# ---------------------------------------------------------------------------
+# 分区开发工具层（2.0）：分区内受控读写 / 分区校验 / 跨区安全搬移 / 提交与变更集回滚。
+# 所有路径都限定在对应分区子目录内，越区写被拦截（强化"防堆叠/防混乱"）。
+# 写操作复用 apply_edit / create_file 的全部护栏（先读后写、.py 语法校验、200KB 上限、人工确认）。
+# ---------------------------------------------------------------------------
+def _parse_keyed(arg, keys):
+    """通用 keyed 解析：从多行文本里提取指定字段（region/path/old_text/new_text/...）。
+    字段值可同行或换行续写、可多行；用于分区工具输入解析，逻辑与 _parse_edit_input 一致。"""
+    arg = (arg or "").lstrip("\n")
+    spans = []
+    for key in keys:
+        for m in re.finditer(r"^\s*" + re.escape(key) + r"\s*:\s*", arg, re.M):
+            spans.append((m.start(), m.end(), key))
+    spans.sort()
+    fields = {}
+    for i, (s, e, key) in enumerate(spans):
+        val_end = spans[i + 1][0] if i + 1 < len(spans) else len(arg)
+        val = arg[e:val_end]
+        if val.startswith("\n"):
+            val = val[1:]
+        if val_end < len(arg):
+            val = val.rstrip("\n")
+        fields[key] = val
+    return fields
+
+
+def _require_regions():
+    """返回 (root, rmap) 或 (None, error_msg)。rmap = {key: region_meta}。"""
+    root = _get_code_root()
+    if not root:
+        return None, "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    try:
+        from regions import get_region_map
+        rmap = get_region_map(root)
+    except Exception as e:  # noqa: BLE001
+        return None, f"读取分区配置失败: {e}"
+    if not rmap:
+        return None, "尚未初始化分区（regions.json 为空）。请先调用 init_regions 初始化分区开发结构。"
+    return (root, rmap), None
+
+
+def _resolve_region_path(root, rmap, region_key, path):
+    """把 path 解析到某分区目录内的绝对路径；越界返回 (None, reason)。
+    允许 path 以分区目录开头（如 values/balance.json）或纯文件名（如 balance.json）。"""
+    if region_key not in rmap:
+        return None, f"未知分区：{region_key}（可选分区：{', '.join(rmap.keys())}）"
+    region_abs = os.path.normpath(os.path.join(root, rmap[region_key]["dir"]))
+    p = (path or "").strip().strip("'\"")
+    if os.path.isabs(p):
+        rel = os.path.relpath(os.path.normpath(p), root)
+    else:
+        rel = p
+    rel = rel.replace("\\", "/")
+    rdir = rmap[region_key]["dir"]
+    if rel == rdir:
+        rel = ""
+    elif rel.startswith(rdir + "/"):
+        rel = rel[len(rdir) + 1:]
+    target = os.path.normpath(os.path.join(region_abs, rel)) if rel else region_abs
+    if target != region_abs and not target.startswith(region_abs + os.sep):
+        return None, f"拒绝写入：{path} 不在分区 {rdir}/ 内（禁止越区写）。"
+    return target, None
+
+
+def _emit_edit_arg(abs_path, old_text, new_text):
+    """拼装给 apply_edit / create_file 的多行输入（复用其护栏：先读后写/.py 校验/人工确认/越区防护）。"""
+    parts = ["path: " + abs_path]
+    if old_text is not None:
+        parts.append("old_text: " + old_text)
+    parts.append("new_text: " + new_text)
+    return "\n".join(parts)
+
+
+def dev_list_regions(arg):
+    """列出已配置分区的 key/名称/目录/依赖/导出/脏状态，供 Agent 选用正确分区。输入留空即可。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, rmap = res
+    from regions import list_regions
+    rows = list_regions(root)
+    lines = [f"已配置 {len(rows)} 个分区（code_root={root}）："]
+    for r in rows:
+        deps = ", ".join(r["depends_on"]) or "无"
+        exports = ", ".join(r["exports"]) or "无"
+        dirty = "（有未提交改动）" if r["dirty"] else ""
+        lines.append(f"- {r['key']}｜{r['name']}（{r['dir']}/）：{r['desc']}；依赖：{deps}；导出：{exports}{dirty}")
+    return "\n".join(lines)
+
+
+def dev_region_read(arg):
+    """读取某分区内的文件（分区作用域，越区读被拒）。
+    输入：region: <分区key> 换行 path: <分区内相对路径>。
+    读取后该文件可被 dev_region_edit 整体重写（满足先读后写护栏）。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, rmap = res
+    f = _parse_keyed(arg, ["region", "path"])
+    region, path = (f.get("region") or "").strip(), (f.get("path") or "").strip()
+    if not region or not path:
+        return "参数缺失：请提供 region: <分区key> 与 path: <分区内相对路径>。"
+    target, reason = _resolve_region_path(root, rmap, region, path)
+    if target is None:
+        return reason
+    return read_file(target)
+
+
+def dev_region_edit(arg):
+    """受控修改/新建某分区内的文件（分区作用域，越区写被拒；复用 apply_edit/create_file 的全部护栏）。
+    两种用法：① 局部安全替换——提供 region、path、old_text（精确旧片段）、new_text；
+    ② 整体重写——提供 region、path、new_text（省略 old_text），前提是你已用 dev_region_read 读过该文件。
+    若路径文件已存在则按修改处理，不存在则按新建处理。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, rmap = res
+    f = _parse_keyed(arg, ["region", "path", "old_text", "new_text"])
+    region = (f.get("region") or "").strip()
+    path = (f.get("path") or "").strip()
+    old_text = f.get("old_text")
+    new_text = f.get("new_text")
+    if not region or not path:
+        return "参数缺失：请提供 region: <分区key> 与 path: <分区内相对路径>。"
+    if new_text is None:
+        return "参数缺失：请提供 new_text: <新内容>（局部替换还需 old_text: <精确旧片段>）。"
+    target, reason = _resolve_region_path(root, rmap, region, path)
+    if target is None:
+        return reason
+    lock = _region_lock(region)
+    with lock:
+        set_runtime("region_edit_context", True)
+        try:
+            if os.path.isfile(target):
+                return apply_edit(_emit_edit_arg(target, old_text, new_text))
+            return create_file(_emit_edit_arg(target, None, new_text))
+        finally:
+            set_runtime("region_edit_context", False)
+
+
+def _run_region_cmd(region_dir_abs, cmd):
+    """在分区目录内执行校验命令（受安全黑名单约束，超时 30s，输出截断 1500 字）。"""
+    cmd = (cmd or "").strip().strip("'\"")
+    if not cmd:
+        return "未提供校验命令。"
+    blocked, why = _cmd_is_blocked(cmd)
+    if blocked:
+        return f"拒绝执行：校验命令被安全策略拦截（命中「{why}」）。"
+    try:
+        proc = subprocess.run(cmd, shell=True, cwd=region_dir_abs, timeout=30,
+                              capture_output=True, text=True)
+    except subprocess.TimeoutExpired:
+        return "校验命令执行超时（>30s）。"
+    except Exception as e:  # noqa: BLE001
+        return f"执行失败: {e}"
+    out = (proc.stdout or "") + (proc.stderr or "")
+    head = f"[exit code {proc.returncode}]\n"
+    return head + (out[:1500] + ("…" if len(out) > 1500 else ""))
+
+
+def dev_region_verify(arg):
+    """校验单个分区：若该分区配置了 verify 命令则在分区目录内执行；否则检查其导出接口文件是否齐全。
+    输入：region: <分区key>。返回命令执行情况或契约自检结果。
+    说明：verify 命令建议写为脚本文件（如 `pytest tests/`）而非 `python -c ...`（后者会被安全策略拦截）。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, rmap = res
+    f = _parse_keyed(arg, ["region"])
+    region = (f.get("region") or "").strip()
+    if not region:
+        return "参数缺失：请提供 region: <分区key>。"
+    if region not in rmap:
+        return f"未知分区：{region}（可选分区：{', '.join(rmap.keys())}）"
+    meta = rmap[region]
+    region_abs = os.path.normpath(os.path.join(root, meta["dir"]))
+    verify_cmd = (meta.get("verify") or "").strip()
+    if verify_cmd:
+        from regions import run_verify
+        ok, output = run_verify(region_abs, verify_cmd)
+        if ok is not None or output is not None:
+            return f"运行 {meta['name']} 的内置校验（{verify_cmd}）：\n{output}"
+        return f"运行 {meta['name']} 的 verify 命令：`{verify_cmd}`\n" + _run_region_cmd(region_abs, verify_cmd)
+    exports = meta.get("exports") or []
+    if not exports:
+        return f"{meta['name']} 未配置 verify 命令，也无导出接口需校验，跳过（OK）。"
+    miss = [ex for ex in exports if not os.path.isfile(os.path.join(region_abs, ex))]
+    if miss:
+        return f"{meta['name']} 导出接口缺失：{', '.join(miss)}（契约校验失败）。"
+    return f"{meta['name']} 导出接口齐全（{', '.join(exports)}），契约自检通过（OK）。"
+
+
+def dev_refactor(arg):
+    """跨分区安全搬移：把某分区内的文件移动到另一分区（受依赖方向约束，不破坏 git 跟踪）。
+    输入：
+      src_region: <源分区key>
+      src_path: <源文件在源分区内的相对路径>
+      dst_region: <目标分区key>
+      dst_path: <目标文件在目标分区内的相对路径>
+    规则：目标文件不能已存在（不覆盖）；搬移后从源分区 git 仓库移除源文件（保留历史）。
+    依赖方向：仅允许移动到 src 依赖的分区（dst ∈ src.depends_on）或前后无关的分区；
+    禁止把代码挪进「已依赖 src」的分区（sr ∈ dst.depends_on），避免循环耦合 / 倒置分层。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, rmap = res
+    f = _parse_keyed(arg, ["src_region", "src_path", "dst_region", "dst_path"])
+    sr, sp = (f.get("src_region") or "").strip(), (f.get("src_path") or "").strip()
+    dr, dp = (f.get("dst_region") or "").strip(), (f.get("dst_path") or "").strip()
+    if not (sr and sp and dr and dp):
+        return "参数缺失：请提供 src_region/src_path/dst_region/dst_path。"
+    if sr not in rmap or dr not in rmap:
+        return f"未知分区：src={sr} dst={dr}（可选：{', '.join(rmap.keys())}）"
+    src_deps = set(rmap[sr].get("depends_on") or [])
+    # 依赖方向校验：禁止把 src 的代码挪进「已依赖 src」的分区（倒置分层 → 潜在循环耦合）
+    if dr != sr and dr not in src_deps and sr in set(rmap[dr].get("depends_on") or []):
+        return (f"拒绝搬移：{sr} → {dr} 会形成反向依赖（{dr} 已依赖 {sr}），"
+                f"把 {sr} 的代码挪进 {dr} 会破坏依赖方向、可能引发循环耦合。"
+                f"请改放到 {sr} 依赖的分区之一（{', '.join(src_deps) or '无'}），或做解耦重组。")
+    src_target, reason = _resolve_region_path(root, rmap, sr, sp)
+    if src_target is None:
+        return reason
+    if not os.path.isfile(src_target):
+        return f"源文件不存在：{sp}（在分区 {sr} 内）。"
+    dst_target, reason = _resolve_region_path(root, rmap, dr, dp)
+    if dst_target is None:
+        return reason
+    if os.path.exists(dst_target):
+        return f"目标文件已存在：{dp}（在分区 {dr} 内），dev_refactor 不覆盖，请先处理目标。"
+    try:
+        with open(src_target, encoding="utf-8", errors="ignore") as fh:
+            content = fh.read()
+    except Exception as e:  # noqa: BLE001
+        return f"读取源文件失败: {e}"
+    create_res = create_file(_emit_edit_arg(dst_target, None, content))
+    # 「人工确认」模式：仅暂存、未落盘 → 不要动源文件，等用户确认后再搬
+    if "待人工确认" in create_res:
+        return (f"目标已暂存、待人工确认，源文件未改动。请在界面确认写入后重新调用本工具，"
+                f"届时本工具会从 {sr} 移除源文件。\n{create_res}")
+    if not create_res.startswith("已创建"):
+        return f"目标创建失败，已中止搬移：{create_res}"
+    # 真正创建成功 → 从源分区 git 移除源文件（保留历史）；未跟踪则直接删除
+    src_region_abs = os.path.normpath(os.path.join(root, rmap[sr]["dir"]))
+    if os.path.isdir(os.path.join(src_region_abs, ".git")):
+        rel_src = os.path.relpath(src_target, src_region_abs)
+        proc = subprocess.run(
+            ["git", "rm", "-q", rel_src], cwd=src_region_abs,
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0 and "not found" in (proc.stdout or proc.stderr or "") \
+                and os.path.isfile(src_target):
+            try:
+                os.remove(src_target)
+            except Exception:
+                pass
+    elif os.path.isfile(src_target):
+        try:
+            os.remove(src_target)
+        except Exception as e:  # noqa: BLE001
+            return f"目标已创建，但删除源文件失败：{e}（请手动清理 {src_target}）"
+    return f"已安全搬移 {sr}/{sp} → {dr}/{dp}（目标已创建，源文件从 {sr} 移除）。\n{create_res}"
+
+
+def dev_commit(arg):
+    """提交单个分区的改动（该分区独立 git 仓库内 commit）。
+    输入：region: <分区key> 换行 message: <提交说明>。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, rmap = res
+    f = _parse_keyed(arg, ["region", "message"])
+    region = (f.get("region") or "").strip()
+    message = (f.get("message") or "docmind: update").strip() or "docmind: update"
+    if not region:
+        return "参数缺失：请提供 region: <分区key>。"
+    from regions import commit_region
+    ok, out = commit_region(root, region, message)
+    return ("已提交" if ok else "提交失败") + f" 分区 {region}：" + out
+
+
+def dev_verify_contracts(arg):
+    """校验全部分区的契约：依赖方向无环、被依赖分区导出文件存在、依赖目标存在。
+    输入留空即可。建议在大幅改动分区前后调用。返回 ok/错误列表/依赖图。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, _ = res
+    from regions import verify_contracts
+    r = verify_contracts(root)
+    if r["ok"]:
+        return "契约校验通过（依赖方向无环、依赖目标与导出接口均存在）。\n依赖图：" + json.dumps(r["graph"], ensure_ascii=False)
+    return "契约校验失败：\n- " + "\n- ".join(r["errors"]) + "\n依赖图：" + json.dumps(r["graph"], ensure_ascii=False)
+
+
+def dev_rebuild_index(arg):
+    """依据当前分区配置重算 DEV_INDEX.md（分区目录/文件数/依赖变动后调用）。输入留空即可。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, _ = res
+    from regions import rebuild_dev_index
+    ok, msg = rebuild_dev_index(root)
+    return msg
+
+
+def dev_commit_all(arg):
+    """把所有分区的改动各提交一次，并记进 dev_changesets.jsonl 作为一次绑定变更集（可整体回滚）。
+    输入：message: <本次功能改动说明>。返回变更集 id 与各分区提交哈希。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, _ = res
+    f = _parse_keyed(arg, ["message"])
+    message = (f.get("message") or "docmind: update").strip() or "docmind: update"
+    from regions import commit_all
+    ok, info = commit_all(root, message)
+    if not ok:
+        return "变更集提交失败：\n" + "\n".join(f"- {k}: {v}" for k, v in (info.get("errors") or {}).items())
+    cs_id = info.get("id", "")
+    commits = info.get("commits", {})
+    if not commits:
+        return info.get("message", "没有可提交的分区改动。")
+    lines = [f"已创建变更集 {cs_id}（message={message}）："]
+    for k, v in commits.items():
+        lines.append(f"- {k}: {v}")
+    return "\n".join(lines) + f"\n（回滚请调用 dev_rollback_changeset，changeset={cs_id}）"
+
+
+def dev_list_changesets(arg):
+    """列出已记录的跨区变更集（dev_changesets.jsonl）。输入留空即可。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, _ = res
+    from regions import list_changesets
+    cs = list_changesets(root)
+    if not cs:
+        return "暂无已记录的变更集。用过 dev_commit_all 后会在此列出。"
+    lines = [f"共 {len(cs)} 个变更集："]
+    for c in cs:
+        lines.append(f"- id={c.get('id')} message={c.get('message','')} 分区={list((c.get('commits') or {}).keys())}")
+    return "\n".join(lines)
+
+
+def dev_rollback_changeset(arg):
+    """整体回滚某变更集：对每个分区 revert 其记录的 commit（生成新提交撤销改动）。
+    输入：changeset: <变更集id> 或 id: <变更集id>。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, _ = res
+    f = _parse_keyed(arg, ["changeset", "id"])
+    cs_id = (f.get("changeset") or f.get("id") or "").strip()
+    if not cs_id:
+        return "参数缺失：请提供 changeset: <变更集id>（先用 dev_list_changesets 查看）。"
+    from regions import rollback_changeset
+    ok, detail = rollback_changeset(root, cs_id)
+    if not ok:
+        return detail
+    return f"已回滚变更集 {cs_id}：\n- " + "\n- ".join(detail)
+
+
+# ---------------------------------------------------------------------------
+# Agent 研判分区工具：勘察目录 → 获取基线建议 → 落地自定义方案 / 增补单分区。
+# 默认 8 个分区仅作「初始建议」，真实分区由 Agent 依据代码库判断后应用。
+# ---------------------------------------------------------------------------
+def list_dir(arg):
+    """浏览代码库内的目录结构（限定 code_root，供 Agent 研判代码库组织方式）。
+    输入：可选 path: <相对 code_root 的目录，默认根目录>。返回该目录下子项（目录/文件）及大小/类型。
+    这是 Agent 研判分区前的「勘察」工具：看清顶层有哪些模块/资源目录，再决定分区方案。"""
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    f = _parse_keyed(arg or "", ["path"])
+    rel = (f.get("path") or "").strip().strip("'\"")
+    target, root_abs = _resolve_in_root(rel if rel else root)
+    if target is None:
+        return f"拒绝访问：{rel} 不在代码根目录内。"
+    if not os.path.isdir(target):
+        return f"不是目录：{rel or '(根目录)'}（请用 list_dir 浏览目录，不要传文件路径）。"
+    try:
+        entries = sorted(os.listdir(target))
+    except Exception as e:  # noqa: BLE001
+        return f"读取目录失败: {e}"
+    rows = []
+    for name in entries:
+        p = os.path.join(target, name)
+        if os.path.isdir(p):
+            try:
+                n = sum(1 for _ in os.scandir(p))
+            except Exception:
+                n = 0
+            rows.append(f"[DIR ] {name}/  ({n} 项)")
+        else:
+            try:
+                sz = os.path.getsize(p)
+            except Exception:
+                sz = 0
+            rows.append(f"[FILE] {name}  ({sz} 字节)")
+    rel_disp = os.path.relpath(target, root_abs)
+    rel_disp = "(代码库根)" if rel_disp in (".", "") else rel_disp
+    header = f"目录 {rel_disp} 共 {len(rows)} 项："
+    return header + "\n" + "\n".join(rows) if rows else header + "（空）"
+
+
+def dev_propose_regions(arg):
+    """依据真实代码库结构，由 Agent 研判分区方案（默认 8 区仅作初始建议）。输入留空即可。
+    返回：结构分析 + 建议分区清单（每区带 detected 证据与 included 建议）+ 代码库特有的可独立模块 + 中文结论。
+    用法：先用 list_dir 勘察 → 调用本工具获取基线方案 → 据 detected/included 增删分区 → 用 dev_apply_regions 落地。"""
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    try:
+        from regions import propose_regions
+        res = propose_regions(root)
+    except Exception as e:  # noqa: BLE001
+        return f"研判分区失败: {e}"
+    if not res.get("ok"):
+        return res.get("error", "研判分区失败。")
+    a = res["analysis"]
+    lines = [res["summary"], ""]
+    lines.append(f"结构分析：顶层目录 = {', '.join(a['top_level_dirs']) or '(无)'}")
+    c = a["counts"]
+    lines.append(f"资源计数：图像 {c['images']} / 音频 {c['audio']} / 模型 {c['models']} / 数据表 {c['data']} / 代码 {c['code']}")
+    lines.append("")
+    lines.append("建议分区（included=建议启用，detected=代码库检出信号）：")
+    for r in res["proposed"]:
+        flag = "✅启用" if r["included"] else "➖可选"
+        det = "（已检出）" if r["detected"] else "（未检出）"
+        ev = ("；证据：" + "、".join(r["evidence"])) if r["evidence"] else ""
+        lines.append(f"- {r['key']}｜{r['name']}（{r['dir']}/） {flag}{det}：{r['reason']}{ev}")
+    if res["custom_suggestions"]:
+        lines.append("")
+        lines.append("代码库特有的可独立分区（custom_suggestions，可据实际增删）：")
+        for r in res["custom_suggestions"]:
+            lines.append(f"- {r['key']}｜{r['name']}（{r['dir']}/）：{r['desc']}")
+    lines.append("")
+    lines.append("落地方式：把最终分区清单（JSON 数组，每项含 key/dir/name/depends_on 等）交给 dev_apply_regions 应用；"
+                 "或仅追加一个分区用 dev_add_region。")
+    return "\n".join(lines)
+
+
+def dev_apply_regions(arg):
+    """应用 Agent 研判后的自定义分区方案：把给定分区清单写入 regions.json 并初始化（建目录/每区 git/导出桩/规则）。
+    输入：regions: <JSON 数组，或 {"regions":[...]} 对象>。每个分区至少含 key 与 dir；可选 name/desc/depends_on/exports/verify。
+    这是把「Agent 判断的分区」落地的关键一步；应用后 Agent 写操作即被约束到这些分区内。"""
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    f = _parse_keyed(arg or "", ["regions"])
+    raw = (f.get("regions") or "").strip()
+    if not raw:
+        return "参数缺失：请提供 regions: <JSON 数组或 {\"regions\":[...]} 分区清单>。"
+    try:
+        data = json.loads(raw)
+    except Exception as e:  # noqa: BLE001
+        return f"regions 不是合法 JSON：{e}。请传入 JSON 数组（可用 dev_propose_regions 的产出再裁减）。"
+    if isinstance(data, dict) and isinstance(data.get("regions"), list):
+        regions_list = data["regions"]
+    elif isinstance(data, list):
+        regions_list = data
+    else:
+        return "regions 格式应为 JSON 数组，或 {\"regions\":[...]} 对象。"
+    from regions import init_regions
+    ok, msg = init_regions(root, regions_list)
+    if not ok:
+        return "应用分区方案失败：" + msg
+    # 重新注入分区契约，使 Agent 立即按新分区约束工作
+    try:
+        from ingest import load_project_rules
+        rules = load_project_rules(os.path.abspath(root))
+        set_runtime("project_rules", rules)
+    except Exception:  # noqa: BLE001
+        pass
+    return "已应用 Agent 研判的分区方案。" + msg
+
+
+def dev_add_region(arg):
+    """向现有分区配置追加（或覆盖同名）一个分区，并立即初始化它（建目录/每区 git/规则）。
+    输入：key: <分区key> 换行 dir: <目录> 换行 name: <中文名> 换行 [desc:] [access:] [depends_on:]（逗号分隔） [exports:]（逗号分隔）。
+    用于 Agent 研判后按需增补单个分区，无需重传整个方案。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, _ = res
+    f = _parse_keyed(arg or "", ["key", "dir", "name", "desc", "access", "depends_on", "exports"])
+    key = (f.get("key") or "").strip()
+    d = (f.get("dir") or "").strip()
+    name = (f.get("name") or "").strip()
+    if not key or not d:
+        return "参数缺失：请提供 key: <分区key> 与 dir: <目录>（建议再给 name: <中文名>）。"
+    from regions import load_region_config, init_regions
+    cur = load_region_config(root)
+    new_region = {
+        "key": key,
+        "dir": d.strip("/\\").replace("\\", "/"),
+        "name": name or key,
+        "desc": (f.get("desc") or "").strip(),
+        "access": (f.get("access") or "").strip(),
+        "depends_on": [x.strip() for x in (f.get("depends_on") or "").split(",") if x.strip()],
+        "exports": [x.strip() for x in (f.get("exports") or "").split(",") if x.strip()],
+        "verify": "",
+    }
+    cur = [r for r in cur if (r.get("key") or "").strip() != key]  # 覆盖同名
+    cur.append(new_region)
+    ok, msg = init_regions(root, cur)
+    if not ok:
+        return "新增/更新分区失败：" + msg
+    try:
+        from ingest import load_project_rules
+        rules = load_project_rules(os.path.abspath(root))
+        set_runtime("project_rules", rules)
+    except Exception:  # noqa: BLE001
+        pass
+    return f"已新增/更新分区 {key}（{d}/）并写入 regions.json。" + msg
+
+
+def dev_approve(arg):
+    """审批敏感操作（提交/回滚/应用分区方案）前必须调用：记录一次审批，30 分钟内该操作放行。
+    输入：action: <commit_region|commit_all|rollback_changeset|apply_regions> 换行 target: <对象>
+    target 精确匹配、不是通配符：commit_region 传分区 key（逐区审批，不能用 *）、
+    rollback_changeset 传变更集 id、commit_all / apply_regions 固定传 *。
+    在调用 dev_commit / dev_commit_all / dev_rollback_changeset / dev_apply_regions / dev_add_region 之前先调用本工具完成审批。
+    若这些工具返回 blocked / approval_required，先调用本工具再重试，不要绕过。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, _ = res
+    f = _parse_keyed(arg or "", ["action", "target"])
+    action = (f.get("action") or "").strip()
+    target = (f.get("target") or "*").strip() or "*"
+    if not action:
+        return "参数缺失：请提供 action: <操作名>（如 commit_all / rollback_changeset / apply_regions）。"
+    from game_workbench import approval
+    approval(root, action, "agent", approved=True, target=target)
+    return f"已审批 {action}(target={target})，30 分钟内该操作放行。现在可执行对应的 dev_* 工具。"
+
+
+def dev_approval_status(arg):
+    """查询某敏感操作当前是否已通过审批。输入：action: <操作名> 换行 target: <对象>(默认 *)
+    返回 approved: true/false。用于决定是否需要先调用 dev_approve。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, _ = res
+    f = _parse_keyed(arg or "", ["action", "target"])
+    action = (f.get("action") or "").strip()
+    target = (f.get("target") or "*").strip() or "*"
+    if not action:
+        return "参数缺失：请提供 action: <操作名>。"
+    from game_workbench import approval_status
+    st = approval_status(root, action, target)
+    return f"操作 {action}(target={target}) 审批状态：{'已通过' if st['approved'] else '未通过（需先调用 dev_approve）'}（有效期 {st['ttl_seconds'] // 60} 分钟）。"
+
+
+def _region_file(root, rmap, key, rel_path):
+    """Resolve a file inside a configured region and reject symlink/path escapes."""
+    if key not in rmap:
+        return None, f"未知分区：{key}"
+    base = os.path.realpath(os.path.join(root, rmap[key]["dir"]))
+    rel = (rel_path or "").strip().strip("'\"").replace("\\", "/")
+    if not rel or os.path.isabs(rel) or any(p in ("", ".", "..") for p in rel.split("/")):
+        return None, "素材路径必须是分区内的相对路径，禁止绝对路径和 ..。"
+    target = os.path.realpath(os.path.join(base, rel))
+    if target != base and not target.startswith(base + os.sep):
+        return None, "拒绝访问：路径不在目标分区内。"
+    return target, None
+
+
+def dev_asset_get(arg):
+    """通过素材区接口取得素材引用；其它分区只能拿到素材区内的路径/元数据。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, rmap = res
+    f = _parse_keyed(arg or "", ["asset_id", "path", "consumer_region"])
+    asset_id = (f.get("asset_id") or f.get("path") or "").strip()
+    consumer = (f.get("consumer_region") or "").strip()
+    if not asset_id:
+        return "参数缺失：请提供 asset_id 或 path。"
+    if consumer and consumer not in rmap:
+        return f"未知调用分区：{consumer}"
+    assets_dir = os.path.realpath(os.path.join(root, rmap.get("assets", {}).get("dir", "assets")))
+    manifest = os.path.join(assets_dir, "manifest.json")
+    rel = asset_id.replace("\\", "/").strip("/")
+    # 支持 manifest 中的 id -> path 映射，也支持直接传相对路径。
+    if os.path.isfile(manifest):
+        try:
+            with open(manifest, encoding="utf-8") as fh:
+                data = json.load(fh)
+            entries = data.get("assets", data) if isinstance(data, dict) else data
+            if isinstance(entries, dict) and asset_id in entries:
+                entry = entries[asset_id]
+                rel = entry.get("path", "") if isinstance(entry, dict) else str(entry)
+            elif isinstance(entries, list):
+                for entry in entries:
+                    if isinstance(entry, dict) and entry.get("id") == asset_id:
+                        rel = entry.get("path", "")
+                        break
+        except (OSError, ValueError):
+            pass
+    target, reason = _region_file(root, rmap, "assets", rel)
+    if target is None:
+        return reason
+    if not os.path.isfile(target):
+        return f"素材不存在：{rel}"
+    return json.dumps({
+        "ok": True, "asset_id": asset_id, "path": os.path.relpath(target, root).replace("\\", "/"),
+        "consumer_region": consumer or None, "size": os.path.getsize(target),
+        "extension": os.path.splitext(target)[1].lower(),
+    }, ensure_ascii=False)
+
+
+def dev_asset_register(arg):
+    """注册素材到 assets/manifest.json；不复制文件，只建立稳定 ID。"""
+    res, err = _require_regions()
+    if res is None: return err
+    root, rmap = res
+    f = _parse_keyed(arg or "", ["asset_id", "path", "type", "license", "tags"])
+    aid, rel = (f.get("asset_id") or "").strip(), (f.get("path") or "").strip()
+    if not aid or not rel: return "参数缺失：请提供 asset_id 和 path。"
+    target, reason = _region_file(root, rmap, "assets", rel)
+    if target is None: return reason
+    if not os.path.isfile(target): return f"素材不存在：{rel}"
+    manifest = os.path.join(root, rmap.get("assets", {}).get("dir", "assets"), "manifest.json")
+    try:
+        with open(manifest, encoding="utf-8") as fh: data = json.load(fh)
+    except (OSError, ValueError): data = {}
+    if not isinstance(data, dict): data = {}
+    data.setdefault("assets", {})[aid] = {"path": rel.replace("\\", "/"), "type": f.get("type") or "unknown", "license": f.get("license") or "unknown", "tags": [x.strip() for x in (f.get("tags") or "").split(",") if x.strip()]}
+    with open(manifest, "w", encoding="utf-8") as fh: json.dump(data, fh, ensure_ascii=False, indent=2)
+    return json.dumps({"ok": True, "asset_id": aid, "path": rel}, ensure_ascii=False)
+
+
+def dev_capture_bug(arg):
+    """把异常堆栈/复现信息归档到 bugs 分区，返回可追踪的 Bug ID。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, rmap = res
+    f = _parse_keyed(arg or "", ["error", "exception", "traceback", "source_region", "reproduction", "severity", "title"])
+    message = (f.get("error") or f.get("exception") or "未知异常").strip()
+    source = (f.get("source_region") or "").strip()
+    if source and source not in rmap:
+        return f"未知来源分区：{source}"
+    bug_id = "BUG-" + __import__("datetime").datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + __import__("uuid").uuid4().hex[:6]
+    bugs_dir = os.path.realpath(os.path.join(root, rmap.get("bugs", {}).get("dir", "bugs")))
+    os.makedirs(bugs_dir, exist_ok=True)
+    record = {
+        "id": bug_id, "title": (f.get("title") or message[:120]).strip(),
+        "severity": (f.get("severity") or "error").strip(), "source_region": source or None,
+        "error": message, "traceback": f.get("traceback") or "",
+        "reproduction": f.get("reproduction") or "", "created_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+        "status": "open",
+    }
+    path = os.path.join(bugs_dir, bug_id + ".json")
+    with open(path, "x", encoding="utf-8") as fh:
+        json.dump(record, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    return json.dumps({"ok": True, "bug_id": bug_id, "path": os.path.relpath(path, root).replace("\\", "/")}, ensure_ascii=False)
+
+
+def dev_list_bugs(arg=""):
+    """列出 bugs 分区中的结构化异常记录。"""
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, rmap = res
+    base = os.path.join(root, rmap.get("bugs", {}).get("dir", "bugs"))
+    rows = []
+    if os.path.isdir(base):
+        for name in sorted(os.listdir(base), reverse=True):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(base, name), encoding="utf-8") as fh:
+                    rows.append(json.load(fh))
+            except (OSError, ValueError):
+                continue
+    return json.dumps({"ok": True, "bugs": rows[:200]}, ensure_ascii=False)
+
+
+def dev_update_bug(arg):
+    """更新 Bug 状态（open/investigating/fixed/ignored）。"""
+    res, err = _require_regions()
+    if res is None: return err
+    root, rmap = res
+    f = _parse_keyed(arg or "", ["bug_id", "status"])
+    bid, status = (f.get("bug_id") or "").strip(), (f.get("status") or "").strip().lower()
+    if not bid or status not in {"open", "investigating", "fixed", "ignored"}:
+        return "参数错误：bug_id 必填，status 必须是 open/investigating/fixed/ignored。"
+    path = os.path.join(root, rmap.get("bugs", {}).get("dir", "bugs"), bid + ".json")
+    if not os.path.isfile(path): return f"未找到 Bug：{bid}"
+    with open(path, encoding="utf-8") as fh: record = json.load(fh)
+    record["status"] = status
+    record["updated_at"] = __import__("datetime").datetime.now().isoformat(timespec="seconds")
+    with open(path, "w", encoding="utf-8") as fh: json.dump(record, fh, ensure_ascii=False, indent=2); fh.write("\n")
+    return json.dumps({"ok": True, "bug": record}, ensure_ascii=False)
+
+
+def game_validate_data(arg=""):
+    root = _get_code_root()
+    from game_workbench import validate_data
+    return json.dumps(validate_data(root), ensure_ascii=False) if root else "尚未配置代码库。"
+
+
+def game_release_check(arg=""):
+    root = _get_code_root()
+    from game_workbench import release_check
+    return json.dumps(release_check(root), ensure_ascii=False) if root else "尚未配置代码库。"
+
+
+def game_upsert_task(arg):
+    root = _get_code_root()
+    if not root: return "尚未配置代码库。"
+    from game_workbench import upsert_task
+    f = _parse_keyed(arg or "", ["id", "title", "description", "region", "priority", "status", "owner", "files"])
+    f["files"] = [x.strip() for x in (f.get("files") or "").split(",") if x.strip()]
+    return json.dumps(upsert_task(root, f), ensure_ascii=False)
+
+def game_simulate(arg):
+    from game_workbench import simulate_growth
+    f=_parse_keyed(arg or "",["levels","base","growth"])
+    return json.dumps(simulate_growth(int(f.get("levels") or 50),float(f.get("base") or 100),float(f.get("growth") or 1.08)),ensure_ascii=False)
+def game_impact(arg):
+    from game_workbench import impact_analysis
+    f=_parse_keyed(arg or "",["query"]); return json.dumps(impact_analysis(_get_code_root(),f.get("query") or ""),ensure_ascii=False)
+def game_playtest(arg):
+    from game_workbench import playtest
+    f=_parse_keyed(arg or "",["command","timeout"]); return json.dumps(playtest(_get_code_root(),f.get("command") or "",int(f.get("timeout") or 30)),ensure_ascii=False)
+
+
 TOOLS = {
     "search_knowledge": {
         "description": "在已上传的知识库中检索相关文档片段。输入应为检索关键词或问题。",
@@ -942,6 +1953,10 @@ TOOLS = {
     "web_search": {
         "description": "当知识库不足或需要时效性/外部信息时，联网搜索（DuckDuckGo，无需 Key）。输入为搜索关键词。返回前 5 条结果的标题/摘要/链接。",
         "func": web_search,
+    },
+    "dev_http_request": {
+        "description": "调用你自己的外部业务 API（REST/JSON）。受 EXTERNAL_API_ALLOWLIST 域名白名单约束（防止 SSRF），未配置白名单则拒绝。输入（多行 key: value）：url: <完整URL> 换行 method: <GET/POST/...默认GET> 换行 可选 timeout: <秒> 换行 可选 headers: <单行JSON对象> 换行 可选 body: <请求体，可多行>。返回 HTTP 状态码 + 响应头 + 截断响应体。",
+        "func": dev_http_request,
     },
     "python_exec": {
         "description": "在受限子进程中执行 Python 代码并返回输出（超时 12s）。适合数值计算、数据处理、文本变换、小规模绘图数据生成等'让 agent 真正动手'的任务。输入为完整 Python 代码。",
@@ -974,5 +1989,103 @@ TOOLS = {
     "run_command": {
         "description": "在代码库根目录内执行 shell 命令（如 pytest / npm run build / gradle test），返回合并后的标准输出与错误（截断 1500 字，超时 12s）。用于跑构建、跑测试、执行项目内命令来验证改动或查看结果。命令在 code_root 内执行，危险操作（rm -rf /、format、shutdown 等）会被拦截。输入为完整命令字符串。",
         "func": run_command,
+    },
+    "dev_asset_get": {
+        "description": "通过素材区接口取得素材引用。输入 asset_id 或 path，可选 consumer_region；只允许读取 assets 分区内的文件，不复制或内联素材。",
+        "func": dev_asset_get,
+    },
+    "dev_asset_register": {
+        "description": "将 assets 分区内已存在的文件注册到 manifest.json，输入 asset_id/path/type/license/tags。",
+        "func": dev_asset_register,
+    },
+    "dev_capture_bug": {
+        "description": "把异常、堆栈、来源分区和复现步骤写入 bugs 分区，生成唯一 Bug ID。输入 error/traceback/source_region/reproduction/title/severity。",
+        "func": dev_capture_bug,
+    },
+    "dev_list_bugs": {
+        "description": "列出 bugs 分区中的异常记录，返回 Bug ID、严重等级、来源和时间。",
+        "func": dev_list_bugs,
+    },
+    "dev_update_bug": {
+        "description": "更新 Bug 状态，输入 bug_id 和 status(open/investigating/fixed/ignored)。",
+        "func": dev_update_bug,
+    },
+    "game_validate_data": {"description": "校验项目 JSON/YAML/TOML 配置格式。", "func": game_validate_data},
+    "game_release_check": {"description": "执行发布前检查：配置、翻译和敏感 .env 文件。", "func": game_release_check},
+    "game_upsert_task": {"description": "创建或更新游戏开发任务，输入 title/region/priority/status 等字段。", "func": game_upsert_task},
+    "game_simulate": {"description": "模拟等级成长数值，输入 levels/base/growth。", "func": game_simulate},
+    "game_impact": {"description": "按符号或关键词分析代码影响文件，输入 query。", "func": game_impact},
+    "game_playtest": {"description": "在项目根目录运行 Playtest 命令，输入 command/timeout。", "func": game_playtest},
+    "init_regions": {
+        "description": "初始化「分区开发」结构：在代码库根目录建 assets/（素材区）、values/（数值区）、bugs/（bug 区）、behaviors/（角色行为区）等独立子目录（具体分区以 regions.json 为准），每个目录 git init 独立仓库，并生成 DEV_INDEX.md、DOCMIND_RULES.md（分区契约，会被注入 Agent 系统提示，强制越区写被拦截）。用于游戏等分工开发，防止代码堆叠与混乱。输入留空即可；需先配置代码库根目录（/api/ingest_code）。",
+        "func": init_regions_tool,
+    },
+    "dev_list_regions": {
+        "description": "列出已配置分区的 key/名称/目录/依赖/导出/脏状态，供你选用正确分区。输入留空即可。在调用 dev_region_read/edit/verify/commit/refactor 前先调用它确认分区 key。",
+        "func": dev_list_regions,
+    },
+    "dev_region_read": {
+        "description": "读取某分区内的文件（分区作用域，越区读被拒）。输入：第一行 region: <分区key>，第二行 path: <分区内相对路径>。读取后该文件可被 dev_region_edit 整体重写（满足先读后写护栏）。",
+        "func": dev_region_read,
+    },
+    "dev_region_edit": {
+        "description": "受控修改/新建某分区内的文件（分区作用域，越区写被拒；复用 apply_edit/create_file 的全部护栏：先读后写、.py 语法校验、200KB 上限、人工确认）。输入格式：第一行 region: <分区key>，第二行 path: <分区内相对路径>，可选 old_text: <精确旧片段>，最后 new_text: <新内容（可多行）>。提供 old_text 做局部安全替换；省略 old_text 且已 dev_region_read 过该文件则整体重写；文件不存在则按新建处理。",
+        "func": dev_region_edit,
+    },
+    "dev_region_verify": {
+        "description": "校验单个分区：若该分区配置了 verify 命令（regions.json 的 verify 字段）则在分区目录内执行；否则检查其导出接口文件是否齐全。输入：region: <分区key>。verify 命令建议写为脚本（如 `pytest tests/`），不要写 `python -c ...`（会被安全策略拦截）。",
+        "func": dev_region_verify,
+    },
+    "dev_refactor": {
+        "description": "跨分区安全搬移：把某分区内的文件移动到另一分区（受依赖方向约束，不破坏 git 跟踪）。输入：src_region: <源key>、src_path: <源相对路径>、dst_region: <目标key>、dst_path: <目标相对路径>。目标不能已存在（不覆盖）；搬移后从源分区 git 移除源文件。禁止把代码挪进「已依赖源分区」的分区（避免循环耦合/倒置分层）。",
+        "func": dev_refactor,
+    },
+    "dev_commit": {
+        "description": "提交单个分区的改动（该分区独立 git 仓库内 commit）。输入：region: <分区key> 换行 message: <提交说明>。",
+        "func": dev_commit,
+    },
+    "dev_verify_contracts": {
+        "description": "校验全部分区的契约：依赖方向无环、被依赖分区导出文件存在、依赖目标存在。输入留空即可。建议在大幅改动分区前后调用，确认架构约束未被破坏。",
+        "func": dev_verify_contracts,
+    },
+    "dev_rebuild_index": {
+        "description": "依据当前分区配置重算 DEV_INDEX.md（分区目录/文件数/依赖变动后调用）。输入留空即可。",
+        "func": dev_rebuild_index,
+    },
+    "dev_commit_all": {
+        "description": "把所有分区的改动各提交一次，并记进 dev_changesets.jsonl 作为一次绑定变更集（可整体回滚）。输入：message: <本次功能改动说明>。返回变更集 id 与各分区提交哈希。",
+        "func": dev_commit_all,
+    },
+    "dev_list_changesets": {
+        "description": "列出已记录的跨区变更集（dev_changesets.jsonl）。输入留空即可。返回各变更集 id/message/涉及分区，供 dev_rollback_changeset 选用。",
+        "func": dev_list_changesets,
+    },
+    "dev_rollback_changeset": {
+        "description": "整体回滚某变更集：对每个分区 revert 其记录的 commit（生成新提交撤销改动）。输入：changeset: <变更集id> 或 id: <变更集id>。先用 dev_list_changesets 查看 id。",
+        "func": dev_rollback_changeset,
+    },
+    "list_dir": {
+        "description": "浏览代码库内的目录结构（限定 code_root，供你研判代码库组织方式）。输入：可选 path: <相对 code_root 的目录，默认根目录>。返回子项（目录/文件）及大小/类型。在研判分区方案前先用它勘察顶层有哪些模块/资源目录。",
+        "func": list_dir,
+    },
+    "dev_propose_regions": {
+        "description": "依据真实代码库结构，由你研判分区方案（默认 8 个分区仅作初始建议，实际分区由你判断）。输入留空即可。返回结构分析 + 建议分区清单（每区带 detected 证据与 included 启用建议）+ 代码库特有的可独立模块 + 中文结论。先用 list_dir 勘察，再调用它拿基线，据 detected/included 增删分区，最后用 dev_apply_regions 落地。",
+        "func": dev_propose_regions,
+    },
+    "dev_apply_regions": {
+        "description": "应用你研判后的自定义分区方案：把给定分区清单写入 regions.json 并初始化（建目录/每区 git/导出桩/规则），此后写操作被约束在这些分区内。输入：regions: <JSON 数组，或 {\"regions\":[...]} 对象>；每项至少含 key 与 dir，可选 name/desc/depends_on/exports/verify。可由 dev_propose_regions 的产出裁减得到。",
+        "func": dev_apply_regions,
+    },
+    "dev_add_region": {
+        "description": "向现有分区配置追加（或覆盖同名）一个分区并立即初始化（建目录/每区 git/规则）。输入：key: <分区key> 换行 dir: <目录> 换行 name: <中文名> 换行 [desc:] [access:] [depends_on:]（逗号分隔） [exports:]（逗号分隔）。用于研判后按需增补单个分区，无需重传整个方案。",
+        "func": dev_add_region,
+    },
+    "dev_approve": {
+        "description": "审批敏感操作前必须调用：记录一次审批，30 分钟内该操作放行。输入：action: <commit_region|commit_all|rollback_changeset|apply_regions> 换行 target: <对象>。target 精确匹配、不是通配符：commit_region 传分区 key（不能用 *）、rollback_changeset 传变更集 id、commit_all/apply_regions 固定传 *。在调用 dev_commit/dev_commit_all/dev_rollback_changeset/dev_apply_regions/dev_add_region 之前先调用本工具；若它们返回 blocked/approval_required，先调用本工具再重试，不要绕过。",
+        "func": dev_approve,
+    },
+    "dev_approval_status": {
+        "description": "查询某敏感操作当前是否已通过审批。输入：action: <操作名> 换行 target: <对象>(默认 *)。返回已通过/未通过，用于决定是否需要先调用 dev_approve。",
+        "func": dev_approval_status,
     },
 }

@@ -24,6 +24,7 @@ import urllib.request
 import webbrowser
 
 from api import app
+from tools import dev_capture_bug
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -89,9 +90,27 @@ def _keep_alive():
             pass
 
 
+def _emit_ollama_guidance():
+    """若本机 Ollama 不可用，打印清晰引导（而非让用户对着报错发懵）。"""
+    try:
+        from api import check_ollama
+        st = check_ollama()
+        if st.get("guidance"):
+            _log("Ollama 未就绪或缺少模型")
+            print("\n" + "=" * 48)
+            print("  WARNING  Ollama 不可用 / 缺少所需模型")
+            print("=" * 48)
+            for line in (st.get("guidance") or "").splitlines():
+                print("  " + line)
+            print()
+    except Exception as e:  # noqa: BLE001
+        _log("Ollama 检查失败：" + str(e))
+
+
 def main():
     if os.getenv("DOCMIND_SERVER_ONLY"):
         _log("服务模式启动")
+        _emit_ollama_guidance()
         _run_server()
         return
 
@@ -121,6 +140,7 @@ def main():
 
     _log("服务就绪")
     print(f"[DocMind] 服务已就绪：{URL}")
+    _emit_ollama_guidance()
     ok = _open_browser()
     _log("浏览器打开尝试 -> %s" % ok)
     if ok:
@@ -138,6 +158,11 @@ if __name__ == "__main__":
     except Exception:
         tb = traceback.format_exc()
         _log("未预期异常：\n" + tb)
+        try:
+            # 若已配置代码库，异常会同时归档到 bugs 分区，便于按提交追踪。
+            dev_capture_bug(f"title: DocMind 启动异常\nerror: {tb.splitlines()[-1] if tb else 'unknown'}\ntraceback: {tb}")
+        except Exception as capture_error:
+            _log("Bug 归档失败：" + str(capture_error))
         print("启动过程出现未预期错误：\n" + tb)
         try:
             input("按 Enter 退出。\n")

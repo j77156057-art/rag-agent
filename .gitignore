@@ -13,6 +13,8 @@ uploads/
 # ===== 打包产物与日志（PyInstaller / 运行时）=====
 build/
 dist/
+_archived_builds/
+build.bak/
 *.log
 
 # ===== 会话临时脚本（本地 git 辅助 / 输出，不入库）=====
@@ -22,6 +24,11 @@ git_report.txt
 
 # ===== 环境变量（含 API Key，严禁提交！）=====
 .env
+
+# ===== 前端工程（Node 依赖与构建产物）=====
+frontend/node_modules/
+web/assets/
+web/workbench.html
 
 # ===== 系统 / 编辑器 =====
 .DS_Store

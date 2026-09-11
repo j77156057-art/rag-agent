@@ -1,12 +1,18 @@
-"""Embedding 客户端：云端(通义千问 text-embedding-v3) + 本地轻量兜底。
+"""Embedding 客户端：云端(通义千问 text-embedding-v3) + 本地(Ollama nomic-embed-text) + 本地轻量兜底。
 
-说明：真实语义检索走通义千问 embedding；本地兜底仅为「零依赖离线演示」，
-用字符 n-gram 哈希成固定维向量（非语义向量），便于在没有 API Key 时也能跑通整条链路。
+说明：
+- qwen:   通义千问 text-embedding-v3 (1024 维), 需 DASHSCOPE_API_KEY
+- ollama: 本机 Ollama 的 OpenAI 兼容 /v1/embeddings, 默认 nomic-embed-text (768 维), 零 Key
+- local:  零依赖离线演示, 字符 n-gram 哈希成固定维向量(非语义, 仅保证链路可跑)
+
+维度在初始化时自动探测(对一条测试文本求嵌入), 避免硬编码与 Chroma 集合维度冲突。
+切到 ollama 后若本机 Ollama/模型不可用, 自动降级为 local 并打警告, 保证服务不崩(只是检索变非语义)。
 """
 import hashlib
 import math
 import os
 import re
+import warnings
 
 from openai import OpenAI
 
@@ -22,7 +28,12 @@ from config import (
 class EmbeddingClient:
     def __init__(self):
         self.provider = get_runtime("embedding_provider") or EMBEDDING_PROVIDER
+        self.client = None
+        self.model = None
+        self.dim = LOCAL_EMBED_DIM  # 兜底默认维度
+
         if self.provider == "qwen":
+            # 云端语义向量(需 key)
             cfg = PROVIDERS["qwen"]
             self.client = OpenAI(
                 base_url=cfg["base_url"],
@@ -30,16 +41,36 @@ class EmbeddingClient:
             )
             self.model = EMBEDDING_MODEL
             self.dim = 1024
-        else:
-            self.client = None
-            self.dim = LOCAL_EMBED_DIM
+        elif self.provider == "ollama":
+            # 本机 Ollama OpenAI 兼容端点, 零 Key
+            cfg = PROVIDERS["ollama"]
+            self.client = OpenAI(base_url=cfg["base_url"], api_key="ollama-local")
+            self.model = EMBEDDING_MODEL or "bge-m3"
+            # 维度自动探测；探测失败则降级 local
+            try:
+                self.dim = self._probe_dim()
+            except Exception as e:  # noqa: BLE001
+                warnings.warn(
+                    f"[embeddings] ollama 嵌入不可用({e}), 降级为 local 哈希向量(非语义)。"
+                    f"请确认 Ollama 已启动且已拉取 {self.model}。"
+                )
+                self.client = None
+                self.dim = LOCAL_EMBED_DIM
+
+    def _probe_dim(self):
+        return len(self._remote_embed(["__dim_probe__"])[0])
 
     def embed(self, texts):
         """texts: list[str] -> list[list[float]]"""
-        if self.provider == "qwen" and self.client is not None:
-            resp = self.client.embeddings.create(model=self.model, input=texts)
-            return [d.embedding for d in resp.data]
+        if self.client is not None and self.provider in ("qwen", "ollama"):
+            return self._remote_embed(texts)
         return [self._local_embed(t) for t in texts]
+
+    def _remote_embed(self, texts):
+        if isinstance(texts, str):
+            texts = [texts]
+        resp = self.client.embeddings.create(model=self.model, input=texts)
+        return [d.embedding for d in resp.data]
 
     def _local_embed(self, text):
         vec = [0.0] * self.dim

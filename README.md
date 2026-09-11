@@ -83,21 +83,22 @@ curl -X POST http://localhost:8000/api/chat -F "question=DocMind 支持哪些文
 
 - **前置**：Windows 需已安装 Microsoft Edge WebView2 运行时（Win10/11 通常自带）。若环境缺失 WebView2，`desktop.py` 会自动回退用默认浏览器打开页面。
 - **与浏览器模式完全一致**：工具链（search_code / read_file / apply_edit / create_file / run_command 等）与 API 全部复用，无功能差异。
-- **打包成独立 exe**：已提供 `docmind.spec`，一条命令产出单文件 `dist/DocMind.exe`，双击即用（内部含 FastAPI 服务 + 前端 + 预索引向量库，无需安装 Python）。
+- **打包成独立 exe（onedir 目录分发）**：已提供 `docmind.spec`，一条命令产出目录版 `dist\DocMind\DocMind.exe`，双击即用（内部含 FastAPI 服务 + 前端，无需安装 Python；首次构建约几分钟，chroma/onnxruntime 较大，整体约 572 MB）。
 
-  ```bash
+  ```powershell
   # 1) 安装打包器（仅需一次）
   .venv\Scripts\python.exe -m pip install pyinstaller
 
-  # 2) 按 docmind.spec 构建（约几分钟，chroma/onnxruntime 较大）
-  .venv\Scripts\python.exe -m PyInstaller --noconfirm --clean docmind.spec
+  # 2) 按 docmind.spec 构建（onedir）
+  .venv\Scripts\python.exe -m PyInstaller docmind.spec --noconfirm --log-level WARN
 
-  # 3) 产物：dist\DocMind.exe  —— 直接双击，或建个桌面快捷方式
+  # 3) 产物：dist\DocMind\DocMind.exe —— 整个 dist\DocMind 目录一起分发，直接双击
   ```
 
-  - 打包要点：`config.py` 已做 frozen 适配——单文件解包后通过 `sys._MEIPASS` 定位 `.chroma` 与 `web`；`CHROMA_DIR` 在打包态强制指向随包资源，避免被外部 `.env` 的相对路径带偏。`docmind.spec` 用 `collect_all("chromadb")`/`collect_all("webview")` 兜底其运行时动态子模块，并 `--add-data` 把 `.chroma`、`web` 一并打进 exe。
-  - **单文件 vs 目录**：`--onefile` 每次启动会把资源解包到临时目录（首启略慢、运行时新增的索引退出即丢）；若想要"索引可持久、启动更快"，把 spec 改成 `COLLECT` 的 `--onedir` 即可，差别仅在产物形态。
+  - 打包要点：`config.py` 已做 frozen 适配——onedir 下按 `sys.executable` 同级的 `_internal/` 定位 `web` 等随包资源（onefile 才走 `sys._MEIPASS`，两种形态都兼容）；运行时索引目录 `dist\DocMind\.chroma` 首次启动自动创建，**开发期 `.chroma` 不打进包**，避免把测试索引带给用户。`docmind.spec` 用 `collect_all("chromadb")`/`collect_all("webview")` 兜底运行时动态子模块，并把 `web` 目录 add-data 进 `_internal`。
+  - **分发版不含独立 Python 解释器**：分区 `builtin:py` 校验在进程内做语法编译检查（exe/源码行为一致）；但 playtest 自动测试（pytest/unittest）、cProfile 剖析、`python_exec` 需要真实 Python 环境，请在源码 `.venv` 中使用，exe 内会直接给出明确提示。分区工作台的 git 初始化/提交/回滚还要求目标机器安装 Git 并加入 PATH。详见 [DocMind_BUILD.md](DocMind_BUILD.md)。
   - 前置：Windows 需 Edge WebView2 运行时（Win10/11 通常自带）；缺失时 `desktop.py` 会回退用默认浏览器打开。
+  - **每次修复后重新打包的标准验证流程**（py_compile → 逻辑用例 → dev 浏览器实测 → 重建 → exe 冷启动冒烟 → 哈希核对）已沉淀在 [DocMind_BUILD.md](DocMind_BUILD.md) 文末，照做可避免"源码已修但分发版仍旧"。
 
 - **前端"分区"设计**：`web/index.html` 已重做为**左分区侧栏 + 主聊天区**的双栏布局，直观呼应"防 AI 改代码混乱"的核心诉求——
   - 左侧「知识库·文档分区」与「代码库·代码分区」两个独立卡片，实时展示已索引的文档与代码切片数；

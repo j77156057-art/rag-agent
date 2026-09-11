@@ -111,6 +111,17 @@
   .badge.emb { background: rgba(34,211,238,.14); color: #67e8f9; border-color: rgba(34,211,238,.3); }
   .actions { display: flex; gap: 8px; margin-top: 10px; }
 
+  /* 模型驻留（显存）开关 */
+  .power-box { margin-top: 11px; padding-top: 10px; border-top: 1px dashed var(--line); }
+  .vr-line { display: flex; align-items: flex-start; gap: 7px; font-size: 11.5px; color: var(--txt-dim); line-height: 1.55; }
+  .vr-dot { width: 7px; height: 7px; border-radius: 50%; margin-top: 5px; flex: 0 0 7px; background: var(--txt-faint); }
+  .vr-dot.on { background: var(--err); box-shadow: 0 0 7px var(--err); }
+  .vr-line b { color: var(--txt); font-weight: 600; word-break: break-all; }
+  .btn.power-off { background: rgba(248,113,113,.12); color: #fca5a5; border-color: rgba(248,113,113,.4); margin-top: 8px; }
+  .btn.power-off:hover { color: #fecaca; border-color: var(--err); }
+  .btn.power-on { background: rgba(52,211,153,.1); color: #6ee7b7; border-color: rgba(52,211,153,.35); margin-top: 8px; }
+  .btn.power-on:hover { color: #a7f3d0; border-color: var(--ok); }
+
   /* ---------- 主区 ---------- */
   .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   .topbar {
@@ -125,6 +136,18 @@
     font-size: 12px; color: var(--txt-dim); max-width: 46%; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap;
   }
+  .ollama-banner {
+    display: flex; gap: 10px; align-items: flex-start;
+    margin: 0 0 12px; padding: 12px 14px; border-radius: 12px;
+    background: #3a2a12; border: 1px solid #8a5a1a; color: #f3d9a8;
+  }
+  .ollama-banner.hidden { display: none; }
+  .ob-icon { font-size: 18px; line-height: 1.4; }
+  .ob-body { flex: 1; min-width: 0; }
+  .ob-title { font-weight: 600; margin-bottom: 4px; }
+  .ob-text { margin: 0; white-space: pre-wrap; font-size: 12.5px; line-height: 1.55;
+    font-family: ui-monospace, Menlo, Consolas, monospace; color: #ecd2a0; }
+  .ob-close { background: transparent; border: 0; color: #f3d9a8; font-size: 18px; cursor: pointer; line-height: 1; padding: 0 2px; }
 
   #chat { flex: 1; overflow-y: auto; padding: 22px 22px 8px; display: flex; flex-direction: column; gap: 16px; }
   .msg { display: flex; gap: 11px; max-width: 86%; animation: rise .25s ease; }
@@ -183,6 +206,32 @@
     font-family: inherit; line-height: 1.4;
   }
   footer #q:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(99,102,241,.18); }
+  footer { flex-wrap: wrap; }
+  footer .send-row { display: flex; flex-direction: column; gap: 6px; flex: 0 0 auto; }
+  footer .send-row .btn { white-space: nowrap; min-width: 72px; }
+
+  /* 图片附件预览条 */
+  .img-preview { flex: 1 1 100%; display: flex; gap: 8px; flex-wrap: wrap; }
+  .img-preview.hidden { display: none; }
+  .img-chip {
+    position: relative; width: 68px; height: 68px; border-radius: 10px; overflow: hidden;
+    border: 1px solid var(--line); background: var(--panel-2);
+  }
+  .img-chip img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .img-chip .rm {
+    position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; padding: 0;
+    line-height: 17px; text-align: center; border-radius: 50%; border: none;
+    background: rgba(0,0,0,.62); color: #fff; font-size: 12px; cursor: pointer;
+  }
+  footer.drag #q { border-color: var(--accent); background: rgba(99,102,241,.12); }
+
+  /* 气泡内随消息发送的图片 */
+  .chat-imgs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .chat-imgs img {
+    max-width: 220px; max-height: 160px; border-radius: 8px; display: block;
+    border: 1px solid rgba(255,255,255,.28);
+  }
+  .msg.bot .chat-imgs img { border-color: var(--line); }
 
   /* ---------- 弹窗 ---------- */
   .overlay {
@@ -194,8 +243,9 @@
   .modal {
     width: 380px; max-width: 92vw; background: var(--panel); border: 1px solid var(--line);
     border-radius: 16px; padding: 20px 20px 22px; box-shadow: var(--shadow);
+    max-height: calc(100vh - 40px); overflow-y: auto; overflow-x: hidden;
   }
-  .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; position: sticky; top: 0; background: var(--panel); z-index: 2; padding-bottom: 6px; }
   .modal-head h2 { font-size: 15px; margin: 0; }
   .modal .close { cursor: pointer; color: var(--txt-faint); font-size: 22px; line-height: 1; background: none; border: none; }
   .modal .close:hover { color: var(--txt); }
@@ -210,9 +260,38 @@
   .cfg-msg { font-size: 12px; line-height: 1.5; flex: 1; }
   .cfg-msg.ok { color: var(--ok); } .cfg-msg.warn { color: var(--warn); } .cfg-msg.error { color: var(--err); }
   .modal-note { margin-top: 14px; font-size: 11px; color: var(--txt-faint); line-height: 1.6; border-top: 1px solid var(--line); padding-top: 12px; }
+  .modal::-webkit-scrollbar { width: 8px; }
+  .modal::-webkit-scrollbar-thumb { background: #233149; border-radius: 8px; }
+  .modal::-webkit-scrollbar-track { background: transparent; }
 
   .sidebar::-webkit-scrollbar, #chat::-webkit-scrollbar { width: 8px; }
   .sidebar::-webkit-scrollbar-thumb, #chat::-webkit-scrollbar-thumb { background: #233149; border-radius: 8px; }
+
+  /* ---------- 分区开发工作台 ---------- */
+  .dev-sec-title { font-size:12px;color:var(--txt-dim);margin-bottom:8px;letter-spacing:.3px; }
+  /* 可变长度列表：随条目增加只在该段内滚动，避免撑爆模态 */
+  #devRegions, #devChangesets, #devBugs { max-height: 260px; overflow-y: auto; padding-right: 4px; }
+  #devRegions::-webkit-scrollbar, #devChangesets::-webkit-scrollbar, #devBugs::-webkit-scrollbar { width: 6px; }
+  #devRegions::-webkit-scrollbar-thumb, #devChangesets::-webkit-scrollbar-thumb, #devBugs::-webkit-scrollbar-thumb { background: #233149; border-radius: 6px; }
+  .dev-region { background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:9px 11px;display:flex;flex-direction:column;gap:6px; }
+  .dev-region .r1 { display:flex;align-items:center;gap:8px; }
+  .dev-region .rname { font-size:13px;font-weight:600; }
+  .dev-region .rdir { color:var(--txt-faint);font-size:11px; }
+  .dev-region .rdesc { font-size:11.5px;color:var(--txt-dim); }
+  .dev-region .rmeta { font-size:11px;color:var(--txt-faint);display:flex;gap:6px;flex-wrap:wrap;align-items:center; }
+  .dev-region .ractions { display:flex;gap:6px;margin-top:2px; }
+  .badge.dirty { background:rgba(251,191,36,.16);color:#fcd34d;border-color:rgba(251,191,36,.35); }
+  .badge.ok { background:rgba(52,211,153,.16);color:#6ee7b7;border-color:rgba(52,211,153,.35); }
+  .badge.warn { background:rgba(248,113,113,.15);color:#fca5a5;border-color:rgba(248,113,113,.35); }
+  .dev-chg { background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:9px 11px;display:flex;align-items:center;gap:8px;font-size:12px; }
+  .dev-chg .cid { font-family:Consolas,monospace;color:var(--accent-2); }
+  .dev-chg .cmeta { color:var(--txt-faint);font-size:11px; }
+  .dev-chg .ractions { margin-left:auto;display:flex;gap:6px; }
+  #devGraph svg .edge { stroke:#3b4d72;stroke-width:1.4;fill:none; }
+  #devGraph svg .earrow { fill:#3b4d72; }
+  #devGraph svg .node-box { fill:#16203a;stroke:#2a3a5c;stroke-width:1; }
+  #devGraph svg .node-label { fill:#cdd9ee;font-size:11px;font-family:"Segoe UI",sans-serif; }
+  #devGraph svg .node-key { fill:#8aa0c4;font-size:9px;font-family:Consolas,monospace; }
 </style>
 </head>
 <body data-page-node-id="X2MohhkbYRgVfpyl5v1CIg">
@@ -248,6 +327,15 @@
       <button class="btn ghost block sm" id="codeLibBtn" style="margin-top:10px;" data-page-node-id="KBFtHwvAqEERm962wTuO1x">📁 索引代码目录</button>
     </div>
 
+    <!-- 分区开发（开发模式） -->
+    <div class="card" data-page-node-id="devCard">
+      <h3 data-page-node-id="devH"><span class="dot" style="background:#BA7517;box-shadow:0 0 8px #BA7517" data-page-node-id="devDot"></span>分区开发 <span class="count" id="regionCount" data-page-node-id="devCnt">0</span></h3>
+      <div class="code-status" id="devStatus" data-page-node-id="devSt">
+        <span class="empty" data-page-node-id="devEmpty">未初始化分区。<br data-page-node-id="devE2">初始化后按 素材区/数值区/bug区/角色行为区 隔离改动，各分区独立 git 回滚。</span>
+      </div>
+      <button class="btn ghost block sm" id="devBtn" style="margin-top:10px;" data-page-node-id="devBtn">🛠 开发模式</button>
+    </div>
+
     <!-- 模型状态 -->
     <div class="card model-box" data-page-node-id="JddNg5gGbu1ihxzY8XG246">
       <h3 data-page-node-id="sj3LsFfbnDmUVLVEa2apUT"><span class="dot" style="background:var(--ok);box-shadow:0 0 8px var(--ok)" data-page-node-id="7UZHhMbFSm848OsgkwokrT"></span>模型状态</h3>
@@ -257,6 +345,10 @@
         <button class="btn ghost sm" id="settingsBtn" style="flex:1;" data-page-node-id="1FiW8m1mNrAL9jJVUQTEyF">⚙ 模型设置</button>
       </div>
       <div class="model-line" id="mModel" style="margin-top:9px;color:var(--txt-faint);" data-page-node-id="R0W2b40FtJZwI9AF0BAaWb"></div>
+      <div class="power-box" id="powerBox">
+        <div class="vr-line"><span class="vr-dot" id="vrDot"></span><span id="vrText">显存驻留：检测中…</span></div>
+        <button class="btn ghost sm block" id="powerBtn" style="display:none;"></button>
+      </div>
     </div>
   </aside>
 
@@ -268,11 +360,26 @@
       <div class="status-pill" id="status" data-page-node-id="0uTeAZIXXoo6g4X1y6Obij">就绪。默认 mock 模式无需 Key，可直接提问示例知识库。</div>
     </div>
 
+    <div id="ollamaBanner" class="ollama-banner hidden" role="alert">
+      <div class="ob-icon">⚠️</div>
+      <div class="ob-body">
+        <div class="ob-title">本机 Ollama 未运行 / 不可达</div>
+        <pre class="ob-text" id="ollamaGuidance"></pre>
+      </div>
+      <button class="ob-close" id="ollamaBannerClose" title="忽略">×</button>
+    </div>
+
     <div id="chat" data-page-node-id="PoGBfeYpwE8D3thZE7lYVf"></div>
 
     <footer data-page-node-id="SWPJ3nNNQK5WQ1HjvQIgmq">
-      <textarea id="q" placeholder="例如：DocMind 支持哪些文件格式？XX 函数在哪里实现？伤害计算逻辑在哪？  (Enter 发送 / Shift+Enter 换行)"></textarea>
-      <button class="btn" id="sendBtn" data-page-node-id="hqk6SKVn2pC3A8uyTElTEh">发送</button>
+      <div id="imgPreview" class="img-preview hidden"></div>
+      <textarea id="q" placeholder="例如：这张截图里的报错是什么意思？UI 这张设计稿帮我还原成代码…  (可直接粘贴/拖入图片，Enter 发送 / Shift+Enter 换行)"></textarea>
+      <div class="send-row">
+        <button class="btn ghost sm" id="imgBtn" title="附加图片（也可直接 Ctrl+V 粘贴截图或拖入，最多 4 张）">🖼 图片</button>
+        <input type="file" id="imgInput" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
+        <button class="btn ghost sm" id="enhanceBtn" title="调用 LLM 把草稿重写成更清晰的提示词（需配置模型；离线时本地规则增强）">✨ 增强</button>
+        <button class="btn" id="sendBtn" data-page-node-id="hqk6SKVn2pC3A8uyTElTEh">发送</button>
+      </div>
     </footer>
   </div>
 
@@ -298,6 +405,7 @@
       <label data-page-node-id="d29KhCHHURfR1cWYkKwKHf">检索向量 Embedding</label>
       <select id="cfgEmbed" data-page-node-id="1SFULGmUf0SIJMRcWf4J1v">
         <option value="local" data-page-node-id="sFwg3OPiniJLLCZClmetYI">local（本地兜底，离线可用）</option>
+        <option value="ollama" data-page-node-id="a7kQmZp3VxR9wT1nYcLbH">ollama（本地 bge-m3，多语言，零 Key）</option>
         <option value="qwen" data-page-node-id="VfYE0eiOQe61YmG81zCzM6">qwen（语义更准，需 Key）</option>
       </select>
 
@@ -328,17 +436,98 @@
     </div>
   </div>
 
+  <!-- ===== 分区开发工作台弹窗 ===== -->
+  <div class="overlay hidden" id="devOverlay" data-page-node-id="devOverlay">
+    <div class="modal" id="devModalBox" data-page-node-id="devModal" style="width:620px;max-width:94vw;">
+      <div class="modal-head" data-page-node-id="devMH"><h2 data-page-node-id="devMH2">分区开发工作台</h2><button class="close" id="devPanelClose" data-page-node-id="devPC">×</button></div>
+      <p style="color:var(--txt-dim);margin:0 0 12px;line-height:1.6;" data-page-node-id="devDesc">代码库按分工切成多个独立分区（子目录），每个分区独立 git 仓库，可单独提交 / 回滚；依赖方向单向，契约校验防循环耦合。初始化后 Agent 写操作被约束在对应分区内。</p>
+      <div class="modal-actions" data-page-node-id="devAct">
+        <button class="btn sm" id="devInitBtn" data-page-node-id="devInit">初始化分区</button>
+        <button class="btn ghost sm" id="devRefreshBtn" data-page-node-id="devRef">刷新状态</button>
+        <button class="btn ghost sm" id="devRebuildBtn" data-page-node-id="devReb">重算索引</button>
+        <button class="btn sm" id="devCommitAllBtn" data-page-node-id="devCA">全部提交</button>
+        <span class="cfg-msg" id="devMsg" data-page-node-id="devMsg"></span>
+      </div>
+
+      <div style="margin-top:16px;">
+        <div class="dev-sec-title">🤖 智能研判分区（默认 8 区仅作初始建议，Agent 据真实代码库判断）</div>
+        <div class="modal-actions">
+          <button class="btn ghost sm" id="devProposeBtn">研判分区方案</button>
+          <button class="btn sm" id="devApplyBtn">应用推荐方案</button>
+          <span class="cfg-msg" id="devJudgeMsg"></span>
+        </div>
+        <div id="devPropose" style="margin-top:8px;display:flex;flex-direction:column;gap:8px;"></div>
+        <div style="margin-top:10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+          <input id="devNewKey" placeholder="key" style="width:88px" autocomplete="off" />
+          <input id="devNewDir" placeholder="dir（目录）" style="width:108px" autocomplete="off" />
+          <input id="devNewName" placeholder="中文名" style="width:104px" autocomplete="off" />
+          <button class="btn ghost sm" id="devAddRegionBtn">新增分区</button>
+        </div>
+      </div>
+
+      <div style="margin-top:14px;">
+        <div class="dev-sec-title">依赖图（单向，防止循环耦合）</div>
+        <div id="devGraph" style="background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:10px;overflow:auto;max-height:240px;"></div>
+      </div>
+
+      <div style="margin-top:14px;">
+        <div class="dev-sec-title">分区状态</div>
+        <div id="devRegions" style="display:flex;flex-direction:column;gap:8px;"></div>
+      </div>
+
+      <div style="margin-top:14px;">
+        <div class="dev-sec-title">变更集（可整体回滚）</div>
+        <div id="devChangesets" style="display:flex;flex-direction:column;gap:8px;"></div>
+      </div>
+
+      <div style="margin-top:14px;">
+        <div class="dev-sec-title">Bug 区异常记录</div>
+        <div id="devBugs" style="display:flex;flex-direction:column;gap:8px;"></div>
+      </div>
+
+      <div style="margin-top:14px;">
+        <div class="dev-sec-title">开发检查</div>
+        <div class="ractions">
+          <button class="btn ghost sm" id="validateDataBtn">校验配置</button>
+          <button class="btn ghost sm" id="releaseCheckBtn">发布检查</button>
+          <button class="btn ghost sm" id="gitInfoBtn">Git 信息</button>
+        </div>
+        <div id="workbenchMsg" class="cfg-msg" style="margin-top:8px;"></div>
+      </div>
+
+      <div class="modal-note" data-page-node-id="devNote">需先「📁 索引代码目录」选定代码库根目录。初始化会创建分区目录并为每区 git init；若父目录已是 git 仓库，会把各分区加入父 .gitignore 避免双重跟踪。依赖图与契约会随 regions.json 变化而更新。</div>
+    </div>
+  </div>
+
 <script>
   const chat = document.getElementById("chat");
   const status = document.getElementById("status");
   const q = document.getElementById("q");
   const $ = (id) => document.getElementById(id);
 
-  function addUser(text) {
+  function addUser(text, imgUrls) {
     const d = document.createElement("div");
     d.className = "msg user";
     d.innerHTML = `<div class="av">你</div><div class="bubble"><div class="answer"></div></div>`;
-    d.querySelector(".answer").textContent = text;
+    const answer = d.querySelector(".answer");
+    if (imgUrls && imgUrls.length) {
+      const wrap = document.createElement("div");
+      wrap.className = "chat-imgs";
+      imgUrls.forEach((u) => {
+        const im = document.createElement("img");
+        im.src = u;
+        im.alt = "附带的图片";
+        wrap.appendChild(im);
+      });
+      answer.appendChild(wrap);
+      if (text) {
+        const t = document.createElement("div");
+        t.textContent = text;
+        answer.appendChild(t);
+      }
+    } else {
+      answer.textContent = text;
+    }
     chat.appendChild(d);
     chat.scrollTop = chat.scrollHeight;
   }
@@ -373,18 +562,145 @@
     chat.scrollTop = chat.scrollHeight;
   }
 
+  // ---------- 图片附件（视觉模型输入）----------
+  const MAX_IMGS = 4;
+  const IMG_MAX_EDGE = 1600;   // 发送前等比缩放的最长边，控制视觉 token 与上传体积
+  const IMG_QUALITY = 0.82;
+  let pendingImages = [];      // [{blob, name, url}]
+
+  // 读入图片并等比压缩为 JPEG：截图普遍 2-8MB/2K 分辨率，原图直传慢且视觉 token 大
+  function downscaleImage(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, IMG_MAX_EDGE / Math.max(img.naturalWidth, img.naturalHeight));
+        const w = Math.max(1, Math.round(img.naturalWidth * scale));
+        const h = Math.max(1, Math.round(img.naturalHeight * scale));
+        const cv = document.createElement("canvas");
+        cv.width = w; cv.height = h;
+        const ctx = cv.getContext("2d");
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        cv.toBlob(
+          (b) => b ? resolve(b) : reject(new Error("图片编码失败")),
+          "image/jpeg", IMG_QUALITY
+        );
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("图片读取失败")); };
+      img.src = url;
+    });
+  }
+
+  async function addImageFiles(fileList) {
+    const files = Array.from(fileList || []).filter(
+      (f) => f.kind ? (f.kind === "file" && f.type.startsWith("image/")) : f.type.startsWith("image/")
+    );
+    for (const f of files) {
+      if (pendingImages.length >= MAX_IMGS) {
+        status.textContent = `最多只能附带 ${MAX_IMGS} 张图片。`;
+        break;
+      }
+      try {
+        const blob = await downscaleImage(f);
+        const base = (f.name || "image").replace(/\.[^.]+$/, "");
+        pendingImages.push({
+          blob,
+          name: `${base}.jpg`,
+          url: URL.createObjectURL(blob),
+        });
+      } catch (e) {
+        status.textContent = "图片处理失败：" + e.message;
+      }
+    }
+    renderImgPreview();
+    if (pendingImages.length) {
+      status.textContent = `已附加 ${pendingImages.length} 张图片，将随下一条消息发送（最多 ${MAX_IMGS} 张；无需文字也可直接发送）。`;
+    }
+  }
+
+  function renderImgPreview() {
+    const box = $("imgPreview");
+    box.innerHTML = "";
+    box.classList.toggle("hidden", pendingImages.length === 0);
+    pendingImages.forEach((it, i) => {
+      const chip = document.createElement("div");
+      chip.className = "img-chip";
+      chip.innerHTML = `<img alt=""><button class="rm" title="移除">×</button>`;
+      chip.querySelector("img").src = it.url;
+      chip.querySelector(".rm").onclick = () => {
+        URL.revokeObjectURL(it.url);
+        pendingImages.splice(i, 1);
+        renderImgPreview();
+      };
+      box.appendChild(chip);
+    });
+  }
+
+  $("imgBtn").onclick = () => $("imgInput").click();
+  $("imgInput").onchange = (e) => {
+    addImageFiles(e.target.files);
+    e.target.value = "";
+  };
+  // Ctrl+V 粘贴截图（剪贴板里的图片会随消息发送，不污染输入框文字）
+  q.addEventListener("paste", (e) => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    const files = [];
+    for (const it of items) {
+      if (it.kind === "file" && it.type.startsWith("image/")) files.push(it.getAsFile());
+    }
+    if (files.length) {
+      e.preventDefault();
+      addImageFiles(files);
+    }
+  });
+  // 拖入图片
+  const footerEl = document.querySelector("footer");
+  ["dragenter", "dragover"].forEach((ev) =>
+    footerEl.addEventListener(ev, (e) => { e.preventDefault(); footerEl.classList.add("drag"); })
+  );
+  footerEl.addEventListener("dragleave", () => footerEl.classList.remove("drag"));
+  footerEl.addEventListener("drop", (e) => {
+    e.preventDefault();
+    footerEl.classList.remove("drag");
+    if (e.dataTransfer && e.dataTransfer.files.length) addImageFiles(e.dataTransfer.files);
+  });
+
   async function send() {
     const question = q.value.trim();
-    if (!question) return;
+    if (!question && pendingImages.length === 0) return;
+    const imgs = pendingImages;
+    pendingImages = [];
+    renderImgPreview();
     q.value = "";
-    addUser(question);
+    addUser(question, imgs.map((it) => it.url));
     const shell = addBotShell();
     const ans = shell.querySelector(".answer");
     ans.innerHTML = `<div class="typing">思考中 <span class="d"></span><span class="d"></span><span class="d"></span></div>`;
 
     const fd = new FormData();
     fd.append("question", question);
-    const resp = await fetch("/api/chat", { method: "POST", body: fd });
+    imgs.forEach((it) => fd.append("images", it.blob, it.name));
+    let resp;
+    try {
+      resp = await fetch("/api/chat", { method: "POST", body: fd });
+    } catch (e) {
+      ans.textContent = "请求发送失败：" + e.message;
+      return;
+    }
+    // 400（图片校验失败等）返回 JSON 而非 SSE：先显错，不要把错误页当事件流解析
+    if (!resp.ok) {
+      let msg = `请求失败（HTTP ${resp.status}）`;
+      try {
+        const j = await resp.json();
+        if (j.error) msg = j.error;
+      } catch { /* 非 JSON 响应时保留状态码提示 */ }
+      ans.textContent = msg;
+      return;
+    }
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = "", acc = "";
@@ -414,6 +730,7 @@
       }
     }
     loadPending();
+    loadPowerStatus();  // 对话会让模型加载驻留，刷新显存开关状态
     chat.scrollTop = chat.scrollHeight;
   }
 
@@ -421,6 +738,34 @@
   q.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   });
+
+  // 增强提示词：把当前草稿交给 LLM 重写为更清晰的提问（无可用模型时本地规则兜底），替换回输入框供确认后发送
+  $("enhanceBtn").onclick = async () => {
+    const draft = q.value.trim();
+    if (!draft) { status.textContent = "请先在输入框写下要增强的提示词草稿。"; return; }
+    const btn = $("enhanceBtn");
+    const oldLabel = btn.textContent;
+    btn.disabled = true; btn.textContent = "增强中…";
+    try {
+      const r = await fetch("/api/enhance_prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: draft }),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        q.value = j.enhanced;
+        status.textContent = (j.mode === "llm" ? "已用 LLM 重写提示词" : "已本地增强提示词")
+          + (j.note ? "：" + j.note : "，可编辑后发送。");
+      } else {
+        status.textContent = "增强失败：" + (j.error || "未知错误");
+      }
+    } catch (e) {
+      status.textContent = "增强请求失败：" + e.message;
+    } finally {
+      btn.disabled = false; btn.textContent = oldLabel;
+    }
+  };
 
   $("uploadBtn").onclick = async () => {
     const f = $("fileInput").files[0];
@@ -437,15 +782,20 @@
   // ---------- 弹窗控制 ----------
   const settingsOverlay = $("settingsOverlay");
   const codeOverlay = $("codeOverlay");
+  const devOverlay = $("devOverlay");
   const openOverlay = (el) => { el.classList.remove("hidden"); };
-  const closeAll = () => { settingsOverlay.classList.add("hidden"); codeOverlay.classList.add("hidden"); };
+  const closeAll = () => { settingsOverlay.classList.add("hidden"); codeOverlay.classList.add("hidden"); devOverlay.classList.add("hidden"); };
   settingsOverlay.addEventListener("click", (e) => { if (e.target === settingsOverlay) closeAll(); });
   codeOverlay.addEventListener("click", (e) => { if (e.target === codeOverlay) closeAll(); });
+  devOverlay.addEventListener("click", (e) => { if (e.target === devOverlay) closeAll(); });
   $("panelClose").onclick = closeAll;
   $("codePanelClose").onclick = closeAll;
+  $("devPanelClose").onclick = closeAll;
 
   $("settingsBtn").onclick = () => { closeAll(); openOverlay(settingsOverlay); loadConfig(); };
+  $("ollamaBannerClose").onclick = () => document.getElementById("ollamaBanner").classList.add("hidden");
   $("codeLibBtn").onclick = () => { closeAll(); openOverlay(codeOverlay); loadConfig(); };
+  $("devBtn").onclick = () => { closeAll(); openOverlay(devOverlay); loadRegions(); };
 
   $("indexCodeBtn").onclick = async () => {
     const root = $("codeRoot").value.trim();
@@ -471,18 +821,398 @@
     }
   };
 
-  $("resetCodeBtn").onclick = async () => {
-    if (!confirm("确定清空代码库索引并解除代码库配置？")) return;
-    const r = await fetch("/api/reset_code", { method: "POST" });
-    const j = await r.json();
-    status.textContent = j.ok ? "已重置代码库。" : "重置失败";
-    loadConfig();
-    loadPending();
+  // resetCodeBtn 为可选元素（部分面板版本不渲染该按钮）：不存在时跳过绑定，
+  // 切勿直接对 getElementById 的 null 结果赋值，否则会中止整个 <script>，
+  // 导致其后所有按钮（保存配置/开发工作台）与初始 loadConfig() 全部失效。
+  const resetCodeBtn = $("resetCodeBtn");
+  if (resetCodeBtn) {
+    resetCodeBtn.onclick = async () => {
+      if (!confirm("确定清空代码库索引并解除代码库配置？")) return;
+      const r = await fetch("/api/reset_code", { method: "POST" });
+      const j = await r.json();
+      status.textContent = j.ok ? "已重置代码库。" : "重置失败";
+      loadConfig();
+      loadPending();
+    };
+  }
+
+  $("devInitBtn").onclick = async () => {
+    const devMsg = $("devMsg");
+    devMsg.className = "cfg-msg"; devMsg.textContent = "初始化中…";
+    status.textContent = "正在初始化分区开发结构…";
+    try {
+      const r = await fetch("/api/init_regions", { method: "POST" });
+      const j = await r.json();
+      if (j.ok) {
+        devMsg.className = "cfg-msg ok";
+        devMsg.textContent = j.message;
+        status.textContent = "分区开发结构已初始化，Agent 写操作将受分区约束。";
+        loadRegions();
+        loadConfig();
+      } else {
+        devMsg.className = "cfg-msg error";
+        devMsg.textContent = "❌ " + (j.error || "初始化失败");
+      }
+    } catch (e) {
+      devMsg.className = "cfg-msg error";
+      devMsg.textContent = "初始化请求失败：" + e;
+    }
   };
+
+  $("devRefreshBtn").onclick = () => loadRegions();
+  $("devRebuildBtn").onclick = () => rebuildIndex();
+  $("devCommitAllBtn").onclick = () => commitAll();
+
+  // ---- Agent 研判分区：勘察 → 研判 → 应用/增补 ----
+  let lastProposal = null;
+  function stripRegion(r) {
+    return {
+      key: r.key, dir: r.dir, name: r.name || r.key,
+      desc: r.desc || "", access: r.access || "",
+      depends_on: r.depends_on || [], exports: r.exports || [], verify: r.verify || "",
+    };
+  }
+  $("devProposeBtn").onclick = async () => {
+    const m = $("devJudgeMsg");
+    m.className = "cfg-msg"; m.textContent = "研判中…";
+    try {
+      const r = await fetch("/api/propose_regions", { method: "POST" });
+      const j = await r.json();
+      if (!j.ok) { m.className = "cfg-msg error"; m.textContent = "❌ " + (j.error || "研判失败"); return; }
+      lastProposal = j;
+      m.className = "cfg-msg ok";
+      m.textContent = "已生成建议方案（见下方卡片，点「应用推荐方案」落地）。";
+      renderProposal(j);
+    } catch (e) {
+      m.className = "cfg-msg error"; m.textContent = "研判请求失败：" + e;
+    }
+  };
+  $("devApplyBtn").onclick = async () => {
+    if (!lastProposal || !lastProposal.proposed) {
+      const m = $("devJudgeMsg"); m.className = "cfg-msg error"; m.textContent = "请先点击「研判分区方案」。"; return;
+    }
+    const regions = lastProposal.proposed.filter((r) => r.included).map(stripRegion);
+    (lastProposal.custom_suggestions || []).forEach((r) => regions.push(stripRegion(r)));
+    await applyRegions(regions);
+  };
+  $("devAddRegionBtn").onclick = async () => {
+    const key = $("devNewKey").value.trim();
+    const dir = $("devNewDir").value.trim();
+    const name = $("devNewName").value.trim();
+    const m = $("devJudgeMsg");
+    if (!key || !dir) { m.className = "cfg-msg error"; m.textContent = "请填写 key 与 dir。"; return; }
+    m.className = "cfg-msg"; m.textContent = "新增分区中…";
+    try {
+      const r = await fetch("/api/add_region", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, dir, name }) });
+      const j = await r.json();
+      m.className = "cfg-msg " + (j.ok ? "ok" : "error");
+      m.textContent = j.ok ? ("已新增/更新分区 " + key) : ("失败：" + (j.error || ""));
+      if (j.ok) loadRegions();
+    } catch (e) { m.className = "cfg-msg error"; m.textContent = "请求失败：" + e; }
+  };
+  async function applyRegions(regions) {
+    const m = $("devJudgeMsg");
+    m.className = "cfg-msg"; m.textContent = "应用分区方案…";
+    try {
+      const r = await fetch("/api/apply_regions", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ regions }) });
+      const j = await r.json();
+      if (j.ok) {
+        m.className = "cfg-msg ok";
+        m.textContent = `已应用 ${regions.length} 个分区：` + regions.map((x) => x.key).join(", ");
+        loadRegions();
+      } else {
+        m.className = "cfg-msg error";
+        m.textContent = "❌ " + (j.error || "应用失败");
+      }
+    } catch (e) {
+      m.className = "cfg-msg error"; m.textContent = "应用请求失败：" + e;
+    }
+  }
+  function renderProposal(p) {
+    const box = $("devPropose");
+    box.innerHTML = "";
+    if (!p || !p.ok) { box.innerHTML = `<div class="empty">${p ? (p.error || "研判失败") : ""}</div>`; return; }
+    const sum = document.createElement("div");
+    sum.className = "rmeta"; sum.style.marginBottom = "2px";
+    sum.textContent = p.summary;
+    box.appendChild(sum);
+    const mk = (r, kind) => {
+      const el = document.createElement("div");
+      el.className = "dev-region";
+      const badge = kind === "custom"
+        ? `<span class="badge emb">建议新增</span>`
+        : ((r.detected ? `<span class="badge ok">已检出</span>` : `<span class="badge">未检出</span>`)
+           + (r.included ? ` <span class="badge emb">建议启用</span>` : ` <span class="badge">可选</span>`));
+      const ev = (r.evidence && r.evidence.length) ? r.evidence.join("；") : "无";
+      const dep = (r.depends_on && r.depends_on.length) ? r.depends_on.join(", ") : "无";
+      el.innerHTML = `
+        <div class="r1"><span class="rname">${r.name}</span><span class="rdir">${r.dir}/</span>${badge}</div>
+        <div class="rdesc">${r.desc || ""}</div>
+        <div class="rmeta">依赖：${dep}</div>
+        <div class="rmeta">证据：${ev}</div>`;
+      box.appendChild(el);
+    };
+    (p.proposed || []).forEach((r) => mk(r, "def"));
+    (p.custom_suggestions || []).forEach((r) => mk(r, "custom"));
+  }
+
+  async function loadRegions() {
+    const card = $("devRegions");
+    const cnt = $("regionCount");
+    if (!card) return;
+    try {
+      const r = await fetch("/api/regions");
+      const j = await r.json();
+      const regions = j.regions || [];
+      cnt.textContent = regions.filter((x) => x.exists).length;
+      card.innerHTML = "";
+      if (!regions.length) {
+        card.innerHTML = `<div class="empty">尚未配置代码库根目录，或尚未初始化分区。</div>`;
+        $("devGraph").innerHTML = "";
+        $("devChangesets").innerHTML = "";
+        return;
+      }
+      for (const x of regions) {
+        const el = document.createElement("div");
+        el.className = "dev-region";
+        const gitBadge = x.git ? `<span class="badge emb">git ${x.branch || ""}</span>` : `<span class="badge">未初始化</span>`;
+        const dirtyBadge = x.dirty ? `<span class="badge dirty">有未提交改动</span>` : `<span class="badge ok">已提交</span>`;
+        const depTxt = (x.depends_on && x.depends_on.length) ? x.depends_on.join(", ") : "无（基础分区）";
+        const expTxt = (x.exports && x.exports.length) ? x.exports.join(", ") : "无";
+        const state = x.exists ? `${x.files} 文件` : "目录未创建";
+        el.innerHTML = `
+          <div class="r1">
+            <span class="rname">${x.name}</span>
+            <span class="rdir">${x.dir}/</span>
+            ${x.exists ? gitBadge + dirtyBadge : `<span class="badge">${state}</span>`}
+          </div>
+          <div class="rdesc">${x.desc}</div>
+          <div class="rmeta">依赖：${depTxt} · 导出：${expTxt}</div>
+          <div class="ractions">
+            <button class="btn ghost sm" data-verify="${x.key}">校验</button>
+            <button class="btn ghost sm" data-commit="${x.key}">提交</button>
+          </div>`;
+        card.appendChild(el);
+      }
+      card.querySelectorAll("[data-verify]").forEach((b) => {
+        b.onclick = () => verifyRegion(b.getAttribute("data-verify"));
+      });
+      card.querySelectorAll("[data-commit]").forEach((b) => {
+        b.onclick = () => commitRegion(b.getAttribute("data-commit"));
+      });
+      drawDepGraph(regions);
+      loadChangesets();
+      loadBugs();
+    } catch (e) {
+      card.innerHTML = `<div class="empty">读取分区状态失败：${e}</div>`;
+    }
+  }
+
+  function drawDepGraph(regions) {
+    const box = $("devGraph");
+    if (!box) return;
+    const byKey = {};
+    regions.forEach((r) => { byKey[r.key] = r; });
+    const level = {};
+    const visiting = {};
+    function calc(k) {
+      if (level[k] !== undefined) return level[k];
+      if (visiting[k]) return 0;
+      visiting[k] = true;
+      const deps = (byKey[k] && byKey[k].depends_on) || [];
+      let lv = 0;
+      deps.forEach((d) => { if (byKey[d]) lv = Math.max(lv, calc(d) + 1); });
+      visiting[k] = false;
+      level[k] = lv;
+      return lv;
+    }
+    regions.forEach((r) => calc(r.key));
+    const maxLevel = Math.max(0, ...Object.values(level));
+    const cols = {};
+    Object.keys(level).forEach((k) => { (cols[level[k]] = cols[level[k]] || []).push(k); });
+    const colGap = 156, rowGap = 46, padX = 14, padY = 14, nodeW = 116, nodeH = 34;
+    const width = padX * 2 + nodeW + maxLevel * colGap;
+    const maxRows = Math.max(1, ...Object.values(cols).map((a) => a.length));
+    const height = padY * 2 + maxRows * rowGap;
+    let edges = "", nodes = "";
+    Object.keys(cols).forEach((lv) => {
+      cols[lv].forEach((k, i) => {
+        const x = padX + lv * colGap;
+        const y = padY + i * rowGap;
+        nodes += `<g><rect class="node-box" x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="8"></rect>`
+          + `<text class="node-label" x="${x + nodeW / 2}" y="${y + 15}" text-anchor="middle">${byKey[k].name}</text>`
+          + `<text class="node-key" x="${x + nodeW / 2}" y="${y + 27}" text-anchor="middle">${byKey[k].dir}/</text></g>`;
+        ((byKey[k].depends_on) || []).forEach((d) => {
+          if (!byKey[d]) return;
+          const dl = level[d], di = cols[dl].indexOf(d);
+          const x2 = padX + dl * colGap + nodeW;
+          const y2 = padY + di * rowGap + nodeH / 2;
+          const x1 = x, y1 = y + nodeH / 2;
+          const mx = (x1 + x2) / 2;
+          edges += `<path class="edge" d="M ${x2} ${y2} C ${mx} ${y2}, ${mx} ${y1}, ${x1} ${y1}"></path>`;
+          edges += `<path class="earrow" d="M ${x1} ${y1} l -6 -3 l 0 6 z"></path>`;
+        });
+      });
+    });
+    box.innerHTML = `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${edges}${nodes}</svg>`;
+  }
+
+  async function verifyRegion(key) {
+    const btn = $("devRegions").querySelector(`[data-verify="${key}"]`);
+    if (btn) btn.disabled = true;
+    try {
+      const r = await fetch("/api/region_verify", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ region: key }),
+      });
+      const j = await r.json();
+      $("devMsg").className = "cfg-msg " + (j.ok ? "ok" : "error");
+      $("devMsg").textContent = `${key} 校验：${j.output || ""}`;
+    } catch (e) {
+      $("devMsg").className = "cfg-msg error";
+      $("devMsg").textContent = "校验请求失败：" + e;
+    } finally { if (btn) btn.disabled = false; }
+  }
+
+  async function commitRegion(key) {
+    try {
+      const r = await fetch("/api/dev_commit", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ region: key, message: "docmind: update " + key }),
+      });
+      const j = await r.json();
+      $("devMsg").className = "cfg-msg " + (j.ok ? "ok" : "error");
+      $("devMsg").textContent = j.ok ? `已提交 ${key}` : ("提交失败：" + (j.error || j.output));
+      loadRegions();
+    } catch (e) {
+      $("devMsg").className = "cfg-msg error";
+      $("devMsg").textContent = "提交请求失败：" + e;
+    }
+  }
+
+  async function commitAll() {
+    $("devMsg").className = "cfg-msg";
+    $("devMsg").textContent = "正在提交所有分区…";
+    try {
+      const r = await fetch("/api/commit_all", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: "docmind: commit all" }),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        $("devMsg").className = "cfg-msg ok";
+        $("devMsg").textContent = `已创建变更集 ${j.id}，包含 ${Object.keys(j.commits || {}).length} 个分区。`;
+      } else {
+        $("devMsg").className = "cfg-msg error";
+        $("devMsg").textContent = "提交失败：" + (j.error || "");
+      }
+      loadRegions();
+    } catch (e) {
+      $("devMsg").className = "cfg-msg error";
+      $("devMsg").textContent = "提交请求失败：" + e;
+    }
+  }
+
+  async function loadChangesets() {
+    const box = $("devChangesets");
+    if (!box) return;
+    try {
+      const r = await fetch("/api/changesets");
+      const j = await r.json();
+      const cs = j.changesets || [];
+      box.innerHTML = "";
+      if (!cs.length) {
+        box.innerHTML = `<div class="empty">暂无已记录的变更集。用过「全部提交」后会在此列出，可整体回滚。</div>`;
+        return;
+      }
+      for (const c of cs) {
+        const el = document.createElement("div");
+        el.className = "dev-chg";
+        const regions = Object.keys(c.commits || {}).join(", ");
+        el.innerHTML = `
+          <span class="cid">${c.id}</span>
+          <span class="cmeta">${c.message || ""} · 分区：${regions}</span>
+          <div class="ractions">
+            <button class="btn ghost sm" data-rollback="${c.id}">回滚</button>
+          </div>`;
+        box.appendChild(el);
+      }
+      box.querySelectorAll("[data-rollback]").forEach((b) => {
+        b.onclick = () => rollbackChangeset(b.getAttribute("data-rollback"));
+      });
+    } catch (e) {
+      box.innerHTML = `<div class="empty">读取变更集失败：${e}</div>`;
+    }
+  }
+
+  async function loadBugs() {
+    const box = $("devBugs");
+    if (!box) return;
+    try {
+      const r = await fetch("/api/bugs");
+      const j = await r.json();
+      box.innerHTML = "";
+      const bugs = j.bugs || [];
+      if (!bugs.length) { box.innerHTML = `<div class="empty">暂无异常记录。</div>`; return; }
+      bugs.forEach((b) => {
+        const el = document.createElement("div"); el.className = "dev-chg";
+        const title = document.createElement("span"); title.className = "cid"; title.textContent = b.id || "BUG";
+        const meta = document.createElement("span"); meta.className = "cmeta";
+        meta.textContent = `${b.title || b.error || "异常"} · ${b.severity || "error"} · ${b.source_region || "未知分区"}`;
+        const sel = document.createElement("select");
+        ["open","investigating","fixed","ignored"].forEach((s) => { const o=document.createElement("option"); o.value=s; o.textContent=s; if ((b.status||"open")===s) o.selected=true; sel.appendChild(o); });
+        sel.onchange = async () => { await fetch("/api/bugs/status", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({bug_id:b.id,status:sel.value})}); loadBugs(); };
+        el.append(title, meta, sel); box.appendChild(el);
+      });
+    } catch (e) { box.textContent = "读取 Bug 记录失败：" + e; }
+  }
+
+  async function workbenchCheck(url) {
+    const m = $("workbenchMsg"); m.textContent = "检查中…";
+    try { const j = await (await fetch(url)).json(); m.textContent = JSON.stringify(j, null, 2); m.className = "cfg-msg " + (j.ok ? "ok" : "error"); }
+    catch (e) { m.textContent = "检查失败：" + e; m.className = "cfg-msg error"; }
+  }
+  $("validateDataBtn").onclick = () => workbenchCheck("/api/validate_data");
+  $("releaseCheckBtn").onclick = () => workbenchCheck("/api/release_check");
+  $("gitInfoBtn").onclick = async () => { const first = document.querySelector("[data-verify]"); if (first) workbenchCheck("/api/region_git/" + encodeURIComponent(first.getAttribute("data-verify"))); else workbenchCheck("/api/regions"); };
+
+  async function rollbackChangeset(id) {
+    if (!confirm(`确认回滚变更集 ${id}？将对各分区生成撤销提交。`)) return;
+    try {
+      const r = await fetch("/api/rollback_changeset", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ changeset: id }),
+      });
+      const j = await r.json();
+      $("devMsg").className = "cfg-msg " + (j.ok ? "ok" : "error");
+      $("devMsg").textContent = j.ok ? `已回滚 ${id}` : ("回滚失败：" + (j.error || JSON.stringify(j.detail)));
+      loadRegions();
+    } catch (e) {
+      $("devMsg").className = "cfg-msg error";
+      $("devMsg").textContent = "回滚请求失败：" + e;
+    }
+  }
+
+  async function rebuildIndex() {
+    try {
+      const r = await fetch("/api/rebuild_index", { method: "POST" });
+      const j = await r.json();
+      $("devMsg").className = "cfg-msg " + (j.ok ? "ok" : "error");
+      $("devMsg").textContent = j.message || (j.ok ? "已重算索引" : "重算失败");
+    } catch (e) {
+      $("devMsg").className = "cfg-msg error";
+      $("devMsg").textContent = "重算请求失败：" + e;
+    }
+  }
 
   async function loadPending() {
     const card = $("pendingCard");
     const list = $("pendingList");
+    // 待确认编辑卡片为可选 UI：三个元素任一缺失（当前单页版本未渲染该卡片）
+    // 时直接返回，避免每次发送消息后都抛 TypeError（未处理的 Promise 拒绝）。
+    if (!card || !list || !$("pendingCount")) return;
     try {
       const r = await fetch("/api/pending_edits");
       const j = await r.json();
@@ -580,9 +1310,21 @@
         cs.innerHTML = `<span class="empty">未索引代码库。<br>索引后可问「某函数在哪实现」「伤害计算逻辑在哪」。</span>`;
       }
       status.textContent = stext;
+
+      // Ollama 离线/缺模型引导横幅：只要后端给出 guidance（不可达 或 缺模型）就提示
+      const banner = document.getElementById("ollamaBanner");
+      const guidance = document.getElementById("ollamaGuidance");
+      const os = c.ollama_status;
+      if (os && os.guidance) {
+        guidance.textContent = os.guidance;
+        banner.classList.remove("hidden");
+      } else {
+        banner.classList.add("hidden");
+      }
     } catch (e) {
       status.textContent = "读取配置失败：" + e;
     }
+    loadRegions();
     loadPending();
   }
 
@@ -618,7 +1360,99 @@
     }
   };
 
+  // ---------- 模型驻留（显存）开关：卸载释放显存 / 预加载，对话后模型会自动驻留 ----------
+  function escHtml(s) {
+    return String(s).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+  }
+  function fmtExpires(loaded) {
+    const mins = loaded.map((m) => m.expires_minutes).filter((v) => v !== null && v !== undefined);
+    if (!mins.length) return "常驻驻留";
+    const m = Math.min(...mins);
+    return m <= 0 ? "即将自动卸载" : m >= 60 ? `约 ${Math.round(m / 60)} 小时后自动卸载` : `约 ${m} 分钟后自动卸载`;
+  }
+
+  async function loadPowerStatus() {
+    const btn = $("powerBtn"), vrText = $("vrText"), vrDot = $("vrDot");
+    if (!btn) return;
+    let s;
+    try {
+      s = await (await fetch("/api/model_status")).json();
+    } catch (e) {
+      vrDot.classList.remove("on");
+      vrText.textContent = "显存驻留状态读取失败";
+      btn.style.display = "none";
+      return;
+    }
+    const loaded = s.loaded || [];
+    if (!s.reachable) {
+      vrDot.classList.remove("on");
+      vrText.textContent = s.needs_ollama
+        ? "Ollama 未运行，当前无本地模型驻留。"
+        : "云端/演示模式，不占用本机显存。";
+      btn.style.display = "none";
+      return;
+    }
+    if (!loaded.length) {
+      vrDot.classList.remove("on");
+      vrText.innerHTML = s.needs_ollama
+        ? "模型已卸载，<b>不占显存</b>。<br>发消息时自动加载（首次稍慢）。"
+        : "无模型驻留，不占显存。";
+      if (s.needs_ollama) {
+        btn.style.display = "";
+        btn.className = "btn power-on sm block";
+        btn.disabled = false;
+        btn.textContent = "⏻ 预加载模型";
+        btn.dataset.action = "on";
+        btn.title = "提前把模型加载进显存，避免下一条消息等待冷启动";
+      } else {
+        btn.style.display = "none";
+      }
+      return;
+    }
+    vrDot.classList.add("on");
+    const names = loaded.map((m) => escHtml(m.name)).join("、");
+    vrText.innerHTML = `驻留中：<b>${names}</b><br>显存 ${s.vram_gb} GB · ${fmtExpires(loaded)}`;
+    btn.style.display = "";
+    btn.className = "btn power-off sm block";
+    btn.disabled = false;
+    btn.textContent = `⏻ 卸载模型 · 释放约 ${s.vram_gb} GB`;
+    btn.dataset.action = "off";
+    btn.title = "立即从显存卸载模型；下次发消息时 Ollama 会自动重新加载";
+  }
+
+  $("powerBtn").onclick = async () => {
+    const btn = $("powerBtn");
+    const action = btn.dataset.action;
+    const old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = action === "off" ? "卸载中…" : "预加载中，冷启动可能需 1–2 分钟…";
+    try {
+      const r = await fetch("/api/model_power", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        status.textContent = action === "off"
+          ? `已卸载 ${(j.unloaded || []).join("、") || "模型"}，显存已释放；下次对话自动重载。`
+          : `模型 ${(j.preloaded || []).join("、")} 已预加载进显存，可以直接提问。`;
+      } else {
+        status.textContent = "模型开关操作失败：" + (j.error || "未知错误");
+      }
+    } catch (e) {
+      status.textContent = "模型开关请求失败：" + e.message;
+    } finally {
+      btn.textContent = old;
+      loadPowerStatus();
+    }
+  };
+
+  // 定时刷新 + 窗口重新可见时刷新（从游戏/其它窗口切回来能看到最新驻留状态）
+  setInterval(loadPowerStatus, 20000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) loadPowerStatus(); });
+
   loadConfig();
+  loadPowerStatus();
 </script>
 </body>
 </html>

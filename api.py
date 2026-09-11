@@ -7,15 +7,20 @@
 """
 import json
 import os
+import re
+import sys
+import time
 import urllib.request
 import urllib.error
 import uuid
+from datetime import datetime
 
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 
 from agent import Agent
 from config import (
@@ -23,12 +28,18 @@ from config import (
     LLM_PROVIDER,
     LLM_MODEL,
     EMBEDDING_PROVIDER,
+    EMBEDDING_MODEL,
     LLM_API_KEY,
     CODE_COLLECTION_NAME,
     CODE_ROOT,
     set_runtime,
     get_runtime,
     edit_confirm_enabled,
+    API_TOKEN,
+    DOCMIND_CORS_ORIGINS,
+    CHAT_IMAGE_MAX_FILES,
+    CHAT_IMAGE_MAX_BYTES,
+    CHAT_IMAGE_ALLOWED_TYPES,
 )
 from ingest import ingest_file, ingest_code_directory, load_project_rules
 from vectorstore import reset_collection, list_sources, count
@@ -39,13 +50,62 @@ from tools import (
     confirm_edit as apply_pending_edit,
     reject_edit as drop_pending_edit,
     clear_read_files,
+    dev_asset_get,
+    dev_asset_register,
+    dev_capture_bug,
+    dev_list_bugs,
+    dev_update_bug,
+    _run_region_cmd,
+)
+from regions import (
+    init_regions,
+    list_regions,
+    load_region_config,
+    verify_contracts,
+    rebuild_dev_index,
+    commit_all,
+    commit_region,
+    list_changesets,
+    rollback_changeset,
+    region_git_info,
+    propose_regions,
 )
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
+import workbench_fs
 from config import PROJECT_WEB_DIR
+from game_workbench import list_tasks, upsert_task, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status
 
 app = FastAPI(title="DocMind RAG Agent")
 agent = Agent()
+
+
+@app.middleware("http")
+async def optional_api_auth(request: Request, call_next):
+    """Enable bearer/token auth only when DOCMIND_API_TOKEN is configured."""
+    # 预检(OPTIONS)放行，交给 CORS 中间件处理，避免鉴权在 CORS 之前拦截导致浏览器跨域失败
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if API_TOKEN and request.url.path.startswith("/api/"):
+        supplied = request.headers.get("x-docmind-token", "")
+        auth = request.headers.get("authorization", "")
+        if supplied != API_TOKEN and auth != f"Bearer {API_TOKEN}":
+            return JSONResponse({"ok": False, "error": "需要有效的 DocMind API Token。"}, status_code=401)
+    return await call_next(request)
+
+
+# 外部接入：允许浏览器/前端跨域调用本服务（来源由 DOCMIND_CORS_ORIGINS 控制，默认 *）。
+# 必须在 optional_api_auth 之后注册——Starlette 中间件栈"后注册者在最外层"，
+# 这样 401 响应也会经过 CORS 中间件并带上 Access-Control-Allow-Origin，
+# 跨域网页端才能读到鉴权失败响应体（否则只能拿到不透明的网络错误）。
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=DOCMIND_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 已上传文档来源（basename 集合）。启动时从 chroma 已有元数据回填，
 # 用于：1) 上传新文档时清空多轮上下文避免污染；2) 聊天时给 LLM 上下文提示
@@ -53,6 +113,122 @@ agent = Agent()
 _INGESTED = set()
 for _s in list_sources():
     _INGESTED.add(os.path.basename(_s))
+
+
+def _project_root_or_error():
+    root = get_runtime("code_root") or CODE_ROOT
+    return root if root and os.path.isdir(root) else None
+
+
+class TaskReq(BaseModel):
+    id: str = ""
+    title: str
+    description: str = ""
+    region: str = ""
+    priority: str = "normal"
+    status: str = "open"
+    owner: str = ""
+    files: list = []
+
+
+@app.get("/api/tasks")
+async def tasks_ep(status: str = ""):
+    root = _project_root_or_error()
+    return {"ok": bool(root), "tasks": list_tasks(root, status) if root else [], "error": None if root else "未配置代码库"}
+
+
+@app.post("/api/tasks")
+async def task_upsert_ep(req: TaskReq):
+    root = _project_root_or_error()
+    if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
+    fields = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    return {"ok": True, "task": upsert_task(root, fields)}
+
+
+@app.get("/api/validate_data")
+async def validate_data_ep():
+    root = _project_root_or_error()
+    return validate_data(root) if root else {"ok": False, "error": "未配置代码库"}
+
+
+@app.get("/api/localization_check")
+async def localization_ep():
+    root = _project_root_or_error()
+    return localization_check(root) if root else {"ok": False, "error": "未配置代码库"}
+
+
+@app.get("/api/release_check")
+async def release_ep():
+    root = _project_root_or_error()
+    return release_check(root) if root else {"ok": False, "error": "未配置代码库"}
+
+
+class MemoryReq(BaseModel):
+    content: str = ""
+
+class CommandReq(BaseModel):
+    command: str = ""
+    timeout: int = 30
+class PreviewReq(BaseModel): path: str
+class PlaceholderReq(BaseModel): path: str; kind: str = "text"
+class ImpactReq(BaseModel): query: str
+class TestSceneReq(BaseModel): name: str; region: str = "behaviors"
+class ApprovalReq(BaseModel): action: str; user: str; approved: bool = False; target: str = ""; check: bool = False
+
+@app.get("/api/simulate_growth")
+async def simulate_ep(levels: int = 50, base: float = 100, growth: float = 1.08): return {"ok": True, "values": simulate_growth(levels,base,growth)}
+@app.get("/api/asset_dependencies")
+async def asset_deps_ep():
+    root=_project_root_or_error(); return {"ok":bool(root),"dependencies":asset_dependencies(root) if root else []}
+@app.post("/api/preview_resource")
+async def preview_ep(req: PreviewReq):
+    root=_project_root_or_error()
+    try: return {"ok":True,"resource":preview_resource(root,req.path)}
+    except Exception as e: return JSONResponse({"ok":False,"error":str(e)},status_code=400)
+@app.post("/api/create_placeholder")
+async def placeholder_ep(req: PlaceholderReq):
+    root=_project_root_or_error()
+    try: return {"ok":True,"resource":create_placeholder(root,req.path,req.kind)}
+    except Exception as e: return JSONResponse({"ok":False,"error":str(e)},status_code=400)
+@app.post("/api/impact")
+async def impact_ep(req: ImpactReq):
+    root=_project_root_or_error(); return {"ok":bool(root),"files":impact_analysis(root,req.query) if root else []}
+@app.post("/api/test_scene")
+async def test_scene_ep(req: TestSceneReq):
+    root=_project_root_or_error()
+    try:
+        paths = generate_test_scene(root, req.name, req.region)
+        return {"ok": True, "paths": paths, "path": paths[0] if paths else ""}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+@app.post("/api/playtest")
+async def playtest_ep(req: CommandReq):
+    root=_project_root_or_error(); return playtest(root,req.command,req.timeout) if root else {"ok":False,"error":"未配置代码库"}
+@app.post("/api/performance")
+async def performance_ep(req: CommandReq):
+    root=_project_root_or_error(); return performance_sample(root,req.command) if root else {"ok":False,"error":"未配置代码库"}
+@app.post("/api/approval")
+async def approval_ep(req: ApprovalReq):
+    root=_project_root_or_error()
+    if not root:
+        return {"ok":False,"error":"未配置代码库"}
+    # check 模式：仅查询是否已审批，不落记录
+    if req.check:
+        return {"ok":True, **approval_status(root, req.action, req.target)}
+    return {"ok":True, "approval": approval(root, req.action, req.user, req.approved, req.target)}
+
+
+@app.get("/api/memory")
+async def memory_get_ep():
+    root = _project_root_or_error()
+    return {"ok": bool(root), "content": project_memory(root) if root else ""}
+
+
+@app.put("/api/memory")
+async def memory_put_ep(req: MemoryReq):
+    root = _project_root_or_error()
+    if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
+    return {"ok": True, "content": project_memory(root, req.content)}
 
 
 @app.post("/api/ingest")
@@ -77,6 +253,9 @@ async def ingest_code(root: str = Form(...)):
     if not os.path.isdir(root):
         return JSONResponse({"ok": False, "error": f"目录不存在: {root}"}, status_code=400)
     try:
+        # 重新索引前先清空代码集合：本端点语义是"把该目录完整重建索引"，
+        # 不 reset 会导致同一切片被重复写入（实测 117 → 234 翻倍）。
+        reset_collection(CODE_COLLECTION_NAME)
         n = ingest_code_directory(root)
         abs_root = os.path.abspath(root)
         set_runtime("code_root", abs_root)
@@ -96,8 +275,89 @@ async def ingest_code(root: str = Form(...)):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
 
+def _read_chat_images(uploads):
+    """校验并读取聊天图片，返回 base64 字符串列表（ollama 原生多模态格式）。
+
+    校验：数量上限 / Content-Type 白名单 / 大小上限 / 文件头魔数与类型一致，
+    任何一项不通过直接抛 ValueError（端点转成 400 JSON，绝不带着坏数据进 SSE）。
+    """
+    import base64
+
+    uploads = [u for u in (uploads or []) if u is not None and u.filename]
+    if len(uploads) > CHAT_IMAGE_MAX_FILES:
+        raise ValueError(f"单条消息最多附带 {CHAT_IMAGE_MAX_FILES} 张图片。")
+
+    # Content-Type 缺失/不可信时按扩展名兜底
+    ext_mime = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".gif": "image/gif",
+    }
+    # 文件头魔数 -> 允许的 MIME（防止伪造 Content-Type 上传非图片）
+    magic_map = (
+        (b"\x89PNG", "image/png"),
+        (b"\xff\xd8", "image/jpeg"),
+        (b"GIF8", "image/gif"),
+    )
+    b64_list = []
+    for up in uploads:
+        mime = (up.content_type or "").lower()
+        if mime not in CHAT_IMAGE_ALLOWED_TYPES:
+            mime = ext_mime.get(os.path.splitext(up.filename)[1].lower(), "")
+        if mime not in CHAT_IMAGE_ALLOWED_TYPES:
+            raise ValueError(f"不支持的图片类型：{up.filename}（仅支持 PNG/JPEG/WebP/GIF）。")
+        raw = up.file.read()
+        if len(raw) > CHAT_IMAGE_MAX_BYTES:
+            raise ValueError(
+                f"图片 {up.filename} 超过 {CHAT_IMAGE_MAX_BYTES // 1024 // 1024}MB 上限。"
+            )
+        # RIFF....WEBP 单独判断（魔数不在头部连续位置）
+        real_mime = ""
+        for magic, m in magic_map:
+            if raw.startswith(magic):
+                real_mime = m
+                break
+        if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            real_mime = "image/webp"
+        if not real_mime:
+            raise ValueError(f"文件 {up.filename} 不是有效的图片（文件头校验失败）。")
+        if real_mime != mime:
+            # 声明类型与实际类型不符：以实际魔数为准，但只接受白名单内类型
+            if real_mime not in CHAT_IMAGE_ALLOWED_TYPES:
+                raise ValueError(f"文件 {up.filename} 类型不受支持。")
+        b64_list.append(base64.b64encode(raw).decode("ascii"))
+    return b64_list
+
+
 @app.post("/api/chat")
-async def chat(question: str = Form(...)):
+async def chat(
+    question: str = Form(""),
+    images: list[UploadFile] = File(default=None),
+):
+    question = (question or "").strip()
+    # 图片必须在进入 SSE 流之前完成读取与校验，错误才能以 400 JSON 返回给前端
+    try:
+        b64_images = _read_chat_images(images)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+    if not question:
+        # 纯图片消息：给一个通用分析指令，避免空 prompt
+        question = "请分析这张图片的内容。" if b64_images else ""
+    if not question:
+        return JSONResponse({"ok": False, "error": "问题不能为空。"}, status_code=400)
+
+    # 若当前 provider / 嵌入依赖 Ollama，但服务不可达，提前给出明确引导（避免进入 SSE 后才泛化报错）
+    _prov = get_runtime("llm_provider") or LLM_PROVIDER
+    _emb = get_runtime("embedding_provider") or EMBEDDING_PROVIDER
+    if _prov == "ollama" or _emb == "ollama":
+        try:
+            # check_ollama 内部是同步 urllib（最坏阻塞 8s），丢到线程池避免卡住事件循环
+            _ol = await run_in_threadpool(check_ollama)
+        except Exception:  # noqa: BLE001
+            _ol = None
+        if _ol is not None and not _ol["reachable"]:
+            return StreamingResponse(_ollama_down_stream(_ol["guidance"]), media_type="text/event-stream")
+
     # 给 LLM 一个上下文提示：列出知识库里已有哪些文档，让它知道"里面/这个文档"指什么
     code_root = get_runtime("code_root") or CODE_ROOT
     hints = []
@@ -118,21 +378,95 @@ async def chat(question: str = Form(...)):
 
     def event_stream():
         try:
-            for ev in agent.run(grounded, stream=True):
+            for ev in agent.run(grounded, stream=True, images=b64_images or None):
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as e:
             # LLM 崩溃 / Ollama CUDA 错 / 网络中断等：给前端一个明确的错误 final，不要让前端把检索原文当答案。
             err_msg = f"{type(e).__name__}: {e}"
             print(f"[chat] agent.run failed: {err_msg}", flush=True)
+            try:
+                dev_capture_bug(f"title: Agent 对话异常\nerror: {err_msg}\ntraceback: {__import__('traceback').format_exc()}")
+            except Exception:
+                pass
             yield f"data: {json.dumps({'type':'final','text':f'模型无响应：{err_msg[:300]}。请到「⚙ 模型设置」换一个能加载的模型再试。'}, ensure_ascii=False)}\n\n"
         yield "data: {\"type\":\"done\"}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+class EnhancePromptReq(BaseModel):
+    prompt: str
+
+
+def _local_enhance(draft: str) -> str:
+    """无可用模型时的确定性兜底：在草稿后追加结构化检索与输出约束。"""
+    return (
+        f"{draft}\n\n"
+        "（本地增强：请基于本地代码库检索后回答——优先用 search_code / read_file / grep 定位相关实现并引用"
+        "文件与行号；若涉及报错先定位来源再给修复；输出分点、关键处附代码片段或路径。）"
+    )
+
+
+@app.post("/api/enhance_prompt")
+async def enhance_prompt_ep(req: EnhancePromptReq):
+    """增强提示词：把用户草稿重写成更清晰、更利于 Agent 检索回答的提示词。
+    优先用已配置的 LLM 重写；未配置可用模型或调用失败时，降级为本地规则增强（仍可用）。"""
+    draft = (req.prompt or "").strip()
+    if not draft:
+        return JSONResponse({"ok": False, "error": "请输入要增强的提示词。"}, status_code=400)
+
+    provider = get_runtime("llm_provider") or LLM_PROVIDER
+    usable = provider != "mock"
+    envk = PROVIDERS.get(provider, {}).get("api_key_env", "")
+    if usable and envk:
+        key = get_runtime("llm_api_key") or LLM_API_KEY or os.getenv(envk, "")
+        usable = bool(key)
+
+    note = ""
+    if usable:
+        try:
+            sys_p = (
+                "你是提示词优化助手。用户会给你一段针对「本地代码库 RAG 问答 Agent」的原始提问草稿。"
+                "请把这段草稿改写为一条更清晰、更具体、更利于 Agent 检索与回答的提示词。要求：\n"
+                "1. 保留用户原意，不要臆造代码库里不存在的文件/函数/路径。\n"
+                "2. 明确意图（定位代码 / 解释逻辑 / 诊断报错 / 总结 / 对比 等）。\n"
+                "3. 补充约束：涉及的语言、模块、文件类型，以及期望输出形式（代码片段 / 步骤 / 表格）。\n"
+                "4. 若草稿过短或含糊，可合理补全上下文，但用「(推测)」标注补全部分。\n"
+                "5. 只输出改写后的提示词本身，不要解释、不要任何前缀或引号包裹。"
+            )
+            enhanced = LLMClient().chat([
+                {"role": "system", "content": sys_p},
+                {"role": "user", "content": "原始草稿：\n" + draft},
+            ], stream=False)
+            enhanced = (enhanced or "").strip()
+            if enhanced:
+                return {"ok": True, "mode": "llm", "enhanced": enhanced}
+        except Exception as e:
+            note = f"LLM 重写失败（{type(e).__name__}: {str(e)[:160]}），已改用本地规则增强。"
+    else:
+        note = "未检测到可用模型（mock 模式或未配置 API Key），已用本地规则增强；在 ⚙ 模型设置 配置模型后可获得 LLM 重写。"
+
+    return {"ok": True, "mode": "local", "enhanced": _local_enhance(draft), "note": note}
+
+
 @app.get("/")
 async def index():
     return FileResponse(os.path.join(PROJECT_WEB_DIR, "index.html"))
+
+
+@app.get("/workbench")
+async def workbench():
+    """开发工作台页（Vite 多页构建产物 web/workbench.html，由 frontend/ 工程构建）。
+
+    源码态若尚未执行 npm run build，返回明确提示而不是 500。
+    """
+    page = os.path.join(PROJECT_WEB_DIR, "workbench.html")
+    if not os.path.isfile(page):
+        return JSONResponse(
+            {"ok": False, "error": "工作台前端未构建：请先在 frontend/ 目录执行 npm install && npm run build。"},
+            status_code=404,
+        )
+    return FileResponse(page)
 
 
 class ConfigReq(BaseModel):
@@ -141,6 +475,21 @@ class ConfigReq(BaseModel):
     model: str = ""
     embedding_provider: str = ""
     edit_confirm: Optional[bool] = None
+
+
+def _build_time() -> str:
+    """返回当前运行二进制（exe）的构建时间，用于核对线上运行的是哪次构建产物。
+
+    打包后的 onedir 中 sys.executable 即 dist/DocMind/DocMind.exe，其修改时间 == 构建时间；
+    未打包（源码直接跑）时返回 "dev"。
+    """
+    try:
+        if getattr(sys, "frozen", False) and os.path.exists(sys.executable):
+            t = os.path.getmtime(sys.executable)
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+    except Exception:
+        pass
+    return "dev"
 
 
 @app.get("/api/config")
@@ -161,20 +510,27 @@ async def get_config():
         "embedding_provider": emb,
         "has_key": has_key,
         "providers": list(PROVIDERS.keys()),
-        "embedding_options": ["local", "qwen"],
+        "embedding_options": ["local", "ollama", "qwen"],
         "ingested_files": sorted(_INGESTED),
         "code_root": get_runtime("code_root") or CODE_ROOT,
         "code_sources": count(CODE_COLLECTION_NAME),
         "project_rules_loaded": bool(get_runtime("project_rules")),
         "edit_confirm": edit_confirm_enabled(),
+        "build_time": _build_time(),
+        # 同步 urllib 探活放线程池，Ollama 不可达时不阻塞事件循环/拖慢面板打开
+        "ollama_status": await run_in_threadpool(check_ollama),
     }
 
 
 OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://127.0.0.1:11434")
 
 
-def _check_ollama_model(model: str, timeout: float = 12.0):
-    """探活：让目标模型做一次极短推理（no-stream）。失败返回 (False, 错误信息)。"""
+def _check_ollama_model(model: str, timeout: float = 60.0):
+    """探活：让目标模型做一次极短推理（no-stream）。失败返回 (False, 错误信息)。
+
+    超时给 60s：首次切换到大参数模型时 Ollama 需要把模型冷加载进显存（远超 12s），
+    旧的 12s 会把健康模型误判为不可切换。
+    """
     payload = json.dumps({"model": model, "prompt": "hi", "stream": False}).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/generate", data=payload,
@@ -200,6 +556,283 @@ def _check_ollama_model(model: str, timeout: float = 12.0):
         return False, f"探活失败：{type(e).__name__}: {e}"
 
 
+def _ollama_name_variants(name: str):
+    """Ollama 模型名归一化：无 tag 时默认 tag 是 latest。
+
+    /api/tags 返回的是 'bge-m3:latest' 这种带 tag 的名字，而配置里常写 'bge-m3'，
+    直接精确比较会把已安装模型误判为缺失。这里对两边都展开成 {原名, latest 补全名} 集合。
+    """
+    name = (name or "").strip()
+    if not name:
+        return set()
+    out = {name}
+    tail = name.rsplit("/", 1)[-1]
+    if ":" not in tail:
+        out.add(name + ":latest")
+    if name.endswith(":latest"):
+        out.add(name[: -len(":latest")])
+    return out
+
+
+def check_ollama():
+    """探测本机 Ollama 服务可达性、所需模型是否已拉取，并返回用户引导文案。
+
+    设计：即使 Ollama 不可用也绝不抛异常，返回一个结构化状态字典，
+    让前端/启动器/聊天接口都能据此给出明确引导，而不是静默失败。
+    仅当当前配置确实依赖 Ollama（needed_models 非空）时才生成引导文案，
+    避免骚扰使用 mock/local/qwen 等不依赖本机 Ollama 的用户。
+    """
+    base = OLLAMA_BASE
+    prov = get_runtime("llm_provider") or LLM_PROVIDER
+    emb = get_runtime("embedding_provider") or EMBEDDING_PROVIDER
+    llm_model = (get_runtime("llm_model") or LLM_MODEL
+                 or PROVIDERS.get(prov, {}).get("default_model", ""))
+    emb_model = EMBEDDING_MODEL
+    needed = []
+    if prov == "ollama":
+        needed.append(llm_model)
+    if emb == "ollama":
+        needed.append(emb_model)
+    needed = [m for m in needed if m]
+
+    reachable = False
+    present = []
+    try:
+        with urllib.request.urlopen(f"{base}/api/tags", timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        reachable = True
+        present = [m.get("name") for m in data.get("models", []) if isinstance(m, dict)]
+    except Exception:  # noqa: BLE001
+        reachable = False
+
+    if reachable:
+        present_variants = set()
+        for p in present:
+            present_variants |= _ollama_name_variants(p)
+        missing = [m for m in needed if not (_ollama_name_variants(m) & present_variants)]
+    else:
+        missing = list(needed)
+
+    guidance = ""
+    if needed and not reachable:
+        pull_lines = "\n".join(f"     ollama pull {m}" for m in needed)
+        guidance = (
+            "未检测到 Ollama 服务（{base} 无响应），而当前模型配置依赖本机 Ollama。\n"
+            "解决步骤：\n"
+            "  1) 安装 Ollama：https://ollama.com/download\n"
+            "  2) 启动后在终端拉取模型：\n"
+            "{pull_lines}\n"
+            "  3) 若 Ollama 运行在其它地址，设置环境变量 OLLAMA_BASE=http://<host>:11434 后重启。\n"
+            "也可在「⚙ 模型设置」改用 qwen / deepseek（需 API Key），"
+            "或把 embedding_provider 设为 local（仅离线占位向量，非语义检索）。"
+        ).format(base=base, pull_lines=pull_lines)
+    elif missing:
+        guidance = (
+            "Ollama 已运行，但缺少所需模型：" + "、".join(missing) +
+            "。请执行：\n  ollama pull " + "\n  ollama pull ".join(missing)
+        )
+    return {
+        "reachable": reachable,
+        "base": base,
+        "provider": prov,
+        "embedding_provider": emb,
+        "needed_models": needed,
+        "present_models": present,
+        "missing_models": missing,
+        "guidance": guidance,
+    }
+
+
+def _ollama_down_stream(guidance: str):
+    """Ollama 不可达时，给聊天接口返回一个清晰的引导 final（而非进入 SSE 后才报错）。"""
+    msg = "⚠️ 本机 Ollama 服务未运行或不可达，无法调用本地模型。\n\n" + (guidance or "")
+    yield f"data: {json.dumps({'type': 'final', 'text': msg}, ensure_ascii=False)}\n\n"
+    yield "data: {\"type\":\"done\"}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# 模型驻留（显存占用）开关：查询 /api/ps，用 keep_alive=0 立即卸载、keep_alive
+# 预加载。本地大模型（如 22GB 的 qwen3.6:35b）默认会长时间驻留显存，不聊天时
+# 也占着 GPU，玩游戏/跑别的 GPU 任务前可一键卸载；下次对话 Ollama 会自动重载。
+# ---------------------------------------------------------------------------
+def _ollama_ps(timeout: float = 8.0):
+    """调用 Ollama /api/ps 列出当前驻留的模型；服务不可达时抛异常。"""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(f"{OLLAMA_BASE}/api/ps", timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    return data.get("models") or []
+
+
+def _ollama_http_post(path: str, payload: dict, timeout: float):
+    """POST JSON 到 Ollama；HTTP 4xx/5xx 时把响应体里的 error 文本带回来。"""
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        OLLAMA_BASE + path, data=data, headers={"Content-Type": "application/json"},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read().decode("utf-8", "replace")).get("error", "")
+        except Exception:  # noqa: BLE001
+            pass
+        return False, detail or f"HTTP {e.code}", e.code
+    if isinstance(body, dict) and body.get("error"):
+        return False, str(body["error"]), 200
+    return True, "", 200
+
+
+def _ollama_keep_alive(model: str, keep_alive, timeout: float = 600.0):
+    """控制模型驻留：keep_alive=0 立即卸载；如 "30m" 则预加载并驻留。
+
+    - 生成型模型：/api/generate 只带 model + keep_alive、不带 prompt，仅改驻留不推理
+      （卸载响应 done_reason="unload"）；
+    - 嵌入型模型（bge-m3 等）：不支持 generate（400 "does not support generate"），
+      改走 /api/embeddings，用一次极小的嵌入计算完成加载/卸载。
+    冷加载 22GB 模型可能要 1-2 分钟，超时给到 600s。
+    """
+    ok, err, code = _ollama_http_post(
+        "/api/generate",
+        {"model": model, "keep_alive": keep_alive, "stream": False},
+        timeout,
+    )
+    if ok:
+        return True, ""
+    if code == 400 and "does not support generate" in err:
+        ok2, err2, _ = _ollama_http_post(
+            "/api/embeddings",
+            {"model": model, "prompt": ".", "keep_alive": keep_alive},
+            timeout,
+        )
+        return ok2, err2
+    return False, err
+
+
+def _ollama_expires_minutes(expires_at: str):
+    """把 /api/ps 的 expires_at（带纳秒的 ISO 时间）换算成"还有多少分钟到期"。"""
+    if not expires_at:
+        return None
+    try:
+        m = re.match(r"^(.*\.\d{1,6})\d*(.*)$", expires_at)  # 纳秒截到微秒，fromisoformat 才认
+        dt = datetime.fromisoformat((m.group(1) + m.group(2)) if m else expires_at)
+        return max(0, int((dt - datetime.now(dt.tzinfo)).total_seconds() // 60))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _format_ps_model(m: dict) -> dict:
+    """规整 /api/ps 单条模型信息给前端展示。"""
+    size_vram = int(m.get("size_vram") or 0)
+    size = int(m.get("size") or 0)
+    return {
+        "name": m.get("name") or m.get("model") or "",
+        "size_vram_gb": round(size_vram / 1024 ** 3, 2),
+        "size_gb": round(size / 1024 ** 3, 2),
+        "expires_minutes": _ollama_expires_minutes(m.get("expires_at") or ""),
+        "processor": m.get("processor") or "",
+    }
+
+
+def _ollama_needed_models():
+    """当前 DocMind 配置实际会用到的 Ollama 模型（LLM + 检索向量），用于预加载。"""
+    prov = get_runtime("llm_provider") or LLM_PROVIDER
+    emb = get_runtime("embedding_provider") or EMBEDDING_PROVIDER
+    out = []
+    if prov == "ollama":
+        out.append(get_runtime("llm_model") or LLM_MODEL or PROVIDERS["ollama"]["default_model"])
+    if emb == "ollama":
+        out.append(EMBEDDING_MODEL or "bge-m3")
+    # 去重保序（LLM 与 embedding 理论上不会同名，稳妥起见）
+    seen, uniq = set(), []
+    for n in out:
+        if n and n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return uniq
+
+
+class ModelPowerReq(BaseModel):
+    action: str = "off"  # off=立即卸载所有驻留模型释放显存；on=预加载当前配置所需模型
+
+
+@app.get("/api/model_status")
+async def model_status_ep():
+    """查询 Ollama 当前驻留模型与显存占用，供前端"模型开关"展示。"""
+    prov = get_runtime("llm_provider") or LLM_PROVIDER
+    emb = get_runtime("embedding_provider") or EMBEDDING_PROVIDER
+    try:
+        models = await run_in_threadpool(_ollama_ps)
+    except Exception as e:  # noqa: BLE001
+        return {
+            "reachable": False, "loaded": [], "vram_gb": 0,
+            "needs_ollama": prov == "ollama" or emb == "ollama",
+            "error": f"{type(e).__name__}: {e}",
+        }
+    loaded = [_format_ps_model(m) for m in models]
+    return {
+        "reachable": True,
+        "loaded": loaded,
+        "vram_gb": round(sum(m["size_vram_gb"] for m in loaded), 2),
+        "needs_ollama": prov == "ollama" or emb == "ollama",
+        "needed_models": _ollama_needed_models(),
+    }
+
+
+@app.post("/api/model_power")
+async def model_power_ep(req: ModelPowerReq):
+    """模型开关：off 卸载全部驻留模型（释放显存，下次对话自动重载）；on 预加载。"""
+    if req.action not in ("off", "on"):
+        return JSONResponse({"ok": False, "error": f"未知 action: {req.action}"}, status_code=400)
+    try:
+        if req.action == "off":
+            # 卸载当前所有驻留模型（一台单机一个 Ollama，DocMind 是主要使用方；
+            # 只动 /api/ps 里实际驻留的，不会影响未加载的模型）
+            resident = await run_in_threadpool(_ollama_ps)
+            names = [m.get("name") or m.get("model") for m in resident]
+            unloaded, errors = [], []
+            for name in [n for n in names if n]:
+                ok, err = await run_in_threadpool(_ollama_keep_alive, name, 0)
+                (unloaded if ok else errors).append(name if ok else f"{name}（{err}）")
+            result = {"ok": not errors, "action": "off", "unloaded": unloaded}
+            if errors:
+                result["error"] = "部分模型卸载失败：" + "、".join(errors)
+            # keep_alive=0 后大模型 runner 释放显存需要几秒（/api/ps 会短暂显示
+            # Stopping...），轮询等待最多 15s，让前端拿到的就是"已清空"的终态
+            if unloaded:
+                deadline = time.time() + 15
+                while time.time() < deadline:
+                    still = await run_in_threadpool(_ollama_ps)
+                    if not still:
+                        break
+                    await run_in_threadpool(time.sleep, 1)
+        else:
+            wanted = _ollama_needed_models()
+            if not wanted:
+                return {
+                    "ok": False,
+                    "error": "当前 Provider 不是 Ollama（云端/演示模型不占本机显存），无需预加载。",
+                }
+            loaded, errors = [], []
+            for name in wanted:
+                ok, err = await run_in_threadpool(_ollama_keep_alive, name, "30m")
+                (loaded if ok else errors).append(name if ok else f"{name}（{err}）")
+            result = {"ok": not errors, "action": "on", "preloaded": loaded}
+            if errors:
+                result["error"] = "部分模型预加载失败：" + "、".join(errors)
+        # 回读最新驻留状态，前端直接渲染
+        models = await run_in_threadpool(_ollama_ps)
+        result["loaded"] = [_format_ps_model(m) for m in models]
+        result["vram_gb"] = round(sum(m["size_vram_gb"] for m in result["loaded"]), 2)
+        return result
+    except urllib.error.URLError as e:
+        return JSONResponse({"ok": False, "error": f"无法连接 Ollama：{e.reason}"}, status_code=400)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
 @app.post("/api/config")
 async def set_config(req: ConfigReq):
     """页面内切换模型：更新运行时覆盖、重建 Agent 的 LLM 客户端，即时生效。"""
@@ -209,7 +842,8 @@ async def set_config(req: ConfigReq):
     # 切到 Ollama 时先做模型健康检查：避免选了一个加载不起来的模型后页面卡死、显示原始检索内容
     target_model = req.model or PROVIDERS[req.provider]["default_model"]
     if req.provider == "ollama" and target_model:
-        ok, err = _check_ollama_model(target_model)
+        # 真实推理探活最坏等待模型冷加载（60s），必须在线程池执行
+        ok, err = await run_in_threadpool(_check_ollama_model, target_model)
         if not ok:
             return {
                 "ok": False,
@@ -282,6 +916,315 @@ async def pending_edits():
     return {"pending": list_pending_edits(), "edit_confirm": edit_confirm_enabled()}
 
 
+# ---------------------------------------------------------------------------
+# 分区开发（Region-based Development）：一键初始化分工区域 + 查询分区状态。
+# init_regions 建目录 / 每区 git init / 写 DEV_INDEX.md 与 DOCMIND_RULES.md；
+# 完成后把分区契约重新注入 Agent 系统提示，让 Agent 自动守约。
+# ---------------------------------------------------------------------------
+@app.post("/api/init_regions")
+async def init_regions_ep():
+    ok, msg = init_regions()
+    if not ok:
+        return JSONResponse({"ok": False, "error": msg}, status_code=400)
+    # 把分区契约（DOCMIND_RULES.md）重新注入运行时，使 Agent 立即按分区约束工作
+    root = get_runtime("code_root") or CODE_ROOT
+    if root:
+        rules = load_project_rules(os.path.abspath(root))
+        set_runtime("project_rules", rules)
+    return {"ok": True, "message": msg, "regions": list_regions()}
+
+
+@app.get("/api/regions")
+async def regions_ep():
+    root = get_runtime("code_root") or CODE_ROOT
+    return {"code_root": root, "regions": list_regions()}
+
+
+@app.get("/api/health")
+async def health_ep():
+    """轻量健康检查：返回 Ollama 可达性/模型就绪状态与引导文案。
+
+    供启动器、外部探针及前端配置面板按需查询（同步 urllib 探活放线程池执行）。
+    """
+    return await run_in_threadpool(check_ollama)
+
+
+@app.get("/api/region_git/{region}")
+async def region_git_ep(region: str):
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root: return JSONResponse({"ok": False, "error": "未配置代码库根目录。"}, status_code=400)
+    ok, data = region_git_info(root, region)
+    return {"ok": ok, **data}
+
+
+# ---------------------------------------------------------------------------
+# Agent 研判分区接口：propose（扫描代码库给建议）/ apply（落地自定义方案）/ add（增补单分区）。
+# 默认 8 个分区仅作初始建议，真实分区由 Agent 依据代码库判断后应用。
+# ---------------------------------------------------------------------------
+class ApplyRegionsReq(BaseModel):
+    regions: list
+
+
+class AddRegionReq(BaseModel):
+    key: str
+    dir: str = ""
+    name: str = ""
+    desc: str = ""
+    access: str = ""
+    depends_on: list = []
+    exports: list = []
+
+
+@app.post("/api/propose_regions")
+async def propose_regions_ep():
+    """依据真实代码库结构研判分区方案（默认 8 区仅作初始建议）。"""
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库根目录。"}, status_code=400)
+    res = propose_regions(root)
+    if not res.get("ok"):
+        return JSONResponse({"ok": False, "error": res.get("error", "研判失败")}, status_code=400)
+    return {"ok": True, **res}
+
+
+@app.post("/api/apply_regions")
+async def apply_regions_ep(req: ApplyRegionsReq):
+    """应用 Agent 研判后的自定义分区方案：写入 regions.json 并初始化（建目录/每区 git/规则）。"""
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库根目录。"}, status_code=400)
+    ok, msg = init_regions(root, req.regions)
+    if not ok:
+        if isinstance(msg, dict) and msg.get("blocked"):
+            return JSONResponse({"ok": False, **msg}, status_code=403)
+        return JSONResponse({"ok": False, "error": msg}, status_code=400)
+    # 把新分区契约（DOCMIND_RULES.md）重新注入运行时，使 Agent 立即按新分区约束工作
+    rules = load_project_rules(os.path.abspath(root)) if root else ""
+    set_runtime("project_rules", rules)
+    return {"ok": True, "message": msg, "regions": list_regions()}
+
+
+@app.post("/api/add_region")
+async def add_region_ep(req: AddRegionReq):
+    """向现有分区配置追加（或覆盖同名）一个分区，并立即初始化。"""
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库根目录。"}, status_code=400)
+    cur = load_region_config(root)
+    new_r = {
+        "key": req.key,
+        "dir": (req.dir or req.key).strip("/\\").replace("\\", "/"),
+        "name": req.name or req.key,
+        "desc": req.desc,
+        "access": req.access,
+        "depends_on": req.depends_on or [],
+        "exports": req.exports or [],
+        "verify": "",
+    }
+    cur = [r for r in cur if (r.get("key") or "") != req.key]
+    cur.append(new_r)
+    ok, msg = init_regions(root, cur)
+    if not ok:
+        if isinstance(msg, dict) and msg.get("blocked"):
+            return JSONResponse({"ok": False, **msg}, status_code=403)
+        return JSONResponse({"ok": False, "error": msg}, status_code=400)
+    rules = load_project_rules(os.path.abspath(root)) if root else ""
+    set_runtime("project_rules", rules)
+    return {"ok": True, "message": msg, "regions": list_regions()}
+
+
+# ---------------------------------------------------------------------------
+# 分区开发 2.0 接口：契约校验 / 索引重算 / 单区校验 / 跨区提交 / 变更集查询与回滚。
+# 这些接口把 tools.py 里的 dev_* 能力以 HTTP 暴露给前端工作台，无需走 Agent。
+# ---------------------------------------------------------------------------
+@app.get("/api/verify_contracts")
+async def verify_contracts_ep():
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库根目录。"}, status_code=400)
+    r = verify_contracts(root)
+    return {"ok": r["ok"], "errors": r["errors"], "graph": r["graph"]}
+
+
+@app.post("/api/rebuild_index")
+async def rebuild_index_ep():
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库根目录。"}, status_code=400)
+    ok, msg = rebuild_dev_index(root)
+    return {"ok": ok, "message": msg}
+
+
+class RegionReq(BaseModel):
+    region: str
+
+
+class RegionCommitReq(BaseModel):
+    region: str
+    message: str = "docmind: update"
+
+
+class AssetReq(BaseModel):
+    asset_id: str = ""
+    path: str = ""
+    consumer_region: str = ""
+    type: str = ""
+    license: str = ""
+    tags: str = ""
+
+
+class BugReq(BaseModel):
+    error: str = ""
+    exception: str = ""
+    traceback: str = ""
+    source_region: str = ""
+    reproduction: str = ""
+    severity: str = "error"
+    title: str = ""
+
+
+class BugStatusReq(BaseModel):
+    bug_id: str
+    status: str
+
+
+@app.post("/api/dev_asset_get")
+async def dev_asset_get_ep(req: AssetReq):
+    fields = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    payload = "\n".join(f"{k}: {v}" for k, v in fields.items() if v)
+    result = dev_asset_get(payload)
+    try:
+        data = json.loads(result)
+        return data if isinstance(data, dict) else {"ok": False, "error": result}
+    except Exception:
+        return JSONResponse({"ok": False, "error": result}, status_code=400)
+
+
+@app.post("/api/dev_asset_register")
+async def dev_asset_register_ep(req: AssetReq):
+    fields = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    payload = "\n".join(f"{k}: {v}" for k, v in fields.items() if v)
+    result = dev_asset_register(payload)
+    try: return json.loads(result)
+    except Exception: return JSONResponse({"ok": False, "error": result}, status_code=400)
+
+
+@app.post("/api/dev_capture_bug")
+async def dev_capture_bug_ep(req: BugReq):
+    fields = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    payload = "\n".join(f"{k}: {v}" for k, v in fields.items() if v)
+    result = dev_capture_bug(payload)
+    try:
+        data = json.loads(result)
+        return data if isinstance(data, dict) else {"ok": False, "error": result}
+    except Exception:
+        return JSONResponse({"ok": False, "error": result}, status_code=400)
+
+
+@app.get("/api/bugs")
+async def bugs_ep(status: str = "", source_region: str = ""):
+    result = dev_list_bugs("")
+    try:
+        data = json.loads(result)
+        bugs = data.get("bugs", [])
+        if status: bugs = [b for b in bugs if b.get("status") == status]
+        if source_region: bugs = [b for b in bugs if b.get("source_region") == source_region]
+        data["bugs"] = bugs
+        return data
+    except Exception:
+        return {"ok": False, "bugs": [], "error": result}
+
+
+@app.post("/api/bugs/status")
+async def bug_status_ep(req: BugStatusReq):
+    result = dev_update_bug(f"bug_id: {req.bug_id}\nstatus: {req.status}")
+    try: return json.loads(result)
+    except Exception: return JSONResponse({"ok": False, "error": result}, status_code=400)
+
+
+@app.post("/api/region_verify")
+async def region_verify_ep(req: RegionReq):
+    """校验单个分区：执行其 verify 命令，或检查导出接口是否齐全。"""
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库根目录。"}, status_code=400)
+    from regions import get_region_map, run_verify
+    rmap = get_region_map(root)
+    if req.region not in rmap:
+        return JSONResponse({"ok": False, "error": f"未知分区：{req.region}"}, status_code=400)
+    region_abs = os.path.join(root, rmap[req.region]["dir"])
+    verify_cmd = (rmap[req.region].get("verify") or "").strip()
+    if verify_cmd:
+        ok, output = run_verify(region_abs, verify_cmd)
+        if ok is not None or output is not None:
+            return {"ok": ok, "verified_by": "builtin", "command": verify_cmd, "output": output[:2000]}
+        output = _run_region_cmd(region_abs, verify_cmd)
+        ok = "[exit code 0]" in output
+        return {"ok": ok, "verified_by": "command", "command": verify_cmd, "output": output[:2000]}
+    exports = rmap[req.region].get("exports") or []
+    if not exports:
+        return {"ok": True, "verified_by": "none", "output": "未配置 verify 命令，也无导出接口，跳过。"}
+    miss = [ex for ex in exports if not os.path.isfile(os.path.join(region_abs, ex))]
+    if miss:
+        return {"ok": False, "verified_by": "exports", "output": f"导出接口缺失：{', '.join(miss)}"}
+    return {"ok": True, "verified_by": "exports", "output": f"导出接口齐全：{', '.join(exports)}"}
+
+
+class CommitAllReq(BaseModel):
+    message: str = "docmind: update"
+
+
+@app.post("/api/commit_all")
+async def commit_all_ep(req: CommitAllReq):
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库根目录。"}, status_code=400)
+    ok, info = commit_all(root, req.message)
+    if isinstance(info, dict) and info.get("blocked"):
+        return JSONResponse({"ok": False, **info}, status_code=403)
+    payload = {"ok": ok, "id": info.get("id"), "commits": info.get("commits", {})}
+    if info.get("message"):
+        payload["message"] = info["message"]
+    if info.get("errors"):
+        payload["errors"] = info["errors"]
+    return payload
+
+
+class RollbackReq(BaseModel):
+    changeset: str
+
+
+@app.post("/api/rollback_changeset")
+async def rollback_changeset_ep(req: RollbackReq):
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库根目录。"}, status_code=400)
+    ok, detail = rollback_changeset(root, req.changeset)
+    if isinstance(detail, dict) and detail.get("blocked"):
+        return JSONResponse({"ok": False, **detail}, status_code=403)
+    return {"ok": ok, "detail": detail}
+
+
+@app.get("/api/changesets")
+async def changesets_ep():
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return {"changesets": []}
+    return {"changesets": list_changesets(root)}
+
+
+@app.post("/api/dev_commit")
+async def dev_commit_ep(req: RegionCommitReq):
+    """提交单个分区的改动（该分区独立 git 仓库内 commit）。"""
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库根目录。"}, status_code=400)
+    ok, out = commit_region(root, req.region, req.message)
+    if isinstance(out, dict) and out.get("blocked"):
+        return JSONResponse({"ok": False, **out}, status_code=403)
+    return {"ok": ok, "region": req.region, "output": out}
+
+
 class PendingId(BaseModel):
     id: str
 
@@ -298,4 +1241,13 @@ async def reject_edit(req: PendingId):
     return {"ok": removed, "message": "已拒绝并丢弃该修改。" if removed else f"未找到待确认修改 #{req.id}。"}
 
 
+# 开发工作台文件系统接口（P0）：/api/fs/tree|file|save|create|rename|delete|gitlog
+app.include_router(workbench_fs.router)
+
 app.mount("/static", StaticFiles(directory=PROJECT_WEB_DIR), name="static")
+
+# Vite 构建产物（web/assets/*，workbench.html 以 /assets/... 绝对路径引用）。
+# 未执行前端构建时该目录不存在，跳过挂载以免源码态启动崩溃。
+_ASSETS_DIR = os.path.join(PROJECT_WEB_DIR, "assets")
+if os.path.isdir(_ASSETS_DIR):
+    app.mount("/assets", StaticFiles(directory=_ASSETS_DIR), name="assets")

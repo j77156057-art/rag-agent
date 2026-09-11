@@ -54,6 +54,19 @@ def reset_collection(name=COLLECTION_NAME):
     return get_collection(name)
 
 
+def delete_by_source(source, collection=COLLECTION_NAME):
+    """删除某来源文件的全部切片（元数据 source 精确匹配）。
+
+    用于工作台手动保存/改名/删除后的增量索引维护；返回是否无异常。
+    """
+    try:
+        col = get_collection(collection)
+        col.delete(where={"source": source})
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def list_sources(collection=COLLECTION_NAME):
     """返回集合中已入库文档的来源（去重、排序，剥 uuid 前缀），供 UI 展示与上下文感知。"""
     try:
