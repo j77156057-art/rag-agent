@@ -60,6 +60,8 @@ from tools import (
 )
 from regions import (
     init_regions,
+    scaffold_region,
+    fill_region_exports,
     list_regions,
     load_region_config,
     verify_contracts,
@@ -1052,6 +1054,34 @@ async def init_regions_ep():
 async def regions_ep():
     root = get_runtime("code_root") or CODE_ROOT
     return {"code_root": root, "regions": list_regions()}
+
+
+class CreateRegionReq(BaseModel):
+    key: str
+
+
+@app.post("/api/regions/create")
+async def create_region_ep(req: CreateRegionReq):
+    """分区可视化一键创建：为缺失分区补建目录 + 声明的导出接口桩/README。"""
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库根目录。"}, status_code=400)
+    ok, detail = scaffold_region(root, req.key.strip())
+    if not ok:
+        return JSONResponse({"ok": False, "error": detail}, status_code=400)
+    return {"ok": True, **detail, "regions": list_regions()}
+
+
+@app.post("/api/regions/fill_exports")
+async def fill_exports_ep(req: CreateRegionReq):
+    """分区可视化补齐导出桩：为已存在但缺导出文件的分区生成缺失桩文件。"""
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库根目录。"}, status_code=400)
+    ok, detail = fill_region_exports(root, req.key.strip())
+    if not ok:
+        return JSONResponse({"ok": False, "error": detail}, status_code=400)
+    return {"ok": True, **detail, "regions": list_regions()}
 
 
 @app.get("/api/health")

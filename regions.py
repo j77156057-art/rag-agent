@@ -406,6 +406,139 @@ def init_regions(root=None, regions_list=None):
     )
 
 
+def scaffold_region(root, key):
+    """为单个缺失分区补建目录与声明的导出接口桩（+README）。
+
+    与 init_regions 的区别：只处理一个分区，不重写 regions.json / DEV_INDEX /
+    DOCMIND_RULES；若本项目的其它分区均为独立 git 仓库则沿用该模式（git init +
+    基线提交），否则仅创建目录文件、纳入项目主仓库统一管理。返回 (ok, detail)。
+    """
+    root = (root or _get_code_root() or "").strip()
+    if not root or not os.path.isdir(root):
+        return False, f"未配置代码库根目录或目录不存在：{root or '(空)'}。"
+    regions = load_region_config(root)
+    meta = next((r for r in regions if r.get("key") == key), None)
+    if not meta:
+        return False, f"未知分区：{key}（不在 regions.json 配置中）"
+
+    # 目录安全：配置里的 dir 必须是根目录内的相对路径，禁止绝对路径与 .. 逃逸
+    rel = meta["dir"].replace("\\", "/").strip("/")
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    if not rel or os.path.isabs(meta["dir"]) or ".." in parts:
+        return False, f"分区目录配置非法：{meta['dir']}"
+    d = os.path.normpath(os.path.join(root, *parts))
+    if os.path.commonpath([d, os.path.normpath(root)]) != os.path.normpath(root):
+        return False, f"分区目录逃逸出代码库根目录：{meta['dir']}"
+    if os.path.exists(d) and not os.path.isdir(d):
+        return False, f"{rel} 已存在且不是目录，无法创建分区。"
+
+    created_dir = not os.path.isdir(d)
+    os.makedirs(d, exist_ok=True)
+    created_files = []
+
+    # 导出接口桩文件（与 init_regions 完全一致：JSON 写 {}，其余写空文件）
+    for ex in meta.get("exports") or []:
+        ex_path = os.path.join(d, ex)
+        if os.path.exists(ex_path) and not os.path.isfile(ex_path):
+            continue
+        if not os.path.isfile(ex_path):
+            os.makedirs(os.path.dirname(ex_path) or d, exist_ok=True)
+            with open(ex_path, "w", encoding="utf-8") as f:
+                f.write("{}\n" if ex.endswith(".json") else "")
+            created_files.append(ex)
+
+    readme = os.path.join(d, "README.md")
+    if not os.path.isfile(readme):
+        deps = meta.get("depends_on") or []
+        footer = (
+            "\n> 本目录是独立 git 仓库，可单独 commit / 回滚，不影响其它分区。\n"
+            if _siblings_use_git(root, regions, key)
+            else "\n> 由 DocMind 分区可视化一键创建，纳入项目主仓库统一版本管理。\n"
+        )
+        with open(readme, "w", encoding="utf-8") as f:
+            f.write(
+                f"# {meta['name']}（{meta['dir']}）\n\n"
+                f"{meta['desc']}\n\n"
+                f"接入方式：{meta['access']}\n"
+                + (f"依赖分区：{', '.join(deps)}\n" if deps else "依赖分区：无（基础分区）\n")
+                + footer
+            )
+        created_files.append("README.md")
+
+    # 本项目其它分区都是独立 git 仓库时，新区沿用同一模式并留下基线提交
+    git_warning = ""
+    if _siblings_use_git(root, regions, key) and not os.path.isdir(os.path.join(d, ".git")):
+        ok, err = _git(["init", "-q"], cwd=d)
+        if ok:
+            _git(["config", "user.email", "docmind@local"], cwd=d)
+            _git(["config", "user.name", "DocMind"], cwd=d)
+            ok_status, status = _git(["status", "--porcelain"], cwd=d)
+            if ok_status and status.strip():
+                _git(["add", "-A"], cwd=d)
+                _git(["commit", "-m", "docmind: initialize region"], cwd=d)
+        else:
+            git_warning = f"（目录与文件已创建，但 git init 失败：{err}）"
+
+    return True, {
+        "key": key,
+        "name": meta["name"],
+        "dir": meta["dir"],
+        "created_dir": created_dir,
+        "created_files": created_files,
+        "git_warning": git_warning,
+    }
+
+
+def _siblings_use_git(root, regions, key):
+    """项目中已存在的其它分区是否都采用独立 git 仓库（用于决定新区的创建模式）。"""
+    existing = [
+        r for r in regions
+        if r.get("key") != key and os.path.isdir(os.path.join(root, r["dir"]))
+    ]
+    if not existing:
+        return False
+    return all(os.path.isdir(os.path.join(root, r["dir"], ".git")) for r in existing)
+
+
+def fill_region_exports(root, key):
+    """为「目录已存在、但缺导出接口文件」的分区补齐缺失的导出桩。
+
+    只写缺失的文件（JSON 写 {}，其余写空文件），不动 README/regions.json，
+    也不自动提交（与工作台保存流程一致）。返回 (ok, detail)。
+    """
+    root = (root or _get_code_root() or "").strip()
+    if not root or not os.path.isdir(root):
+        return False, f"未配置代码库根目录或目录不存在：{root or '(空)'}。"
+    regions = load_region_config(root)
+    meta = next((r for r in regions if r.get("key") == key), None)
+    if not meta:
+        return False, f"未知分区：{key}（不在 regions.json 配置中）"
+    d = os.path.join(root, meta["dir"])
+    if not os.path.isdir(d):
+        return False, f"{meta['name']} 目录尚未创建，请先一键创建分区。"
+
+    created_files = []
+    for ex in meta.get("exports") or []:
+        ex_path = os.path.normpath(os.path.join(d, ex))
+        # 导出文件必须落在分区目录内，禁止绝对路径与 .. 逃逸
+        if os.path.commonpath([ex_path, os.path.normpath(d)]) != os.path.normpath(d):
+            return False, f"导出文件路径非法：{ex}"
+        if os.path.exists(ex_path) and not os.path.isfile(ex_path):
+            return False, f"{ex} 已存在且不是文件，无法生成导出桩。"
+        if not os.path.isfile(ex_path):
+            os.makedirs(os.path.dirname(ex_path) or d, exist_ok=True)
+            with open(ex_path, "w", encoding="utf-8") as f:
+                f.write("{}\n" if ex.endswith(".json") else "")
+            created_files.append(ex)
+
+    return True, {
+        "key": key,
+        "name": meta["name"],
+        "dir": meta["dir"],
+        "created_files": created_files,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Agent 研判分区：默认 8 个分区仅作「初始建议」，真实分区由 Agent 依据代码库判断。
 # propose_regions() 扫描顶层目录与资源类型，给出带证据（evidence）的建议方案；
@@ -899,6 +1032,7 @@ def list_regions(root=None):
         if git:
             ok, outp = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=d)
             branch = outp if ok else ""
+        exports = meta.get("exports") or []
         out.append({
             "key": meta["key"],
             "name": meta["name"],
@@ -906,7 +1040,12 @@ def list_regions(root=None):
             "desc": meta["desc"],
             "access": meta["access"],
             "depends_on": meta.get("depends_on") or [],
-            "exports": meta.get("exports") or [],
+            "exports": exports,
+            # 仅目录已存在时统计缺失导出，供前端「补齐导出桩」按钮判定
+            "missing_exports": (
+                [ex for ex in exports if not os.path.isfile(os.path.join(d, ex))]
+                if exists else []
+            ),
             "verify": meta.get("verify") or "",
             "exists": exists,
             "git": git,

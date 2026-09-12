@@ -307,6 +307,8 @@ export interface RegionInfo {
   access: string
   depends_on: string[]
   exports: string[]
+  /** 目录已存在但缺失的导出文件（空=契约完整或目录尚未创建） */
+  missing_exports: string[]
   verify: string
   exists: boolean
   /** 该分区目录是否为独立 git 仓库 */
@@ -356,6 +358,36 @@ export const regionsApi = {
       graph: body?.graph || {},
     }
   },
+  /** 一键创建缺失分区（目录 + 导出接口桩/README） */
+  createRegion(key: string): Promise<CreateRegionResp> {
+    return postJson<CreateRegionResp>('/api/regions/create', { key })
+  },
+  /** 为已存在但缺导出文件的分区补齐导出桩 */
+  fillExports(key: string): Promise<FillExportsResp> {
+    return postJson<FillExportsResp>('/api/regions/fill_exports', { key })
+  },
+}
+
+/** POST /api/regions/create 响应：创建结果 + 刷新后的全量分区状态 */
+export interface CreateRegionResp {
+  ok: boolean
+  key: string
+  name: string
+  dir: string
+  created_dir: boolean
+  created_files: string[]
+  git_warning: string
+  regions: RegionInfo[]
+}
+
+/** POST /api/regions/fill_exports 响应 */
+export interface FillExportsResp {
+  ok: boolean
+  key: string
+  name: string
+  dir: string
+  created_files: string[]
+  regions: RegionInfo[]
 }
 
 // ---------------------------------------------------------------- P2：选区 AI（SSE 流式）

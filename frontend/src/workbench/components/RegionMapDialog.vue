@@ -9,6 +9,7 @@ import type { RegionInfo } from '../api'
 
 const {
   regionMapOpen, regionMap, openRegionMap, closeRegionMap, locateRegion,
+  busyRegionKey, createRegion, fillRegionExports,
 } = useWorkbench()
 
 const selectedKey = ref<string | null>(null)
@@ -22,7 +23,7 @@ function depName(key: string): string {
 // ---------------------------------------------------------------- DAG 分层布局
 const NODE_W = 168
 const NODE_H = 46
-const GAP_X = 76
+const GAP_X = 40
 const GAP_Y = 16
 const PAD = 10
 
@@ -30,6 +31,7 @@ interface LaidEdge { x1: number; y1: number; x2: number; y2: number }
 interface DagLayout {
   pos: Map<string, { x: number; y: number }>
   edges: LaidEdge[]
+  order: string[]
   width: number
   height: number
 }
@@ -80,8 +82,13 @@ const layout = computed<DagLayout>(() => {
 
   const width = PAD * 2 + Math.max(1, cols.length) * NODE_W + Math.max(0, cols.length - 1) * GAP_X
   const height = PAD * 2 + Math.max(1, maxRows) * NODE_H + Math.max(0, maxRows - 1) * GAP_Y
-  return { pos, edges, width, height }
+  return { pos, edges, order: cols.flat(), width, height }
 })
+
+// 卡片排序与 DAG 分层同语义：先按依赖深度（列），同列按 key 字典序
+const orderedRegions = computed<RegionInfo[]>(() =>
+  layout.value.order.map((k) => byKey.value.get(k)).filter((r): r is RegionInfo => !!r),
+)
 
 function nodePos(key: string) {
   return layout.value.pos.get(key) || { x: 0, y: 0 }
@@ -207,10 +214,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 
         <!-- 分区状态卡 -->
         <section class="rm-section">
-          <h3>分区状态 <em>点击卡片可在左侧文件树中定位</em></h3>
+          <h3>分区状态 <em>点击卡片定位目录 · 未创建可生成 · 缺导出可补齐</em></h3>
           <div class="rm-cards">
             <article
-              v-for="r in regionMap.regions" :key="r.key"
+              v-for="r in orderedRegions" :key="r.key"
               :id="`rm-card-${r.key}`"
               class="rm-card"
               :class="{ missing: !r.exists, selected: selectedKey === r.key }"
@@ -234,6 +241,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
                       git · {{ r.branch || '?' }}
                     </span>
                     <span v-else class="rm-badge rm-badge-nogit">无独立仓库</span>
+                    <span v-if="r.missing_exports.length" class="rm-badge rm-badge-missing-export">
+                      缺 {{ r.missing_exports.length }} 个导出
+                    </span>
                     <span v-if="r.dirty" class="rm-badge rm-badge-dirty">有未提交改动</span>
                   </template>
                 </div>
@@ -247,11 +257,43 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
                 <div class="rm-card-meta">
                   <span class="rm-meta-label">导出</span>
                   <span v-if="!r.exports.length" class="rm-mata-faint">无对外接口文件</span>
-                  <code v-for="ex in r.exports" :key="ex" class="rm-export">{{ ex }}</code>
+                  <template v-for="ex in r.exports" :key="ex">
+                    <code
+                      class="rm-export"
+                      :class="{ missing: r.missing_exports.includes(ex) }"
+                      :title="r.missing_exports.includes(ex) ? '该导出文件尚不存在，可一键补齐' : ''"
+                    >{{ ex }}</code>
+                  </template>
                 </div>
                 <div class="rm-card-meta">
                   <span class="rm-meta-label">校验</span>
                   <span class="rm-mata-faint">{{ verifyText(r) }}</span>
+                </div>
+                <div v-if="!r.exists" class="rm-card-actions">
+                  <button
+                    class="rm-create-btn"
+                    :disabled="busyRegionKey !== null"
+                    @click.stop="void createRegion(r)"
+                  >
+                    <span v-if="busyRegionKey === r.key" class="rm-btn-spin" />
+                    <svg v-else width="11" height="11" viewBox="0 0 11 11" aria-hidden="true">
+                      <path d="M5.5 1.5 V9.5 M1.5 5.5 H9.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+                    </svg>
+                    {{ busyRegionKey === r.key ? '创建中…' : '创建目录与文件' }}
+                  </button>
+                </div>
+                <div v-else-if="r.missing_exports.length" class="rm-card-actions">
+                  <button
+                    class="rm-fill-btn"
+                    :disabled="busyRegionKey !== null"
+                    @click.stop="void fillRegionExports(r)"
+                  >
+                    <span v-if="busyRegionKey === r.key" class="rm-btn-spin rm-btn-spin-amber" />
+                    <svg v-else width="11" height="11" viewBox="0 0 11 11" aria-hidden="true">
+                      <path d="M5.5 1.5 V9.5 M1.5 5.5 H9.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+                    </svg>
+                    {{ busyRegionKey === r.key ? '补齐中…' : `补齐导出桩（${r.missing_exports.length}）` }}
+                  </button>
                 </div>
               </div>
             </article>
@@ -365,7 +407,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   background: #0a0e14;
   padding: 4px;
 }
-.rm-dag { display: block; min-width: 100%; }
+/* 画布按实际列宽收缩并居中；列数多到溢出时 margin:auto 退化为 0，可横向滚动 */
+.rm-dag { display: block; margin: 0 auto; }
 .rm-node { cursor: pointer; }
 .rm-node rect { transition: stroke-width 0.12s; }
 .rm-node:hover rect, .rm-node.selected rect { stroke-width: 2; }
@@ -463,6 +506,54 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   color: #e6c07b;
   background: #1d2230;
   border-radius: 4px;
+  padding: 0 5px;
+}
+
+.rm-card-actions { display: flex; justify-content: flex-end; margin-top: 9px; }
+.rm-create-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  line-height: 1;
+  padding: 6px 11px;
+  border-radius: 6px;
+  border: 1px solid #2c4a6b;
+  background: #58a6ff12;
+  color: #8fc1ff;
+  cursor: pointer;
+}
+.rm-create-btn:hover:not(:disabled) { background: #58a6ff22; border-color: #3d6491; }
+.rm-create-btn:disabled { opacity: 0.55; cursor: default; }
+.rm-fill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  line-height: 1;
+  padding: 6px 11px;
+  border-radius: 6px;
+  border: 1px solid #6e4d26;
+  background: #d98a3d12;
+  color: #e0a05c;
+  cursor: pointer;
+}
+.rm-fill-btn:hover:not(:disabled) { background: #d98a3d22; border-color: #8a6030; }
+.rm-fill-btn:disabled { opacity: 0.55; cursor: default; }
+.rm-btn-spin {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1.5px solid #8fc1ff55;
+  border-top-color: #8fc1ff;
+  animation: rm-spin 0.7s linear infinite;
+}
+.rm-btn-spin-amber { border-color: #e0a05c55; border-top-color: #e0a05c; }
+.rm-badge-missing-export { color: #e0a05c; border-color: #6e4d26; background: #d98a3d12; }
+.rm-export.missing {
+  color: #ff9d9d;
+  background: #3a1c2055;
+  border: 1px dashed #6e3238;
   padding: 0 5px;
 }
 
