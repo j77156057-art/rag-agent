@@ -147,6 +147,18 @@ def _symbol_name(line, ext):
     m = re.search(r"const\s+([A-Za-z_]\w*)\s*=", line)
     if m:
         return m.group(1)
+    # Java/Kotlin 构造器：访问修饰符后直接跟大写类名 + (（无返回类型，
+    # 与「修饰符 + 返回类型 + 方法名 (」的普通方法互斥）
+    m = re.match(r"^\s*(?:public|protected|private)\s+([A-Z][A-Za-z0-9_$]*)\s*\(", line)
+    if m:
+        return m.group(1)
+    # Java static final 常量（含泛型/数组类型，如 private static final Map<K,V> KEY = …）
+    m = re.search(
+        r"\bstatic\s+final\b[\w<>\[\],.\s?]*?\s([A-Za-z_][\w$]*)\s*=",
+        line,
+    )
+    if m:
+        return m.group(1)
     m = re.search(r"([A-Za-z_]\w*)\s*:\s*(?:\(|async\s*\()", line)  # TS 方法简写
     if m:
         return m.group(1)

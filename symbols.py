@@ -543,6 +543,395 @@ def _extract_godot_scene(text, lang):
     }
 
 
+# ---------------------------------------------------------------- Java
+# 正则启发式（非完整语法分析）：先掩码注释/字符串字面量，再按花括号深度定位
+# 类型体；成员签名允许跨行，方法体从首个 { 做括号配平定结束行。
+# 匿名类/方法内部的局部声明因深度更深而不会被误收为成员。
+
+_JAVA_MOD_PART = (
+    r"(?:public|private|protected|static|final|abstract|native|synchronized|"
+    r"strictfp|default|sealed|non-sealed|transient|volatile)\s+"
+)
+_JAVA_TYPE_HEAD = re.compile(
+    r"^(?P<mods>(?:" + _JAVA_MOD_PART + r")*)"
+    r"(?P<kind>class|interface|enum|record|@interface)\s+"
+    r"(?P<name>[A-Za-z_$][\w$]*)"
+)
+_JAVA_TYPE_EXPR = r"@?[\w$.]+(?:\s*<[^;{}]*>)?(?:\s*\[\s*\])*(?:\s*\.\s*\.\s*\.)?"
+_JAVA_METHOD_HEAD = re.compile(
+    r"^(?P<mods>(?:" + _JAVA_MOD_PART + r")*)"
+    r"(?:<[^;{}<>]*(?:<[^;{}<>]*>[^;{}<>]*)*>\s*)?"          # 泛型方法 <T extends …>
+    r"(?P<ret>" + _JAVA_TYPE_EXPR + r")\s+"
+    r"(?P<name>[A-Za-z_$][\w$]*)\s*"
+    r"\((?P<params>[^;{}]*)\)\s*"
+    r"(?:throws\s+[\w$.,\s]+?\s*)?"
+    r"(?:default\b[^;{}]*)?"
+    r"(?P<end>[;{])\s*$"
+)
+_JAVA_FIELD_HEAD = re.compile(
+    r"^(?P<mods>(?:" + _JAVA_MOD_PART + r")*)"
+    r"(?P<type>" + _JAVA_TYPE_EXPR + r")\s+"
+    r"(?P<rest>[\w$].*)$"
+)
+_JAVA_ENUM_CONST = re.compile(r"^([A-Z][\w$]*)\b")
+
+
+def _java_mask(text):
+    """把 // 、/* */ 注释与字符串/字符字面量内容替换为空白（保留换行与制表符），
+    使花括号深度计数不受注释/字面量中的括号干扰。"""
+    out = []
+    i, n = 0, len(text)
+    state = "code"
+    while i < n:
+        c = text[i]
+        if state == "code":
+            if text[i:i + 2] == "//":
+                state = "line"; out.append("  "); i += 2
+            elif text[i:i + 2] == "/*":
+                state = "block"; out.append("  "); i += 2
+            elif c == '"':
+                state = "str"; out.append(" "); i += 1
+            elif c == "'":
+                state = "char"; out.append(" "); i += 1
+            else:
+                out.append(c); i += 1
+        elif state == "line":
+            out.append("\n" if c == "\n" else ("\t" if c == "\t" else " "))
+            if c == "\n":
+                state = "code"
+            i += 1
+        elif state == "block":
+            if text[i:i + 2] == "*/":
+                state = "code"; out.append("  "); i += 2
+            else:
+                out.append("\n" if c == "\n" else ("\t" if c == "\t" else " ")); i += 1
+        else:  # str / char
+            q = '"' if state == "str" else "'"
+            if c == "\\":
+                out.append(" ")
+                if i + 1 < n:
+                    nxt = text[i + 1]
+                    out.append("\n" if nxt == "\n" else " ")
+                    i += 2
+                else:
+                    i += 1
+            elif c == q:
+                state = "code"; out.append(" "); i += 1
+            else:
+                out.append("\n" if c == "\n" else ("\t" if c == "\t" else " ")); i += 1
+    return "".join(out)
+
+
+def _java_javadoc_ends(text):
+    """返回 {结束行(0基): 清洗后的 javadoc 文本}；非 javadoc 的普通块注释不收录。"""
+    ends = {}
+    for m in re.finditer(r"/\*\*(.*?)\*/", text, re.S):
+        end_line = text.count("\n", 0, m.end())
+        cleaned = []
+        for ln in m.group(1).split("\n"):
+            s = ln.strip()
+            if s.startswith("*"):
+                s = s[1:].lstrip("*").strip()
+            if s:
+                cleaned.append(s)
+        if cleaned:
+            ends[end_line] = "\n".join(cleaned)[:400]
+    return ends
+
+
+def _brace_span_end(lines, open_idx, start_depth):
+    """从含首个 { 的 open_idx 行起做花括号配平，返回闭合行（0基）；找不到返回 open_idx。"""
+    depth = 0
+    for j in range(open_idx, min(len(lines), open_idx + 4000)):
+        depth += lines[j].count("{") - lines[j].count("}")
+        if depth <= 0:
+            return j
+    return open_idx
+
+
+def _extract_java(text):
+    raw = text.split("\n")
+    lines = _java_mask(text).split("\n")
+    n = len(lines)
+    jdoc = _java_javadoc_ends(text)
+    symbols = []
+    depth = 0
+    # 栈项：{name, kind, body_depth, end0, consts_done}
+    stack = []
+    primary = None  # (name, extends, is_public)
+    ann_start = -1  # 待消费注解的最早行（0基），-1 表示无
+    i = 0
+
+    def take_doc(decl_line):
+        d_line = ann_start if ann_start >= 0 else decl_line
+        return jdoc.get(d_line - 1, "")
+
+    while i < n:
+        s = lines[i].strip()
+        same_line_tail = False  # 本行注解被剥掉、s 为剩余声明
+        if not s:
+            i += 1
+            continue
+        top = stack[-1] if stack else None
+        in_body = bool(top) and depth == top["body_depth"]
+
+        # —— 注解行（仅在类型体内收集，参数允许跨行）——
+        if in_body and s.startswith("@"):
+            if ann_start < 0:
+                ann_start = i
+            # 跨过注解名与（可能跨行、嵌套的）参数括号
+            col = 1
+            while col < len(s) and (s[col].isalnum() or s[col] in "$_."):
+                col += 1
+            while col < len(s) and s[col] in " \t":
+                col += 1
+            li = i
+            if col < len(s) and s[col] == "(":
+                bal = 1
+                col += 1
+                while bal > 0:
+                    if li == i:
+                        if col >= len(s):
+                            li += 1; col = 0
+                            continue
+                        ch = s[col]; col += 1
+                    else:
+                        ln = lines[li]
+                        if col >= len(ln):
+                            li += 1; col = 0
+                            continue
+                        ch = ln[col]; col += 1
+                    if ch == "(":
+                        bal += 1
+                    elif ch == ")":
+                        bal -= 1
+            if li == i:
+                tail = s[col:].strip()
+                if not tail:
+                    i += 1
+                    continue
+                s = tail  # 注解与声明同行：用剩余文本继续本行分类
+                same_line_tail = True
+            else:
+                rest_line = lines[li][col:].strip()
+                i = li if rest_line else li + 1
+                continue
+
+        # —— 枚举常量区（第一个 ; 之前）——
+        if in_body and top["kind"] == "enum" and not top["consts_done"]:
+            mc1 = _JAVA_ENUM_CONST.match(s)
+            if mc1 and not s.startswith(";"):
+                end0 = i
+                if "{" in s:
+                    end0 = _brace_span_end(lines, i, depth)
+                symbols.append(_mk(mc1.group(1), CONST, i + 1, end0 + 1,
+                                   parent=top["name"]))
+                if ";" in s:
+                    top["consts_done"] = True
+                depth += lines[i].count("{") - lines[i].count("}")
+                i += 1
+                continue
+            # 常量参数跨行延续、匿名常量体闭合行（};）等
+            if ";" in s:
+                top["consts_done"] = True
+            depth += lines[i].count("{") - lines[i].count("}")
+            while stack and depth < stack[-1]["body_depth"]:
+                stack.pop()
+            i += 1
+            continue
+
+        # —— 类型声明（含嵌套类型）——
+        m = _JAVA_TYPE_HEAD.match(s)
+        if m and (depth == 0 or in_body):
+            # 收集到首个 { 为止的完整头部
+            k = i
+            joined = s
+            while "{" not in joined and k + 1 < n and k - i < 20:
+                k += 1
+                joined += " " + lines[k].strip()
+            if "{" in joined:
+                open_idx = k
+                for jj in range(i, k + 1):
+                    if "{" in lines[jj]:
+                        open_idx = jj
+                        break
+                end0 = _brace_span_end(lines, open_idx, depth)
+                name = m.group("name")
+                raw_kind = m.group("kind")  # class/interface/enum/record/@interface
+                ext = ""
+                me = re.search(r"\bextends\s+([\w$]+)", joined.split("{", 1)[0])
+                if me:
+                    ext = me.group(1)
+                sym = _mk(name, ENUM if raw_kind == "enum" else CLASS,
+                          (ann_start if ann_start >= 0 else i) + 1, end0 + 1,
+                          signature=joined.split("{", 1)[0].strip()[:300],
+                          doc=take_doc(i), parent=top["name"] if top else "")
+                symbols.append(sym)
+                body_depth = depth
+                for jj in range(i, open_idx + 1):
+                    body_depth += lines[jj].count("{") - lines[jj].count("}")
+                stack.append({
+                    "name": name, "kind": raw_kind, "body_depth": body_depth,
+                    "end0": end0, "consts_done": False,
+                })
+                if depth == 0:
+                    is_pub = "public" in m.group("mods")
+                    if primary is None or (is_pub and not primary[2]):
+                        primary = (name, ext, is_pub)
+                ann_start = -1
+                if body_depth == depth:
+                    stack.pop()  # class X {} 类体在头部行已自闭合
+                depth = body_depth  # 头部可能跨行：直接定位到类型体内深度
+                i = open_idx + 1
+                continue
+
+        # —— 静态/实例初始化块：不出符号，靠深度计数跳过 ——
+        if in_body and (s == "{" or s.startswith("{") or re.match(r"^static\s*\{", s)):
+            ann_start = -1
+            depth += lines[i].count("{") - lines[i].count("}")
+            i += 1
+            continue
+
+        if in_body and not s.startswith("}"):
+            # 同行注解已被剥掉时，扫描用行以剥后文本替代
+            slines = list(lines) if same_line_tail else lines
+            if same_line_tail:
+                slines[i] = s
+
+            def scan_end(want_brace):
+                """从 i 起找成员结束：want_brace=True 取首个 { 的配平闭合行；
+                want_brace=False 取花括号深度归零且含 ; 的语句行。返回 (行号, token)。"""
+                run2, opened = 0, None
+                jj = i
+                while jj < n and jj - i < 80:
+                    lj = slines[jj]
+                    run2 += lj.count("{") - lj.count("}")
+                    if want_brace and opened is None and "{" in lj:
+                        opened = jj
+                    if opened is None and run2 == 0 and ";" in lj:
+                        return jj, ";"
+                    if want_brace and opened is not None and run2 <= 0:
+                        return jj, "{"
+                    jj += 1
+                return jj, None
+
+            def build_sig(last_j, tok):
+                parts = []
+                open_line = None
+                if tok == "{":
+                    for jj in range(i, last_j + 1):
+                        if "{" in slines[jj]:
+                            open_line = jj
+                            break
+                for jj in range(i, last_j + 1):
+                    part = slines[jj].strip()
+                    if tok == "{":
+                        if jj == open_line:
+                            part = part.split("{", 1)[0].strip()
+                        elif jj > open_line:
+                            part = ""
+                    if part:
+                        parts.append(part)
+                base = " ".join(parts).strip()
+                if tok == ";":
+                    base = base.rstrip(";").strip()  # 行内自带分号，避免重复
+                return (base + (" " + tok if tok else "")).strip()
+
+            end_j, tok = scan_end(True)
+            if tok is None:
+                end_j, tok = scan_end(False)
+            if tok is None:
+                # 无法判定结束位置（畸形/不支持的写法）：只做深度维护，不产出符号
+                depth += lines[i].count("{") - lines[i].count("}")
+                while stack and depth < stack[-1]["body_depth"]:
+                    stack.pop()
+                i += 1
+                continue
+            sig = build_sig(end_j, tok)
+
+            ctor = re.compile(
+                r"^(?P<mods>(?:" + _JAVA_MOD_PART + r")*)"
+                + re.escape(top["name"]) + r"\s*\((?P<params>[^;{}]*)\)\s*"
+                r"(?:throws\s+[\w$.,\s]+?)?(?P<end>[;{])\s*$"
+            )
+            mc = ctor.match(sig)
+            mm = _JAVA_METHOD_HEAD.match(sig) if not mc else None
+            if mc or mm:
+                if mc:
+                    mname, detail = top["name"], "constructor"
+                else:
+                    mname, detail = mm.group("name"), (mm.group("ret").strip() or "")
+                symbols.append(_mk(
+                    mname, FUNCTION, (ann_start if ann_start >= 0 else i) + 1, end_j + 1,
+                    signature=sig[:300], doc=take_doc(i),
+                    detail=detail, parent=top["name"],
+                ))
+                ann_start = -1
+                i = end_j + 1  # 整段花括号配平、净深度不变，跳过方法体
+                continue
+
+            # 非方法：按分号语句重扫（兼容字段初始化里的 lambda/匿名类花括号）
+            fend, ftok = scan_end(False)
+            fsig = build_sig(fend, ftok)
+            mf = _JAVA_FIELD_HEAD.match(fsig.rstrip(";").strip())
+            head_m = None
+            following = "("
+            if mf:
+                head_m = re.match(r"([\w$]+)", mf.group("rest"))
+                if head_m:
+                    following = mf.group("rest")[head_m.end():].lstrip()
+            if mf and ftok == ";" and head_m and (not following or following[0] in "=,["):
+                mods = mf.group("mods")
+                is_const = ("static" in mods and "final" in mods) or top["kind"] in ("interface", "@interface")
+                names = [head_m.group(1)]
+                tail = following
+                if tail.startswith("=") or "=" in tail:
+                    tail = tail.split("=", 1)[0]
+                depth_p = 0
+                buf = ""
+                for ch in tail:
+                    if ch in "(<[":
+                        depth_p += 1
+                    elif ch in ")>]":
+                        depth_p -= 1
+                    elif ch == "," and depth_p == 0:
+                        nm2 = re.match(r"\s*([\w$]+)", buf)
+                        if nm2:
+                            names.append(nm2.group(1))
+                        buf = ""
+                        continue
+                    buf += ch
+                for nm in names:
+                    symbols.append(_mk(
+                        nm, CONST if is_const else VAR,
+                        (ann_start if ann_start >= 0 else i) + 1, fend + 1,
+                        doc=take_doc(i) if nm == names[0] else "",
+                        detail=mf.group("type").strip(), parent=top["name"],
+                    ))
+                ann_start = -1
+                i = fend + 1  # 整条语句（含初始化花括号）净深度不变
+                continue
+
+        ann_start = -1
+        depth += lines[i].count("{") - lines[i].count("}")
+        # 枚举匿名常量体的闭合行（};）从底路径返回：标记常量区结束
+        if (stack and stack[-1]["kind"] == "enum"
+                and not stack[-1]["consts_done"]
+                and depth == stack[-1]["body_depth"] and ";" in lines[i]):
+            stack[-1]["consts_done"] = True
+        # 闭合已记录结束行的类型
+        while stack and depth < stack[-1]["body_depth"]:
+            stack.pop()
+        i += 1
+
+    symbols.sort(key=lambda s: s["start"])
+    cname, extends = "", ""
+    if primary:
+        cname, extends = primary[0], primary[1]
+    return {"lang": "java", "class_name": cname, "extends": extends,
+            "doc": "", "symbols": symbols}
+
+
 # ---------------------------------------------------------------- 通用兜底
 
 _GENERIC_PATTERNS = [
@@ -633,6 +1022,8 @@ def extract(text, path):
             return _extract_gdscript(text)
         if ext == ".py":
             return _extract_python(text) or empty
+        if ext == ".java":
+            return _extract_java(text)
         if ext == ".tscn":
             return _extract_godot_scene(text, "godot-scene")
         if ext == ".tres":
