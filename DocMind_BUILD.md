@@ -1,13 +1,31 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第十三次重建（P3：Git 历史/一键回滚、AI 改写 diff 预览、分区治理可视化）」；历史构建清单保留在下文。
+> 最新构建见下方「第十四次重建（分区可视化增强：一键创建分区、补齐导出桩、卡片按依赖排序）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 18.5 MB，控制台模式，启动时自动开浏览器）
-- 整体体积：约 663.4 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB）
-- **当前构建时间：`2026-09-12 03:24:52`（第十三次重建，P3 三件套，exe 19,408,724 字节）**
-- 上一版：`2026-09-12 00:32:23`（第十二次重建，P2 选区 AI，exe 19,405,162 字节）
+- 整体体积：约 663.4 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB/365 文件）
+- **当前构建时间：`2026-09-12 18:26:30`（第十四次重建，分区可视化增强，exe 19,412,925 字节）**
+- 上一版：`2026-09-12 03:24:52`（第十三次重建，P3 三件套，exe 19,408,724 字节）
+
+---
+
+## 第十四次重建：分区可视化增强 — 一键创建 + 补齐导出桩 + 排序收紧（2026-09-12 18:26）
+
+### 改动
+- **missing 分区一键创建**：`regions.py` 新增 `scaffold_region(root, key)`——为单个缺失分区建目录、声明的导出接口桩（JSON 写 `{}`，与全量 init 一致）与 README；不重写 regions.json/DEV_INDEX/RULES；含目录根逃逸与「同名非目录」防护；项目其它已存在分区均为独立 git 仓库时才沿用 `git init` + 基线提交，否则纳入主仓库（`_siblings_use_git` 判定）。新端点 `POST /api/regions/create`。
+- **已存在分区补齐导出桩**：新增 `fill_region_exports(root, key)`——只补写缺失导出文件，不动 README、不自动提交，含导出路径逃逸防护；新端点 `POST /api/regions/fill_exports`。`list_regions` 输出新增 `missing_exports`（目录存在时统计缺失导出）驱动按钮显隐。
+- **前端（`RegionMapDialog.vue`）**：卡片顺序从配置声明序改为「依赖深度优先、同列 key 字典序」（与 DAG 分列同一语义，layout 暴露 `order: cols.flat()`）；DAG 列间距 76→40、去掉 `min-width:100%` 改 `margin:0 auto` 居中（溢出退化横滚）；missing 卡右下角蓝色「创建目录与文件」、缺导出的已存在卡琥珀色「补齐导出桩（N）」+「缺 N 个导出」徽章 + 红色虚线文件名；两类操作均有确认弹窗（列明将生成文件）、互斥 busy 态、成功后面板不关就地刷新分区/契约横幅/文件树。
+- `api.ts`：`RegionInfo.missing_exports`、`createRegion`/`fillExports` 与响应类型；`workbench.ts` 抽出 `refreshContracts()`，busy 态统一为 `busyRegionKey`。
+- 业务 chunk 100.02 KB（gzip 37.14K，105,997 字节）、CSS 54.13 KB；vendor 三分包哈希全部不变；构建前已清空 `web/assets/` 历史 workbench hash。
+
+### 验证
+- 单测：新增 `tests/test_regions_scaffold.py` **15 例**（桩生成、幂等、已有内容不覆盖、无导出区仅 README、未知 key、缺目录、非 git 兄弟不 init、git 兄弟 init+基线提交、非法 `../` 目录在归一化层被丢弃、missing_exports 三态、scaffold+fill 后契约转绿）；全量 `unittest discover` **88/88 通过**（MinGit 在 PATH，git 用例实际执行）。
+- dev 生产态浏览器实测：初始仅数值区有补齐按钮（红标 balance.schema.json），取消无副作用；确认后 2→3 文件、按钮消失、文件树出现桩文件、契约 2→1；再建素材区后横幅转绿「契约校验通过」、DAG 节点虚线转实；创建素材区/bug 区流程同上轮（5→4→3 按钮）；控制台无应用错误，测试产物已删、样例仓 git 干净。
+- 冻结态（最小 PATH 仅 System32，DOCMIND_SERVER_ONLY=1，PyInstaller 退出码 0）：冷启动 0.7s `/workbench/` 200；`build_time=2026-09-12 18:26:30` 确认新版；空 code_root 时 `/api/regions` 返 code_root 空串+默认 8 区；新业务 JS `/assets/workbench-BlWw82QY.js` 200（105,997 字节）与源一致；表单 ingest 样例 **19 切片**；**本轮新端点回归**——fill_exports(values) 200 生成 balance.schema.json（files 2→3）、verify_contracts 1 错误，create(assets) 200（manifest.json+README.md）、verify_contracts ok=true/0 错误；随后经 fs/delete 清理样例仓，契约恢复 2 错误。前端 6 文件 SHA-256 全一致；包内无 python*.exe/.env/状态文件；MinGit 89.5 MB/365 文件。
+- **冒烟后清理**：ingest 在冻结默认 local 嵌入下改写包内 `_internal/.chroma`（mtime 18:29，新增 1 个 collection），已用源 `.chroma` `robocopy /MIR` 镜像还原（148=148 文件、逐一 SHA-256 零不一致，无 dist 根级 .chroma），已删 `_internal/.docmind_state.json`；进程结束、端口释放。
+- 源码对应提交：`4000fd2 feat(workbench): region one-click scaffold and export stub repair`（6 文件 +579−16）。
 
 ---
 
