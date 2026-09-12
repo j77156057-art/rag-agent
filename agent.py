@@ -28,8 +28,12 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
 - python_exec(code): 在受限子进程中执行 Python 代码并返回输出。用于数值计算、数据处理、文本变换等需要"真正动手"的任务。
 - gen_video_prompt(spec): 按 MiniMax H3 的三段结构，把一段创意描述生成为结构化视频提示词（可直接粘贴进 ComfyUI）。
 - search_code(query): 在已索引的源代码/配置中检索相关函数、类、配置片段。回答"某功能在哪实现/某函数做什么/某配置怎么写"等关于代码库的问题。
-- read_file(path): 读取代码库中的某个文件内容（path 为相对代码根目录的路径或文件名）。需要看完整文件、或某文件细节时用。
-- grep(pattern): 在代码库中按正则搜索文本/符号，返回匹配的文件路径与行号。定位某段代码、某变量、某错误出现位置时用。
+- read_file(path): 读取代码库中的某个文件内容（path 为相对代码根目录的路径或文件名）。需要看完整文件、或某文件细节时用。大文件默认只返回前 4000 字，要看中后段（如枚举/方法定义）时在输入里换行追加 start/end 行号，例如：
+  app/src/main/java/.../A.java
+  start: 160
+  end: 175
+  注意：Observation 会截断到约 1200 字，start/end 区间务必控制在 40 行以内；要看的代码不在区间里就 grep 先定位真实行号，再读下一段，不要一次读上百行。
+- grep(pattern): 在代码库中按正则搜索文本/符号，返回匹配的文件路径与行号。定位某段代码、某变量、某错误出现位置时用。可在输入换行追加 `path: 相对路径` 只搜某个文件或目录（如 pattern 后另起一行 `path: app/src/main/java/.../A.java`），避免全仓噪声。
 - apply_edit(path, old_text?, new_text): 受控修改代码库中【已存在】的文件（不能新建、不能越界写）。两种用法：① 局部安全替换——提供 path、old_text（要被替换的【精确】旧片段）、new_text（替换后内容），工具在文件中唯一匹配处替换；② 整体重写——只提供 path 与 new_text（省略 old_text），但前提是你已用 read_file 读取过该文件。修改前请务必先用 read_file 确认当前内容；.py 写入后会做语法校验，不通过自动回滚。Action Input 按多行格式写：第一行 `path: <路径>`，可选 `old_text: <精确旧片段>`，最后 `new_text: <新内容（可多行）>`。
 - create_file(path, content): 在代码库内【新建】一个文件（不能覆盖已有文件，修改已有文件请用 apply_edit）。用于新增模块/分区（如新建 combat/crit.py）。同样受路径沙箱、单文件 200KB 上限、.py 语法校验约束；父目录不存在会自动创建（仍在 code_root 内）。Action Input 格式：第一行 `path: <路径>`，最后 `new_text: <文件内容（可多行）>`。新建前建议先用 search_code/grep 确认不会与已有实现重复（防堆叠）。
 - run_command(cmd): 在代码库根目录内执行 shell 命令（如 pytest / npm run build / gradle test），返回合并后的标准输出与错误（截断 1500 字，超时 12s）。需要跑构建、跑测试、执行项目内命令来验证改动或查看结果时用。命令在 code_root 内执行，危险操作（rm -rf /、format、shutdown 等）会被拦截。输入为完整命令字符串。
@@ -68,10 +72,13 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
 - 知识库能答的优先 search_knowledge；知识库没有、或需要最新/外部信息时用 web_search。
 - 用户要"调外部接口 / 查订单 / 拉取内部服务数据 / 打通某个业务 API"时，用 dev_http_request（需先确认 EXTERNAL_API_ALLOWLIST 已包含目标域名，否则会被安全拦截）。
 - 用户想要"视频提示词/分镜/短视频脚本"类产出时用 gen_video_prompt。
-- 关于"代码/工程/实现/函数/类/配置/报错"的问题，优先用 search_code / read_file / grep：
+- 关于"代码/工程/实现/函数/类/枚举/字段/数据库表/配置/报错/播放逻辑/服务器切换"等一切涉及已索引代码库内容的问题，【第一个 Action 必须是 search_code / read_file / grep 之一】：
+  · 严禁先用 search_knowledge 或 web_search——知识库存的是产品文档、联网搜的是外部资料，都不包含本代码库实现，首步走它们必然查空后误判"项目没有该功能"。只有代码工具确实定位不到、且问题明确转向文档定义/外部资料时才允许改用它们。
   · 先用 search_code 概览相关函数/类；需要看完整实现再用 read_file 打开具体文件；需要定位某符号或报错位置再用 grep。
-  · grep / search_code 的输入必须是【纯符号或关键词】（例如 seekTo、PlayerManager、setOnClickListener），只写要检索的标识符本身，不要附加中文说明、不要写整句——「seekTo 进行进度跳转」是错误的，应只写 `seekTo`。
+  · grep / search_code 的输入必须是【纯符号或关键词】（例如 seekTo、PlayerManager、setOnClickListener），只写要检索的标识符本身，不要附加中文说明、不要写整句——「seekTo 进行进度跳转」是错误的，应只写 `seekTo`。【严禁空参数】调用 search_code()/grep()：必须提供标识符，空输入只会得到无关结果。
+  · "支持哪些/有哪些取值/有几种模式/枚举成员/常量列表/接口提供商"这类【枚举清单】问题，直接 search_code 找到枚举（如 enum PlayMode / Language / ApiProvider）所在文件和行号，再 read_file 用 start:/end: 读枚举定义本体（从 enum 行读到下一个分号/右括号，通常 10~30 行），逐项列出成员；不要查知识库、不要联网，读不到时换关键词重试并明确标注哪些无法确认，禁止凭印象编造或只凭几个 grep 命中就声称"仅支持这些"。
   · 没有配置代码库时（search_code 提示未配置），可改用 python_exec 在本地读取文件做兜底，但优先引导用户先用 /api/ingest_code 索引代码目录。
+  · python_exec 在【代码根目录】下执行：脚本中可用相对代码根的相对路径（如 open("app/src/main/java/.../X.java")）读取项目文件；但读代码仍优先用 read_file/grep，python_exec 仅用于需要真正计算/解析的场合，执行报错（如 FileNotFoundError）要先修正路径或改工具，绝不能把异常堆栈当成最终答案。
   · list_dir 仅用于分区研判前勘察一次顶层结构；普通代码问答不要逐层反复浏览目录，直接用 search_code/read_file/grep 拿证据。
   · 需要【修改】代码库中的文件时，使用 apply_edit。无论哪种用法，都请先 read_file 看清当前内容再动手：能用 old_text 精确局部替换就用它（最安全，能避免误改）；只有确实需要整体重写且已 read_file 过该文件时，才用不带 old_text 的重写模式。修改成功后可用 read_file 复查确认变更。apply_edit 只能改已存在文件，不要指望它创建新文件或越界写。
   · 需要【新建】文件/模块（例如为项目新增一个分区目录与源文件）时，使用 create_file；它不能覆盖已有文件（覆盖请用 apply_edit）。新建前务必先用 search_code/grep 确认没有重复实现，避免堆叠；父目录不存在时会自动创建（仍在代码根目录内）。新建 .py 文件会通过语法校验。
@@ -108,7 +115,9 @@ Final Answer: 你的最终回答
 
 # 解析 LLM 输出的正则
 _RE_THOUGHT = re.compile(r"Thought:\s*(.*?)(?=Action:|Final Answer:|$)", re.S)
-_RE_ACTION = re.compile(r"Action:\s*(\w+)", re.S)
+# 兼容弱模型写法：Action: tool("arg")（参数内联在括号里、不写 Action Input 行）。
+# 不用 re.S：行内参数不跨行，避免吞掉后续内容。
+_RE_ACTION = re.compile(r"Action:\s*(\w+)\s*(?:[（(]\s*(.*?)\s*[)）]\s*)?(?:\n|$)")
 _RE_ACTION_INPUT = re.compile(r"Action Input:\s*(.*?)(?=\n\s*(?:Thought|Action|Final Answer)\s*:|$)", re.S)
 _RE_FINAL = re.compile(r"Final Answer:\s*(.*)", re.S)
 
@@ -118,10 +127,17 @@ def parse_response(text):
     action = _RE_ACTION.search(text)
     action_input = _RE_ACTION_INPUT.search(text)
     final = _RE_FINAL.search(text)
+    inp = action_input.group(1).strip() if action_input else ""
+    # 没写 Action Input 行时，退回解析 Action 同行括号里的行内参数并剥掉外层引号
+    if not inp and action is not None and action.lastindex and action.lastindex >= 2:
+        inline = (action.group(2) or "").strip()
+        if len(inline) >= 2 and inline[0] == inline[-1] and inline[0] in "\"'`":
+            inline = inline[1:-1].strip()
+        inp = inline
     return {
         "thought": thought.group(1).strip() if thought else "",
         "action": action.group(1).strip() if action else None,
-        "action_input": action_input.group(1).strip() if action_input else "",
+        "action_input": inp,
         "final": final.group(1).strip() if final else None,
     }
 
@@ -179,6 +195,134 @@ _VERBATIM_TOOLS = {"calculate", "python_exec", "gen_video_prompt"}
 
 # 写工具：只有用户问题明确表达修改/新建意图才允许执行，防止审查类任务越权改代码。
 _WRITE_TOOLS = {"apply_edit", "create_file", "dev_region_edit"}
+
+# 输入留空即合法的工具（无参调用 / 可选 path 调用）；
+# 其余工具在 Action Input 为空时一律拦截回填，不消耗工具步数——
+# 弱模型常输出 search_code()/grep() 空参，空跑一步后误判"项目无此实现"。
+_NO_ARG_TOOLS = {
+    "init_regions", "dev_list_regions", "dev_verify_contracts",
+    "dev_list_changesets", "list_pending_edits", "game_validate_data",
+    "game_release_check",
+}
+_OPTIONAL_ARG_TOOLS = {"list_dir"}
+_EMPTY_ARG_OBS = (
+    "参数缺失：{tool} 必须提供有效输入才能执行（空参数不会返回任何有用信息，本次未执行、不计工具步数）。"
+    "请立即用【完整参数】重新调用该工具——代码检索类工具只放纯标识符（如 `PlayMode`），"
+    "不要附加中文说明；或直接基于已有 Observation 给出 Final Answer。\n"
+    "用户原问题（请从中提取类名/方法名/枚举名等标识符作为参数）：{question}"
+)
+# 已配置代码库时，知识库/网搜空参往往是弱模型误路由的起点：直接强制改道代码工具。
+_EMPTY_ARG_CODE_REDIRECT = (
+    "参数缺失且路由错误：{tool} 未执行。当前问题针对【已索引的本地代码库】，"
+    "知识库与联网搜索都不包含本项目的实现细节，用它们只会查空或诱导编造，"
+    "因此禁止再调用 search_knowledge / web_search 回答本问题。"
+    "请立即改调代码工具，输入只放从问题里提取的纯标识符：\n"
+    "  search_code(标识符) 或 grep(标识符) 或 read_file(路径，可换行附 start:/end: 行号)\n"
+    "用户原问题：{question}"
+)
+
+
+# 弱模型常把单值工具写成关键字参数风格：search_code(query: "x") / grep(pattern: "x") /
+# read_file(path: "p", start: 10, end: 20)。这些工具本不收 key:value，统一在入口归一化。
+_ARG_PREFIX_TOOLS = {
+    "search_code": ("query", "q", "keyword"),
+    "search_knowledge": ("query", "q", "keyword"),
+    "web_search": ("query", "q", "keyword"),
+    "search_assets": ("query", "q", "keyword"),
+    "grep": ("pattern", "regex", "p"),
+    "read_file": ("path", "file"),
+    "list_dir": ("path", "dir"),
+    "calculate": ("expression", "expr"),
+    "run_command": ("cmd", "command"),
+}
+
+
+def _strip_wrap_quotes(text):
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`":
+        return text[1:-1].strip()
+    return text
+
+
+# grep 的 `pattern: "x", path: "y"`（同行逗号）形式：拆成规范的两行 <正则>\npath: <范围>。
+_RE_GREP_KEYED_INLINE = re.compile(
+    r'^(?:pattern|regex|p)\s*[:：]\s*(?P<q>["\'`]?)(?P<pat>.*?)(?P=q)\s*[,，]\s*'
+    r'path\s*[:：]\s*(?P<q2>["\'`]?)(?P<path>.+?)(?P=q2)\s*$',
+    re.I,
+)
+_RE_GREP_PATH_LINE = re.compile(r"^\s*path\s*[:：]\s*(.+?)\s*$", re.I)
+
+
+def _normalize_grep_arg(arg):
+    """grep 关键字风格归一化；附带的 path: 限定转成规范的第二行 `path: <范围>`。"""
+    first, _, rest = arg.partition("\n")
+    mi = _RE_GREP_KEYED_INLINE.match(first.strip())
+    if mi:
+        return f"{mi.group('pat')}\npath: {mi.group('path')}"
+    mk = re.match(r"^(?:pattern|regex|p)\s*[:：]\s*(.*)$", first.strip(), re.I)
+    scope, kept = None, []
+    for ln in rest.splitlines():
+        ms = _RE_GREP_PATH_LINE.match(ln)
+        if ms:
+            scope = _strip_wrap_quotes(ms.group(1).strip())
+        else:
+            kept.append(ln)
+    if mk:
+        out = _strip_wrap_quotes(mk.group(1).strip())
+        tail = "\n".join(kept).strip()
+        if tail:
+            out += "\n" + tail
+        if scope:
+            out += ("\n" if out else "") + f"path: {scope}"
+        return out
+    if scope:  # 纯正则首行 + 后续行 path:
+        return f"{first.strip()}\npath: {scope}"
+    return arg
+
+
+def _normalize_tool_arg(tool, arg):
+    """把 `key: value` 风格的单值工具入参还原成纯 value；read_file 兼容同行逗号 start/end。"""
+    if not arg or tool not in _ARG_PREFIX_TOOLS:
+        return arg
+    if tool == "grep":
+        norm = _normalize_grep_arg(arg)
+        if norm != arg:
+            return norm
+    first_line, _, remainder = arg.partition("\n")
+    keys = "|".join(_ARG_PREFIX_TOOLS[tool])
+    m = re.match(rf"^(?:{keys})\s*[:：]\s*(.*)$", first_line.strip(), re.I)
+    if not m:
+        return arg
+    value = m.group(1).strip()
+    if tool == "read_file":
+        # path: "p", start: 10, end: 20 → p / start: 10 / end: 20 拆成多行
+        segs = re.split(r"\s*[,，]\s*(?=(?:start|end)\s*[:：])", value)
+        lines = [_strip_wrap_quotes(segs[0])]
+        lines.extend(s.strip() for s in segs[1:] if s.strip())
+        if remainder.strip():
+            lines.append(remainder.strip())
+        return "\n".join(lines)
+    if remainder.strip():
+        return arg  # 多行内容不做剥离（可能是合法的复杂输入）
+    return _strip_wrap_quotes(value)
+
+
+def _user_question(grounded):
+    """/api/chat 会在用户问题前拼【系统提示】上下文，护栏文案只应回带真实用户问题。"""
+    marker = "用户问题："
+    idx = grounded.rfind(marker)
+    return grounded[idx + len(marker):].strip() if idx >= 0 else grounded.strip()
+
+
+def _empty_arg_obs(tool_name, question):
+    """空参拦截回填文案：知识库/网搜在已配置代码库时强制改道；其余回带原问题辅助提取标识符。"""
+    user_q = _clip(_user_question(question), 200)
+    if tool_name in ("search_knowledge", "web_search") and get_runtime("code_root"):
+        return _EMPTY_ARG_CODE_REDIRECT.format(tool=tool_name, question=user_q)
+    return _EMPTY_ARG_OBS.format(tool=tool_name, question=user_q)
+
+# 工具步数耗尽后，先强制模型基于已有观察收尾的次数；仍不收尾则用观察证据确定性兜底。
+_MAX_FORCED_FINALS = 1
 _RE_WRITE_INTENT = re.compile(
     r"修改|修复|改正|改一下|改成|改好|重构|新建|创建|新增|添加|加上|"
     r"补全|删掉|删除|移除|替换|重写|提交代码|帮我改|动手改|fix|refactor"
@@ -292,9 +436,27 @@ class Agent:
         executed = set()  # 本轮已执行过的 (工具, 参数)，用于防空转循环
         last_action = None
         last_obs = None
+        forced_finals = 0  # 已发出的强制收尾提示次数（步数耗尽 / 重复空转共用一次机会）
+        forced_final_reason = ""  # 触发强制收尾的原因，证据兜底 final 里原样告知用户
+        evidence = []  # 本轮已执行工具的简要清单（action(input)），耗尽时兜底用
+
+        def _evidence_final(reason):
+            """模型在强制收尾后仍不给出 Final Answer：用本轮真实观察做确定性兜底。"""
+            steps_used = "；".join(evidence) or "（无）"
+            last = _clip(last_obs or "", OBS_MAX_CHARS)
+            return {
+                "type": "final",
+                "text": (
+                    f"{reason}\n"
+                    "以下为本轮真实检索到的证据，请缩小问题范围后重问；"
+                    f"未在观察中出现的结论请勿采信。\n"
+                    f"已执行：{steps_used}\n最后观察：\n{last}"
+                ),
+            }
+
         while True:
             iterations += 1
-            if iterations > MAX_AGENT_STEPS + _MAX_NUDGES + 4:
+            if iterations > MAX_AGENT_STEPS + _MAX_NUDGES + _MAX_FORCED_FINALS + 4:
                 yield {
                     "type": "final",
                     "text": "（已达到最大推理步数，请尝试更具体的问题，或补充知识库内容。）",
@@ -319,7 +481,15 @@ class Agent:
                 yield {"type": "thought", "text": parsed["thought"]}
 
             if parsed["action"] and parsed["action"] in TOOLS:
-                sig = (parsed["action"], (parsed["action_input"] or "").strip())
+                action_name = parsed["action"]
+                action_arg = _normalize_tool_arg(action_name, (parsed["action_input"] or "").strip())
+                sig = (action_name, action_arg)
+
+                # 强制收尾（步数耗尽/重复空转）已发出后，模型仍输出任何 Action——
+                # 即使换了不同参数——也不再执行/回填，直接用已有观察证据确定性兜底。
+                if forced_finals >= _MAX_FORCED_FINALS:
+                    yield _evidence_final(forced_final_reason)
+                    return
 
                 # 写操作同意护栏：审查/问答类问题未明确要求修改时，拒绝真正落盘，
                 # 以一条 Observation 把模型引导回"只报告"模式（不消耗工具步数）。
@@ -345,13 +515,34 @@ class Agent:
                 if sig in executed:
                     repeats += 1
                     if repeats >= 3:
-                        yield {
-                            "type": "final",
-                            "text": (
-                                "（模型反复用完全相同的参数调用同一工具，已自动停止。"
-                                "请换一种问法，或明确指定要查看的文件/函数。）"
-                            ),
-                        }
+                        # 不直接硬停：先强制模型基于已有 Observation 收尾一次
+                        # （答案可能已在观察中，如刚 grep 到目标行号）；仍要调工具再证据兜底。
+                        if forced_finals < _MAX_FORCED_FINALS:
+                            forced_finals += 1
+                            forced_final_reason = (
+                                "（模型反复用完全相同的参数调用同一工具，已要求其停止工具调用并收尾。）"
+                            )
+                            trail.append(
+                                {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
+                            )
+                            trail.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "Nudge: 你已多次用完全相同的参数调用同一工具，重复调用不会"
+                                        "返回任何新结果。禁止再调用任何工具（即使更换参数也不行）。"
+                                        "请立即基于上文全部 Observation 输出 `Final Answer:`："
+                                        "用中文简洁总结已确认的结论并附文件:行号；关键结论尚未确认的"
+                                        "部分如实说明「当前无法确认」，不要编造，也不要输出 Action。"
+                                    ),
+                                }
+                            )
+                            yield {
+                                "type": "reflection",
+                                "text": "检测到模型重复空转，正在要求模型基于已有观察强制收尾。",
+                            }
+                            continue
+                        yield _evidence_final(forced_final_reason)
                         return
                     trail.append(
                         {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
@@ -375,16 +566,64 @@ class Agent:
                     }
                     continue
 
-                if tool_steps >= MAX_AGENT_STEPS:
+                # 空参数护栏：需要输入的工具不允许空参调用（不执行、不计工具步数）。
+                # 放在重复计数之后：连续空参第 2/3 次直接走上面的重复升级（Nudge→停止），
+                # 避免弱模型靠空参空转刷到迭代上限。
+                if not action_arg and action_name not in (_NO_ARG_TOOLS | _OPTIONAL_ARG_TOOLS):
+                    executed.add(sig)
+                    trail.append(
+                        {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
+                    )
+                    empty_obs = _empty_arg_obs(action_name, question)
+                    trail.append({"role": "user", "content": empty_obs})
                     yield {
-                        "type": "final",
-                        "text": "（已达到最大工具调用步数，请缩小问题范围或开新对话后重试。）",
+                        "type": "action",
+                        "text": f"{action_name}() [已拦截：缺少参数]",
                     }
+                    yield {
+                        "type": "observation",
+                        "text": empty_obs,
+                    }
+                    continue
+
+                if tool_steps >= MAX_AGENT_STEPS:
+                    # 步数耗尽：先强制模型基于已有 Observation 收尾（不执行新工具、不计步），
+                    # 给一次机会产出带证据的 Final Answer；仍要调工具则由前置拦截证据兜底。
+                    if forced_finals < _MAX_FORCED_FINALS:
+                        forced_finals += 1
+                        forced_final_reason = (
+                            f"（已达到最大工具调用步数 {MAX_AGENT_STEPS}，模型未能自行收尾。）"
+                        )
+                        trail.append(
+                            {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
+                        )
+                        trail.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Nudge: 工具调用步数已达上限（{MAX_AGENT_STEPS} 步），"
+                                    "禁止再调用任何工具。请立即基于上文全部 Observation 输出 "
+                                    "`Final Answer:`：用中文简洁总结已确认的结论并附文件:行号；"
+                                    "证据不足的部分如实说明"
+                                    "「当前无法确认」，不要编造，也不要输出 Action。"
+                                ),
+                            }
+                        )
+                        yield {
+                            "type": "reflection",
+                            "text": "工具步数已用尽，正在要求模型基于已有观察收尾。",
+                        }
+                        continue
+                    # 防御性兜底：正常路径已被循环顶部的前置拦截覆盖
+                    yield _evidence_final(forced_final_reason)
                     return
                 executed.add(sig)
                 tool_steps += 1
-                yield {"type": "action", "text": f"{parsed['action']}({parsed['action_input']})"}
-                obs = TOOLS[parsed["action"]]["func"](parsed["action_input"])
+                # 事件展示 / 证据清单 / 实际派发必须统一用归一化后的 action_arg：
+                # 弱模型的 query:/pattern:/path: 关键字风格已在此处还原为工具真实入参。
+                evidence.append(f"{action_name}({_clip(action_arg, 120)})")
+                yield {"type": "action", "text": f"{action_name}({action_arg})"}
+                obs = TOOLS[action_name]["func"](action_arg)
                 yield {"type": "observation", "text": obs}
                 last_action = parsed["action"]
                 last_obs = obs

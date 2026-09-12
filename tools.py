@@ -291,13 +291,23 @@ def python_exec(code):
     # 不能拿它当解释器跑代码（只会再启动一个应用实例）。
     if getattr(sys, "frozen", False):
         return "分发版（DocMind.exe）未内置 Python 解释器，python_exec 仅在源码/venv 环境可用。"
+    # 弱模型常把多行代码写成单行、换行用字面量 \n/\t（Action Input 是单行字段）；
+    # 首次编译失败且代码里没有真实换行时，反转义一次再执行（正常代码不受影响）。
+    try:
+        compile(code, "<python_exec>", "exec")
+    except SyntaxError:
+        if "\\n" in code and "\n" not in code:
+            code = code.replace("\\n", "\n").replace("\\t", "\t")
+    # 已索引代码库时在代码根目录内执行：脚本里的相对路径（如 open("app/src/...")）
+    # 才能按项目语义解析；未配置代码库时维持旧行为（服务端目录）。
+    cwd = _get_code_root() or os.path.dirname(__file__)
     try:
         proc = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True,
             text=True,
             timeout=12,
-            cwd=os.path.dirname(__file__),
+            cwd=cwd,
         )
     except subprocess.TimeoutExpired:
         return "代码执行超时（>12s），可能被死循环阻塞。"
@@ -668,11 +678,30 @@ def search_code(query):
 
 
 def read_file(path):
-    """读取代码库中的文件内容（path 为相对 code_root 的路径或文件名）。"""
+    """读取代码库中的文件内容（path 为相对 code_root 的路径或文件名）。
+
+    大文件默认只给前 4000 字；可在输入里附 `start: <1基行号>` 与可选 `end: <行号>`
+    只看某个区间（如枚举/方法所在行段），格式：路径换行后接 start:/end: 两行。
+    """
     root = _get_code_root()
     if not root:
         return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
     root_abs = os.path.normpath(root)
+    start_line = end_line = None
+    ms = re.search(r"(?:^|\n)\s*start\s*[:：]\s*(\d+)", path)
+    me = re.search(r"(?:^|\n)\s*end\s*[:：]\s*(\d+)", path)
+    cuts = []
+    if ms:
+        start_line = max(1, int(ms.group(1)))
+        cuts.append(ms.start())
+    if me:
+        end_line = max(1, int(me.group(1)))
+        cuts.append(me.start())
+    if cuts:
+        path = path[:min(cuts)]
+    path = path.strip()
+    if start_line and end_line and end_line < start_line:
+        end_line = start_line + 200
     target = os.path.normpath(path if os.path.isabs(path) else os.path.join(root_abs, path))
     # 路径越界防护：只允许读取 code_root 目录内的文件
     if not (target == root_abs or target.startswith(root_abs + os.sep)):
@@ -690,47 +719,115 @@ def read_file(path):
         return f"读取失败: {e}"
     # 记录已读，供 apply_edit 的"先读后写"护栏使用
     _READ_FILES.add(os.path.normcase(target))
-    if len(content) > 4000:
-        content = content[:4000] + "\n…（已截断，仅显示前 4000 字）"
     rel = os.path.relpath(target, root_abs)
+    if start_line:
+        all_lines = content.splitlines(keepends=True)
+        if not end_line:
+            end_line = start_line + 199  # 区间默认 200 行
+        end_line = min(end_line, len(all_lines))
+        picked = all_lines[start_line - 1:end_line]
+        shown = "".join(f"{i}: {ln}" for i, ln in enumerate(picked, start=start_line))
+        return f"=== {rel}（第 {start_line}-{end_line} 行，共 {len(all_lines)} 行）===\n{shown}"
+    if len(content) > 4000:
+        content = content[:4000] + "\n…（已截断，仅显示前 4000 字；需要后续段落请用 start:/end: 指定行号）"
     return f"=== {rel} ===\n{content}"
 
 
+_RE_GREP_SCOPE_LINE = re.compile(r"^\s*path\s*[:：]\s*(.+?)\s*$", re.I)
+_RE_GREP_SCOPE_INLINE = re.compile(r"\s*[,，]\s*path\s*[:：]\s*(.+?)\s*$", re.I)
+_RE_GREP_PATTERN_KEY = re.compile(r"^\s*(?:pattern|regex|p)\s*[:：]\s*(.+)$", re.I)
+
+
+def _strip_arg_quotes(text):
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`":
+        return text[1:-1].strip()
+    return text
+
+
 def grep(pattern):
-    """在代码库中按正则搜索文本/符号，返回匹配的文件路径与行号。"""
+    """在代码库中按正则搜索文本/符号，返回匹配的文件路径与行号。
+
+    可在输入末尾用 path: 限定搜索范围（相对 code_root 的文件或目录），避免全仓扫描：
+      某正则
+      path: app/src/main/java/.../A.java
+    或一行内：某正则, path: app/src/main/java/...（目录）
+    """
     root = _get_code_root()
     if not root:
         return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    # 解析可选 path: 作用域（独立行优先），剩余文本才是正则
+    scope_rel = None
+    kept = []
+    for i, ln in enumerate((pattern or "").splitlines()):
+        ms = _RE_GREP_SCOPE_LINE.match(ln)
+        if ms and i >= 1:
+            scope_rel = _strip_arg_quotes(ms.group(1))
+        else:
+            kept.append(ln)
+    pattern = "\n".join(kept).strip()
+    mi = _RE_GREP_SCOPE_INLINE.search(pattern)
+    if mi:
+        scope_rel = _strip_arg_quotes(mi.group(1))
+        pattern = pattern[:mi.start()].strip()
+    mp = _RE_GREP_PATTERN_KEY.match(pattern)
+    if mp and "\n" not in pattern:
+        pattern = _strip_arg_quotes(mp.group(1))
     pattern = _clean_symbol(pattern)
     try:
         rx = re.compile(pattern)
     except re.error as e:
         return f"正则错误: {e}"
     root_abs = os.path.normpath(root)
+
+    def _resolve_scope(rel):
+        target = os.path.normpath(os.path.join(root_abs, rel))
+        if not (target == root_abs or target.startswith(root_abs + os.sep)):
+            alt = os.path.normpath(os.path.join(root_abs, rel.lstrip("./\\")))
+            if os.path.exists(alt) and (alt == root_abs or alt.startswith(root_abs + os.sep)):
+                target = alt
+            else:
+                return None, f"拒绝访问：{rel} 不在代码根目录内。"
+        if not os.path.exists(target):
+            return None, f"路径不存在：{rel}"
+        return target, None
+
+    scope_abs = None
+    if scope_rel:
+        scope_abs, err = _resolve_scope(scope_rel)
+        if err:
+            return err
+
+    def _iter_candidate_files():
+        if scope_abs and os.path.isfile(scope_abs):
+            if os.path.splitext(scope_abs)[1].lower() in _CODE_EXT:
+                yield scope_abs
+            return
+        for dp, dns, fns in os.walk(scope_abs or root_abs):
+            dns[:] = [d for d in dns if d not in _SKIP_DIRS]
+            for fn in fns:
+                if os.path.splitext(fn)[1].lower() not in _CODE_EXT:
+                    continue
+                yield os.path.join(dp, fn)
+
     hits = []
-    for dp, dns, fns in os.walk(root_abs):
-        dns[:] = [d for d in dns if d not in _SKIP_DIRS]
-        for fn in fns:
-            if os.path.splitext(fn)[1].lower() not in _CODE_EXT:
-                continue
-            fp = os.path.join(dp, fn)
-            if os.path.getsize(fp) > 2_000_000:
-                continue
-            try:
-                with open(fp, encoding="utf-8", errors="ignore") as f:
-                    for i, line in enumerate(f, 1):
-                        if rx.search(line):
-                            hits.append(f"{os.path.relpath(fp, root_abs)}:{i}: {line.rstrip()}")
-                            if len(hits) >= 40:
-                                break
-            except Exception:  # noqa: BLE001
-                pass
-            if len(hits) >= 40:
-                break
+    for fp in _iter_candidate_files():
+        if os.path.getsize(fp) > 2_000_000:
+            continue
+        try:
+            with open(fp, encoding="utf-8", errors="ignore") as f:
+                for i, line in enumerate(f, 1):
+                    if rx.search(line):
+                        hits.append(f"{os.path.relpath(fp, root_abs)}:{i}: {line.rstrip()}")
+                        if len(hits) >= 40:
+                            break
+        except Exception:  # noqa: BLE001
+            pass
         if len(hits) >= 40:
             break
     if not hits:
-        return f"代码库中未匹配到：{pattern}"
+        scope_note = f"（范围：{scope_rel}）" if scope_rel else ""
+        return f"代码库中未匹配到：{pattern}{scope_note}"
     return "\n".join(hits[:40])
 
 
