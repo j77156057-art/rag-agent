@@ -35,7 +35,7 @@ def engine_scan(root):
 
 def engine_inspect(root, engine=''):
     """深度读取 Unity/Unreal 项目文本资产，建立可供 AI 定位的轻量索引。"""
-    base=_root(root); result={'ok':True,'engine':engine,'manifests':[],'scenes':[],'prefabs':[],'assets':[],'symbols':[]}
+    base=_root(root); result={'ok':True,'engine':engine,'manifests':[],'scenes':[],'prefabs':[],'assets':[],'symbols':[],'blueprints':[],'levels':[]}
     projects=engine_scan(base).get('projects',[])
     if not engine and projects: engine=projects[0]['engine']; result['engine']=engine
     if engine=='unity':
@@ -76,7 +76,15 @@ def engine_inspect(root, engine=''):
         for dp,_,files in os.walk(base):
             if any(x in dp.split(os.sep) for x in ('.git','Intermediate','DerivedDataCache','Saved')): continue
             for fn in files:
-                if fn.endswith('.uplugin'): result['assets'].append({'path':os.path.relpath(os.path.join(dp,fn),base).replace('\\','/'),'kind':'plugin'})
+                rel=os.path.relpath(os.path.join(dp,fn),base).replace('\\','/')
+                if fn.endswith('.uplugin'): result['assets'].append({'path':rel,'kind':'plugin'})
+                elif fn.endswith('.umap'):
+                    result['levels'].append({'path':rel,'kind':'level'})
+                elif fn.endswith('.uasset'):
+                    low=fn.lower()
+                    kind='blueprint' if ('blueprint' in low or low.startswith('bp_') or low.endswith('_bp.uasset')) else 'asset'
+                    item={'path':rel,'kind':kind}
+                    result['blueprints' if kind=='blueprint' else 'assets'].append(item)
     return result
 
 def engine_prepare(root, engine='godot', executable=''):

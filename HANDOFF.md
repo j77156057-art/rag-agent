@@ -354,3 +354,6 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - GPU 协调器新增优先级队列：`acquire(..., priority=N)`，高优先级任务优先获得释放的租约，同优先级保持 FIFO；取消和 TTL 回收会清理优先级元数据。
 - 新增优先级交接测试，GPU 队列相关测试通过。
 仍待实现：跨进程真实显存隔离和任务进程绑定；GPU 优先级尚未持久化到磁盘队列。
+- Unreal `engine_inspect` 现在分类索引 Content 资产：`blueprints`（按 BP_/Blueprint 命名）与 `levels`（.umap），并保留其它 .uasset 为 assets；仅做只读索引，不修改二进制资源。
+- 新增资产分类测试。
+仍待实现：通过 Unreal Editor Python/HTTP 插件读取 Blueprint 节点、Level Actor 属性并执行安全编辑；当前索引不能替代编辑器级解析。
