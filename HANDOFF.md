@@ -410,3 +410,10 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 证明 Z-Image 模型、GGUF 节点、VAE、GPU 推理和结果查询链路均可用。
 - MiniMax H3 实机首次 workflow 已提交并被 ComfyUI 接受，但在 `MiniMaxH3ImageToVideo` 文本编码阶段失败：`mat1 and mat2 shapes cannot be multiplied (8x5120 and 2560x8192)`。
 - 诊断表明当前 `CLIPLoaderGGUF(qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors, type=minimax)` 与 H3 节点期望的文本编码维度不匹配；未把失败误报为成功。下一步需读取官方 H3 workflow/正确文本编码器配置后再重试。
+### MiniMax H3 实机成功验证（2026-09-14）
+
+- 使用本地官方 `minimax_h3_t2v.json` 展开脚本 `h3_video_gen.py`，避免手写 workflow 的文本编码器维度错误。
+- 实际参数：首帧 `starblade_kf01.png`、672x384、约 5 秒、8 steps。
+- ComfyUI prompt：`ff95c4f5-e632-4468-9a6c-a0f48dd17df6`，状态 success，耗时约 10 秒。
+- 输出：`D:\ComfyUI\ComfyUI\output\docmind_h3_00001_.mp4`，SaveVideo 返回 animated=true。
+- 证明 H3 模型、正确 Qwen3VL 配置、I2V workflow、GPU 推理和视频输出链路可用。
