@@ -400,3 +400,11 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI 日志确认已加载 `TE-Speed-MiniMaxH3-OSS`、`ComfyUI-GGUF`、`comfyui-ollama` 自定义节点。
 
 实机服务已具备，下一步可提交实际 Z-Image/H3 workflow 做端到端生成验证；生成任务会经过工作台 watcher 和 GPU 租约调度。
+
+### Z-Image 实机端到端验证（2026-09-14）
+
+- 使用本地 `UnetLoaderGGUF + CLIPLoaderGGUF + TextEncodeZImageOmni + KSampler + VAEDecode + SaveImage` workflow。
+- ComfyUI 返回 prompt：`2a82927b-0468-478e-857c-26a3c1fab143`。
+- history 状态：`success/completed=true`，耗时约 25 秒。
+- 输出：`docmind_zimage_00001_.png`（ComfyUI output 目录）。
+- 证明 Z-Image 模型、GGUF 节点、VAE、GPU 推理和结果查询链路均可用。
