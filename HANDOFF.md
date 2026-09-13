@@ -375,3 +375,6 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - GPU 新增 `GET /api/gpu/environment`，返回启动 Ollama/ComfyUI/引擎子进程时建议注入的 `CUDA_VISIBLE_DEVICES` 与 `DOCMIND_GPU_INDEX`，不修改工作台自身环境。
 - 新增环境生成测试。
 仍待实现：将该环境实际传入各子进程启动器，以及真实跨进程显存监控/隔离。
+- 引擎启动现在会将 GPU 调度器生成的 `CUDA_VISIBLE_DEVICES`/`DOCMIND_GPU_INDEX` 环境注入 Godot、Unity、Unreal 子进程，便于实际设备选择；工作台自身环境不变。
+- API 路由与 GPU 环境测试通过。
+仍待实现：引擎启动前自动申请/停止时释放 GPU 租约（当前仅注入环境）；跨进程显存监控与持久队列。

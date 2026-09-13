@@ -1,7 +1,7 @@
 """Game-development helpers built on top of the region workspace."""
 import json, os, re, subprocess, math, time, mimetypes, sys, ast as _ast, urllib.request, urllib.parse, urllib.error, shutil, zipfile, tempfile, hashlib
 import mcp_client
-from gpu_coordinator import acquire as _gpu_acquire, release as _gpu_release
+from gpu_coordinator import acquire as _gpu_acquire, release as _gpu_release, process_environment as _gpu_process_environment
 from datetime import datetime
 
 _ENGINE_PROCS = {}
@@ -614,7 +614,8 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
     try:
         log_path = _file(root_abs, ".docmind_engine.log")
         log = open(log_path, "a", encoding="utf-8")
-        p = subprocess.Popen(args, cwd=root_abs, stdout=log, stderr=subprocess.STDOUT, text=True)
+        child_env = os.environ.copy(); child_env.update(_gpu_process_environment())
+        p = subprocess.Popen(args, cwd=root_abs, stdout=log, stderr=subprocess.STDOUT, text=True, env=child_env)
         _ENGINE_PROCS[root_abs] = p
         _ENGINE_LOGS[root_abs] = log
         result = {"ok": True, "running": True, "pid": p.pid}
