@@ -383,3 +383,4 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 仍待实现：跨进程显存真实监控/隔离、持久任务队列，以及 Unreal Editor Blueprint 节点/Actor 属性的实际通信读写。
 - ComfyUI queue 响应新增 `workflow_sha256`，对规范化 workflow 计算稳定哈希，便于任务追踪、缓存和资源来源审计；不保存敏感 workflow 内容。
 - ComfyUI 导入元数据现在保留可选 `license`、`source_url`、`author`、`workflow_sha256` 字段（长度受限），便于资源来源和授权审计。
+- 新增引擎 GPU 租约护栏测试：验证 GPU 忙时引擎启动被阻止，防止未来改动绕过调度器。
