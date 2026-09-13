@@ -1,5 +1,5 @@
 """Game-development helpers built on top of the region workspace."""
-import json, os, re, subprocess, math, time, mimetypes, sys, ast as _ast, urllib.request, urllib.parse, urllib.error, shutil, zipfile, tempfile
+import json, os, re, subprocess, math, time, mimetypes, sys, ast as _ast, urllib.request, urllib.parse, urllib.error, shutil, zipfile, tempfile, hashlib
 import mcp_client
 from gpu_coordinator import acquire as _gpu_acquire, release as _gpu_release
 from datetime import datetime
@@ -821,6 +821,29 @@ def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="
 def comfy_import_all(root, prompt_id, images, url="http://127.0.0.1:8188", dest_dir="assets/generated"):
     results = [comfy_import(root, prompt_id, image, url, dest_dir) for image in (images or [])[:32]]
     return {"ok": all(x.get("ok") for x in results), "results": results, "imported": sum(1 for x in results if x.get("ok"))}
+
+def comfy_resource_duplicates(root, directory="assets/generated"):
+    """按 SHA-256 查找 ComfyUI 导入目录中的重复资源，只读。"""
+    base = _file(root, directory)
+    groups = {}
+    if not os.path.isdir(base):
+        return {'ok': True, 'directory': directory, 'groups': [], 'files': 0}
+    count = 0
+    for dp, _, files in os.walk(base):
+        for fn in files:
+            if fn.endswith('.json'):
+                continue
+            path = os.path.join(dp, fn)
+            try:
+                h = hashlib.sha256()
+                with open(path, 'rb') as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b''): h.update(chunk)
+                rel = os.path.relpath(path, _root(root)).replace('\\', '/')
+                groups.setdefault(h.hexdigest(), []).append(rel); count += 1
+            except OSError:
+                continue
+    dup = [{'sha256': h, 'paths': paths, 'duplicate_count': len(paths)-1} for h, paths in groups.items() if len(paths) > 1]
+    return {'ok': True, 'directory': directory, 'groups': dup, 'duplicate_files': sum(x['duplicate_count'] for x in dup), 'files': count}
 
 # Dedicated module keeps scene inspection and runtime capture independently testable.
 from scene_runtime import scene_tree, runtime_events, set_scene_property

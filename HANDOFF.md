@@ -357,3 +357,6 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - Unreal `engine_inspect` 现在分类索引 Content 资产：`blueprints`（按 BP_/Blueprint 命名）与 `levels`（.umap），并保留其它 .uasset 为 assets；仅做只读索引，不修改二进制资源。
 - 新增资产分类测试。
 仍待实现：通过 Unreal Editor Python/HTTP 插件读取 Blueprint 节点、Level Actor 属性并执行安全编辑；当前索引不能替代编辑器级解析。
+- ComfyUI 资源管理新增只读重复检测：`comfy_resource_duplicates()` 按 SHA-256 对生成目录分组，并通过 `GET /api/comfy/resources/duplicates` 提供报告；不会自动删除资源。
+- 新增哈希分组测试。
+仍待实现：ComfyUI 任务取消、许可证/来源元数据完善、未使用资源分析；GPU 跨进程显存隔离与持久队列；Unreal Editor 深度读写桥接。
