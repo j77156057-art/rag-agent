@@ -1379,3 +1379,5 @@ def require_approval(root, action, target):
             f"审批通过后 {APPROVAL_TTL_SECONDS // 60} 分钟内该操作放行。"
         ),
     }
+
+
