@@ -716,6 +716,9 @@ def engine_verify(root, executable="godot", timeout=30):
         project_path=os.path.join(root_abs, projects[0]) if projects else root_abs
         cmd=[executable, project_path, '-Unattended','-NullRHI','-ProjectOnly']
     else: cmd=[executable,'--headless','--path',root_abs,'--editor','--quit']
+    lease_owner = 'verify:' + root_abs
+    if not _gpu_acquire(lease_owner, timeout=2, purpose='engine-verify'):
+        return {'ok': False, 'error': 'GPU 资源正忙，无法执行引擎校验。'}
     try:
         verify_env = os.environ.copy(); verify_env.update(_gpu_process_environment())
         p = subprocess.run(cmd, cwd=root_abs, capture_output=True, text=True, timeout=max(3, min(int(timeout), 180)),
@@ -724,13 +727,20 @@ def engine_verify(root, executable="godot", timeout=30):
         diagnostics = parse_godot_diagnostics(out) if selected == 'godot' else (parse_unreal_diagnostics(out) if selected == 'unreal' else [])
         # 子进程直接捕获的诊断优先；日志文件解析作为历史兜底
         log_errors = engine_logs(root_abs).get("errors", [])
-        return {"ok": p.returncode == 0 and not any(d['severity'] == 'error' for d in diagnostics),
+        result = {"ok": p.returncode == 0 and not any(d['severity'] == 'error' for d in diagnostics),
                 "returncode": p.returncode, "output": out,
                 "diagnostics": diagnostics, "errors": diagnostics or log_errors}
+        _gpu_release(lease_owner)
+        return result
     except FileNotFoundError:
+        _gpu_release(lease_owner)
         return {"ok": False, "error": f"未找到 {selected} 可执行文件，请配置路径或将其加入 PATH。"}
     except subprocess.TimeoutExpired:
+        _gpu_release(lease_owner)
         return {"ok": False, "error": f"{selected} headless 校验超时。"}
+    except Exception as e:
+        _gpu_release(lease_owner)
+        return {"ok": False, "error": f"引擎校验失败：{e}"}
 
 def install_runtime_probe(root, dest='addons/docmind_runtime/probe.gd'):
     path = _file(root, dest)

@@ -385,3 +385,4 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI 导入元数据现在保留可选 `license`、`source_url`、`author`、`workflow_sha256` 字段（长度受限），便于资源来源和授权审计。
 - 新增引擎 GPU 租约护栏测试：验证 GPU 忙时引擎启动被阻止，防止未来改动绕过调度器。
 - `engine_verify` 的 Godot/Unity/Unreal headless 校验进程现在同样继承 GPU 设备环境，确保验证阶段与运行阶段使用一致的 CUDA 设备。
+- `engine_verify` 现在也申请独立 GPU 租约，并在成功、找不到可执行文件、超时或异常时释放，避免校验任务与运行任务并发争抢显存。
