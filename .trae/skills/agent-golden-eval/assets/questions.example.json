@@ -1,0 +1,7 @@
+[
+  {"id": "Q1", "question": "播放下一首的逻辑在哪里实现的？"},
+  {"id": "Q2", "question": "Where is the NetEase (NeteaseCloud) song search implemented?"},
+  {"id": "Q3", "question": "随机播放模式下，下一首歌是怎么选出来的？"},
+  {"id": "Q4", "question": "What happens when the currently playing song finishes?"},
+  {"id": "Q5", "question": "AI 歌词功能支持哪些语言？"}
+]
