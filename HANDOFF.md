@@ -424,3 +424,4 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 前端 ComfyUI 面板新增最近 10 个 prompt 历史（localStorage），支持点击切换并自动查询；提交后每 4 秒自动刷新当前任务结果，显示生成状态和输出数量。
 - Unreal 桥接脚本升级为本地 HTTP 服务骨架：在 Editor Python 中运行 `run_server(8765)` 后，`/` 探活、`/assets` 枚举 Blueprint 资产、`/actors` 枚举当前关卡 Actor；工作台新增 `GET /api/engine/unreal-bridge/status` 探测端点。
 - 尚需在真实 Unreal Editor 中启用 Python 插件并运行脚本后做通信实测；未宣称节点级编辑已完成。
+- Unreal 桥接新增工作台代理接口：`GET /api/engine/unreal-bridge/assets` 与 `/actors`，转发本地 Editor bridge 的 Blueprint 资产和当前关卡 Actor 数据；不可达时返回 `available=false`，不伪造结果。

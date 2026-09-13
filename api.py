@@ -509,6 +509,21 @@ async def unreal_bridge_status_ep(url: str = 'http://127.0.0.1:8765'):
     except Exception as e:
         return {'ok': True, 'available': False, 'error': str(e)}
 
+async def _unreal_bridge_get(path: str, url: str):
+    try:
+        with urllib.request.urlopen(url.rstrip('/') + path, timeout=5) as r:
+            return {'ok': True, 'available': True, **json.loads(r.read().decode())}
+    except Exception as e:
+        return {'ok': True, 'available': False, 'error': str(e)}
+
+@app.get('/api/engine/unreal-bridge/assets')
+async def unreal_bridge_assets_ep(url: str = 'http://127.0.0.1:8765'):
+    return await _unreal_bridge_get('/assets', url)
+
+@app.get('/api/engine/unreal-bridge/actors')
+async def unreal_bridge_actors_ep(url: str = 'http://127.0.0.1:8765'):
+    return await _unreal_bridge_get('/actors', url)
+
 # 注意：EngineEmbedReq 只在文件上方定义一次（带 x/y/offset_y 的完整版）。
 # 这里曾经又定义了一次窄版本，把上面的覆盖掉——处理器读 req.x 会 AttributeError，
 # 而因为当时还有一个重复的旧处理器在生效，这个错被完全掩盖了。
