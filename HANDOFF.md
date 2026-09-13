@@ -421,3 +421,4 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI 模板现在可直接加载 workflow：`GET /api/comfy/templates/{template_id}`；Z-Image 返回 API prompt 骨架，H3 读取本机官方 UI workflow。前端模板按钮会自动填充 JSON 编辑器。
 - 新增模板加载测试。
 - Ollama 本地聊天与选区 AI 的流式请求现在纳入 GPU 租约：请求开始申请、SSE 完成/异常时释放；GPU 忙时返回清晰提示，避免与 ComfyUI/H3 抢占。
+- 前端 ComfyUI 面板新增最近 10 个 prompt 历史（localStorage），支持点击切换并自动查询；提交后每 4 秒自动刷新当前任务结果，显示生成状态和输出数量。

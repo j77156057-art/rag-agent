@@ -4,7 +4,7 @@ import { engineApi, taskApi, comfyApi } from '../api'
 import { useWorkbench } from '../composables/workbench'
 const { jumpToLine } = useWorkbench()
 const open = ref(false), title = ref(''), region = ref(''), files = ref(''), result = ref(''), impact = ref<string[]>([]), taskId = ref(''), tasks = ref<Record<string, unknown>[]>([])
-const running = ref(false), busy = ref(false), logs = ref<string[]>([]), errors = ref<{path:string;line:number;message:string}[]>([]), comfyUrl = ref('http://127.0.0.1:8188'), comfyState = ref('未检测'), workflow = ref(''), comfyResult = ref(''), promptId = ref(''), outputs = ref<{filename?:string;subfolder?:string;type?:string}[]>([]), comfyTemplates = ref<{id:string;name:string;model:string;kind:string;workflow?:string}[]>([])
+const running = ref(false), busy = ref(false), logs = ref<string[]>([]), errors = ref<{path:string;line:number;message:string}[]>([]), comfyUrl = ref('http://127.0.0.1:8188'), comfyState = ref('未检测'), workflow = ref(''), comfyResult = ref(''), promptId = ref(''), outputs = ref<{filename?:string;subfolder?:string;type?:string}[]>([]), comfyTemplates = ref<{id:string;name:string;model:string;kind:string;workflow?:string}[]>([]), comfyHistory = ref<string[]>(JSON.parse(localStorage.getItem('docmind.comfy.history') || '[]'))
 async function loadTasks() { try { tasks.value = (await taskApi.list()).tasks.slice(-5).reverse() } catch {} }
 async function refresh() { try { running.value = (await engineApi.status()).running; const r = await engineApi.logs(); logs.value = r.lines.slice(-8); errors.value = r.errors } catch {} }
 async function analyze() {
@@ -18,12 +18,13 @@ async function toggleEngine() { busy.value = true; try { const r = running.value
 async function verifyEngine() { busy.value = true; try { const r = await engineApi.verify(); result.value = r.ok ? 'Godot 校验通过' : (r.error || 'Godot 校验失败') } catch (e) { result.value = (e as Error).message } finally { busy.value = false } }
 onMounted(refresh); onMounted(loadTasks); onMounted(async () => { try { comfyTemplates.value = (await comfyApi.templates()).templates } catch {} })
 let timer: number | undefined
-onMounted(() => { timer = window.setInterval(refresh, 3000) })
+onMounted(() => { timer = window.setInterval(refresh, 3000); window.setInterval(() => { if (promptId.value) pollComfy() }, 4000) })
 import { onBeforeUnmount } from 'vue'
 onBeforeUnmount(() => { if (timer) window.clearInterval(timer) })
 async function checkComfy() { try { const r = await comfyApi.status(comfyUrl.value); comfyState.value = r.available ? '可用' : '不可用' } catch { comfyState.value = '不可用' } }
-async function queueComfy() { try { const w = JSON.parse(workflow.value); const r = await comfyApi.queue(w, comfyUrl.value); promptId.value = String(r.response?.prompt_id || ''); comfyResult.value = r.ok ? `已提交 ${promptId.value}` : (r.error || '提交失败') } catch { comfyResult.value = 'Workflow JSON 无效' } }
+async function queueComfy() { try { const w = JSON.parse(workflow.value); const r = await comfyApi.queue(w, comfyUrl.value); promptId.value = String(r.response?.prompt_id || ''); if (promptId.value) { comfyHistory.value = [promptId.value, ...comfyHistory.value.filter(x => x !== promptId.value)].slice(0, 10); localStorage.setItem('docmind.comfy.history', JSON.stringify(comfyHistory.value)) }; comfyResult.value = r.ok ? `已提交 ${promptId.value}` : (r.error || '提交失败') } catch { comfyResult.value = 'Workflow JSON 无效' } }
 async function pollComfy() { if (!promptId.value) return; const r = await comfyApi.history(promptId.value, comfyUrl.value); outputs.value = r.outputs || []; comfyResult.value = r.done ? `生成完成（${outputs.value.length} 个结果）` : '生成中' }
+async function selectComfyHistory(id: string) { promptId.value = id; await pollComfy() }
 async function importOutput(o: Record<string, unknown>) { const x = await comfyApi.import(promptId.value, o, comfyUrl.value); comfyResult.value = x.ok ? `已导入 ${x.path}` : (x.error || '导入失败') }
 async function loadComfyTemplate(id: string) { const r = await comfyApi.template(id); if (r.ok && r.workflow) { workflow.value = JSON.stringify(r.workflow, null, 2); comfyResult.value = `已加载模板（${r.format || 'api'}）` } else comfyResult.value = r.error || '模板加载失败' }
 </script>
@@ -42,7 +43,7 @@ async function loadComfyTemplate(id: string) { const r = await comfyApi.template
       <div class="te-engine"><span :class="{ live: running }" /> Godot {{ running ? '运行中' : '未运行' }} <button @click="verifyEngine">校验</button><button @click="toggleEngine">{{ running ? '停止' : '启动' }}</button></div>
       <pre v-if="logs.length" class="te-logs">{{ logs.join('\n') }}</pre>
       <button v-for="e in errors" :key="`${e.path}:${e.line}`" class="te-error" @click="jumpToLine(e.path, e.line)">{{ e.path }}:{{ e.line }} · {{ e.message }}</button>
-      <div class="te-comfy"><b>ComfyUI 资源</b><input v-model="comfyUrl" @change="checkComfy" /><div class="te-templates"><button v-for="t in comfyTemplates" :key="t.id" @click="loadComfyTemplate(t.id)">{{ t.name }}</button></div><textarea v-model="workflow" placeholder="粘贴 workflow JSON" /><button @click="queueComfy">提交生成</button><button v-if="promptId" @click="pollComfy">查询结果</button><span>{{ comfyState }} {{ comfyResult }}</span></div>
+      <div class="te-comfy"><b>ComfyUI 资源</b><input v-model="comfyUrl" @change="checkComfy" /><div class="te-templates"><button v-for="t in comfyTemplates" :key="t.id" @click="loadComfyTemplate(t.id)">{{ t.name }}</button></div><div v-if="comfyHistory.length" class="te-history"><button v-for="id in comfyHistory" :key="id" @click="selectComfyHistory(id)">{{ id.slice(0,8) }}</button></div><textarea v-model="workflow" placeholder="粘贴 workflow JSON" /><button @click="queueComfy">提交生成</button><button v-if="promptId" @click="pollComfy">查询结果</button><span>{{ comfyState }} {{ comfyResult }}</span></div>
       <div v-if="outputs.length" class="te-outputs"><div v-for="o in outputs" :key="o.filename" class="te-output"><img v-if="o.mime?.startsWith('image/')" :src="o.preview_url" :alt="o.filename" /><audio v-else-if="o.mime?.startsWith('audio/')" :src="o.preview_url" controls /><video v-else-if="o.mime?.startsWith('video/')" :src="o.preview_url" controls /><span>{{ o.filename }}</span><button @click="importOutput(o)">导入</button></div></div>
     </div>
   </div>
