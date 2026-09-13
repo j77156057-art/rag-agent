@@ -389,3 +389,14 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI watcher 现在在轮询生命周期内持有 `comfy:<prompt_id>` GPU 租约，并在完成、失败或超时时释放；重复 watcher 不重复占用租约。
 - 这使生成监控阶段与 Ollama/引擎调度互斥，避免轮询期间 GPU 被其它任务抢占。
 - ComfyUI workflow 提交成功后会自动启动后台 watcher（当响应包含 `prompt_id`），`/api/comfy/queue` 返回 `watch` 状态；无需前端额外发起轮询请求。
+
+### 本地 ComfyUI 实机联调（2026-09-14）
+
+- 已确认安装目录：`D:\ComfyUI\ComfyUI`，便携 Python 3.13.14。
+- 已启动实例 PID 46712：`127.0.0.1:8188`，ComfyUI 0.33.1，PyTorch 2.13.0+cu130。
+- 实测 GPU：`cuda:0 NVIDIA GeForce RTX 5070 Ti Laptop GPU`，总显存约 12.82 GB，启动时空闲约 11.58 GB。
+- 已发现 Z-Image：`models/unet/z_image_turbo-Q8_0.gguf`、`models/clip/Qwen3-4B-Q8_0.gguf`、`models/vae/ae.safetensors`。
+- 已发现 MiniMax H3：`diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors`、`diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors`、对应 LoRA、Qwen3VL 文本编码器及音视频 VAE。
+- ComfyUI 日志确认已加载 `TE-Speed-MiniMaxH3-OSS`、`ComfyUI-GGUF`、`comfyui-ollama` 自定义节点。
+
+实机服务已具备，下一步可提交实际 Z-Image/H3 workflow 做端到端生成验证；生成任务会经过工作台 watcher 和 GPU 租约调度。
