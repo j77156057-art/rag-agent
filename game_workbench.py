@@ -58,13 +58,19 @@ def engine_inspect(root, engine=''):
             path=os.path.join(base,p['path'])
             try:
                 with open(path,encoding='utf-8',errors='replace') as f: data=json.load(f)
-                result['manifests'].append({'path':p['path'],'file_version':data.get('FileVersion'),'modules':[x.get('Name') for x in data.get('Modules',[]) if isinstance(x,dict)]})
+                result['manifests'].append({'path':p['path'],'file_version':data.get('FileVersion'),'modules':[x.get('Name') for x in data.get('Modules',[]) if isinstance(x,dict)],'plugins':[x.get('Name') for x in data.get('Plugins',[]) if isinstance(x,dict)],'targets':data.get('TargetPlatforms',[])})
             except Exception: result['manifests'].append({'path':p['path'],'error':'invalid json'})
         for dp,_,files in os.walk(os.path.join(base,'Source')) if os.path.isdir(os.path.join(base,'Source')) else []:
             for fn in files:
                 if fn.endswith(('.h','.cpp','.cs','.Build.cs')):
                     rel=os.path.relpath(os.path.join(dp,fn),base).replace('\\','/')
-                    result['symbols'].append({'path':rel,'kind':'source'})
+                    item={'path':rel,'kind':'build' if fn.endswith('.Build.cs') else 'source'}
+                    if fn.endswith('.Build.cs'):
+                        try:
+                            text=open(os.path.join(dp,fn),encoding='utf-8',errors='replace').read(12000)
+                            item['dependencies']=re.findall(r'\"([A-Za-z0-9_]+)\"', text)
+                        except OSError: pass
+                    result['symbols'].append(item)
         for dp,_,files in os.walk(base):
             if any(x in dp.split(os.sep) for x in ('.git','Intermediate','DerivedDataCache','Saved')): continue
             for fn in files:

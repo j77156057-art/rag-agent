@@ -327,3 +327,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 审批请求支持 before/after 自动生成 unified diff，AgentPolicyPanel 审批列表可展示 Diff 并批准/拒绝；前端构建通过。
 
 - 独立分支 codex/p1-3-gpu-comfyui 新增 /api/comfy/wait/{prompt_id} 有界轮询接口，ComfyUI 可等待完成/失败/超时；测试 213 项通过。
+
+- Unreal inspect 现在额外返回 .uproject 插件/目标平台，并解析 Build.cs 依赖。
