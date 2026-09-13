@@ -18,6 +18,7 @@ _held_owner = None
 _held_purpose = ""
 _held_since = None
 _held_ttl = 0.0
+_held_device = None
 _waiters = collections.deque()  # (owner, purpose, event)
 _waiter_priorities = {}  # event -> numeric priority (higher first, FIFO within priority)
 
@@ -51,16 +52,21 @@ def _expire_locked(now):
 
 def _handover_locked():
     """释放当前持有者并把租约交给队首等待者；队列为空则真正空闲。调用方须持 _cv。"""
-    global _held_owner, _held_purpose, _held_since, _held_ttl
+    global _held_owner, _held_purpose, _held_since, _held_ttl, _held_device
     while _waiters:
         owner, purpose, event = _waiters.popleft()
         _waiter_priorities.pop(event, None)
         if not event.is_set():
             _held_owner, _held_purpose = owner, purpose
             _held_since, _held_ttl = time.time(), DEFAULT_TTL
+            _held_device = _device_index()
             event.set()
             return
-    _held_owner, _held_purpose, _held_since, _held_ttl = None, "", None, 0.0
+    _held_owner, _held_purpose, _held_since, _held_ttl, _held_device = None, "", None, 0.0, None
+
+def _device_index():
+    try: return int(os.getenv('DOCMIND_GPU_INDEX', '0') or 0)
+    except ValueError: return 0
 
 
 def status():
@@ -72,6 +78,7 @@ def status():
             "mode": GPU_MODE,
             "active": _held_owner,
             "purpose": _held_purpose,
+            "device_index": _held_device,
             "held_for_seconds": held_for,
             "lease_ttl": _held_ttl,
             "queue": [{"owner": o, "purpose": pu} for o, pu, _ in _waiters],
@@ -88,7 +95,7 @@ def acquire(owner, timeout=2, purpose="", ttl=None, priority=0):
     - timeout 内排队等待，FIFO 转交。
     - ttl 秒后租约可被自动回收（防持有者崩溃死锁）；None 取 DOCMIND_GPU_LEASE_TTL。
     """
-    global _held_owner, _held_purpose, _held_since, _held_ttl
+    global _held_owner, _held_purpose, _held_since, _held_ttl, _held_device
     if GPU_MODE == "parallel":
         return True
     owner = str(owner)
@@ -106,6 +113,7 @@ def acquire(owner, timeout=2, purpose="", ttl=None, priority=0):
         if _held_owner is None:
             _held_owner, _held_purpose = owner, str(purpose)
             _held_since, _held_ttl = time.time(), lease_ttl
+            _held_device = _device_index()
             return True
         if _held_owner == owner:
             return True
