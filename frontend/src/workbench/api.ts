@@ -592,6 +592,7 @@ export const playApi = {
 
 export const comfyApi = {
   templates() { return request<{ ok: boolean; templates: { id:string; name:string; model:string; kind:string; workflow?:string }[] }>('/api/comfy/templates') },
+  template(id: string) { return request<{ ok:boolean; workflow?:Record<string, unknown>; format?:string; error?:string }>(`/api/comfy/templates/${encodeURIComponent(id)}`) },
   status(url = 'http://127.0.0.1:8188') { return request<{ ok: boolean; available: boolean; url: string; error?: string }>(`/api/comfy/status?url=${encodeURIComponent(url)}`) },
   queue(workflow: Record<string, unknown>, url = 'http://127.0.0.1:8188') { return postJson<{ ok: boolean; response?: Record<string, unknown>; error?: string }>('/api/comfy/queue', { url, workflow }) },
   history(promptId: string, url = 'http://127.0.0.1:8188') { return request<{ ok: boolean; done?: boolean; outputs?: { filename?: string; subfolder?: string; type?: string }[]; error?: string }>(`/api/comfy/history/${encodeURIComponent(promptId)}?url=${encodeURIComponent(url)}`) },

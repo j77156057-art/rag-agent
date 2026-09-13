@@ -25,6 +25,7 @@ async function checkComfy() { try { const r = await comfyApi.status(comfyUrl.val
 async function queueComfy() { try { const w = JSON.parse(workflow.value); const r = await comfyApi.queue(w, comfyUrl.value); promptId.value = String(r.response?.prompt_id || ''); comfyResult.value = r.ok ? `已提交 ${promptId.value}` : (r.error || '提交失败') } catch { comfyResult.value = 'Workflow JSON 无效' } }
 async function pollComfy() { if (!promptId.value) return; const r = await comfyApi.history(promptId.value, comfyUrl.value); outputs.value = r.outputs || []; comfyResult.value = r.done ? `生成完成（${outputs.value.length} 个结果）` : '生成中' }
 async function importOutput(o: Record<string, unknown>) { const x = await comfyApi.import(promptId.value, o, comfyUrl.value); comfyResult.value = x.ok ? `已导入 ${x.path}` : (x.error || '导入失败') }
+async function loadComfyTemplate(id: string) { const r = await comfyApi.template(id); if (r.ok && r.workflow) { workflow.value = JSON.stringify(r.workflow, null, 2); comfyResult.value = `已加载模板（${r.format || 'api'}）` } else comfyResult.value = r.error || '模板加载失败' }
 </script>
 <template>
   <div class="te-panel">
@@ -41,7 +42,7 @@ async function importOutput(o: Record<string, unknown>) { const x = await comfyA
       <div class="te-engine"><span :class="{ live: running }" /> Godot {{ running ? '运行中' : '未运行' }} <button @click="verifyEngine">校验</button><button @click="toggleEngine">{{ running ? '停止' : '启动' }}</button></div>
       <pre v-if="logs.length" class="te-logs">{{ logs.join('\n') }}</pre>
       <button v-for="e in errors" :key="`${e.path}:${e.line}`" class="te-error" @click="jumpToLine(e.path, e.line)">{{ e.path }}:{{ e.line }} · {{ e.message }}</button>
-      <div class="te-comfy"><b>ComfyUI 资源</b><input v-model="comfyUrl" @change="checkComfy" /><div class="te-templates"><button v-for="t in comfyTemplates" :key="t.id" @click="comfyResult=`${t.name} · ${t.model}`">{{ t.name }}</button></div><textarea v-model="workflow" placeholder="粘贴 workflow JSON" /><button @click="queueComfy">提交生成</button><button v-if="promptId" @click="pollComfy">查询结果</button><span>{{ comfyState }} {{ comfyResult }}</span></div>
+      <div class="te-comfy"><b>ComfyUI 资源</b><input v-model="comfyUrl" @change="checkComfy" /><div class="te-templates"><button v-for="t in comfyTemplates" :key="t.id" @click="loadComfyTemplate(t.id)">{{ t.name }}</button></div><textarea v-model="workflow" placeholder="粘贴 workflow JSON" /><button @click="queueComfy">提交生成</button><button v-if="promptId" @click="pollComfy">查询结果</button><span>{{ comfyState }} {{ comfyResult }}</span></div>
       <div v-if="outputs.length" class="te-outputs"><div v-for="o in outputs" :key="o.filename" class="te-output"><img v-if="o.mime?.startsWith('image/')" :src="o.preview_url" :alt="o.filename" /><audio v-else-if="o.mime?.startsWith('audio/')" :src="o.preview_url" controls /><video v-else-if="o.mime?.startsWith('video/')" :src="o.preview_url" controls /><span>{{ o.filename }}</span><button @click="importOutput(o)">导入</button></div></div>
     </div>
   </div>

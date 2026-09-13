@@ -764,6 +764,23 @@ def comfy_templates():
         {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','workflow':'D:/ComfyUI/ComfyUI/user/default/workflows/minimax_h3_t2v.json'}
     ]}
 
+def comfy_template_workflow(template_id):
+    if template_id == 'minimax-h3-i2v':
+        path = r'D:\ComfyUI\ComfyUI\user\default\workflows\minimax_h3_t2v.json'
+        try:
+            with open(path, encoding='utf-8') as f: return {'ok': True, 'id': template_id, 'workflow': json.load(f), 'format': 'ui'}
+        except Exception as e: return {'ok': False, 'error': f'无法读取 H3 workflow：{e}'}
+    if template_id == 'z-image-turbo':
+        return {'ok': True, 'id': template_id, 'format': 'api', 'workflow': {
+            '1': {'class_type':'UnetLoaderGGUF','inputs':{'unet_name':'z_image_turbo-Q8_0.gguf'}},
+            '2': {'class_type':'CLIPLoaderGGUF','inputs':{'clip_name':'Qwen3-4B-Q8_0.gguf','type':'lumina2'}},
+            '3': {'class_type':'TextEncodeZImageOmni','inputs':{'clip':['2',0],'prompt':'a cinematic game character concept','auto_resize_images':True}},
+            '4': {'class_type':'TextEncodeZImageOmni','inputs':{'clip':['2',0],'prompt':'blurry, low quality','auto_resize_images':True}},
+            '5': {'class_type':'EmptyLatentImage','inputs':{'width':512,'height':512,'batch_size':1}},
+            '6': {'class_type':'KSampler','inputs':{'model':['1',0],'seed':42,'steps':8,'cfg':1.0,'sampler_name':'euler','scheduler':'simple','positive':['3',0],'negative':['4',0],'latent_image':['5',0],'denoise':1.0}},
+            '7': {'class_type':'VAELoader','inputs':{'vae_name':'ae.safetensors'}}, '8': {'class_type':'VAEDecode','inputs':{'samples':['6',0],'vae':['7',0]}}, '9': {'class_type':'SaveImage','inputs':{'images':['8',0],'filename_prefix':'docmind_zimage'}}}}
+    return {'ok': False, 'error': '未知模板。'}
+
 def comfy_queue(workflow, url="http://127.0.0.1:8188"):
     try: url = _safe_comfy_url(url)
     except ValueError as e: return {"ok": False, "error": str(e)}

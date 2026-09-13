@@ -86,7 +86,7 @@ import mcp_client
 import web_export
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
-from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_templates, comfy_queue, comfy_history, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
+from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_templates, comfy_template_workflow, comfy_queue, comfy_history, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
 
 app = FastAPI(title="DocMind RAG Agent")
 agent = Agent()
@@ -740,6 +740,8 @@ async def comfy_status_ep(url: str = "http://127.0.0.1:8188"):
     return comfy_status(url)
 @app.get("/api/comfy/templates")
 async def comfy_templates_ep(): return comfy_templates()
+@app.get("/api/comfy/templates/{template_id}")
+async def comfy_template_ep(template_id: str): return comfy_template_workflow(template_id)
 @app.get("/api/gpu/status")
 async def gpu_status_ep():
     return {"ok": True, **gpu_status()}
