@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // 文件树侧栏：头部（根目录名 + 新建 + 刷新）、递归树、节点截断提示。
 // 展开状态本地维护：首次/刷新后默认展开全部一级目录，并保留用户已展开的路径。
+// AI 答案引用点击时，展开目标的全部祖先目录并闪烁该节点。
 import { ref, watch } from 'vue'
 import type { TreeNode, TreeResp } from '../api'
 import FileTreeNode from './FileTreeNode.vue'
@@ -16,9 +17,11 @@ const emit = defineEmits<{
   (e: 'select', node: TreeNode): void
 }>()
 
-const { loadTree, createAt, openNodeMenu, openRootMenu } = useWorkbench()
+const { loadTree, createAt, openNodeMenu, openRootMenu, treeReveal } = useWorkbench()
 
 const openPaths = ref<Set<string>>(new Set())
+const flashPath = ref<string | null>(null)
+const flashNonce = ref(0)
 
 function allDirPaths(nodes: TreeNode[], acc: Set<string>) {
   for (const n of nodes) {
@@ -27,6 +30,25 @@ function allDirPaths(nodes: TreeNode[], acc: Set<string>) {
       if (n.children.length) allDirPaths(n.children, acc)
     }
   }
+}
+
+function findNode(nodes: TreeNode[], path: string): TreeNode | null {
+  for (const n of nodes) {
+    if (n.path === path) return n
+    if (n.type === 'dir') {
+      const hit = findNode(n.children, path)
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
+/** 目标路径的所有祖先目录（按路径分段推导，节点存在即可展开）。 */
+function ancestorDirs(path: string): string[] {
+  const parts = path.replace(/\\/g, '/').split('/').slice(0, -1)
+  const out: string[] = []
+  for (let i = 1; i <= parts.length; i++) out.push(parts.slice(0, i).join('/'))
+  return out
 }
 
 function reseed(nodes: TreeNode[]) {
@@ -39,6 +61,18 @@ function reseed(nodes: TreeNode[]) {
 }
 
 watch(() => props.tree, (t) => reseed(t.nodes), { immediate: true })
+
+// AI 引用定位：树节点必须真实存在才展开/闪烁（幻觉路径不做反应）
+watch(treeReveal, (req) => {
+  if (!req || !props.tree) return
+  const node = findNode(props.tree.nodes, req.path)
+  if (!node) return
+  const next = new Set(openPaths.value)
+  for (const d of ancestorDirs(req.path)) next.add(d)
+  openPaths.value = next
+  flashPath.value = req.path
+  flashNonce.value = req.nonce
+})
 
 function toggle(path: string) {
   const next = new Set(openPaths.value)
@@ -90,6 +124,8 @@ function rootLabel(p: string): string {
         :depth="0"
         :selected-path="selectedPath"
         :open-paths="openPaths"
+        :flash-path="flashPath"
+        :flash-nonce="flashNonce"
         @toggle="toggle"
         @select="emit('select', $event)"
         @contextmenu="(ev, n) => openNodeMenu(ev, n)"

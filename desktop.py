@@ -94,6 +94,56 @@ def _open_browser() -> bool:
     except Exception:  # noqa: BLE001
         return False
 
+def _open_native_window() -> bool:
+    """Prefer a native pywebview window; return False when its runtime is unavailable."""
+    try:
+        import webview
+        _log("检测到 pywebview %s，尝试创建 Edge 原生窗口" % getattr(webview, '__version__', 'unknown'))
+        win = webview.create_window("DocMind 开发工作台", URL + "workbench/", width=1440, height=920,
+                                    min_size=(1024, 680), text_select=True)
+        embedded_child = {'hwnd': None}
+        def _loaded():
+            # pywebview 已创建原生窗口后，通过 Win32 标题枚举获取宿主 HWND。
+            try:
+                from desktop_bridge import find_host
+                host = find_host("DocMind")
+                if not host:
+                    _log("未找到 pywebview 宿主 HWND，Godot 保持独立窗口")
+                    return
+                _log("已找到 DocMind 宿主 HWND: %s" % host[0])
+                import desktop_bridge
+                desktop_bridge.set_host(host[0])
+                try:
+                    req = urllib.request.Request(URL + "api/desktop/host", data=(('{"hwnd": %d}' % host[0]).encode()), headers={'Content-Type':'application/json'}, method='POST')
+                    urllib.request.urlopen(req, timeout=2).read()
+                except Exception as e:
+                    _log("宿主 HWND 注册后端失败：" + str(e))
+            except Exception as e:
+                _log("宿主 HWND 检测失败：" + str(e))
+        def _resized(*_args):
+            # pywebview 不同版本的事件参数不同；从窗口对象读取尺寸并转发给桥接层。
+            try:
+                if not embedded_child.get('hwnd'): return
+                w, h = int(win.width), int(win.height)
+                from desktop_bridge import resize
+                resize(embedded_child['hwnd'], w, h)
+            except Exception as e:
+                _log("嵌入窗口尺寸同步失败：" + str(e))
+        try:
+            # pywebview 事件属于具体窗口对象；绑定全局 webview.events 在部分版本不会触发。
+            win.events.loaded += _loaded
+            if hasattr(win.events, 'resized'):
+                win.events.resized += _resized
+        except Exception:
+            pass
+        _log("开始运行 pywebview 事件循环")
+        webview.start(gui="edgechromium", debug=False)
+        _log("pywebview 事件循环已退出")
+        return True
+    except Exception as e:
+        _log("原生桌面窗口不可用，回退浏览器：" + str(e))
+        return False
+
 
 def _keep_alive():
     """常驻直到用户按 Enter；无法读取输入时退化为保活睡眠。"""
@@ -159,7 +209,10 @@ def main():
     _log("服务就绪")
     print(f"[DocMind] 服务已就绪：{URL}")
     _emit_ollama_guidance()
-    ok = _open_browser()
+    ok = _open_native_window()
+    _log("原生窗口启动结果 -> %s" % ok)
+    if not ok:
+        ok = _open_browser()
     _log("浏览器打开尝试 -> %s" % ok)
     if ok:
         print(f"[DocMind] 已尝试用默认浏览器打开页面。")

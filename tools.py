@@ -1695,6 +1695,12 @@ def list_dir(arg):
         return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
     f = _parse_keyed(arg or "", ["path"])
     rel = (f.get("path") or "").strip().strip("'\"")
+    if not rel:
+        # 弱模型常按 list_dir(behaviors/) 裸参数调用（内联括号参数剥引号后无 path: 前缀）。
+        # 整段输入若不含 key: 字段标记，就当作相对目录路径，避免静默回退根目录导致空转。
+        bare = (arg or "").strip().strip("'\"")
+        if bare and not re.search(r"^\s*[A-Za-z_]\w*\s*:", bare, re.M):
+            rel = bare
     target, root_abs = _resolve_in_root(rel if rel else root)
     if target is None:
         return f"拒绝访问：{rel} 不在代码根目录内。"
@@ -2180,7 +2186,7 @@ TOOLS = {
         "func": dev_rollback_changeset,
     },
     "list_dir": {
-        "description": "浏览代码库内的目录结构（限定 code_root，供你研判代码库组织方式）。输入：可选 path: <相对 code_root 的目录，默认根目录>。返回子项（目录/文件）及大小/类型。在研判分区方案前先用它勘察顶层有哪些模块/资源目录。",
+        "description": "浏览代码库内的目录结构（限定 code_root，供 Agent 研判代码库组织方式）。输入：目录相对路径，可直接写 behaviors/ 或 behaviors（也兼容 path: behaviors/）；留空列根目录。返回子项（目录/文件）及大小/类型。在研判分区方案前先用它勘察顶层有哪些模块/资源目录。",
         "func": list_dir,
     },
     "dev_propose_regions": {

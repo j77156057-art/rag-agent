@@ -14,6 +14,9 @@ import SelectionAiPanel from './components/SelectionAiPanel.vue'
 import GitHistoryDialog from './components/GitHistoryDialog.vue'
 import RewriteDiffDialog from './components/RewriteDiffDialog.vue'
 import RegionMapDialog from './components/RegionMapDialog.vue'
+import TaskEnginePanel from './components/TaskEnginePanel.vue'
+import SceneRuntimePanel from './components/SceneRuntimePanel.vue'
+import ChatDock from './components/ChatDock.vue'
 import { useWorkbench } from './composables/workbench'
 import { regionColor } from './theme'
 
@@ -76,6 +79,8 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
         </button>
       </div>
       <div class="wb-topbar-right">
+        <TaskEnginePanel />
+        <SceneRuntimePanel />
         <button
           v-if="tree"
           class="wb-map-btn"
@@ -166,6 +171,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
             <SelectionAiPanel v-if="aiPanelOpen" />
             <SymbolOutline />
           </div>
+          <ChatDock />
           <footer class="wb-statusbar">
             <span v-if="selectedPath" class="wb-status-path">{{ selectedPath }}</span>
             <span v-else class="wb-status-faint">未选择文件</span>

@@ -75,13 +75,44 @@ from regions import (
 )
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
+from engine_adapters import skill_for_engine
+from gpu_coordinator import status as gpu_status
+_DESKTOP_HOST_HWND = None
 
 import workbench_fs
+import mcp_client
+import web_export
 from config import PROJECT_WEB_DIR
-from game_workbench import list_tasks, upsert_task, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status
+from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_prepare, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, install_runtime_probe, comfy_status, comfy_queue, comfy_history, comfy_import, comfy_import_all, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
 
 app = FastAPI(title="DocMind RAG Agent")
 agent = Agent()
+
+class DesktopHostReq(BaseModel):
+    hwnd: int
+
+class DesktopResizeReq(BaseModel):
+    child_hwnd: int
+    width: int
+    height: int
+
+@app.post('/api/desktop/host')
+async def desktop_host_ep(req: DesktopHostReq):
+    global _DESKTOP_HOST_HWND
+    _DESKTOP_HOST_HWND = int(req.hwnd)
+    return {'ok': True, 'host_hwnd': _DESKTOP_HOST_HWND}
+
+@app.get('/api/desktop/host')
+async def desktop_host_get_ep():
+    return {'ok': True, 'host_hwnd': _DESKTOP_HOST_HWND}
+
+@app.post('/api/desktop/resize')
+async def desktop_resize_ep(req: DesktopResizeReq):
+    try:
+        from desktop_bridge import resize
+        return {'ok': bool(resize(req.child_hwnd, req.width, req.height)), 'child_hwnd': req.child_hwnd, 'width': req.width, 'height': req.height}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
 
 
 @app.middleware("http")
@@ -132,6 +163,12 @@ class TaskReq(BaseModel):
     status: str = "open"
     owner: str = ""
     files: list = []
+    allowed_paths: list = []
+    symbols: list = []
+    verification: list = []
+    impact_files: list = []
+    snapshot: dict = {}
+    verification_result: dict = {}
 
 
 @app.get("/api/tasks")
@@ -139,14 +176,81 @@ async def tasks_ep(status: str = ""):
     root = _project_root_or_error()
     return {"ok": bool(root), "tasks": list_tasks(root, status) if root else [], "error": None if root else "未配置代码库"}
 
+@app.get("/api/tasks/{task_id}")
+async def task_get_ep(task_id: str):
+    root = _project_root_or_error()
+    if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
+    rows = [x for x in list_tasks(root) if str(x.get("id")) == task_id]
+    if not rows: return JSONResponse({"ok": False, "error": "任务不存在"}, status_code=404)
+    return {"ok": True, "task": rows[0]}
+
 
 @app.post("/api/tasks")
 async def task_upsert_ep(req: TaskReq):
     root = _project_root_or_error()
     if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
     fields = req.model_dump() if hasattr(req, "model_dump") else req.dict()
-    return {"ok": True, "task": upsert_task(root, fields)}
+    scope = validate_task_scope(root, fields)
+    if not scope["ok"]:
+        return JSONResponse({"ok": False, "error": "任务范围校验失败", "scope": scope}, status_code=422)
+    if not fields.get("snapshot"):
+        fields["snapshot"] = task_snapshot(root, fields)
+    return {"ok": True, "task": upsert_task(root, fields), "scope": scope}
 
+
+@app.post("/api/tasks/validate")
+async def task_validate_ep(req: TaskReq):
+    root = _project_root_or_error()
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
+    fields = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    return validate_task_scope(root, fields)
+
+@app.post("/api/tasks/impact")
+async def task_impact_ep(req: TaskReq):
+    root = _project_root_or_error()
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
+    fields = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    scope = validate_task_scope(root, fields)
+    if not scope["ok"]:
+        return JSONResponse({"ok": False, "scope": scope}, status_code=422)
+    return task_impact(root, fields)
+
+@app.post("/api/tasks/snapshot")
+async def task_snapshot_ep(req: TaskReq):
+    root = _project_root_or_error()
+    if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
+    fields = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    scope = validate_task_scope(root, fields)
+    if not scope["ok"]: return JSONResponse({"ok": False, "scope": scope}, status_code=422)
+    return {"ok": True, "snapshot": task_snapshot(root, fields)}
+
+@app.post("/api/tasks/verify")
+async def task_verify_ep(req: TaskReq):
+    root = _project_root_or_error()
+    if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
+    fields = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    scope = validate_task_scope(root, fields)
+    if not scope["ok"]: return JSONResponse({"ok": False, "scope": scope}, status_code=422)
+    return verify_task(root, fields)
+
+@app.post("/api/tasks/revert")
+async def task_revert_ep(req: TaskReq):
+    root=_project_root_or_error()
+    if not root: return JSONResponse({"ok":False,"error":"未配置代码库"}, status_code=400)
+    fields=req.model_dump() if hasattr(req,'model_dump') else req.dict()
+    scope=validate_task_scope(root, fields)
+    if not scope['ok']: return JSONResponse({"ok":False,"scope":scope}, status_code=422)
+    return task_revert(root, fields)
+
+
+@app.post("/api/tasks/branch")
+async def task_branch_ep(req: TaskReq):
+    root=_project_root_or_error()
+    if not root: return JSONResponse({"ok":False,"error":"未配置代码库"}, status_code=400)
+    fields=req.model_dump() if hasattr(req,"model_dump") else req.dict()
+    return task_branch(root, fields)
 
 @app.get("/api/validate_data")
 async def validate_data_ep():
@@ -172,6 +276,28 @@ class MemoryReq(BaseModel):
 class CommandReq(BaseModel):
     command: str = ""
     timeout: int = 30
+class EngineReq(BaseModel):
+    executable: str = "godot"
+    scene: str = ""
+    engine: str = "godot"
+    embed: bool = False
+    host_hwnd: int = 0
+class ComfyReq(BaseModel):
+    url: str = "http://127.0.0.1:8188"
+    workflow: dict = {}
+class ComfyImportReq(BaseModel):
+    url: str = "http://127.0.0.1:8188"
+    prompt_id: str
+    image: dict
+    dest_dir: str = "assets/generated"
+    images: list = []
+class RuntimeEventsReq(BaseModel):
+    events: list = []
+class ScenePropertyReq(BaseModel):
+    path: str
+    node: str
+    property: str
+    value: str
 class PreviewReq(BaseModel): path: str
 class PlaceholderReq(BaseModel): path: str; kind: str = "text"
 class ImpactReq(BaseModel): query: str
@@ -207,6 +333,250 @@ async def test_scene_ep(req: TestSceneReq):
 @app.post("/api/playtest")
 async def playtest_ep(req: CommandReq):
     root=_project_root_or_error(); return playtest(root,req.command,req.timeout) if root else {"ok":False,"error":"未配置代码库"}
+@app.get("/api/engine/status")
+async def engine_status_ep():
+    root=_project_root_or_error(); return engine_status(root) if root else {"ok":False,"error":"未配置代码库"}
+@app.get("/api/engine/catalog")
+async def engine_catalog_ep(): return engine_catalog()
+
+@app.get("/api/engine/scan")
+async def engine_scan_ep():
+    root=_project_root_or_error(); return engine_scan(root) if root else {"ok":False,"error":"未配置代码库"}
+
+@app.post('/api/engine/prepare')
+async def engine_prepare_ep(req: EngineReq):
+    root=_project_root_or_error(); return engine_prepare(root, req.engine, req.executable) if root else {'ok':False,'error':'未配置代码库'}
+
+class EngineEmbedReq(BaseModel):
+    host_hwnd: int
+    width: int = 1280
+    height: int = 720
+    title_hint: str = 'Godot'
+
+@app.post('/api/engine/embed')
+async def engine_embed_ep(req: EngineEmbedReq):
+    root=_project_root_or_error(); return engine_embed(root, req.host_hwnd, req.width, req.height, req.title_hint) if root else {'ok':False,'error':'未配置代码库'}
+@app.get("/api/engine/skill")
+async def engine_skill_ep(engine: str = "godot"):
+    if engine not in {"godot", "unity", "unreal"}: return JSONResponse({"ok":False,"error":"不支持的引擎。"}, status_code=400)
+    return {"ok":True,"engine":engine,"skill":skill_for_engine(engine)}
+@app.get("/api/engine/config")
+async def engine_config_get_ep():
+    root=_project_root_or_error(); return engine_config(root) if root else {"ok":False,"error":"未配置代码库"}
+@app.post("/api/engine/config")
+async def engine_config_post_ep(req: EngineReq):
+    root=_project_root_or_error(); return engine_config(root, req.engine, req.executable) if root else {"ok":False,"error":"未配置代码库"}
+
+@app.post("/api/engine/start")
+async def engine_start_ep(req: EngineReq):
+    root=_project_root_or_error()
+    host = req.host_hwnd or _DESKTOP_HOST_HWND
+    return engine_start(root,req.executable,req.scene,host,req.embed) if root else {"ok":False,"error":"未配置代码库"}
+@app.post("/api/engine/stop")
+async def engine_stop_ep():
+    root=_project_root_or_error(); return engine_stop(root) if root else {"ok":False,"error":"未配置代码库"}
+@app.get("/api/engine/logs")
+async def engine_logs_ep(limit: int = 200):
+    root=_project_root_or_error(); return engine_logs(root, limit) if root else {"ok":False,"error":"未配置代码库"}
+@app.post("/api/runtime/probe")
+async def runtime_probe_ep():
+    root=_project_root_or_error()
+    return install_runtime_probe(root) if root else {"ok":False,"error":"未配置代码库"}
+
+@app.post("/api/engine/verify")
+async def engine_verify_ep(req: EngineReq):
+    root=_project_root_or_error(); return engine_verify(root, req.executable) if root else {"ok":False,"error":"未配置代码库"}
+
+# ---------------------------------------------------------------- P0：Godot 单文件校验 + godot-ai 插件
+class GodotCheckReq(BaseModel):
+    path: str
+    executable: str = ""
+    timeout: int = 120
+
+@app.post("/api/engine/check")
+async def godot_check_ep(req: GodotCheckReq):
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    return await run_in_threadpool(godot_check_script, root, req.path, req.executable, req.timeout)
+
+@app.get("/api/engine/addon/status")
+async def godot_addon_status_ep():
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    return godot_addon_status(root)
+
+class GodotAddonInstallReq(BaseModel):
+    confirm: bool = False
+    force: bool = False
+
+@app.post("/api/engine/addon/install")
+async def godot_addon_install_ep(req: GodotAddonInstallReq):
+    # 安装会改写用户项目目录与 project.godot，必须经前端二次确认
+    if not req.confirm:
+        return JSONResponse({"ok": False, "error": "安装 godot-ai 插件需要用户明确确认。"}, status_code=400)
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    return await run_in_threadpool(install_godot_addon, root, req.force)
+
+# ---------------------------------------------------------------- P1：Web 导出 + iframe 试玩
+def _godot_exe_for(root):
+    cfg = engine_config(root)
+    if cfg.get("engine", "godot") != "godot":
+        return None
+    return _resolve_engine_executable("godot", cfg.get("executable", "godot"))
+
+@app.get("/api/engine/web/templates")
+async def web_templates_ep():
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    exe = _godot_exe_for(root)
+    if not exe: return {"ok": False, "error": "当前引擎不是 Godot 或未找到可执行文件。"}
+    return await run_in_threadpool(web_export.templates_status, exe)
+
+class WebTemplateInstallReq(BaseModel):
+    confirm: bool = False
+
+@app.post("/api/engine/web/templates/install")
+async def web_templates_install_ep(req: WebTemplateInstallReq):
+    # 模板包来自官方 GitHub（约数百 MB），下载与磁盘写入需用户明确确认
+    if not req.confirm:
+        return JSONResponse({"ok": False, "error": "下载 Godot Web 导出模板需要用户明确确认。"}, status_code=400)
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    exe = _godot_exe_for(root)
+    if not exe: return {"ok": False, "error": "当前引擎不是 Godot 或未找到可执行文件。"}
+    started = await run_in_threadpool(web_export.install_templates_async, exe)
+    return {"ok": True, "started": started, "install": web_export.install_state()}
+
+@app.post("/api/engine/web/export")
+async def web_export_ep():
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    exe = _godot_exe_for(root)
+    if not exe: return {"ok": False, "error": "当前引擎不是 Godot 或未找到可执行文件。"}
+    return await run_in_threadpool(web_export.export_web, root, exe, 300)
+
+_COOP_HEADERS = {
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Embedder-Policy": "require-corp",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    # 试玩产物文件名固定（index.pck/index.js 无哈希），重新导出后必须重新验证；
+    # no-cache 配合 FileResponse 的 ETag：未变走 304，变了立即拉新。
+    "Cache-Control": "no-cache",
+}
+
+@app.get("/play/{token}")
+@app.get("/play/{token}/{file_path:path}")
+async def play_file_ep(token: str, file_path: str = "index.html"):
+    # 试玩产物服务：token 绑定当前代码库绝对路径，隔离不同项目；带 COOP/COEP 以启用 SharedArrayBuffer
+    root = _project_root_or_error()
+    if not root or token != web_export.play_token(root):
+        return JSONResponse({"ok": False, "error": "未知试玩会话。"}, status_code=404)
+    target = web_export.resolve_play_file(root, file_path)
+    if not target:
+        return JSONResponse({"ok": False, "error": "文件不存在。"}, status_code=404)
+    ext = os.path.splitext(target)[1].lower()
+    media = web_export.PLAY_MIME.get(ext, "application/octet-stream")
+    if ext == ".js" and target.endswith(".worker.js"):
+        media = "application/javascript; charset=utf-8"
+    return FileResponse(target, media_type=media, headers=_COOP_HEADERS)
+
+# ---------------------------------------------------------------- P0：MCP 服务器（引擎桥）
+class McpServerReq(BaseModel):
+    key: str
+    config: dict
+
+@app.get("/api/mcp/servers")
+async def mcp_servers_ep():
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    return {"ok": True, "servers": mcp_client.server_configs(root)}
+
+@app.post("/api/mcp/servers")
+async def mcp_server_save_ep(req: McpServerReq):
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    try: return mcp_client.save_server(root, req.key, req.config)
+    except mcp_client.MCPError as e: return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+class McpServerKeyReq(BaseModel):
+    key: str
+
+@app.post("/api/mcp/servers/remove")
+async def mcp_server_remove_ep(req: McpServerKeyReq):
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    try:
+        mcp_client.close_server(root, req.key)
+        return mcp_client.remove_server(root, req.key)
+    except mcp_client.MCPError as e: return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+class McpProbeReq(BaseModel):
+    key: str
+
+@app.post("/api/mcp/probe")
+async def mcp_probe_ep(req: McpProbeReq):
+    # stdio 冷启动（uvx 首次构建环境）可能耗时数分钟，放线程池避免阻塞事件循环
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    try: return await run_in_threadpool(mcp_client.probe_server, root, req.key)
+    except mcp_client.MCPError as e: return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+
+@app.get("/api/mcp/tools")
+async def mcp_tools_ep(key: str):
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    try: return await run_in_threadpool(mcp_client.list_tools, root, key)
+    except mcp_client.MCPError as e: return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+
+class McpCallReq(BaseModel):
+    key: str
+    name: str
+    arguments: dict = {}
+
+@app.post("/api/mcp/call")
+async def mcp_call_ep(req: McpCallReq):
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    try:
+        return await run_in_threadpool(mcp_client.call_tool, root, req.key, req.name, req.arguments)
+    except mcp_client.MCPError as e: return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+
+@app.get("/api/comfy/status")
+async def comfy_status_ep(url: str = "http://127.0.0.1:8188"):
+    return comfy_status(url)
+@app.get("/api/gpu/status")
+async def gpu_status_ep():
+    return {"ok": True, **gpu_status()}
+@app.post("/api/comfy/queue")
+async def comfy_queue_ep(req: ComfyReq):
+    return comfy_queue(req.workflow, req.url)
+@app.get("/api/comfy/history/{prompt_id}")
+async def comfy_history_ep(prompt_id: str, url: str = "http://127.0.0.1:8188"):
+    return comfy_history(prompt_id, url)
+@app.post("/api/comfy/import")
+async def comfy_import_ep(req: ComfyImportReq):
+    root=_project_root_or_error()
+    return comfy_import(root, req.prompt_id, req.image, req.url, req.dest_dir) if root else {"ok":False,"error":"未配置代码库"}
+@app.post("/api/comfy/import-all")
+async def comfy_import_all_ep(req: ComfyImportReq):
+    root=_project_root_or_error()
+    return comfy_import_all(root, req.prompt_id, req.images, req.url, req.dest_dir) if root else {"ok":False,"error":"未配置代码库"}
+@app.get("/api/fs/scene-tree")
+async def scene_tree_ep(path: str):
+    root=_project_root_or_error(); return scene_tree(root,path) if root else {"ok":False,"error":"未配置代码库"}
+@app.get("/api/runtime/events")
+async def runtime_events_get_ep():
+    root=_project_root_or_error(); return runtime_events(root) if root else {"ok":False,"error":"未配置代码库"}
+@app.post("/api/fs/scene-property")
+async def scene_property_ep(req: ScenePropertyReq):
+    root=_project_root_or_error()
+    if not root: return {"ok":False,"error":"未配置代码库"}
+    try: return set_scene_property(root, req.path, req.node, req.property, req.value)
+    except Exception as e: return JSONResponse({"ok":False,"error":str(e)}, status_code=400)
+@app.post("/api/runtime/events")
+async def runtime_events_post_ep(req: RuntimeEventsReq):
+    root=_project_root_or_error(); return runtime_events(root, req.events) if root else {"ok":False,"error":"未配置代码库"}
 @app.post("/api/performance")
 async def performance_ep(req: CommandReq):
     root=_project_root_or_error(); return performance_sample(root,req.command) if root else {"ok":False,"error":"未配置代码库"}
@@ -463,6 +833,11 @@ class SelectionAiReq(BaseModel):
     instruction: str = ""
     file_context: str = ""
     mode: str = "rewrite"
+    task_id: str = ""
+    task_region: str = ""
+    allowed_paths: list = []
+    verification: list = []
+    engine: str = "godot"
 
 
 SELECTION_MAX_CHARS = 40_000
@@ -482,6 +857,15 @@ def _selection_rewrite_messages(req: SelectionAiReq) -> list[dict]:
         "类名/函数名/签名/公共类型。\n"
         "3. 即使需求牵涉更大范围，也只给出替换该片段所需的代码，不输出任何说明。"
     )
+    if req.task_region or req.allowed_paths:
+        scope = req.task_region or "未指定"
+        allowed = ", ".join(str(x) for x in req.allowed_paths) or scope
+        verify = ", ".join(str(x) for x in req.verification) or "保存后执行项目验证"
+        sys_p += (f"\n4. 当前任务分区：{scope}；允许路径：{allowed}。"
+                  f"不要提出或依赖范围外文件的修改；修改后验证：{verify}。")
+    adapter = skill_for_engine(req.engine)
+    if adapter:
+        sys_p += "\n\n引擎适配 Skill（必须遵守）：\n" + adapter
     loc = f"第 {req.start_line}–{req.end_line} 行" if req.start_line and req.end_line else "行号未知"
     parts = [
         f"文件：{req.path}",
@@ -517,6 +901,19 @@ async def selection_ai_ep(req: SelectionAiReq):
         return JSONResponse({"ok": False, "error": "文件上下文过长，请缩小选区后重试。"}, status_code=413)
     if len(req.instruction or "") > SELECTION_INSTR_MAX_CHARS:
         return JSONResponse({"ok": False, "error": "改写指令过长。"}, status_code=413)
+
+    # 选区改写同样必须受任务分区约束，避免模型绕过保存接口修改越权文件。
+    if req.task_id:
+        root = _project_root_or_error()
+        if not root:
+            return JSONResponse({"ok": False, "error": "未配置代码库，无法校验任务范围。"}, status_code=400)
+        rows = [x for x in list_tasks(root) if str(x.get("id")) == str(req.task_id)]
+        if not rows:
+            return JSONResponse({"ok": False, "error": "任务不存在。"}, status_code=422)
+        task = rows[0]
+        scope = validate_task_scope(root, {**task, "files": [req.path]})
+        if not scope["ok"]:
+            return JSONResponse({"ok": False, "error": "选区文件不在任务范围内。", "scope": scope}, status_code=422)
 
     # 进入 SSE 前做可用性预检，错误才能以 JSON 直接返回（与 /api/chat 的图片校验同理）
     provider = get_runtime("llm_provider") or LLM_PROVIDER
@@ -1395,3 +1792,4 @@ app.mount("/static", StaticFiles(directory=PROJECT_WEB_DIR), name="static")
 _ASSETS_DIR = os.path.join(PROJECT_WEB_DIR, "assets")
 if os.path.isdir(_ASSETS_DIR):
     app.mount("/assets", StaticFiles(directory=_ASSETS_DIR), name="assets")
+

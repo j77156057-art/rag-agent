@@ -7,3 +7,4 @@ python-dotenv
 httpx
 markdown
 python-multipart
+pywebview

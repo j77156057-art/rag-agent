@@ -6,6 +6,7 @@ OpenAI chat/completions 接口后面，运行时切换 provider 即可，业务�
 import json
 import os
 import urllib.request
+from gpu_coordinator import acquire as _gpu_acquire, release as _gpu_release
 
 from openai import OpenAI
 
@@ -51,13 +52,15 @@ class _OllamaStream:
     末行 done=true 带 done_reason（"stop" / "length"），映射到 finish_reason。
     """
 
-    def __init__(self, resp):
+    def __init__(self, resp, on_close=None):
         self._resp = resp
+        self._on_close = on_close
         self.finish_reason = None
         self.reasoning_chars = 0
 
     def __iter__(self):
-        for raw in self._resp:
+        try:
+          for raw in self._resp:
             line = raw.decode("utf-8", "ignore").strip()
             if not line:
                 continue
@@ -75,6 +78,8 @@ class _OllamaStream:
             if obj.get("done"):
                 # ollama done_reason: stop/length；无该字段时按 stop 处理
                 self.finish_reason = obj.get("done_reason") or "stop"
+        finally:
+            if self._on_close: self._on_close()
 
 
 class LLMClient:
@@ -177,6 +182,7 @@ class LLMClient:
         return root + path
 
     def _ollama_chat(self, messages, stream=False, temperature=0.3):
+        if not _gpu_acquire("ollama", 2): raise RuntimeError("GPU 正忙：ComfyUI 正在使用中，请稍后重试。")
         payload = {
             "model": self.model,
             "messages": messages,
@@ -200,10 +206,15 @@ class LLMClient:
             headers={"Content-Type": "application/json"},
         )
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        resp = opener.open(req, timeout=self._OLLAMA_TIMEOUT)
+        try:
+            resp = opener.open(req, timeout=self._OLLAMA_TIMEOUT)
+        except Exception:
+            _gpu_release("ollama")
+            raise
         if stream:
-            return _OllamaStream(resp)
+            return _OllamaStream(resp, lambda: _gpu_release("ollama"))
         body = json.loads(resp.read().decode("utf-8"))
+        _gpu_release("ollama")
         return (body.get("message") or {}).get("content", "")
 
     def count_tokens(self, text):

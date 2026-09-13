@@ -4,6 +4,7 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { useWorkbench, askAlert } from '../composables/workbench'
 import type { AiTraceItem, AiTurn } from '../composables/workbench'
+import { mdToHtml } from '../markdown'
 
 const {
   turns, aiStreaming, askComposing, activeSelection,
@@ -19,75 +20,7 @@ const askSummary = computed(() => {
   return s ? `${s.name} · 第 ${s.startLine}–${s.endLine} 行` : ''
 })
 
-// ---------------------------------------------------------------- 极简 markdown
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-}
-
-function inlineHtml(s: string): string {
-  let t = escapeHtml(s)
-  // 行内代码
-  t = t.replace(/`([^`\n]+?)`/g, (_m, c) => `<code class="md-ic">${c}</code>`)
-  // 加粗
-  t = t.replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>')
-  return t
-}
-
-/** 仅覆盖答案里实际会出现的 markdown：围栏代码、标题、列表、段落/换行；输入已转义。 */
-function mdToHtml(md: string): string {
-  const blocks: string[] = []
-  const codeStore: string[] = []
-  // 抽出围栏代码块占位
-  const rest = md.replace(/```[A-Za-z0-9_+\-.]*\n?([\s\S]*?)```/g, (_m, code: string) => {
-    const i = codeStore.length
-    codeStore.push(code.replace(/\n$/, ''))
-    return `\0CODEBLOCK${i}\0`
-  })
-
-  const lines = rest.replace(/\r\n/g, '\n').split('\n')
-  let html = ''
-  let listOpen = false
-  const closeList = () => { if (listOpen) { html += '</ul>'; listOpen = false } }
-
-  for (const rawLine of lines) {
-    const line = rawLine
-    const cb = /^\s*CODEBLOCK(\d+)\s*$/.exec(line.trim())
-    if (cb) {
-      closeList()
-      html += `<pre class="md-pre"><code>${escapeHtml(codeStore[Number(cb[1])] || '')}</code></pre>`
-      continue
-    }
-    const h = /^(#{1,4})\s+(.*)$/.exec(line)
-    if (h) {
-      closeList()
-      html += `<div class="md-h md-h${h[1].length}">${inlineHtml(h[2])}</div>`
-      continue
-    }
-    const li = /^\s*[-*]\s+(.*)$/.exec(line)
-    if (li) {
-      if (!listOpen) { html += '<ul class="md-ul">'; listOpen = true }
-      html += `<li>${inlineHtml(li[1])}</li>`
-      continue
-    }
-    if (/^\s*$/.test(line)) {
-      closeList()
-      continue
-    }
-    closeList()
-    html += `<p class="md-p">${inlineHtml(line)}</p>`
-  }
-  closeList()
-  // 代码块占位（理论上已被逐行消费，兜底替换散落占位）
-  html = html.replace(/\s*CODEBLOCK(\d+)\s*/g, (_m, i) =>
-    `<pre class="md-pre"><code>${escapeHtml(codeStore[Number(i)] || '')}</code></pre>`)
-  blocks.push(html)
-  return blocks.join('')
-}
-
+// ---------------------------------------------------------------- 极简 markdown（共用 ../markdown）
 function answerHtml(turn: AiTurn): string {
   return mdToHtml(turn.answer || '')
 }

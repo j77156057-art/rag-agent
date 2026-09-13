@@ -33,6 +33,15 @@ export interface TreeResp {
   truncated: boolean
 }
 
+export interface TaskScope {
+  ok: boolean
+  errors: { path: string; error: string }[]
+  region: string
+  allowed_paths: string[]
+}
+
+export interface EngineStatus { ok: boolean; running: boolean; pid?: number | null; error?: string }
+
 export interface FileResp {
   ok: boolean
   path: string
@@ -250,12 +259,13 @@ export const fsApi = {
   read(path: string): Promise<FileResp> {
     return request<FileResp>(`/api/fs/file?path=${encodeURIComponent(path)}`)
   },
-  save(path: string, content: string, ifMtime: number | null, reindex = true): Promise<SaveResp> {
+  save(path: string, content: string, ifMtime: number | null, reindex = true, taskId = ''): Promise<SaveResp> {
     return postJson<SaveResp>('/api/fs/save', {
       path,
       content,
       if_mtime: ifMtime,
       reindex,
+      task_id: taskId,
     })
   },
   create(path: string, type: 'file' | 'folder', content = '') {
@@ -280,6 +290,8 @@ export const fsApi = {
   relationGraph(): Promise<RelationGraphResp> {
     return request<RelationGraphResp>('/api/fs/relation-graph')
   },
+  sceneTree(path: string) { return request<{ ok: boolean; nodes: { name: string; type: string; parent: string; line: number; node_path?: string; properties?: {name:string;value:string;line:number}[] }[] }>(`/api/fs/scene-tree?path=${encodeURIComponent(path)}`) },
+  setSceneProperty(path: string, node: string, property: string, value: string) { return postJson<{ ok: boolean; error?: string }>('/api/fs/scene-property', { path, node, property, value }) },
   gitlog(path: string, limit = 20): Promise<GitLogResp> {
     return request<GitLogResp>(
       `/api/fs/gitlog?path=${encodeURIComponent(path)}&limit=${limit}`,
@@ -296,6 +308,69 @@ export const fsApi = {
   restoreAt(path: string, ref: string, reindex = true): Promise<RestoreResp> {
     return postJson<RestoreResp>('/api/fs/restore-at', { path, ref, reindex })
   },
+}
+
+export const taskApi = {
+  create(payload: Record<string, unknown>) { return postJson<{ ok: boolean; task?: Record<string, unknown>; error?: string }>('/api/tasks', payload) },
+  validate(payload: Record<string, unknown>) { return postJson<{ ok: boolean; scope: TaskScope }>('/api/tasks/validate', payload) },
+  impact(payload: Record<string, unknown>) { return postJson<{ ok: boolean; files: string[]; direct_files: string[]; related_files: string[] }>('/api/tasks/impact', payload) },
+  snapshot(payload: Record<string, unknown>) { return postJson<{ ok: boolean; snapshot: Record<string, unknown> }>('/api/tasks/snapshot', payload) },
+  verify(payload: Record<string, unknown>) { return postJson<{ ok: boolean; checks: { command: string; ok: boolean; output?: string; error?: string }[] }>('/api/tasks/verify', payload) },
+  branch(payload: Record<string, unknown>) { return postJson<{ ok: boolean; branch?: string; error?: string }>('/api/tasks/branch', payload) },
+}
+
+export const engineApi = {
+  catalog() { return request<{ ok:boolean; engines:{id:string;name:string;executable:string;download:string}[] }>('/api/engine/catalog') },
+  config(engine?: string, executable?: string) { return engine ? postJson<{ok:boolean;engine:string;executable:string}>('/api/engine/config',{engine,executable}) : request<{ok:boolean;engine:string;executable:string}>('/api/engine/config') },
+  status() { return request<EngineStatus>('/api/engine/status') },
+  start(executable = 'godot', embed = true) { return postJson<EngineStatus>('/api/engine/start', { executable, embed }) },
+  stop() { return postJson<{ ok: boolean; stopped: boolean }>('/api/engine/stop', {}) },
+  logs(limit = 200) { return request<{ ok: boolean; lines: string[]; errors: { path: string; line: number; message: string }[] }>(`/api/engine/logs?limit=${limit}`) },
+  verify(executable = 'godot') { return postJson<{ ok: boolean; output?: string; error?: string }>('/api/engine/verify', { executable }) },
+}
+
+export const runtimeApi = {
+  events() { return request<{ ok: boolean; events: Record<string, unknown>[] }>('/api/runtime/events') },
+  append(events: Record<string, unknown>[]) { return postJson<{ ok: boolean; events: Record<string, unknown>[] }>('/api/runtime/events', { events }) },
+}
+
+/** P1：Web 导出 / iframe 试玩 */
+export interface WebTemplates {
+  ok: boolean
+  version?: string
+  template_dir?: string
+  installed: boolean
+  web_debug: boolean
+  web_release: boolean
+  install?: { state: string; downloaded: number; total: number; error: string; started_at: number; mirror?: string }
+  error?: string
+}
+export interface WebExportResult {
+  ok: boolean
+  token?: string
+  url?: string
+  elapsed?: number
+  files?: Record<string, number>
+  html_injected?: boolean
+  bridge_changed?: string[]
+  preset_added?: boolean
+  output?: string
+  error?: string
+  message?: string
+  templates?: WebTemplates
+}
+export const playApi = {
+  templates() { return request<WebTemplates>('/api/engine/web/templates') },
+  installTemplates() { return postJson<{ ok: boolean; started: boolean }>('/api/engine/web/templates/install', { confirm: true }) },
+  exportWeb() { return postJson<WebExportResult>('/api/engine/web/export', {}) },
+}
+
+export const comfyApi = {
+  status(url = 'http://127.0.0.1:8188') { return request<{ ok: boolean; available: boolean; url: string; error?: string }>(`/api/comfy/status?url=${encodeURIComponent(url)}`) },
+  queue(workflow: Record<string, unknown>, url = 'http://127.0.0.1:8188') { return postJson<{ ok: boolean; response?: Record<string, unknown>; error?: string }>('/api/comfy/queue', { url, workflow }) },
+  history(promptId: string, url = 'http://127.0.0.1:8188') { return request<{ ok: boolean; done?: boolean; outputs?: { filename?: string; subfolder?: string; type?: string }[]; error?: string }>(`/api/comfy/history/${encodeURIComponent(promptId)}?url=${encodeURIComponent(url)}`) },
+  import(promptId: string, image: Record<string, unknown>, url = 'http://127.0.0.1:8188', destDir = 'assets/generated') { return postJson<{ ok: boolean; path?: string; error?: string }>('/api/comfy/import', { prompt_id: promptId, image, url, dest_dir: destDir }) },
+  importAll(promptId: string, images: Record<string, unknown>[], url = 'http://127.0.0.1:8188', destDir = 'assets/generated') { return postJson<{ ok: boolean; imported: number; results: { ok: boolean; path?: string; error?: string }[] }>('/api/comfy/import-all', { prompt_id: promptId, images, url, dest_dir: destDir }) },
 }
 
 /** P3：分区状态（GET /api/regions → regions.list_regions） */
@@ -410,6 +485,11 @@ export interface SelectionAiRequest {
   /** 改写指令（rewrite 快通道）；解释/Review/提问走 agent 不用此结构 */
   instruction?: string
   file_context?: string
+  task_id?: string
+  task_region?: string
+  allowed_paths?: string[]
+  verification?: string[]
+  engine?: string
 }
 
 /**
@@ -480,5 +560,60 @@ export const aiApi = {
       },
       h,
     )
+  },
+}
+
+// ---------------------------------------------------------------- P0：MCP 引擎桥 + Godot 插件
+export interface McpServer {
+  key: string
+  label?: string
+  engine?: string
+  transport: 'stdio' | 'http'
+  command?: string
+  args?: string[]
+  url?: string
+  enabled: boolean
+  help?: string
+  config_error?: string
+}
+
+export interface McpToolInfo {
+  name: string
+  description: string
+  input_schema: Record<string, unknown>
+}
+
+export interface GodotAddonStatus {
+  ok: boolean
+  is_godot_project: boolean
+  installed: boolean
+  version: string
+  enabled: boolean
+  uvx: string
+  uvx_available: boolean
+  godot: string
+  godot_available: boolean
+  min_version: string
+}
+
+export const mcpApi = {
+  servers(): Promise<{ ok: boolean; servers: McpServer[] }> {
+    return request('/api/mcp/servers')
+  },
+  probe(key: string): Promise<{ ok: boolean; tool_count?: number; tools?: string[]; error?: string }> {
+    return postJson('/api/mcp/probe', { key })
+  },
+  tools(key: string): Promise<{ ok: boolean; tools: McpToolInfo[]; count?: number; error?: string }> {
+    return request(`/api/mcp/tools?key=${encodeURIComponent(key)}`)
+  },
+  call(key: string, name: string, args: Record<string, unknown>):
+      Promise<{ ok: boolean; text?: string; is_error?: boolean; error?: string }> {
+    return postJson('/api/mcp/call', { key, name, arguments: args })
+  },
+  addonStatus(): Promise<GodotAddonStatus> {
+    return request('/api/engine/addon/status')
+  },
+  addonInstall(force = false): Promise<{ ok: boolean; version?: string; error?: string; next?: string }> {
+    return postJson('/api/engine/addon/install', { confirm: true, force })
   },
 }

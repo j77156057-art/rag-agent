@@ -96,6 +96,19 @@ const selectedPath = ref<string | null>(null)
 const dialog = ref<DialogSpec | null>(null)
 const ctxMenu = ref<MenuPos | null>(null)
 
+/** 点击 AI 答案引用时，文件树展开祖先目录并闪烁目标行（nonce 保证同一路径重复触发也有动画）。 */
+const treeReveal = ref<{ path: string; nonce: number } | null>(null)
+
+function nodeExists(path: string): boolean {
+  return !!(tree.value && findNode(tree.value.nodes, path))
+}
+
+/** AI 答案引用：选中目标并请求文件树展开/闪烁（节点可能尚不存在，由树侧自行判空）。 */
+function revealPath(path: string) {
+  selectedPath.value = path
+  treeReveal.value = { path, nonce: Date.now() }
+}
+
 /** tab.id -> 取当前编辑器文本（由 CodeView 注册，保存时取最新内容） */
 const contentGetters = new Map<number, () => string>()
 
@@ -367,7 +380,8 @@ async function saveTab(id: number, overwrite = false): Promise<boolean> {
   tab.saving = true
   tab.reindexWarn = null
   try {
-    const resp = await fsApi.save(tab.path, content, overwrite ? null : tab.mtime)
+    const taskId = window.localStorage.getItem('docmind.activeTaskId') || ''
+    const resp = await fsApi.save(tab.path, content, overwrite ? null : tab.mtime, true, taskId)
     tab.mtime = resp.mtime
     tab.savedContent = content
     tab.dirty = false
@@ -965,6 +979,10 @@ async function runAi(action: AiAction, instruction?: string): Promise<void> {
           selection: sel.text,
           instruction,
           file_context: fileCtx,
+          task_id: window.localStorage.getItem('docmind.activeTaskId') || undefined,
+          task_region: window.localStorage.getItem('docmind.activeTaskRegion') || undefined,
+          allowed_paths: (window.localStorage.getItem('docmind.activeTaskAllowedPaths') || '').split(',').map((x) => x.trim()).filter(Boolean),
+          engine: window.localStorage.getItem('docmind.engine') || 'godot',
         },
         { onEvent, signal: ac.signal },
       )
@@ -1207,6 +1225,8 @@ export function useWorkbench() {
     dialog, ctxMenu,
     // tree
     loadTree, openNode, openPath,
+    // AI 引用定位：文件树展开 + 闪烁
+    treeReveal, nodeExists, revealPath,
     // P1 符号地图 / 行跳转
     jumpToLine, symbolMapOpen, openSymbolMap, closeSymbolMap,
     relationGraphOpen, openRelationGraph, closeRelationGraph,

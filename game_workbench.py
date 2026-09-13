@@ -1,6 +1,611 @@
 """Game-development helpers built on top of the region workspace."""
-import json, os, re, subprocess, math, time, mimetypes, sys, ast as _ast
+import json, os, re, subprocess, math, time, mimetypes, sys, ast as _ast, urllib.request, urllib.parse, urllib.error, shutil, zipfile, tempfile
+import mcp_client
+from gpu_coordinator import acquire as _gpu_acquire, release as _gpu_release
 from datetime import datetime
+
+_ENGINE_PROCS = {}
+_ENGINE_LOGS = {}
+ENGINE_CATALOG = [
+ {'id':'godot','name':'Godot 4','executable':'godot','download':'https://godotengine.org/download/windows/','project_file':'project.godot'},
+ {'id':'unity','name':'Unity','executable':'Unity.exe','download':'https://unity.com/download','project_file':'ProjectSettings/ProjectVersion.txt'},
+ {'id':'unreal','name':'Unreal Engine','executable':'UnrealEditor.exe','download':'https://www.unrealengine.com/download','project_file':'*.uproject'},
+]
+def engine_catalog(): return {'ok':True,'engines':ENGINE_CATALOG}
+
+def engine_scan(root):
+    """识别并摘要 Godot/Unity/Unreal 项目文件，供适配层和 AI 定位入口。"""
+    base = _root(root); found=[]
+    for dp, _, files in os.walk(base):
+        if any(x in dp.split(os.sep) for x in ('.git','node_modules','.venv','Library','Intermediate','DerivedDataCache')): continue
+        for fn in files:
+            rel=os.path.relpath(os.path.join(dp,fn),base).replace('\\','/')
+            if fn=='project.godot': found.append({'engine':'godot','path':rel})
+            elif fn=='ProjectVersion.txt': found.append({'engine':'unity','path':rel})
+            elif fn.endswith('.uproject'): found.append({'engine':'unreal','path':rel})
+    return {'ok':True,'projects':found}
+
+def engine_prepare(root, engine='godot', executable=''):
+    """为 AI 提供幂等的引擎准备动作：探测可执行文件并写入项目配置。"""
+    if engine not in {x['id'] for x in ENGINE_CATALOG}: return {'ok':False,'error':'不支持的游戏引擎。'}
+    path=_resolve_engine_executable(engine, executable or next(x['executable'] for x in ENGINE_CATALOG if x['id']==engine))
+    if not path or not os.path.isfile(path):
+        return {'ok':False,'ready':False,'engine':engine,'download':next(x['download'] for x in ENGINE_CATALOG if x['id']==engine),'error':'未找到引擎可执行文件。'}
+    cfg=engine_config(root, engine, path)
+    return {'ok':True,'ready':True,'config':cfg,'projects':engine_scan(root).get('projects',[])}
+def engine_config(root, engine=None, executable=None):
+ path=_file(root,'.docmind_engine.json')
+ if engine is not None:
+  item=next((x for x in ENGINE_CATALOG if x['id']==engine),None)
+  if not item: return {'ok':False,'error':'不支持的游戏引擎。'}
+  with open(path,'w',encoding='utf-8') as f: json.dump({'engine':engine,'executable':executable or item['executable']},f,ensure_ascii=False,indent=2)
+ try:
+  with open(path,encoding='utf-8') as f: data=json.load(f)
+ except Exception: data={'engine':'godot','executable':'godot'}
+ return {'ok':True,**data}
+
+def _scan_godot_dirs():
+    """在常见安装目录浅层搜索 Godot exe，优先控制台版（headless 才能捕获 stdout）。"""
+    dirs = [
+        os.environ.get('LOCALAPPDATA', '') and os.path.join(os.environ['LOCALAPPDATA'], 'Godot'),
+        os.environ.get('PROGRAMFILES', '') and os.path.join(os.environ['PROGRAMFILES'], 'Godot'),
+        os.environ.get('PROGRAMFILES(X86)', '') and os.path.join(os.environ['PROGRAMFILES(X86)'], 'Godot'),
+        r'D:\Tools\Godot', r'C:\Tools\Godot', r'D:\Godot', r'C:\Godot',
+        os.path.expandvars(r'%USERPROFILE%\scoop\apps\godot\current'),
+    ]
+    hits = []
+    for d in dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        for dp, _dirs, files in os.walk(d):
+            depth = os.path.relpath(dp, d).count(os.sep)
+            if depth > 2:
+                _dirs[:] = []
+                continue
+            for fn in files:
+                if re.fullmatch(r'Godot_[\w.-]*win64_console\.exe', fn) or fn in ('godot.exe', 'godot_console.exe'):
+                    hits.append(os.path.join(dp, fn))
+    return hits
+
+
+def _resolve_engine_executable(engine, executable):
+    if executable and os.path.isfile(executable): return executable
+    hit = shutil.which(executable or '')
+    if hit: return hit
+    if engine == 'godot':
+        # 用户显式配置/旧固定候选
+        candidates = [
+            os.path.expandvars(r'%LOCALAPPDATA%\Godot\godot.exe'),
+            os.path.expandvars(r'%PROGRAMFILES%\Godot\godot.exe'),
+            os.path.expandvars(r'%PROGRAMFILES%\Godot\Godot_v4.3-stable_win64.exe'),
+        ]
+        found = next((p for p in candidates if os.path.isfile(p)), '')
+        if found:
+            return found
+        scans = _scan_godot_dirs()
+        if scans:
+            # 控制台版优先（同目录/同版本），其余按版本字符串排序取最高
+            scans.sort(key=lambda p: ('_console' not in os.path.basename(p), p), reverse=False)
+            return scans[0]
+        return executable or ''
+    elif engine == 'unity': candidates = [os.path.expandvars(r'%PROGRAMFILES%\Unity Hub\Editor\Unity.exe')]
+    else: candidates = [os.path.expandvars(r'%PROGRAMFILES%\Epic Games\UE_5.4\Engine\Binaries\Win64\UnrealEditor.exe')]
+    return next((p for p in candidates if os.path.isfile(p)), executable or '')
+
+# ---------------------------------------------------------------- Godot 静态诊断
+# 格式 1（同行）：res://x.gd:22 - Parse Error: msg ／ x.gd:10: ERROR: msg
+_GODOT_DIAG_RX = re.compile(
+    r'(?:res://)?(?P<path>[A-Za-z0-9_./\\-]+\.gd):(?P<line>\d+)\s*[-:]\s*'
+    r'(?P<kind>Parse Error|SCRIPT ERROR|ERROR|WARNING|Error|error)\s*:?\s*(?P<msg>.*)'
+)
+# 格式 2（分两行，Godot 4.x check-only 实际输出）：
+#   SCRIPT ERROR: Parse Error: <msg>
+#      at: GDScript::reload (res://x.gd:4)
+_GODOT_SCRIPT_ERR_RX = re.compile(r'^\s*SCRIPT ERROR:\s*(?:Parse Error:\s*)?(?P<msg>.*\S)\s*$')
+_GODOT_AT_RX = re.compile(r'\(res://(?P<path>[A-Za-z0-9_./\\-]+\.gd):(?P<line>\d+)\)')
+# 旧版/其它路径同行情境：SCRIPT ERROR: ... (at res://x.gd:88)
+_GODOT_DIAG_TAIL_RX = re.compile(
+    r'SCRIPT ERROR:\s*(?:Parse Error:\s*)?(?P<msg>.*?)\s*\(at\s+res://(?P<path>[A-Za-z0-9_./\\-]+\.gd):(?P<line>\d+)\)', re.S
+)
+
+
+def parse_godot_diagnostics(text):
+    """把 Godot headless/check-only 输出解析为 [{path,line,severity,message}]，按出现顺序去重。"""
+    out, seen = [], set()
+
+    def add(path, line, kind, msg):
+        path = str(path).replace('\\', '/').removeprefix('res://').strip()
+        msg = ' '.join(str(msg or '').split())
+        severity = 'warning' if str(kind).upper() == 'WARNING' else 'error'
+        sig = (path, int(line or 0), severity, msg)
+        if msg and sig not in seen:
+            seen.add(sig)
+            out.append({'path': path, 'line': int(line or 0), 'severity': severity, 'message': msg})
+
+    # 先处理同一行的 tail 格式（旧版兼容）
+    for m in _GODOT_DIAG_TAIL_RX.finditer(text or ''):
+        add(m.group('path'), m.group('line'), 'SCRIPT ERROR', m.group('msg'))
+
+    pending = None  # 上一条 SCRIPT ERROR 的消息，等待下一行 (at res://x.gd:N)
+    for line in (text or '').splitlines():
+        inline = _GODOT_DIAG_RX.search(line)
+        if inline:
+            add(inline.group('path'), inline.group('line'), inline.group('kind'), inline.group('msg'))
+            pending = None
+            continue
+        se = _GODOT_SCRIPT_ERR_RX.match(line)
+        if se:
+            pending = se.group('msg').strip()
+            continue
+        at = _GODOT_AT_RX.search(line)
+        if at:
+            if pending:
+                add(at.group('path'), at.group('line'), 'SCRIPT ERROR', pending)
+            pending = None
+            continue
+        # at 行允许是空行或以 at: 开头；其它实质行打断挂起消息
+        if pending and line.strip() and not line.strip().startswith('at:'):
+            pending = None
+    return out
+
+
+def _resolve_project_godot(root, executable=''):
+    """读取项目引擎配置并解析出 Godot 可执行文件；非 Godot 项目/找不到时返回错误串。"""
+    cfg = engine_config(root)
+    selected = cfg.get('engine', 'godot')
+    if selected != 'godot':
+        return None, f'当前配置的引擎是 {selected}，Godot 校验仅适用于 Godot 项目。'
+    exe = executable if executable and executable != 'godot' else cfg.get('executable', 'godot')
+    exe = _resolve_engine_executable('godot', exe)
+    if not exe or not os.path.isfile(exe):
+        return None, '未找到 Godot 可执行文件，请在引擎配置中填写 Godot exe 绝对路径（建议用 _console 版）。'
+    return exe, ''
+
+
+def _project_autoloads(root_abs):
+    """读取 project.godot [autoload] 节的单例名集合（--check-only 不注册 autoload 全局，需据此过滤误报）。"""
+    proj = os.path.join(root_abs, 'project.godot')
+    try:
+        with open(proj, encoding='utf-8-sig') as f:
+            text = f.read()
+    except OSError:
+        return set()
+    sec = re.search(r'^\[autoload\](?P<body>.*?)(?=^\[|\Z)', text, re.S | re.M)
+    if not sec:
+        return set()
+    return set(re.findall(r'^\s*([A-Za-z_]\w*)\s*=', sec.group('body'), re.M))
+
+
+_AUTOLOAD_MISS_RX = re.compile(r'Identifier (?:not found: ?|")([A-Za-z_]\w*)')
+
+
+def godot_check_script(root, rel, executable='', timeout=120):
+    """单文件 GDScript 校验：godot --headless --check-only --script。
+
+    返回该文件诊断（同时附带全工程诊断供参考）。--check-only 不打开编辑器，
+    速度快，适合保存后即时反馈。
+    """
+    root_abs = _root(root)
+    rel = str(rel or '').replace('\\', '/').lstrip('/')
+    if not rel.endswith('.gd'):
+        return {'ok': False, 'error': '仅支持 .gd 文件的单文件校验。'}
+    try:
+        abs_path = _file(root_abs, rel)
+    except ValueError:
+        return {'ok': False, 'error': '路径超出代码库范围。'}
+    if not os.path.isfile(abs_path):
+        return {'ok': False, 'error': f'文件不存在：{rel}'}
+    exe, err = _resolve_project_godot(root_abs, executable)
+    if err:
+        return {'ok': False, 'error': err}
+    cmd = [exe, '--head', '--path', root_abs, '--check-only', '--script', abs_path]
+    try:
+        p = subprocess.run(cmd, cwd=root_abs, capture_output=True, text=True,
+                           timeout=max(5, min(int(timeout), 300)),
+                           encoding='utf-8', errors='replace')
+    except FileNotFoundError:
+        return {'ok': False, 'error': f'无法启动 Godot：{exe}'}
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': 'Godot 单文件校验超时。'}
+    output = (p.stdout or '') + '\n' + (p.stderr or '')
+    autoloads = _project_autoloads(root_abs)
+
+    def _is_autoload_false_positive(d):
+        if d['severity'] != 'error' or 'Identifier' not in d['message']:
+            return False
+        m = _AUTOLOAD_MISS_RX.search(d['message'])
+        return bool(m and m.group(1) in autoloads)
+
+    diags = [d for d in parse_godot_diagnostics(output) if not _is_autoload_false_positive(d)]
+    target = [d for d in diags if d['path'] == rel]
+    errors = [d for d in diags if d['severity'] == 'error']
+    # returncode 在校验到编译错误时恒为 1；误报过滤后以「是否仍有错误诊断」为准。
+    return {'ok': not errors, 'returncode': p.returncode,
+            'path': rel, 'diagnostics': target, 'all_diagnostics': diags,
+            'output': output[-4000:]}
+
+
+# ---------------------------------------------------------------- godot-ai 插件安装
+GODOT_AI_REPO_API = 'https://api.github.com/repos/hi-godot/godot-ai/releases/latest'
+GODOT_AI_MIN_VERSION = (4, 0, 0)
+
+
+def _parse_plugin_version(text):
+    m = re.search(r'^\s*version\s*=\s*"([^"]+)"', text or '', re.M)
+    return m.group(1) if m else ''
+
+
+def _plugin_enabled(project_text):
+    sec = re.search(r'^\[editor_plugins\](?P<body>.*?)(?=^\[|\Z)', project_text or '', re.S | re.M)
+    if not sec:
+        return False
+    m = re.search(r'^\s*enabled\s*=\s*PackedStringArray\((?P<items>[^)]*)\)', sec.group('body'), re.M)
+    if not m:
+        return False
+    return 'godot_ai' in re.findall(r'"([^"]+)"', m.group('items'))
+
+
+def _enable_plugin_in_project_text(text):
+    """在 project.godot 的 [editor_plugins] 中幂等启用 godot_ai。"""
+    text = text if text.endswith('\n') else text + '\n'
+    sec = re.search(r'^(\[editor_plugins\]\n)(?P<body>.*?)(?=^\[|\Z)', text, re.S | re.M)
+    if not sec:
+        return text + '\n[editor_plugins]\nenabled=PackedStringArray("godot_ai")\n'
+    body = sec.group('body')
+    m = re.search(r'^(\s*enabled\s*=\s*PackedStringArray\()([^)]*)(\))', body, re.M)
+    if m:
+        items = re.findall(r'"([^"]+)"', m.group(2))
+        if 'godot_ai' in items:
+            return text
+        items.append('godot_ai')
+        new_line = m.group(1) + ', '.join(f'"{x}"' for x in items) + m.group(3)
+        return text[:sec.start('body')] + body.replace(m.group(0), new_line, 1) + text[sec.end('body'):]
+    new_body = body + 'enabled=PackedStringArray("godot_ai")\n'
+    return text[:sec.start('body')] + new_body + text[sec.end('body'):]
+
+
+def godot_addon_status(root):
+    """godot-ai 插件与接入前置条件摘要（供前端安装引导）。"""
+    root_abs = _root(root)
+    project_file = os.path.join(root_abs, 'project.godot')
+    plugin_cfg = os.path.join(root_abs, 'addons', 'godot_ai', 'plugin.cfg')
+    result = {'ok': True, 'is_godot_project': os.path.isfile(project_file),
+              'installed': os.path.isfile(plugin_cfg), 'version': '', 'enabled': False,
+              'uvx': mcp_client.resolve_command('uvx'),
+              'uvx_available': os.path.isfile(mcp_client.resolve_command('uvx')),
+              'godot': _resolve_engine_executable('godot', engine_config(root_abs).get('executable', 'godot')),
+              'min_version': '.'.join(map(str, GODOT_AI_MIN_VERSION))}
+    if result['installed']:
+        try:
+            with open(plugin_cfg, encoding='utf-8') as f:
+                result['version'] = _parse_plugin_version(f.read())
+        except OSError:
+            pass
+    if result['is_godot_project']:
+        try:
+            with open(project_file, encoding='utf-8') as f:
+                result['enabled'] = _plugin_enabled(f.read())
+        except OSError:
+            pass
+    result['godot_available'] = bool(result['godot'] and os.path.isfile(result['godot']))
+    return result
+
+
+def _pick_addon_asset(assets):
+    zips = [a for a in assets if str(a.get('name', '')).lower().endswith('.zip')]
+    if not zips:
+        return None
+    for a in zips:
+        name = str(a.get('name', '')).lower()
+        if 'plugin' in name or 'addon' in name or 'asset' in name:
+            return a
+    return zips[0]
+
+
+def install_godot_addon(root, force=False):
+    """从 GitHub Releases 下载安装 godot-ai 插件并在 project.godot 启用。
+
+    必须由上层 API 在用户明确确认后调用（会改写用户项目目录与 project.godot）。
+    """
+    root_abs = _root(root)
+    if not os.path.isfile(os.path.join(root_abs, 'project.godot')):
+        return {'ok': False, 'error': '当前代码库不是 Godot 项目（缺少 project.godot）。'}
+    status = godot_addon_status(root_abs)
+    if status['installed'] and not force:
+        return {'ok': False, 'error': 'godot-ai 插件已安装，如需重装请先确认覆盖。', 'status': status}
+    if not status['uvx_available']:
+        return {'ok': False, 'error': '未找到 uvx，请先安装 uv（https://docs.astral.sh/uv/getting-started/installation/）。'}
+    try:
+        req = urllib.request.Request(GODOT_AI_REPO_API, headers={'User-Agent': 'docmind-workbench', 'Accept': 'application/vnd.github+json'})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            release = json.loads(r.read().decode())
+    except Exception as e:
+        return {'ok': False, 'error': f'获取 godot-ai 最新版本失败：{e}'}
+    asset = _pick_addon_asset(release.get('assets') or [])
+    if not asset:
+        return {'ok': False, 'error': f'发布版本 {release.get("tag_name", "?")} 中未找到插件 zip 包，请按 Release 说明手动安装。'}
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
+            tmp_path = tmp.name
+            req = urllib.request.Request(asset['browser_download_url'], headers={'User-Agent': 'docmind-workbench'})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                shutil.copyfileobj(r, tmp)
+        extracted = []
+        with zipfile.ZipFile(tmp_path) as zf:
+            members = zf.namelist()
+            marker = next((n for n in members if n.endswith('addons/godot_ai/plugin.cfg')), None)
+            if not marker:
+                return {'ok': False, 'error': f"压缩包 {asset['name']} 中未找到 addons/godot_ai/plugin.cfg，请确认包格式。"}
+            prefix = marker[: marker.index('addons/')]
+            for n in members:
+                if n.endswith('/') or not n.startswith(prefix + 'addons/'):
+                    continue
+                rel_part = n[len(prefix):].replace('\\', '/')
+                target = os.path.join(root_abs, *rel_part.split('/'))
+                if not os.path.abspath(target).startswith(root_abs + os.sep):
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(n) as src, open(target, 'wb') as dst:
+                    shutil.copyfileobj(src, dst)
+                extracted.append(rel_part)
+    except Exception as e:
+        return {'ok': False, 'error': f'下载/解压插件失败：{e}'}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    # 启用插件
+    project_path = os.path.join(root_abs, 'project.godot')
+    try:
+        with open(project_path, encoding='utf-8') as f:
+            project_text = f.read()
+        with open(project_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(_enable_plugin_in_project_text(project_text))
+    except OSError as e:
+        return {'ok': False, 'error': f'插件文件已解压，但写入 project.godot 失败：{e}'}
+
+    status = godot_addon_status(root_abs)
+    version = status.get('version') or str(release.get('tag_name', '')).lstrip('v')
+    try:
+        if version:
+            mcp_client.pin_godot_server(root_abs, version)
+    except Exception:
+        pass
+    return {'ok': True, 'installed': True, 'version': version, 'enabled': True,
+            'release_tag': release.get('tag_name'), 'files': len(extracted),
+            'next': '重启（或打开）Godot 编辑器使插件生效，然后在 AI 对话台连接 godot-ai。'}
+
+COMFY_MAX_DOWNLOAD = 25 * 1024 * 1024
+
+def _safe_comfy_url(url):
+    p = urllib.parse.urlparse(url)
+    if p.scheme not in ("http", "https") or p.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError("ComfyUI 地址仅允许本机 localhost/127.0.0.1。")
+    return url.rstrip('/')
+
+def engine_status(root):
+    p = _ENGINE_PROCS.get(_root(root)); running = bool(p and p.poll() is None)
+    return {"ok": True, "running": running, "pid": p.pid if running else None}
+
+def engine_embed(root, host_hwnd, width=1280, height=720, title_hint=''):
+    st=engine_status(root)
+    if not st.get('running'): return {'ok':False,'error':'引擎尚未运行。'}
+    try:
+        from desktop_bridge import find_window, embed
+        child=find_window(st['pid'], title_hint)
+        if not child: return {'ok':False,'error':'尚未找到引擎窗口，请稍后重试。'}
+        r=embed(child[0], int(host_hwnd), width, height); r.update({'title':child[1]}); return r
+    except Exception as e: return {'ok':False,'error':str(e)}
+
+def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False):
+    root_abs = _root(root)
+    if engine_status(root_abs)["running"]: return engine_status(root_abs)
+    cfg=engine_config(root); selected=cfg.get('engine','godot'); executable=cfg.get('executable','godot') if not executable or (executable == 'godot' and selected != 'godot') else executable; executable=_resolve_engine_executable(selected, executable)
+    # Godot 的 *_console.exe 只是转发器（0.2MB），窗口模式会派生 GUI 进程且不继承重定向的
+    # stdout（时间线收不到 DOCMIND_EVENT）。窗口/编辑器运行改用同目录真引擎 GUI 可执行文件。
+    if selected == 'godot' and isinstance(executable, str) and executable.lower().endswith('_console.exe'):
+        gui_exe = executable[:-len('_console.exe')] + '.exe'
+        if os.path.isfile(gui_exe):
+            executable = gui_exe
+    if selected == 'unity': args=[executable, '-projectPath', root_abs]
+    elif selected == 'unreal': args=[executable, os.path.join(root_abs, scene)] if scene else [executable, root_abs]
+    else: args=[executable, '--path', root_abs]
+    if scene and selected == 'godot': args += ['--editor']
+    try:
+        log_path = _file(root_abs, ".docmind_engine.log")
+        log = open(log_path, "a", encoding="utf-8")
+        p = subprocess.Popen(args, cwd=root_abs, stdout=log, stderr=subprocess.STDOUT, text=True)
+        _ENGINE_PROCS[root_abs] = p
+        _ENGINE_LOGS[root_abs] = log
+        result = {"ok": True, "running": True, "pid": p.pid}
+        if embed and host_hwnd:
+            for _ in range(20):
+                time.sleep(0.15)
+                er = engine_embed(root_abs, host_hwnd, 1280, 720)
+                if er.get('ok'):
+                    result['embedded'] = True; result['hwnd'] = er.get('hwnd'); break
+            else: result['embedded'] = False
+        return result
+    except FileNotFoundError:
+        return {"ok": False, "error": f"找不到 {selected} 可执行文件。请安装引擎，或在 .docmind_engine.json 中配置 executable 的绝对路径。下载地址：{next((x['download'] for x in ENGINE_CATALOG if x['id']==selected), '')}"}
+    except Exception as e:
+        return {"ok": False, "error": f"无法启动 {selected}：{e}"}
+
+def engine_stop(root):
+    p = _ENGINE_PROCS.get(_root(root))
+    if not p or p.poll() is not None: return {"ok": True, "stopped": False}
+    p.terminate()
+    try: p.wait(timeout=5)
+    except subprocess.TimeoutExpired: p.kill()
+    log = _ENGINE_LOGS.pop(_root(root), None)
+    if log: log.close()
+    return {"ok": True, "stopped": True}
+
+def engine_logs(root, limit=200):
+    path = _file(root, ".docmind_engine.log")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f: lines = f.readlines()[-max(1, min(int(limit), 2000)):]
+    except OSError: lines = []
+    errors = []
+    rx = re.compile(r"(?P<path>(?:res://)?[A-Za-z0-9_./\\-]+\.(?:gd|tscn|cs|py))(?::(?P<line>\d+))?.{0,80}(?:error|Error|ERROR)")
+    for line in lines:
+        m = rx.search(line)
+        if m:
+            path = m.group("path").replace("\\", "/").removeprefix("res://")
+            errors.append({"path": path, "line": int(m.group("line") or 0), "message": line.strip()})
+    return {"ok": True, "lines": [x.rstrip("\n") for x in lines], "errors": errors, "running": engine_status(root)["running"]}
+
+def engine_verify(root, executable="godot", timeout=30):
+    """Run a bounded headless editor import/parse check when the executable is available."""
+    root_abs = _root(root)
+    cfg=engine_config(root); selected=cfg.get('engine','godot'); executable=cfg.get('executable','godot') if not executable or (executable == 'godot' and selected != 'godot') else executable
+    executable = _resolve_engine_executable(selected, executable)
+    if selected == 'unity': cmd=[executable,'-batchmode','-nographics','-quit','-projectPath',root_abs]
+    elif selected == 'unreal': cmd=[executable,'-Unattended','-NullRHI','-ProjectOnly']
+    else: cmd=[executable,'--headless','--path',root_abs,'--editor','--quit']
+    try:
+        p = subprocess.run(cmd, cwd=root_abs, capture_output=True, text=True, timeout=max(3, min(int(timeout), 180)),
+                           encoding='utf-8', errors='replace')
+        out = ((p.stdout or '') + '\n' + (p.stderr or ''))[-6000:]
+        diagnostics = parse_godot_diagnostics(out) if selected == 'godot' else []
+        # 子进程直接捕获的诊断优先；日志文件解析作为历史兜底
+        log_errors = engine_logs(root_abs).get("errors", [])
+        return {"ok": p.returncode == 0 and not any(d['severity'] == 'error' for d in diagnostics),
+                "returncode": p.returncode, "output": out,
+                "diagnostics": diagnostics, "errors": diagnostics or log_errors}
+    except FileNotFoundError:
+        return {"ok": False, "error": f"未找到 {selected} 可执行文件，请配置路径或将其加入 PATH。"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"{selected} headless 校验超时。"}
+
+def install_runtime_probe(root, dest='addons/docmind_runtime/probe.gd'):
+    path = _file(root, dest)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    source = 'extends Node\nclass_name DocMindRuntimeProbe\n\nfunc emit_event(event_type: String, name: String, data: Dictionary = {}) -> void:\n\tvar event = {"type": event_type, "name": name, "data": data}\n\tprint("DOCMIND_EVENT " + JSON.stringify(event))\n'
+    with open(path, 'w', encoding='utf-8', newline='\n') as f: f.write(source)
+    return {'ok': True, 'path': dest.replace('\\','/'), 'created': True}
+
+def comfy_status(url="http://127.0.0.1:8188"):
+    try: url = _safe_comfy_url(url)
+    except ValueError as e: return {"ok": False, "available": False, "error": str(e)}
+    try:
+        with urllib.request.urlopen(url.rstrip('/') + '/system_stats', timeout=3) as r: data = json.loads(r.read().decode())
+        return {"ok": True, "available": True, "url": url, "system": data}
+    except Exception as e:
+        return {"ok": True, "available": False, "url": url, "error": str(e)}
+
+def comfy_queue(workflow, url="http://127.0.0.1:8188"):
+    try: url = _safe_comfy_url(url)
+    except ValueError as e: return {"ok": False, "error": str(e)}
+    if not _gpu_acquire("comfyui", 2): return {"ok": False, "error": "GPU 正忙：Ollama 正在使用中，请稍后重试。"}
+    payload = json.dumps({"prompt": workflow}).encode()
+    req = urllib.request.Request(url.rstrip('/') + '/prompt', data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r: return {"ok": True, "response": json.loads(r.read().decode())}
+    except Exception as e: return {"ok": False, "error": f"ComfyUI 请求失败：{e}"}
+    finally: _gpu_release("comfyui")
+
+def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
+    try: url = _safe_comfy_url(url)
+    except ValueError as e: return {"ok": False, "error": str(e)}
+    pid = str(prompt_id or "").strip()
+    if not pid or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", pid):
+        return {"ok": False, "error": "无效的 ComfyUI prompt_id。"}
+    try:
+        with urllib.request.urlopen(url.rstrip('/') + '/history/' + pid, timeout=5) as r:
+            data = json.loads(r.read().decode())
+        item = data.get(pid, data)
+        outputs = []
+        for node in (item.get("outputs") or {}).values():
+            for img in (node.get("images") or []):
+                if isinstance(img, dict): outputs.append(img)
+        return {"ok": True, "prompt_id": pid, "status": item.get("status", {}), "outputs": outputs, "done": bool(item.get("outputs"))}
+    except Exception as e:
+        return {"ok": False, "error": f"ComfyUI 状态查询失败：{e}"}
+
+def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="assets/generated"):
+    """Download one ComfyUI output into a project asset directory with metadata."""
+    try: url = _safe_comfy_url(url)
+    except ValueError as e: return {"ok": False, "error": str(e)}
+    name = os.path.basename(str(image.get("filename") or "output.bin"))
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,160}", name): return {"ok": False, "error": "无效的资源文件名。"}
+    sub = str(image.get("subfolder") or "").replace("\\", "/").strip("/")
+    if sub and (".." in sub.split("/") or not re.fullmatch(r"[A-Za-z0-9._/-]{1,300}", sub)): return {"ok": False, "error": "无效的资源子目录。"}
+    rel = "/".join(x for x in [dest_dir.strip("/"), name] if x)
+    target = _file(root, rel); os.makedirs(os.path.dirname(target), exist_ok=True)
+    query = urllib.parse.urlencode({"filename": name, "subfolder": sub, "type": image.get("type") or "output"})
+    try:
+        with urllib.request.urlopen(url + '/view?' + query, timeout=30) as r:
+            data = r.read(COMFY_MAX_DOWNLOAD + 1)
+        if len(data) > COMFY_MAX_DOWNLOAD: return {"ok": False, "error": "资源超过 25MB 下载上限。"}
+        with open(target, "wb") as f: f.write(data)
+        meta_path = _file(root, rel + ".json")
+        meta = {"source": "comfyui", "url": url, "prompt_id": str(prompt_id), "filename": name, "subfolder": sub, "imported_at": datetime.now().isoformat(timespec="seconds"), "size": len(data)}
+        with open(meta_path, "w", encoding="utf-8") as f: json.dump(meta, f, ensure_ascii=False, indent=2)
+        return {"ok": True, "path": rel.replace("\\", "/"), "metadata": meta}
+    except Exception as e: return {"ok": False, "error": f"资源下载失败：{e}"}
+
+def comfy_import_all(root, prompt_id, images, url="http://127.0.0.1:8188", dest_dir="assets/generated"):
+    results = [comfy_import(root, prompt_id, image, url, dest_dir) for image in (images or [])[:32]]
+    return {"ok": all(x.get("ok") for x in results), "results": results, "imported": sum(1 for x in results if x.get("ok"))}
+
+# Dedicated module keeps scene inspection and runtime capture independently testable.
+from scene_runtime import scene_tree, runtime_events, set_scene_property
+
+def task_revert(root, task):
+    import workbench_fs
+    results=[]
+    snap=(task.get('snapshot') or {}).get('files') or {}
+    for rel in task.get('files') or []:
+        try:
+            saved=snap.get(str(rel).replace('\\','/'))
+            if saved and 'content' in saved:
+                target,_=workbench_fs._resolve(root, rel, must_exist=False, for_write=True)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target,'w',encoding='utf-8',newline='') as f: f.write(saved['content'])
+                results.append({'ok':True,'path':rel,'restored':'snapshot'})
+            elif saved is None and os.path.lexists(_file(root, rel)):
+                target,_=workbench_fs._resolve(root, rel, must_exist=True, for_write=True)
+                os.remove(target)
+                results.append({'ok':True,'path':rel,'restored':'deleted-created-file'})
+            else: results.append(workbench_fs.revert_file(root, rel))
+        except Exception as e: results.append({'ok':False,'path':rel,'error':str(e)})
+    return {'ok': all(x.get('ok') for x in results), 'results': results}
+
+def task_branch(root, task):
+    import workbench_fs
+    branch = re.sub(r'[^A-Za-z0-9._/-]+', '-', str(task.get('id') or task.get('title') or 'task')).strip('-/')[:60] or 'task'
+    full_branch = 'docmind/' + branch
+    repo = workbench_fs._find_repo_bounded(_root(root), _root(root))
+    if not repo: return {'ok': False, 'error': '项目未初始化 Git。'}
+    _, current = workbench_fs._git(['branch', '--show-current'], cwd=repo)
+    current = current.strip()
+    exists, _ = workbench_fs._git(['show-ref', '--verify', '--quiet', 'refs/heads/' + full_branch], cwd=repo)
+    if exists:
+        if current != full_branch:
+            # 已有分支只在工作区干净时切换，避免覆盖用户未提交修改。
+            _, porcelain = workbench_fs._git(['status', '--porcelain'], cwd=repo)
+            if porcelain.strip():
+                return {'ok': False, 'error': '当前工作区有未提交修改，无法安全切换到已有任务分支。', 'branch': full_branch}
+            ok, out = workbench_fs._git(['switch', full_branch], cwd=repo)
+            if not ok: return {'ok': False, 'error': out[:300]}
+        created = False
+    else:
+        ok, out = workbench_fs._git(['switch','-c',full_branch], cwd=repo)
+        if not ok: return {'ok': False, 'error': out[:300]}
+        created = True
+    # 将分支写回任务记录，后续回滚/审计可追踪实际工作分支。
+    if task.get('id'):
+        rows = _jsonl(_file(root, '.docmind_tasks.jsonl'))
+        for row in rows:
+            if str(row.get('id')) == str(task.get('id')):
+                row['branch'] = full_branch
+                row['updated_at'] = datetime.now().isoformat(timespec='seconds')
+        with open(_file(root, '.docmind_tasks.jsonl'), 'w', encoding='utf-8') as f:
+            for row in rows: f.write(json.dumps(row, ensure_ascii=False) + '\n')
+    return {'ok': True, 'branch': full_branch, 'created': created, 'current': full_branch}
 
 def _root(root):
     return os.path.abspath(root) if root else ""
@@ -26,11 +631,90 @@ def list_tasks(root, status=""):
 def upsert_task(root, task):
     path = _file(root, ".docmind_tasks.jsonl"); rows = _jsonl(path)
     tid = (task.get("id") or "TASK-" + datetime.now().strftime("%Y%m%d-%H%M%S")).strip()
-    item = {"id": tid, "title": task.get("title", ""), "description": task.get("description", ""), "region": task.get("region", ""), "priority": task.get("priority", "normal"), "status": task.get("status", "open"), "owner": task.get("owner", ""), "files": task.get("files", []), "updated_at": datetime.now().isoformat(timespec="seconds")}
+    item = {"id": tid, "title": task.get("title", ""), "description": task.get("description", ""), "region": task.get("region", ""), "priority": task.get("priority", "normal"), "status": task.get("status", "open"), "owner": task.get("owner", ""), "files": task.get("files", []), "allowed_paths": task.get("allowed_paths", []), "symbols": task.get("symbols", []), "verification": task.get("verification", []), "impact_files": task.get("impact_files", []), "snapshot": task.get("snapshot", {}), "updated_at": datetime.now().isoformat(timespec="seconds")}
     rows = [x for x in rows if x.get("id") != tid] + [item]
     with open(path, "w", encoding="utf-8") as f:
         for x in rows: f.write(json.dumps(x, ensure_ascii=False) + "\n")
     return item
+
+def validate_task_scope(root, task):
+    """Validate that task files stay inside the declared region and project root."""
+    root = _root(root); region = (task.get("region") or "").strip().replace("\\", "/")
+    allowed = [str(x).replace("\\", "/").strip("/") for x in (task.get("allowed_paths") or [])]
+    errors = []
+    for rel in task.get("files") or []:
+        rel = str(rel).replace("\\", "/").lstrip("/")
+        if ".." in rel.split("/"):
+            errors.append({"path": rel, "error": "路径包含 .."}); continue
+        if region and not (rel == region or rel.startswith(region + "/")):
+            errors.append({"path": rel, "error": "文件不在任务分区内"}); continue
+        if allowed and not any(rel == p or rel.startswith(p.rstrip("/") + "/") for p in allowed):
+            errors.append({"path": rel, "error": "文件不在 allowed_paths 范围内"})
+    return {"ok": not errors, "errors": errors, "region": region, "allowed_paths": allowed}
+
+def task_impact(root, task):
+    """Resolve semantic files plus relation-graph neighbors for an editable task."""
+    query = " ".join([str(task.get("title", "")), str(task.get("description", "")), *[str(x) for x in task.get("symbols", [])]])
+    direct = [str(x).replace("\\", "/") for x in (task.get("files") or [])]
+    related = impact_analysis(root, query, k=12) if query.strip() else []
+    graph_files = []
+    try:
+        import workbench_fs
+        g = workbench_fs.build_relation_graph(root)
+        ids = {"gd:" + p for p in direct} | {"py:" + p for p in direct}
+        for e in g.get("edges", []):
+            if e.get("source") in ids or e.get("target") in ids:
+                for nid in (e.get("source"), e.get("target")):
+                    n = next((x for x in g.get("nodes", []) if x.get("id") == nid), None)
+                    if n and n.get("rel"): graph_files.append(n["rel"])
+    except Exception:
+        pass
+    files = list(dict.fromkeys(direct + related + graph_files))
+    return {"ok": True, "direct_files": direct, "semantic_files": related, "related_files": graph_files, "files": files}
+
+def task_snapshot(root, task):
+    """Capture lightweight pre-edit mtimes and sizes for task auditing."""
+    rows = {}
+    for rel in task.get("files") or []:
+        try:
+            st = os.stat(_file(root, str(rel)))
+            key = str(rel).replace("\\", "/")
+            item = {"mtime_ns": st.st_mtime_ns, "size": st.st_size}
+            if st.st_size <= 512 * 1024:
+                with open(_file(root, str(rel)), encoding='utf-8', errors='replace') as f: item['content'] = f.read()
+            rows[key] = item
+        except OSError:
+            rows[str(rel).replace("\\", "/")] = None
+    return {"created_at": datetime.now().isoformat(timespec="seconds"), "files": rows}
+
+def verify_task(root, task):
+    """Run declared checks (or safe defaults) and return one auditable report."""
+    checks = task.get("verification") or []
+    if not checks: checks = ["python -m unittest discover -s tests"] if os.path.isdir(_file(root, "tests")) else []
+    if not checks:
+        return {"ok": False, "skipped": True, "reason": "no_checks", "checks": [], "completed_at": datetime.now().isoformat(timespec="seconds")}
+    results = []
+    for cmd in checks[:8]:
+        try:
+            from tools import _cmd_is_blocked
+            blocked, why = _cmd_is_blocked(str(cmd))
+        except Exception: blocked, why = False, ""
+        if blocked: results.append({"command": cmd, "ok": False, "error": f"命令被安全策略拦截：{why}"}); continue
+        try:
+            p = subprocess.run(str(cmd), shell=True, cwd=_root(root), capture_output=True, text=True, timeout=120)
+            results.append({"command": cmd, "ok": p.returncode == 0, "output": (p.stdout + p.stderr)[-3000:]})
+        except Exception as e: results.append({"command": cmd, "ok": False, "error": str(e)})
+    report = {"ok": all(x["ok"] for x in results), "checks": results, "completed_at": datetime.now().isoformat(timespec="seconds")}
+    if task.get("id"):
+        rows = _jsonl(_file(root, ".docmind_tasks.jsonl")); tid = str(task["id"])
+        for row in rows:
+            if str(row.get("id")) == tid:
+                row["status"] = "verified" if report["ok"] else "failed"
+                row["verification_result"] = report
+                row["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        with open(_file(root, ".docmind_tasks.jsonl"), "w", encoding="utf-8") as f:
+            for row in rows: f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return report
 
 def validate_data(root):
     errors=[]; checked=0

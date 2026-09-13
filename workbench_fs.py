@@ -1307,6 +1307,7 @@ class SaveReq(BaseModel):
     content: str
     if_mtime: float | None = None
     reindex: bool = True
+    task_id: str = ""
 
 
 class CreateReq(BaseModel):
@@ -1356,7 +1357,14 @@ def file_ep(path: str):
 @router.post("/save")
 def save_ep(req: SaveReq):
     try:
-        return save_file(_runtime_root(), req.path, req.content, req.if_mtime, reindex=req.reindex)
+        root = _runtime_root()
+        if req.task_id:
+            from game_workbench import list_tasks, validate_task_scope
+            tasks = [t for t in list_tasks(root) if str(t.get('id')) == req.task_id]
+            if not tasks: raise FsError(403, "任务不存在，拒绝写入。")
+            scope = validate_task_scope(root, {**tasks[0], "files": [req.path]})
+            if not scope["ok"]: raise FsError(403, "文件不在当前任务允许范围内。", {"scope": scope})
+        return save_file(root, req.path, req.content, req.if_mtime, reindex=req.reindex)
     except FsError as e:
         return _err(e)
 

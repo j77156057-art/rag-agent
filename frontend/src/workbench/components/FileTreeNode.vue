@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 递归树节点：文件夹（chevron + 文件夹 glyph）/ 文件（类型 chip + git 状态点）。
 // 分区根目录（depth=0 且带 region）使用分区色描边与中文区名。
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type { TreeNode } from '../api'
 import { regionColor, fileChip, gitState } from '../theme'
 
@@ -10,6 +10,8 @@ const props = defineProps<{
   depth: number
   selectedPath: string | null
   openPaths: Set<string>
+  flashPath?: string | null
+  flashNonce?: number
 }>()
 
 const emit = defineEmits<{
@@ -26,7 +28,24 @@ const chip = computed(() => fileChip(props.node.name))
 const git = computed(() => gitState(props.node.tracked, props.node.dirty))
 const isOpen = computed(() => props.openPaths.has(props.node.path))
 const isSelected = computed(() => props.selectedPath === props.node.path)
+const isFlashing = ref(false)
 const indent = computed(() => 8 + props.depth * 13)
+
+// AI 引用定位：闪烁 + 滚动到可见区域（nonce 变化重新触发动画）
+const rowEl = ref<HTMLElement | null>(null)
+watch(
+  () => props.flashNonce,
+  (n) => {
+    if (n && props.flashPath === props.node.path) {
+      isFlashing.value = false
+      requestAnimationFrame(() => {
+        isFlashing.value = true
+        rowEl.value?.scrollIntoView({ block: 'nearest' })
+        window.setTimeout(() => { isFlashing.value = false }, 1800)
+      })
+    }
+  },
+)
 
 function onClick() {
   if (props.node.type === 'dir') emit('toggle', props.node.path)
@@ -36,10 +55,11 @@ function onClick() {
 
 <template>
   <div
+    ref="rowEl"
     class="ft-row"
     :class="[
       `ft-${node.type}`,
-      { 'ft-region-root': isRegionRoot, 'ft-selected': isSelected, 'ft-dir-open': isOpen },
+      { 'ft-region-root': isRegionRoot, 'ft-selected': isSelected, 'ft-dir-open': isOpen, 'ft-flash': isFlashing },
     ]"
     :style="{ paddingLeft: indent + 'px' }"
     @click="onClick"
@@ -90,6 +110,8 @@ function onClick() {
       :depth="depth + 1"
       :selected-path="selectedPath"
       :open-paths="openPaths"
+      :flash-path="flashPath"
+      :flash-nonce="flashNonce"
       @toggle="emit('toggle', $event)"
       @select="emit('select', $event)"
       @contextmenu="(ev, n) => emit('contextmenu', ev, n)"
