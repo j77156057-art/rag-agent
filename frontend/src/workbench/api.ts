@@ -252,6 +252,29 @@ async function postJson<T>(url: string, payload: unknown): Promise<T> {
   })
 }
 
+/**
+ * 业务失败也当数据返回（不抛错）。
+ *
+ * 通用 request 会把 `ok:false` 抛成异常，但场景编辑必须读到失败体里的
+ * stale / rolled_back / warnings 才能正确分支，所以这里单独给一条原始通道；
+ * 只有网络不可达或响应不是 JSON 才抛错。
+ */
+async function rawJson<T>(url: string, payload?: unknown): Promise<T> {
+  let res: Response
+  try {
+    res = await fetch(url, payload === undefined
+      ? { method: 'GET' }
+      : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+  } catch {
+    throw new FsApiError(0, '无法连接本地服务（127.0.0.1:8000），请确认 DocMind 已启动。')
+  }
+  try {
+    return (await res.json()) as T
+  } catch {
+    throw new FsApiError(res.status, `响应不是合法 JSON（HTTP ${res.status}）`)
+  }
+}
+
 export const fsApi = {
   tree(depth = 4): Promise<TreeResp> {
     return request<TreeResp>(`/api/fs/tree?depth=${depth}`)
@@ -332,6 +355,157 @@ export const engineApi = {
 export const runtimeApi = {
   events() { return request<{ ok: boolean; events: Record<string, unknown>[] }>('/api/runtime/events') },
   append(events: Record<string, unknown>[]) { return postJson<{ ok: boolean; events: Record<string, unknown>[] }>('/api/runtime/events', { events }) },
+  /** 会话切分（时间线按会话分组） */
+  sessions(gap = 120) { return request<{ ok: boolean; total: number; sessions: RuntimeSession[] }>(`/api/runtime/sessions?gap=${gap}`) },
+  clear(scope: 'stored' | 'all' = 'stored') { return postJson<{ ok: boolean; scope: string; removed: number }>('/api/runtime/clear', { scope }) },
+}
+
+export interface RuntimeSession {
+  index: number
+  id: string
+  start: string
+  end: string
+  count: number
+  types: Record<string, number>
+  sources: Record<string, number>
+}
+
+/* ---------------- 场景画布（P0-2） ---------------- */
+
+export interface SceneProperty {
+  name: string
+  value: string
+  line: number
+  kind: 'ref' | 'transform' | 'vector' | 'array' | 'string' | 'bool' | 'number' | 'other'
+}
+
+export interface SceneNode {
+  id: string
+  name: string
+  type: string
+  parent: string | null
+  parent_attr: string
+  line: number
+  space: '2d' | '3d'
+  depth: number
+  instance_id: string
+  script_id: string
+  instance: string
+  script: string
+  groups: string[]
+  index: string
+  position: number[] | null
+  position_from: string
+  rotation: number | null
+  scale: number[] | null
+  children: string[]
+  /** 引用的其它外部资源卡 id（'ext:<rid>'），贴图/材质/字体等 */
+  resource_ids: string[]
+  /** true = 位于实例（instance）子树内，改动属于引擎侧覆写 */
+  overridden: boolean
+  properties: SceneProperty[]
+}
+
+export interface SceneFile {
+  id: string
+  rel: string
+  raw: string
+  kind: 'scene' | 'script' | 'resource'
+  chip: string
+  resolved: boolean
+  type: string
+  uid: string
+  nodes: string[]
+  used: number
+  orphan?: boolean
+}
+
+export interface SceneEdge {
+  id: string
+  source: string
+  target: string
+  kind: 'hierarchy' | 'script' | 'instance' | 'reference'
+}
+
+export interface SceneGuard {
+  writable: boolean
+  reason: string
+  region: string | null
+  region_name: string | null
+  tracked: boolean | null
+  dirty: boolean | null
+}
+
+export interface SceneGraph {
+  ok: boolean
+  error?: string
+  path: string
+  root_id: string
+  header: Record<string, string>
+  space: '2d' | '3d'
+  nodes: SceneNode[]
+  files: SceneFile[]
+  edges: SceneEdge[]
+  sub_resources: { id: string; type: string; line: number }[]
+  structure_errors: string[]
+  warnings: string[]
+  guard: SceneGuard
+  stats: {
+    nodes: number
+    edges: number
+    files: number
+    max_depth: number
+    instances: number
+    scripts: number
+    lines: number
+    size: number
+    /** 零引用的外部资源数（可清理提示） */
+    orphans: number
+    revision: string
+    mtime: number
+    editable: boolean
+  }
+  read_only: boolean
+}
+
+/**
+ * 一条可反向执行的编辑描述。
+ * 字段名与 POST /api/scene/op 的请求体完全同形，所以 `sceneApi.op(undo)` 就能撤销，
+ * 前端不需要任何字段映射（这个"同形"是刻意的：曾经用过 props/properties 两套名字，
+ * 结果撤销请求被后端当成空 payload 拒掉，所以定死一套）。
+ */
+export interface SceneUndo {
+  op: string
+  node?: string
+  name?: string
+  parent?: string
+  properties?: Record<string, string>
+  remove?: string[]
+  lines?: string[]
+  at?: number
+}
+
+export interface SceneOpResult {
+  ok: boolean
+  error?: string
+  status?: number
+  /** 文件已被外部修改，需重新加载 */
+  stale?: boolean
+  /** 编辑导致结构非法且已自动回滚 */
+  rolled_back?: boolean
+  errors?: string[]
+  path?: string
+  op?: string
+  node?: string
+  undo?: SceneUndo
+  warnings?: string[]
+  revision?: string
+  mtime?: number
+}
+
+export const sceneApi = {
+  graph(path: string) { return rawJson<SceneGraph>(`/api/scene/graph?path=${encodeURIComponent(path)}`) },
+  op(payload: Record<string, unknown>) { return rawJson<SceneOpResult>('/api/scene/op', payload) },
 }
 
 /** P1：Web 导出 / iframe 试玩 */

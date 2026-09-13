@@ -1,116 +1,177 @@
-# DocMind · 支持工具调用的 RAG 问答 Agent
+# DocMind · 本地游戏开发 AI 工作台
 
-一个面向简历作品集的轻量级 RAG Agent 项目：把文档变成可对话的知识库，并让大语言模型**自主决定调用工具**来回答问题（ReAct 范式），而不是朴素地"检索完直接喂给 LLM"。
+一个**本地、单人、面向游戏 / Mod 工程**的轻量研发脚手架。它要解决的是 AI 写代码最常见的两个失败模式：
 
-## ✨ 核心特性
+1. **幻觉**——AI 凭印象说"伤害计算在 player.py"，其实没有这个文件；
+2. **代码堆叠**——数值、UI、行为逻辑全塞进少数文件，越改越乱，一改就崩、无法回滚。
 
-- **真正的 Agent 循环**：Thought → Action → Observation 多轮推理，LLM 自主决定何时检索 / 计算 / 联网、何时给出最终答案，过程完全可解释、可观测。
-- **工具集（9 个，易扩展）**：`search_knowledge`（知识库检索）、`search_assets`（游戏素材筛选）、`calculate`（表达式求值）、`python_exec`（受限沙箱执行 Python，用于计算/数据处理/文本变换）、`web_search`（DuckDuckGo 联网，无需 Key）、`gen_video_prompt`（按 MiniMax H3 三段结构生成视频提示词）；以及**代码问答三件套** `search_code` / `read_file` / `grep`——可索引你的工程源码与配置，回答"某功能在哪实现 / 某函数做什么 / 某配置怎么写 / 某报错在哪"类问题。加一个工具只需在 `tools.py` 的 `TOOLS` 字典里追加一项。
-- **多模型 Provider 抽象**：通过 OpenAI 兼容协议统一封装 **通义千问 / DeepSeek / Ollama 本地 / mock**，配置文件一键切换，业务代码零改动。
-- **服务化**：FastAPI 把 Agent 封装为 HTTP 服务，SSE 流式返回推理过程与答案；附带单页演示前端。
-- **零依赖可跑**：内置 `mock` 模式，无需任何 API Key 即可本地跑通「摄取 → 检索 → Agent 问答」全链路。
+DocMind 的应对分两层：
+
+- **本地 RAG + ReAct Agent**：让模型先**检索 / 定位真实代码与文档**（文件 + 行号 + 证据）再回答，而不是直接编代码。零 API Key 可跑（mock / 本地 Ollama / llama.cpp）。
+- **仓库级工作流（工作台）**：在 RAG 之上加**任务分区、每区独立 Git、契约方向校验、变更集回滚、选区 AI、符号 / 关系图、引擎嵌入、场景画布、运行时时间线、GPU 协调**。目标形态是能真正拿来改一个 Godot / Unity / Unreal 工程的脚手架，而不是通用 ALM 平台（不做多用户 / 数据库 / 鉴权）。
+
+---
+
+## ✨ 工作台六件事（2026-09 当前形态）
+
+| 能力 | 一句话 |
+|---|---|
+| **分区开发** | 一个按钮把工程切成 assets / values / behaviors / levels / ui / audio / net / bugs 等分区，每区**独立 git**；Agent 的写操作被约束在对应分区内，越区写直接拒；依赖是单向 DAG，契约校验防循环耦合 |
+| **受控改写** | 所有 AI 写操作走 `apply_edit` / `create_file`（先读后写 + 体积上限 + `.py` 语法校验 + 人工确认）；跨区搬移校验依赖方向；改动可单区提交或**跨区变更集整体回滚** |
+| **选区 AI** | 编辑器里选中一段代码 → 解释 / Review / 提问（走 Agent，带证据）或**改写**（走直连快通道 + LCS diff 预览，接受才落盘） |
+| **符号与关系图** | 多语言符号抽取（Python `ast` / GDScript / Java…）+ 继承 / 场景挂载 / 调用边的关系图；场景画布另有四类边 |
+| **场景画布** | Godot `.tscn` 的**可视化 + 可编辑**画布：层级树 / 空间坐标两种布局，节点父子层级、实例（instance）、position / transform、资源引用一目了然；新增 / 删除 / 改名 / 换父 / 复制 / 改属性 / 拖拽写回位置，**全部可撤销，且撤销能逐字节还原文件** |
+| **运行时时间线** | 把游戏跑起来产生的事件（掉血 / 死亡 / 生成 / 变量变化）画成多轨道时间轴：类型筛选、时间缩放、会话分组、数值曲线、导出 JSON、点事件跳代码行 |
+
+配套：**引擎嵌入**（Godot / Unity / Unreal 启停 + Win32 HWND 嵌进工作台）、**Web 试玩**（导出 WASM 在画布里边玩边改）、**MCP 桥接**、**GPU 租约队列**、**桌面打包**（PyInstaller onedir，双击即用）。
 
 ## 🧱 技术栈
 
-Python · OpenAI 兼容 SDK（通义千问/DeepSeek/Ollama）· Chroma 向量库 · FastAPI · pypdf
+- 后端：Python · FastAPI（HTTP + SSE）· Chroma 双集合（文档 / 代码）· OpenAI 兼容多 Provider（qwen / deepseek / ollama / llamacpp / mock）· PyInstaller + pywebview
+- 前端：Vue 3.5 · Vite 5 · TypeScript · CodeMirror 6 · Vue Flow · 手写深色设计系统
+- 验证：`unittest` 202 项 · 后端自检 50 项 · 浏览器冒烟 23 项（Playwright + 系统 Edge）
 
 ## 📁 目录结构
 
 ```
 rag-agent/
-├── config.py          # 配置中心（provider / 路径 / 参数）
-├── llm.py             # LLM 客户端：多 provider 抽象 + 流式 + mock
-├── embeddings.py      # 嵌入：云端(通义千问) + 本地兜底
-├── vectorstore.py     # Chroma 封装
-├── ingest.py          # 文档加载 / 切分 / 入库
-├── tools.py           # Agent 工具集
-├── agent.py           # ReAct Agent 核心循环 + 记忆
-├── api.py             # FastAPI 服务（SSE 流式问答 + 上传）
-├── run.py             # 一键启动
-├── web/index.html     # 演示前端
-├── sample_docs/       # 示例知识库
-└── requirements.txt
+├── api.py                 # HTTP / SSE 总入口（105 条路由：chat / ingest / 工作台 fs / regions /
+│                          #   engine / desktop-host / selection-ai / scene / runtime / MCP / GPU）
+├── agent.py               # ReAct 循环、反思重试、代码优先路由、证据护栏
+├── tools.py               # 42 个工具：9 基础 + 受控写 + 24 个分区 / 研发工具
+├── regions.py             # 分区 2.0：声明式配置、契约校验（DAG 无环 / 导出存在）、变更集与回滚
+├── scene_runtime.py       # 场景画布内核：.tscn 行块解析 → 图模型 → 受控编辑（可回滚 + 可撤销）
+├── workbench_fs.py        # 沙箱文件树、读写、git 状态 / 历史 / 回滚、符号地图、关系图
+├── symbols.py             # 多语言符号抽取 + 代码感知分块
+├── game_workbench.py      # 引擎 catalog / 启停 / 嵌入、任务 / 资产 / bug 工作流
+├── engine_adapters.py     # 引擎适配薄封装
+├── desktop_bridge.py      # Win32：查找宿主窗口 / SetParent 嵌入 / resize / focus
+├── desktop.py             # 桌面启动器（单实例保护 + pywebview 窗口）
+├── gpu_coordinator.py     # GPU 租约队列（TTL 过期 / 移交 + 显存阈值）
+├── mcp_client.py          # MCP（Model Context Protocol）桥接
+├── web_export.py          # Godot Web 导出与本地试玩
+├── llm.py / embeddings.py / vectorstore.py / ingest.py / config.py
+├── frontend/              # Vue 工作台（构建产物输出到 ../web）
+│   └── src/workbench/components/
+│       ├── SceneCanvas.vue / SceneNodeCard.vue / SceneFileCard.vue   # 场景画布
+│       └── RuntimeTimeline.vue                                       # 运行时时间线
+├── tests/                 # unittest 202 项
+├── verify_scene_canvas.py / verify_scene_canvas_ui.mjs   # 场景画布自检 + 浏览器冒烟
+├── HANDOFF.md             # ★ 唯一权威交接文档（原因 / 基线 / 待办 / 坑，接手先读它）
+├── DocMind_BUILD.md       # 冻结构建档案（发布流程强制在其中追加，不新建文件）
+└── 分区开发设计.md         # 分区 2.0 架构设计
 ```
 
 ## 🚀 快速开始
 
 ```bash
-# 1. 建虚拟环境并装依赖（国内建议使用阿里云镜像）
+# 1. 建虚拟环境并装依赖（国内建议阿里云镜像）
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
 
 # 2. 配置（可选，默认 mock 模式无需 key）
-cp .env.example .env
-#   修改 LLM_PROVIDER=qwen 并填入 DASHSCOPE_API_KEY
+cp .env.example .env      # 改 LLM_PROVIDER=qwen 并填 DASHSCOPE_API_KEY
 
-# 3. 启动（会自动摄取 sample_docs 并启动服务）
-python run.py
-#   打开 http://localhost:8000
+# 3. 启动后端
+.venv\Scripts\python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000
+
+# 4. 前端：开发用 vite dev，或构建一次产物给后端托管
+cd frontend && npm install && npm run build      # 产物 -> ../web
+
+# 5. 打开
+#   工作台 : http://127.0.0.1:8000/workbench
+#   问答页 : http://127.0.0.1:8000
 ```
+
+> 服务地址请用 `127.0.0.1` 而不是 `localhost`（本机 IPv6 解析会连不上）；路径含单引号用户名时 shell 一律用双引号包裹。
 
 ### 用真实模型（以通义千问为例）
+
 两种方式任选其一：
 
-**方式 A · 页面内切换（推荐，免重启）**：打开 http://localhost:8000，点右上角「⚙ 模型设置」，选 provider（mock / qwen / deepseek / ollama）、填 Key、可选填模型名与 Embedding 方式，点「保存并切换」即时生效。Key 仅存内存，重启服务后恢复 `.env` 默认值。
+- **页面内切换（推荐，免重启）**：打开问答页点右上角「⚙ 模型设置」，选 provider、填 Key、点「保存并切换」即时生效（Key 仅存内存）。
+- **改 `.env`**：`LLM_PROVIDER=qwen` / `EMBEDDING_PROVIDER=qwen` / `DASHSCOPE_API_KEY=...`，改完重启服务。
 
-**方式 B · 改 `.env`**：
-```
-LLM_PROVIDER=qwen
-EMBEDDING_PROVIDER=qwen
-DASHSCOPE_API_KEY=你的key
-```
-改完需重启服务（`uvicorn` 未开热加载）。
-
-### 调 API（不依赖前端）
 ```bash
-curl -X POST http://localhost:8000/api/chat -F "question=DocMind 支持哪些文件格式？"
+# 不依赖前端直接调 API
+curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文件格式？"
 ```
 
 ## 🖥️ 桌面端（原生窗口一键启动）
 
-不想手动起服务、开浏览器？`desktop.py` 把后端服务与单页前端打包成一个原生桌面窗口（Windows 端基于 Edge WebView2），双击即用。
+`desktop.py` 把后端服务与前端组装成原生桌面窗口（Windows 走 Edge WebView2），双击即用：
 
 ```bash
-# 安装桌面窗口依赖（仅需一次）
-.venv\Scripts\python.exe -m pip install pywebview
-
-# 一键启动（也可直接双击 run_desktop.bat）
-.venv\Scripts\python.exe desktop.py
+.venv\Scripts\python.exe -m pip install pywebview   # 仅需一次
+.venv\Scripts\python.exe desktop.py                 # 或双击 run_desktop.bat
 ```
 
-启动后会在后台拉起 FastAPI 服务（127.0.0.1:8000），原生窗口自动加载前端页面；关闭窗口即退出。
+- **引擎嵌入**：Godot / Unity / Unreal 的窗口可以按 Win32 HWND 规则嵌进工作台（`desktop_bridge.py`），嵌入状态下键鼠输入直接作用于引擎窗口。⚠️ **该链路的接口与单测已齐，但尚未在真实引擎 + 实机窗口下验证 DPI / 焦点 / 退出清理**，详见 `HANDOFF.md` §5 的 P0-1。
+- **打包成独立 exe（onedir 目录分发）**：`docmind.spec` 一条命令产出 `dist\DocMind\DocMind.exe`，把整个 `dist\DocMind` 目录一起分发即可，目标机器无需安装 Python。完整流程见 [DocMind_BUILD.md](DocMind_BUILD.md) 与 `.trae/skills/docmind-frozen-release/SKILL.md`。
+- **分发版能力边界**：分包 `builtin:py` 校验在进程内做语法检查（exe 与源码行为一致）；但 playtest 自动测试、cProfile 剖析、`python_exec` 需要真实 Python 环境，请在源码 `.venv` 里用；分区的 git 操作要求目标机器装有 Git。
 
-- **前置**：Windows 需已安装 Microsoft Edge WebView2 运行时（Win10/11 通常自带）。若环境缺失 WebView2，`desktop.py` 会自动回退用默认浏览器打开页面。
-- **与浏览器模式完全一致**：工具链（search_code / read_file / apply_edit / create_file / run_command 等）与 API 全部复用，无功能差异。
-- **打包成独立 exe（onedir 目录分发）**：已提供 `docmind.spec`，一条命令产出目录版 `dist\DocMind\DocMind.exe`，双击即用（内部含 FastAPI 服务 + 前端，无需安装 Python；首次构建约几分钟，chroma/onnxruntime 较大，整体约 572 MB）。
+## 🧪 测试与自检
 
-  ```powershell
-  # 1) 安装打包器（仅需一次）
-  .venv\Scripts\python.exe -m pip install pyinstaller
+```bash
+# 全量单元测试（202 项；MinGit 在 PATH 时 git 用例会实际执行）
+.venv\Scripts\python.exe -B -m unittest discover -s tests
 
-  # 2) 按 docmind.spec 构建（onedir）
-  .venv\Scripts\python.exe -m PyInstaller docmind.spec --noconfirm --log-level WARN
+# 场景画布 —— 后端自检：进程内起 FastAPI + 临时 Godot 工程，走真实路由，不占端口
+.venv\Scripts\python.exe verify_scene_canvas.py
 
-  # 3) 产物：dist\DocMind\DocMind.exe —— 整个 dist\DocMind 目录一起分发，直接双击
-  ```
+# 场景画布 —— 浏览器冒烟：先在另一个终端起演示服务，再用托管 node 执行
+.venv\Scripts\python.exe verify_scene_canvas.py --serve 8011
+node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
+```
 
-  - 打包要点：`config.py` 已做 frozen 适配——onedir 下按 `sys.executable` 同级的 `_internal/` 定位 `web` 等随包资源（onefile 才走 `sys._MEIPASS`，两种形态都兼容）；运行时索引目录 `dist\DocMind\.chroma` 首次启动自动创建，**开发期 `.chroma` 不打进包**，避免把测试索引带给用户。`docmind.spec` 用 `collect_all("chromadb")`/`collect_all("webview")` 兜底运行时动态子模块，并把 `web` 目录 add-data 进 `_internal`。
-  - **分发版不含独立 Python 解释器**：分区 `builtin:py` 校验在进程内做语法编译检查（exe/源码行为一致）；但 playtest 自动测试（pytest/unittest）、cProfile 剖析、`python_exec` 需要真实 Python 环境，请在源码 `.venv` 中使用，exe 内会直接给出明确提示。分区工作台的 git 初始化/提交/回滚还要求目标机器安装 Git 并加入 PATH。详见 [DocMind_BUILD.md](DocMind_BUILD.md)。
-  - 前置：Windows 需 Edge WebView2 运行时（Win10/11 通常自带）；缺失时 `desktop.py` 会回退用默认浏览器打开。
-  - **每次修复后重新打包的标准验证流程**（py_compile → 逻辑用例 → dev 浏览器实测 → 重建 → exe 冷启动冒烟 → 哈希核对）已沉淀在 [DocMind_BUILD.md](DocMind_BUILD.md) 文末，照做可避免"源码已修但分发版仍旧"。
+浏览器冒烟会产出 `docs/screenshots/scene-canvas.png` 与 `docs/screenshots/runtime-timeline.png`。
 
-- **前端"分区"设计**：`web/index.html` 已重做为**左分区侧栏 + 主聊天区**的双栏布局，直观呼应"防 AI 改代码混乱"的核心诉求——
-  - 左侧「知识库·文档分区」与「代码库·代码分区」两个独立卡片，实时展示已索引的文档与代码切片数；
-  - 代码索引说明里明确写出"分区让 Agent 精准定位、按需修改，避免堆叠与幻觉"，把工具链（search_code→read_file→apply_edit/create_file→run_command 验证）的闭环在界面层可视化；
-  - ReAct 推理轨迹（思考/行动/观察/反思）默认折叠、可一键展开，信息密度可控；模型状态、Embedding 选择、上传/索引入口都收敛在侧栏与弹窗中，操作路径更短。
+---
+
+## 🗺️ 场景画布
+
+把 `.tscn` 画成可操作的节点图。**为什么不是"把节点树画成容器套容器"**：真实场景动辄 4–6 层，容器嵌套表达"归属"还行，但场景开发真正高频的是**空间关系**（position / transform），容器根本表达不了"这几个东西该画在哪"。所以画布用**扁平节点 + 四类边**：
+
+| 边 | 含义 | 样式 |
+|---|---|---|
+| `hierarchy` | 父子层级（上 → 下） | 灰色实线 |
+| `script` | 节点 ↔ 脚本文件 | 紫色虚线 |
+| `instance` | 节点 ↔ 被实例化的子场景 | 青色点线 |
+| `reference` | 节点 ↔ 贴图 / 材质等资源 | 灰色（默认隐藏，可开） |
+
+两种布局：**层级布局**（DFS 前序的水平树）与**空间布局**（直接按场景坐标落点，拖拽即回写 `position`）。双击文件卡在编辑器打开该脚本 / 场景；右侧检查器列出全部属性。
+
+**安全与可逆性**（这部分才是真功夫，不是画得像就行）：
+
+- 所有写入经双层沙箱（`code_root` 包含性 + 分区 / 契约保护）；属性值含换行会被拒（防注入）；
+- 改写走"行块模型"，**写完即自检**（父节点存在 / 同级不重名 / 父块先于子块），任一项不通过就**原样回滚**；
+- 每个操作都回传一条与接口请求体**同形**的 `undo`，前端原样回传即可撤销——并有回归用例保证**撤销后文件逐字节还原**（含空行位置与属性顺序）。
+
+## ⏱️ 运行时时间线
+
+游戏跑起来后事件写进 `.docmind_runtime.jsonl`（引擎侧按约定打印 `DOCMIND_EVENT {json}` 即被抓取）。时间线把这些事件画成多轨道时间轴：按类型分轨、按来源 / 会话 / 关键字筛选、时间缩放、数值指标曲线、导出 JSON、点事件跳代码行。清空时用**字节游标**归零，不截断正在被引擎写入的日志。
+
+---
 
 ## 🎯 设计要点（面试可讲）
 
 1. **为什么是 Agent 而非朴素 RAG**：简单 RAG 对"需要计算""需要跨文档汇总"的问题力不从心；ReAct 让模型自行规划工具调用，泛化能力更强。
 2. **Provider 抽象**：把不同厂商收敛到统一的 OpenAI 协议后，切换模型不改动业务代码——同一种思路也用在作者另一个 Android 项目 `MusicLayout` 的 `AIApiClient` 中。
-3. **降级与健壮性**：mock 模式保证无网络/无 key 也有可演示产物；向量检索失败有明确兜底提示。
-4. **服务化思维**：用 FastAPI 暴露 SSE 流式接口，前端可逐步渲染"思考/行动/观察"，对应简历中"将 Agent 封装为服务"。
+3. **降级与健壮性**：mock 模式保证无网络 / 无 key 也有可演示产物；向量检索失败有明确兜底提示。
+4. **服务化思维**：用 FastAPI 暴露 SSE 流式接口，前端可逐步渲染"思考 / 行动 / 观察"，对应简历中"将 Agent 封装为服务"。
+5. **子进程而非进程内执行**：`python_exec` 走 `subprocess` + 12s 超时，LLM 生成的代码永远不会污染主进程状态；
+   同理 playtest / 构建验证都跑独立进程，失败只返回文本而不是拖垮服务。
+6. **为什么分区用「每区独立 git 仓库」而不是单仓库分支 / tag**：要的是"出错后只回滚该分区"，
+   独立仓库语义最干净；跨区功能再用**变更集**把多区的 commit 绑在一起整体 revert，比单仓库更可控。
+7. **为什么场景画布用扁平节点 + 四类边，而不是容器嵌套**：见下文「场景画布」一节。
+   配套设计的可逆性链路是重点——**每个写操作回传一条与接口请求体同形的 `undo`，前端原样回传即撤销**，
+   不在工程里落盘副本；并用回归用例钉死"撤销后文件逐字节还原"。这条不变量反过来约束了后端实现
+   （.tscn 里空行归属上一个块，所以任何"顺手规整空行"的清理都会破坏可逆性——代码里有注释守着）。
+8. **为什么值得写两个 `verify_*` 脚本**：单元测试量不到"接口字段名漂移"和"CSS 没加载"这类跨层问题。
+   实际上"Vue Flow 样式漏 import + `manualChunks` 把它的 CSS 切进独立 chunk 导致永不加载"这个 bug
+   就是浏览器冒烟抓到的——它不报错，只是节点在画布里堆成一列，靠数节点/数连线永远发现不了。
+   所以自检脚本的断言要盯**几何比例**（落点差值 ÷ 坐标差值必须是常数），不是盯"元素存在"。
 
 ## 🎮 素材筛选工具（`search_assets`）
 

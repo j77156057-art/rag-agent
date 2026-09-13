@@ -1,12 +1,16 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted } from 'vue'
-import { fsApi, runtimeApi, engineApi, playApi } from '../api'
+import { ref, watch, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
+import { runtimeApi, engineApi, playApi } from '../api'
 import type { WebTemplates, WebExportResult } from '../api'
 import { useWorkbench } from '../composables/workbench'
+// 画布与时间线都引了重依赖（@vue-flow 约 243KB / gzip 79KB），
+// 用异步组件延迟到真正切到对应 tab 再加载，工作台首屏体积不受影响。
+const SceneCanvas = defineAsyncComponent(() => import('./SceneCanvas.vue'))
+const RuntimeTimeline = defineAsyncComponent(() => import('./RuntimeTimeline.vue'))
 
-const { jumpToLine } = useWorkbench()
+const { jumpToLine, openPath, activeTab } = useWorkbench()
 const open = ref(false)
-const tab = ref<'play' | 'scene'>('play')
+const tab = ref<'play' | 'scene' | 'timeline'>('play')
 
 /* ---------------- 试玩器 ---------------- */
 const iframeEl = ref<HTMLIFrameElement | null>(null)
@@ -173,33 +177,31 @@ function clearEvents() {
   seen.clear()
 }
 
-/* ---------------- 场景检查（原有功能，搬到第二 tab） ---------------- */
-const path = ref('')
-const nodes = ref<{ name: string; type: string; parent: string; line: number; script?: string; properties?: { name: string; value: string; line: number }[]; x?: number; y?: number }[]>([])
-const message = ref('')
-const selected = ref<typeof nodes.value[number] | null>(null)
-async function loadScene() {
-  try {
-    const r = await fsApi.sceneTree(path.value)
-    nodes.value = (r.nodes as typeof nodes.value).map((n, i) => ({ ...n, x: 40 + (i % 4) * 120, y: 35 + Math.floor(i / 4) * 70 }))
-    message.value = `已加载 ${nodes.value.length} 个节点`
-  } catch (e) { message.value = (e as Error).message }
+/* ---------------- 场景画布（P0-2：Vue Flow 转正） ---------------- */
+// pathInput 是正在输入的路径，scenePath 是「已提交、值得去解析」的路径——
+// 分开是为了避免每敲一个字符就触发一次后端解析。
+const pathInput = ref('')
+const scenePath = ref('')
+const sceneMessage = ref('')
+function loadScene() {
+  const value = pathInput.value.trim()
+  if (!value) { sceneMessage.value = '请先填写场景路径，例如 scenes/Main.tscn'; return }
+  sceneMessage.value = ''
+  scenePath.value = value
 }
-async function savePosition(n: typeof nodes.value[number]) {
-  await fsApi.setSceneProperty(path.value, n.name, 'position', `Vector2(${Math.round(n.x || 0)}, ${Math.round(n.y || 0)})`)
-  message.value = `已保存 ${n.name} 位置`
-}
-function dragStart(ev: PointerEvent, n: typeof nodes.value[number]) {
-  selected.value = n
-  const x = ev.clientX, y = ev.clientY, ox = n.x || 0, oy = n.y || 0
-  const move = (e: PointerEvent) => { n.x = ox + e.clientX - x; n.y = oy + e.clientY - y }
-  const up = () => {
-    window.removeEventListener('pointermove', move)
-    window.removeEventListener('pointerup', up)
-    void savePosition(n)
+/** 编辑器里打开 .tscn 时自动同步到画布——点开场景就能看结构，不用再手抄路径 */
+watch(() => activeTab.value?.path, (next) => {
+  if (next && next.toLowerCase().endsWith('.tscn')) {
+    pathInput.value = next
+    sceneMessage.value = ''
+    scenePath.value = next
   }
-  window.addEventListener('pointermove', move)
-  window.addEventListener('pointerup', up)
+})
+
+/** 画布/时间线里双击文件卡 -> 在工作台编辑器打开（带行号时定位） */
+function openFromScene(rel: string, line?: number) {
+  if (line && line > 0) void jumpToLine(rel, line)
+  else void openPath(rel)
 }
 
 watch(open, v => {
@@ -228,7 +230,8 @@ onUnmounted(() => {
         <div class="pb-head">
           <div class="pb-tabs">
             <button :class="{ on: tab === 'play' }" @click="tab = 'play'">🎮 Web 试玩</button>
-            <button :class="{ on: tab === 'scene' }" @click="tab = 'scene'">场景检查</button>
+            <button :class="{ on: tab === 'scene' }" @click="tab = 'scene'">🗺 场景画布</button>
+            <button :class="{ on: tab === 'timeline' }" @click="tab = 'timeline'">⏱ 运行时时间线</button>
           </div>
           <button class="pb-x" @click="open = false">×</button>
         </div>
@@ -305,46 +308,28 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <!-- ================= 场景检查 tab ================= -->
-        <div v-else class="pb-body">
+        <!-- ================= 场景画布 tab（P0-2） ================= -->
+        <div v-else-if="tab === 'scene'" class="pb-body">
           <div class="pb-main">
             <div class="pb-toolbar">
-              <input v-model="path" class="pb-path" placeholder="scenes/Main.tscn" />
-              <button class="pb-btn primary" @click="loadScene">加载场景树</button>
-              <button class="pb-btn" @click="pollEvents">刷新事件</button>
+              <input v-model="pathInput" class="pb-path" placeholder="scenes/Main.tscn（支持任意 .tscn 路径）"
+                     @keyup.enter="loadScene" />
+              <button class="pb-btn primary" @click="loadScene">加载场景</button>
+              <small class="pb-hint">在左侧文件树里点开 .tscn 会自动带到这里；画布上可改节点、属性与位置，全部可撤销。</small>
             </div>
-            <div v-if="message" class="pb-msg">{{ message }}</div>
-            <div v-if="nodes.length" class="sr-canvas">
-              <div
-                v-for="n in nodes"
-                :key="`${n.line}-${n.name}`"
-                class="sr-card"
-                :class="{ sel: selected?.name === n.name }"
-                :style="{ left: `${n.x}px`, top: `${n.y}px` }"
-                @pointerdown="dragStart($event, n)"
-                @click="selected = n"
-              >
-                <b>◈ {{ n.name }}</b><small>{{ n.type }}</small>
-              </div>
-            </div>
-            <div v-if="selected" class="sr-inspector">
-              <b>{{ selected.name }} 属性</b>
-              <div v-for="p in selected.properties || []" :key="p.name">
-                <span>{{ p.name }}</span>
-                <input v-model="p.value" @change="fsApi.setSceneProperty(path, selected!.name, p.name, p.value)" />
-              </div>
-              <button v-if="selected.script" @click="jumpToLine(selected!.script!, selected!.line)">打开脚本 {{ selected.script }}</button>
+            <div v-if="sceneMessage" class="pb-msg err">{{ sceneMessage }}</div>
+            <SceneCanvas v-if="scenePath" :path="scenePath" @open-file="openFromScene" />
+            <div v-else class="pb-empty2">
+              填入场景路径并点「加载场景」<br />
+              <small>也可在左侧文件树双击任意 .tscn 直接打开画布</small>
             </div>
           </div>
-          <div class="pb-side">
-            <div class="pb-side-head"><b>运行时事件</b><button class="pb-link" @click="pollEvents">刷新</button></div>
-            <div class="pb-tl">
-              <div v-for="e in [...events].reverse()" :key="e.key" class="pb-ev" :class="evClass(e.type)">
-                <span class="pb-ev-time">{{ evTime(e) }}</span>
-                <span class="pb-ev-type">{{ e.type }}</span>
-                <span v-if="evData(e)" class="pb-ev-data">{{ evData(e) }}</span>
-              </div>
-            </div>
+        </div>
+
+        <!-- ================= 运行时时间线 tab（P1-1） ================= -->
+        <div v-else class="pb-body">
+          <div class="pb-main">
+            <RuntimeTimeline @open-file="openFromScene" />
           </div>
         </div>
       </div>
@@ -358,7 +343,7 @@ onUnmounted(() => {
 .sr-trigger:hover { color: var(--text); border-color: #315c86; }
 
 .pb-mask { position: fixed; inset: 0; background: #0009; z-index: 65; }
-.pb-pop { position: fixed; z-index: 66; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 1140px; max-width: 94vw; height: 760px; max-height: 90vh; background: var(--bg-raised); border: 1px solid var(--border-strong); border-radius: 10px; box-shadow: 0 24px 70px #000c; display: flex; flex-direction: column; overflow: hidden; }
+.pb-pop { position: fixed; z-index: 66; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 1360px; max-width: 96vw; height: 840px; max-height: 92vh; background: var(--bg-raised); border: 1px solid var(--border-strong); border-radius: 10px; box-shadow: 0 24px 70px #000c; display: flex; flex-direction: column; overflow: hidden; }
 .pb-head { display: flex; align-items: center; justify-content: space-between; padding: 9px 12px; border-bottom: 1px solid var(--border); }
 .pb-tabs { display: flex; gap: 6px; }
 .pb-tabs button { background: transparent; border: 1px solid transparent; color: var(--text-muted); padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
@@ -409,13 +394,7 @@ onUnmounted(() => {
 .pb-ev.mid .pb-ev-type { color: #8fc1f0; }
 .pb-ev.sys .pb-ev-type { color: var(--text-faint); }
 
-.sr-canvas { flex: 1; position: relative; border: 1px solid var(--border); border-radius: 6px; margin-top: 6px; background: repeating-linear-gradient(0deg, transparent 0 34px, #ffffff08 35px), repeating-linear-gradient(90deg, transparent 0 59px, #ffffff08 60px); min-height: 300px; }
-.sr-card { position: absolute; width: 105px; padding: 7px; background: #142235; border: 1px solid #315c86; border-radius: 5px; cursor: grab; font-size: 11px; }
-.sr-card.sel { border-color: #e8c267; box-shadow: 0 0 0 1px #e8c26755; }
-.sr-card small { display: block; color: var(--text-faint); margin-top: 4px; }
-.sr-inspector { margin-top: 7px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 11px; max-height: 200px; overflow: auto; }
-.sr-inspector div { display: flex; gap: 5px; margin-top: 5px; align-items: center; }
-.sr-inspector span { width: 110px; color: var(--text-muted); }
-.sr-inspector input { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text); font-size: 10px; padding: 3px 5px; border-radius: 4px; }
-.sr-inspector button { margin-top: 7px; background: #17304b; border: 1px solid #315c86; color: #b9d8f5; border-radius: 4px; padding: 4px 8px; cursor: pointer; font-size: 11px; }
+.pb-hint { color: var(--text-faint); font-size: 10.5px; }
+.pb-empty2 { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--text-faint); border: 1px dashed var(--border); border-radius: 8px; text-align: center; line-height: 1.8; }
+.pb-empty2 small { font-size: 11px; }
 </style>

@@ -46,12 +46,25 @@ class GpuLeaseQueueTest(unittest.TestCase):
 
         t1 = threading.Thread(target=waiter, args=("w1",))
         t2 = threading.Thread(target=waiter, args=("w2",))
-        t1.start(); time.sleep(0.05); t2.start(); time.sleep(0.05)
-        self.assertEqual([q["owner"] for q in g.status()["queue"]], ["w1", "w2"])
+        # 不能靠 sleep(0.05) 赌线程调度：机器一忙 w2 会先入队，用例随机变红。
+        # 改成等队列真的出现 w1 再放 w2，FIFO 断言就不再依赖时序运气。
+        t1.start()
+        self.assertTrue(self._wait_queue(["w1"]), g.status()["queue"])
+        t2.start()
+        self.assertTrue(self._wait_queue(["w1", "w2"]), g.status()["queue"])
         g.release("holder")
         t1.join(2); t2.join(2)
         self.assertEqual(order, ["w1", "w2"])
         self.assertIsNone(g.status()["active"])
+
+    @staticmethod
+    def _wait_queue(expected, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if [q["owner"] for q in g.status()["queue"]] == expected:
+                return True
+            time.sleep(0.005)
+        return False
 
     def test_timeout_leaves_queue(self):
         self.assertTrue(g.acquire("holder", 0.1))

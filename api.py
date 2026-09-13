@@ -17,7 +17,7 @@ from datetime import datetime
 
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, UploadFile, Request
+from fastapi import FastAPI, File, Form, UploadFile, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -83,6 +83,7 @@ import workbench_fs
 import mcp_client
 import web_export
 from config import PROJECT_WEB_DIR
+from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
 from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_prepare, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, install_runtime_probe, comfy_status, comfy_queue, comfy_history, comfy_import, comfy_import_all, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
 
 app = FastAPI(title="DocMind RAG Agent")
@@ -298,6 +299,24 @@ class ScenePropertyReq(BaseModel):
     node: str
     property: str
     value: str
+class SceneOpReq(BaseModel):
+    """场景画布的受控编辑请求：一个入口覆盖 add/delete/rename/reparent/duplicate/set_props/move/restore。"""
+    path: str
+    op: str
+    node: str = ""
+    parent: str = "."
+    name: str = ""
+    type: str = ""
+    properties: dict = {}
+    remove: list = []
+    order: dict = {}
+    groups: list = []
+    position: list = []
+    lines: list = []
+    at: int = 0
+    if_mtime: Optional[float] = None
+class RuntimeClearReq(BaseModel):
+    scope: str = "stored"
 class PreviewReq(BaseModel): path: str
 class PlaceholderReq(BaseModel): path: str; kind: str = "text"
 class ImpactReq(BaseModel): query: str
@@ -566,13 +585,48 @@ async def comfy_import_all_ep(req: ComfyImportReq):
 async def scene_tree_ep(path: str):
     root=_project_root_or_error(); return scene_tree(root,path) if root else {"ok":False,"error":"未配置代码库"}
 @app.get("/api/runtime/events")
-async def runtime_events_get_ep():
-    root=_project_root_or_error(); return runtime_events(root) if root else {"ok":False,"error":"未配置代码库"}
+async def runtime_events_get_ep(from_ts: str = "", to_ts: str = "", types: str = "", sources: str = "",
+                                keyword: str = "", limit: int = 0, sessions: bool = False):
+    """运行时事件检索：支持时间区间、类型/来源多选、关键字与条数上限。"""
+    root=_project_root_or_error()
+    if not root: return {"ok":False,"error":"未配置代码库"}
+    return runtime_events(root, None, from_ts=from_ts or None, to_ts=to_ts or None,
+                          types=[x for x in types.split(",") if x],
+                          sources=[x for x in sources.split(",") if x],
+                          keyword=keyword or None, limit=limit or None, with_sessions=sessions)
+@app.get("/api/runtime/sessions")
+async def runtime_sessions_ep(gap: int = 120):
+    """把运行时事件按时间间隔切成会话（前端时间线的会话分组）。"""
+    root=_project_root_or_error()
+    return runtime_sessions(root, gap) if root else {"ok":False,"error":"未配置代码库"}
+@app.post("/api/runtime/clear")
+async def runtime_clear_ep(req: RuntimeClearReq):
+    root=_project_root_or_error()
+    if not root: return {"ok":False,"error":"未配置代码库"}
+    try: return runtime_clear(root, req.scope)
+    except workbench_fs.FsError as e: return workbench_fs._err(e)
 @app.post("/api/fs/scene-property")
 async def scene_property_ep(req: ScenePropertyReq):
     root=_project_root_or_error()
     if not root: return {"ok":False,"error":"未配置代码库"}
     try: return set_scene_property(root, req.path, req.node, req.property, req.value)
+    except Exception as e: return JSONResponse({"ok":False,"error":str(e)}, status_code=400)
+@app.get("/api/scene/graph")
+async def scene_graph_ep(path: str):
+    """场景画布图模型：节点 + 外部引用 + 层级/脚本/实例化边 + 写护栏。"""
+    root=_project_root_or_error()
+    if not root: return {"ok":False,"error":"未配置代码库"}
+    try: return scene_graph(root, path)
+    except workbench_fs.FsError as e: return workbench_fs._err(e)
+    except Exception as e: return JSONResponse({"ok":False,"error":str(e)}, status_code=400)
+@app.post("/api/scene/op")
+async def scene_op_ep(req: SceneOpReq):
+    """场景受控编辑。写前过双层沙箱，写后自检，结构非法自动回滚，并回传 undo 描述。"""
+    root=_project_root_or_error()
+    if not root: return {"ok":False,"error":"未配置代码库"}
+    payload = req.model_dump(exclude={"path", "op"})
+    try: return scene_op(root, req.path, req.op, **payload)
+    except workbench_fs.FsError as e: return workbench_fs._err(e)
     except Exception as e: return JSONResponse({"ok":False,"error":str(e)}, status_code=400)
 @app.post("/api/runtime/events")
 async def runtime_events_post_ep(req: RuntimeEventsReq):
@@ -960,6 +1014,18 @@ async def selection_ai_ep(req: SelectionAiReq):
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
+
+@app.get("/favicon.ico")
+async def favicon():
+    """浏览器默认会去根路径要图标；不接这个路由每个页面都留一条 404 噪音。
+
+    图标取自 web/（Vite 会把 frontend/public/ 原样拷进去，所以打包后也在），
+    缺失时返回 204 而不是 404——"没有图标"不该被记成错误。
+    """
+    path = os.path.join(PROJECT_WEB_DIR, "favicon.ico")
+    if os.path.isfile(path):
+        return FileResponse(path, media_type="image/x-icon")
+    return Response(status_code=204)
 
 @app.get("/")
 async def index():

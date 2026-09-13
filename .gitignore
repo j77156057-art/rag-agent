@@ -37,3 +37,7 @@ web/workbench.html
 Thumbs.db
 .idea/
 .vscode/
+web/favicon.ico
+
+# ===== WorkBuddy 会话记忆（工具本地状态，不入库；结论已沉淀到 HANDOFF/README）=====
+.workbuddy/
