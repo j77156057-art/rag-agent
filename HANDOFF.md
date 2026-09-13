@@ -378,3 +378,6 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 引擎启动现在会将 GPU 调度器生成的 `CUDA_VISIBLE_DEVICES`/`DOCMIND_GPU_INDEX` 环境注入 Godot、Unity、Unreal 子进程，便于实际设备选择；工作台自身环境不变。
 - API 路由与 GPU 环境测试通过。
 仍待实现：引擎启动前自动申请/停止时释放 GPU 租约（当前仅注入环境）；跨进程显存监控与持久队列。
+- 引擎启动现在先申请 GPU 租约（owner 为 `engine:<project-root>`），启动失败会释放；停止或发现进程已结束也会释放，避免引擎与 Ollama/ComfyUI 抢占。
+- 全量测试运行中已通过前段检查；编译通过。
+仍待实现：跨进程显存真实监控/隔离、持久任务队列，以及 Unreal Editor Blueprint 节点/Actor 属性的实际通信读写。

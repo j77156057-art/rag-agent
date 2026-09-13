@@ -611,6 +611,9 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
     elif selected == 'unreal': args=[executable, os.path.join(root_abs, scene)] if scene else [executable, root_abs]
     else: args=[executable, '--path', root_abs]
     if scene and selected == 'godot': args += ['--editor']
+    lease_owner = 'engine:' + root_abs
+    if not _gpu_acquire(lease_owner, timeout=2, purpose=selected):
+        return {'ok': False, 'error': 'GPU 资源正忙，无法启动引擎。'}
     try:
         log_path = _file(root_abs, ".docmind_engine.log")
         log = open(log_path, "a", encoding="utf-8")
@@ -641,8 +644,10 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
             result['embed_error'] = '没有桌面宿主窗口（请用桌面端启动工作台）。'
         return result
     except FileNotFoundError:
+        _gpu_release(lease_owner)
         return {"ok": False, "error": f"找不到 {selected} 可执行文件。请安装引擎，或在 .docmind_engine.json 中配置 executable 的绝对路径。下载地址：{next((x['download'] for x in ENGINE_CATALOG if x['id']==selected), '')}"}
     except Exception as e:
+        _gpu_release(lease_owner)
         return {"ok": False, "error": f"无法启动 {selected}：{e}"}
 
 def engine_stop(root):
@@ -656,6 +661,7 @@ def engine_stop(root):
     detached = engine_detach(root_abs)
     if not p or p.poll() is not None:
         _ENGINE_PROCS.pop(root_abs, None)
+        _gpu_release('engine:' + root_abs)
         return {"ok": True, "stopped": False, "detached": detached.get('was_embedded', False)}
     pid = p.pid
     killed = []
@@ -681,6 +687,7 @@ def engine_stop(root):
         except Exception:  # noqa: BLE001
             pass
     _ENGINE_PROCS.pop(root_abs, None)
+    _gpu_release('engine:' + root_abs)
     return {"ok": True, "stopped": True, "pid": pid,
             "detached": detached.get('was_embedded', False), "killed": killed}
 
