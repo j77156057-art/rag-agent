@@ -369,3 +369,6 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI 新增显式取消：`POST /api/comfy/cancel/{prompt_id}` 调用原生 `/interrupt`，并在 watcher 状态记录 `cancel_requested`；返回值明确表示“已请求中断”，不会伪装成任务完成。
 - 新增取消请求测试。
 仍待实现：按 prompt_id 的精确取消（ComfyUI 原生 interrupt 是全局当前任务）、Unreal Editor 深度读写桥接、GPU 跨进程显存隔离与持久队列。
+- Unreal 新增桥接脚本安装 API：`POST /api/engine/unreal-bridge/install`（需 `confirm=true`，可 `force` 覆盖）。脚本写入 `Content/Python/docmind_bridge.py`，提供 Editor Python 下的 Blueprint 资产枚举和当前 Level Actor 枚举入口；不修改二进制 `.uasset`。
+- 已通过 API 路由与资产索引测试。
+仍待实现：在 Unreal Editor 中启用并运行桥接脚本的进程通信、Blueprint 节点级读写和 Actor 属性安全编辑；GPU 跨进程显存隔离/持久队列。

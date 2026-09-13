@@ -87,6 +87,18 @@ def engine_inspect(root, engine=''):
                     result['blueprints' if kind=='blueprint' else 'assets'].append(item)
     return result
 
+def install_unreal_bridge(root, force=False):
+    """安装 Unreal Editor Python 桥接脚本；不修改 .uasset。"""
+    base = _root(root)
+    if not any(x.get('engine') == 'unreal' for x in engine_scan(base).get('projects', [])):
+        return {'ok': False, 'error': '未找到 Unreal .uproject。'}
+    rel = 'Content/Python/docmind_bridge.py'; path = _file(base, rel)
+    if os.path.exists(path) and not force: return {'ok': False, 'error': '桥接脚本已存在，请使用 force 覆盖。', 'path': rel}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    source = '"""DocMind Unreal Editor Python bridge."""\nimport unreal\n\ndef list_assets(asset_class="Blueprint"):\n    ar = unreal.AssetRegistryHelpers.get_asset_registry()\n    return [str(x.object_path) for x in ar.get_assets_by_class(asset_class)]\n\ndef list_level_actors():\n    return [{"name": a.get_name(), "class": a.get_class().get_name()} for a in unreal.EditorLevelLibrary.get_all_level_actors()]\n'
+    with open(path, 'w', encoding='utf-8', newline='\n') as f: f.write(source)
+    return {'ok': True, 'path': rel, 'created': True, 'note': '需启用 Unreal Editor Python Script Plugin 后执行。'}
+
 def engine_prepare(root, engine='godot', executable=''):
     """为 AI 提供幂等的引擎准备动作：探测可执行文件并写入项目配置。"""
     if engine not in {x['id'] for x in ENGINE_CATALOG}: return {'ok':False,'error':'不支持的游戏引擎。'}
