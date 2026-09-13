@@ -329,3 +329,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 独立分支 codex/p1-3-gpu-comfyui 新增 /api/comfy/wait/{prompt_id} 有界轮询接口，ComfyUI 可等待完成/失败/超时；测试 213 项通过。
 
 - Unreal inspect 现在额外返回 .uproject 插件/目标平台，并解析 Build.cs 依赖。
+
+- ComfyUI history 输出现在包含 preview_url 与 MIME，导入元数据记录 mime，便于前端多媒体预览。
