@@ -662,7 +662,10 @@ def engine_verify(root, executable="godot", timeout=30):
     cfg=engine_config(root); selected=cfg.get('engine','godot'); executable=cfg.get('executable','godot') if not executable or (executable == 'godot' and selected != 'godot') else executable
     executable = _resolve_engine_executable(selected, executable)
     if selected == 'unity': cmd=[executable,'-batchmode','-nographics','-quit','-projectPath',root_abs]
-    elif selected == 'unreal': cmd=[executable,'-Unattended','-NullRHI','-ProjectOnly']
+    elif selected == 'unreal':
+        projects=[x['path'] for x in engine_scan(root_abs).get('projects',[]) if x.get('engine')=='unreal']
+        project_path=os.path.join(root_abs, projects[0]) if projects else root_abs
+        cmd=[executable, project_path, '-Unattended','-NullRHI','-ProjectOnly']
     else: cmd=[executable,'--headless','--path',root_abs,'--editor','--quit']
     try:
         p = subprocess.run(cmd, cwd=root_abs, capture_output=True, text=True, timeout=max(3, min(int(timeout), 180)),
