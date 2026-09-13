@@ -4,7 +4,7 @@ import { engineApi, taskApi, comfyApi } from '../api'
 import { useWorkbench } from '../composables/workbench'
 const { jumpToLine } = useWorkbench()
 const open = ref(false), title = ref(''), region = ref(''), files = ref(''), result = ref(''), impact = ref<string[]>([]), taskId = ref(''), tasks = ref<Record<string, unknown>[]>([])
-const running = ref(false), busy = ref(false), logs = ref<string[]>([]), errors = ref<{path:string;line:number;message:string}[]>([]), comfyUrl = ref('http://127.0.0.1:8188'), comfyState = ref('未检测'), workflow = ref(''), comfyResult = ref(''), promptId = ref(''), outputs = ref<{filename?:string;subfolder?:string;type?:string}[]>([])
+const running = ref(false), busy = ref(false), logs = ref<string[]>([]), errors = ref<{path:string;line:number;message:string}[]>([]), comfyUrl = ref('http://127.0.0.1:8188'), comfyState = ref('未检测'), workflow = ref(''), comfyResult = ref(''), promptId = ref(''), outputs = ref<{filename?:string;subfolder?:string;type?:string}[]>([]), comfyTemplates = ref<{id:string;name:string;model:string;kind:string;workflow?:string}[]>([])
 async function loadTasks() { try { tasks.value = (await taskApi.list()).tasks.slice(-5).reverse() } catch {} }
 async function refresh() { try { running.value = (await engineApi.status()).running; const r = await engineApi.logs(); logs.value = r.lines.slice(-8); errors.value = r.errors } catch {} }
 async function analyze() {
@@ -16,7 +16,7 @@ async function createBranch() { try { const r=await taskApi.branch({id:taskId.va
 async function verifyTask() { busy.value = true; try { const r = await taskApi.verify({ id: taskId.value, title: title.value, region: region.value, files: files.value.split(/[,\n]/).map(x => x.trim()).filter(Boolean), allowed_paths: region.value ? [region.value] : [] }); result.value = r.ok ? '任务验证通过' : '任务验证失败：请查看检查结果' } catch (e) { result.value = (e as Error).message } finally { busy.value = false } }
 async function toggleEngine() { busy.value = true; try { const r = running.value ? await engineApi.stop() : await engineApi.start(); running.value = 'running' in r ? !!r.running : false; await refresh() } catch (e) { result.value = (e as Error).message } finally { busy.value = false } }
 async function verifyEngine() { busy.value = true; try { const r = await engineApi.verify(); result.value = r.ok ? 'Godot 校验通过' : (r.error || 'Godot 校验失败') } catch (e) { result.value = (e as Error).message } finally { busy.value = false } }
-onMounted(refresh); onMounted(loadTasks)
+onMounted(refresh); onMounted(loadTasks); onMounted(async () => { try { comfyTemplates.value = (await comfyApi.templates()).templates } catch {} })
 let timer: number | undefined
 onMounted(() => { timer = window.setInterval(refresh, 3000) })
 import { onBeforeUnmount } from 'vue'
@@ -41,7 +41,7 @@ async function importOutput(o: Record<string, unknown>) { const x = await comfyA
       <div class="te-engine"><span :class="{ live: running }" /> Godot {{ running ? '运行中' : '未运行' }} <button @click="verifyEngine">校验</button><button @click="toggleEngine">{{ running ? '停止' : '启动' }}</button></div>
       <pre v-if="logs.length" class="te-logs">{{ logs.join('\n') }}</pre>
       <button v-for="e in errors" :key="`${e.path}:${e.line}`" class="te-error" @click="jumpToLine(e.path, e.line)">{{ e.path }}:{{ e.line }} · {{ e.message }}</button>
-      <div class="te-comfy"><b>ComfyUI 资源</b><input v-model="comfyUrl" @change="checkComfy" /><textarea v-model="workflow" placeholder="粘贴 workflow JSON" /><button @click="queueComfy">提交生成</button><button v-if="promptId" @click="pollComfy">查询结果</button><span>{{ comfyState }} {{ comfyResult }}</span></div>
+      <div class="te-comfy"><b>ComfyUI 资源</b><input v-model="comfyUrl" @change="checkComfy" /><div class="te-templates"><button v-for="t in comfyTemplates" :key="t.id" @click="comfyResult=`${t.name} · ${t.model}`">{{ t.name }}</button></div><textarea v-model="workflow" placeholder="粘贴 workflow JSON" /><button @click="queueComfy">提交生成</button><button v-if="promptId" @click="pollComfy">查询结果</button><span>{{ comfyState }} {{ comfyResult }}</span></div>
       <div v-if="outputs.length" class="te-outputs"><div v-for="o in outputs" :key="o.filename" class="te-output"><img v-if="o.mime?.startsWith('image/')" :src="o.preview_url" :alt="o.filename" /><audio v-else-if="o.mime?.startsWith('audio/')" :src="o.preview_url" controls /><video v-else-if="o.mime?.startsWith('video/')" :src="o.preview_url" controls /><span>{{ o.filename }}</span><button @click="importOutput(o)">导入</button></div></div>
     </div>
   </div>

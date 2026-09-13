@@ -758,6 +758,12 @@ def comfy_status(url="http://127.0.0.1:8188"):
     except Exception as e:
         return {"ok": True, "available": False, "url": url, "error": str(e)}
 
+def comfy_templates():
+    return {'ok': True, 'templates': [
+        {'id':'z-image-turbo','name':'Z-Image Turbo 图片','model':'z_image_turbo-Q8_0.gguf','kind':'image'},
+        {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','workflow':'D:/ComfyUI/ComfyUI/user/default/workflows/minimax_h3_t2v.json'}
+    ]}
+
 def comfy_queue(workflow, url="http://127.0.0.1:8188"):
     try: url = _safe_comfy_url(url)
     except ValueError as e: return {"ok": False, "error": str(e)}
