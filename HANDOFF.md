@@ -388,3 +388,4 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - `engine_verify` 现在也申请独立 GPU 租约，并在成功、找不到可执行文件、超时或异常时释放，避免校验任务与运行任务并发争抢显存。
 - ComfyUI watcher 现在在轮询生命周期内持有 `comfy:<prompt_id>` GPU 租约，并在完成、失败或超时时释放；重复 watcher 不重复占用租约。
 - 这使生成监控阶段与 Ollama/引擎调度互斥，避免轮询期间 GPU 被其它任务抢占。
+- ComfyUI workflow 提交成功后会自动启动后台 watcher（当响应包含 `prompt_id`），`/api/comfy/queue` 返回 `watch` 状态；无需前端额外发起轮询请求。

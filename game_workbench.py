@@ -768,7 +768,11 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188"):
         with urllib.request.urlopen(req, timeout=10) as r:
             response = json.loads(r.read().decode())
         canonical = json.dumps(workflow, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
-        return {"ok": True, "response": response, "workflow_sha256": hashlib.sha256(canonical).hexdigest()}
+        result = {"ok": True, "response": response, "workflow_sha256": hashlib.sha256(canonical).hexdigest()}
+        prompt_id = response.get('prompt_id') if isinstance(response, dict) else None
+        if prompt_id:
+            result['watch'] = comfy_watch(str(prompt_id), url)
+        return result
     except Exception as e: return {"ok": False, "error": f"ComfyUI 请求失败：{e}"}
     finally: _gpu_release("comfyui")
 
