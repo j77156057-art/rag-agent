@@ -726,6 +726,9 @@ async def comfy_queue_ep(req: ComfyReq):
 @app.get("/api/comfy/history/{prompt_id}")
 async def comfy_history_ep(prompt_id: str, url: str = "http://127.0.0.1:8188"):
     return comfy_history(prompt_id, url)
+@app.get("/api/comfy/wait/{prompt_id}")
+async def comfy_wait_ep(prompt_id: str, url: str = "http://127.0.0.1:8188", timeout: int = 120, interval: float = 1.0):
+    return comfy_wait(prompt_id, url, timeout, interval)
 @app.post("/api/comfy/import")
 async def comfy_import_ep(req: ComfyImportReq):
     root=_project_root_or_error()
@@ -2027,3 +2030,4 @@ app.mount("/static", StaticFiles(directory=PROJECT_WEB_DIR), name="static")
 _ASSETS_DIR = os.path.join(PROJECT_WEB_DIR, "assets")
 if os.path.isdir(_ASSETS_DIR):
     app.mount("/assets", StaticFiles(directory=_ASSETS_DIR), name="assets")
+
