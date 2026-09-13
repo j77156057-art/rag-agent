@@ -339,3 +339,12 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - GPU status 现返回 devices 全量列表，并支持 DOCMIND_GPU_INDEX 选择显存门控目标卡；保持旧 used/free 字段兼容。
 
 - TaskEnginePanel 现按 MIME 预览 ComfyUI 图片/音频/视频输出，并保留导入操作；独立 worktree 未安装 node_modules，需在主仓/frontend 环境构建验证。
+
+### 本轮新增（独立 worktree）
+
+- Unreal 诊断解析：新增 `parse_unreal_diagnostics()`，支持 MSVC/Unreal 常见 `path(line[,column]): error|warning ...` 格式；`engine_verify()` 在 Unreal 模式返回结构化 diagnostics。
+- 新增 `POST /api/engine/diagnostics`，用于前端/Agent 对任意 Unreal 编译日志做结构化解析。
+- 补回并验证 `comfy_wait()` 及 `/api/comfy/wait/{prompt_id}` 有界轮询（超时最多 900 秒），避免无限等待。
+- 新增 Unreal 诊断单元测试；独立 worktree 全量测试 215 项通过。
+
+仍待实现：Unreal Blueprint/Level 深度桥接、GPU 跨进程真实显存隔离与优先级持久队列、ComfyUI 后台自动轮询 UI/取消任务/许可证与重复资源分析。

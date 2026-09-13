@@ -200,6 +200,25 @@ def parse_godot_diagnostics(text):
             pending = None
     return out
 
+_UNREAL_DIAG_RX = re.compile(r'^\s*(?P<path>(?:[A-Za-z]:[\\/])?[^():\r\n]+\.(?:cpp|h|inl|cs|Build\.cs))\((?P<line>\d+)(?:,\d+)?\)\s*:\s*(?P<kind>error|warning)\s*(?P<msg>.*)$', re.I)
+
+def parse_unreal_diagnostics(text):
+    """解析 Unreal/MSVC 编译输出，返回统一诊断结构。"""
+    out, seen = [], set()
+    for raw in (text or '').splitlines():
+        m = _UNREAL_DIAG_RX.match(raw)
+        if not m:
+            continue
+        path = m.group('path').replace('\\', '/').strip()
+        msg = ' '.join(m.group('msg').split())
+        severity = m.group('kind').lower()
+        item = (path, int(m.group('line')), severity, msg)
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append({'path': path, 'line': int(m.group('line')), 'severity': severity, 'message': msg})
+    return out
+
 
 def _resolve_project_godot(root, executable=''):
     """读取项目引擎配置并解析出 Godot 可执行文件；非 Godot 项目/找不到时返回错误串。"""
@@ -671,7 +690,7 @@ def engine_verify(root, executable="godot", timeout=30):
         p = subprocess.run(cmd, cwd=root_abs, capture_output=True, text=True, timeout=max(3, min(int(timeout), 180)),
                            encoding='utf-8', errors='replace')
         out = ((p.stdout or '') + '\n' + (p.stderr or ''))[-6000:]
-        diagnostics = parse_godot_diagnostics(out) if selected == 'godot' else []
+        diagnostics = parse_godot_diagnostics(out) if selected == 'godot' else (parse_unreal_diagnostics(out) if selected == 'unreal' else [])
         # 子进程直接捕获的诊断优先；日志文件解析作为历史兜底
         log_errors = engine_logs(root_abs).get("errors", [])
         return {"ok": p.returncode == 0 and not any(d['severity'] == 'error' for d in diagnostics),
@@ -729,6 +748,21 @@ def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
         return {"ok": True, "prompt_id": pid, "status": item.get("status", {}), "outputs": outputs, "done": bool(item.get("outputs"))}
     except Exception as e:
         return {"ok": False, "error": f"ComfyUI 状态查询失败：{e}"}
+
+def comfy_wait(prompt_id, url="http://127.0.0.1:8188", timeout=120, interval=1.0):
+    """有界轮询 ComfyUI history，避免前端自行实现忙等。"""
+    deadline = time.time() + max(1, min(int(timeout), 900))
+    delay = max(0.1, min(float(interval), 10.0))
+    while time.time() < deadline:
+        result = comfy_history(prompt_id, url)
+        if not result.get('ok'):
+            return result
+        status = result.get('status') or {}
+        if result.get('done') or status.get('completed') or status.get('status_str') in ('success', 'error'):
+            result['timed_out'] = False
+            return result
+        time.sleep(delay)
+    return {'ok': False, 'prompt_id': str(prompt_id), 'timed_out': True, 'error': 'ComfyUI 任务轮询超时。'}
 
 def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="assets/generated"):
     """Download one ComfyUI output into a project asset directory with metadata."""

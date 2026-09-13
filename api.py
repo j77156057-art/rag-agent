@@ -86,7 +86,7 @@ import mcp_client
 import web_export
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
-from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_queue, comfy_history, comfy_import, comfy_import_all, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
+from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_queue, comfy_history, comfy_wait, comfy_import, comfy_import_all, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
 
 app = FastAPI(title="DocMind RAG Agent")
 agent = Agent()
@@ -558,6 +558,16 @@ async def runtime_probe_ep():
 @app.post("/api/engine/verify")
 async def engine_verify_ep(req: EngineReq):
     root=_project_root_or_error(); return engine_verify(root, req.executable) if root else {"ok":False,"error":"未配置代码库"}
+
+class EngineDiagnosticsReq(BaseModel):
+    engine: str = "unreal"
+    text: str = ""
+
+@app.post("/api/engine/diagnostics")
+async def engine_diagnostics_ep(req: EngineDiagnosticsReq):
+    if req.engine.lower() != "unreal":
+        return {"ok": False, "error": "当前仅支持 Unreal 诊断解析。"}
+    return {"ok": True, "engine": "unreal", "diagnostics": parse_unreal_diagnostics(req.text)}
 
 # ---------------------------------------------------------------- P0：Godot 单文件校验 + godot-ai 插件
 class GodotCheckReq(BaseModel):
