@@ -333,3 +333,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI history 输出现在包含 preview_url 与 MIME，导入元数据记录 mime，便于前端多媒体预览。
 
 - GPU 队列新增 /api/gpu/cancel/{owner}，可取消尚未获得租约的等待任务；持有中的任务不强制中断。
+
+- Unreal headless verify 现在自动传入扫描到的 .uproject 路径，避免 -ProjectOnly 校验错误项目。
