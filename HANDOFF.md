@@ -408,3 +408,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - history 状态：`success/completed=true`，耗时约 25 秒。
 - 输出：`docmind_zimage_00001_.png`（ComfyUI output 目录）。
 - 证明 Z-Image 模型、GGUF 节点、VAE、GPU 推理和结果查询链路均可用。
+- MiniMax H3 实机首次 workflow 已提交并被 ComfyUI 接受，但在 `MiniMaxH3ImageToVideo` 文本编码阶段失败：`mat1 and mat2 shapes cannot be multiplied (8x5120 and 2560x8192)`。
+- 诊断表明当前 `CLIPLoaderGGUF(qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors, type=minimax)` 与 H3 节点期望的文本编码维度不匹配；未把失败误报为成功。下一步需读取官方 H3 workflow/正确文本编码器配置后再重试。
