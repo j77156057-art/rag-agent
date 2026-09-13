@@ -28,10 +28,13 @@ def memory_info():
                            capture_output=True, text=True, timeout=2)
         if p.returncode != 0 or not p.stdout.strip():
             return None
-        used, total = [int(x.strip()) for x in p.stdout.splitlines()[0].split(',')[:2]]
-        return {"used_mb": used, "total_mb": total,
-                "free_mb": max(0, total - used),
-                "utilization": used / total if total else 0}
+        devices=[]
+        for idx,line in enumerate(p.stdout.splitlines()):
+            used,total=[int(x.strip()) for x in line.split(',')[:2]]
+            devices.append({"index":idx,"used_mb":used,"total_mb":total,"free_mb":max(0,total-used),"utilization":used/total if total else 0})
+        if not devices: return None
+        selected=int(os.getenv('DOCMIND_GPU_INDEX','0') or 0); chosen=next((x for x in devices if x['index']==selected),devices[0])
+        return {**chosen,"index":chosen['index'],"devices":devices}
     except Exception:
         return None
 
