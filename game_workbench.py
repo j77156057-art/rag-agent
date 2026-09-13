@@ -717,8 +717,9 @@ def engine_verify(root, executable="godot", timeout=30):
         cmd=[executable, project_path, '-Unattended','-NullRHI','-ProjectOnly']
     else: cmd=[executable,'--headless','--path',root_abs,'--editor','--quit']
     try:
+        verify_env = os.environ.copy(); verify_env.update(_gpu_process_environment())
         p = subprocess.run(cmd, cwd=root_abs, capture_output=True, text=True, timeout=max(3, min(int(timeout), 180)),
-                           encoding='utf-8', errors='replace')
+                           encoding='utf-8', errors='replace', env=verify_env)
         out = ((p.stdout or '') + '\n' + (p.stderr or ''))[-6000:]
         diagnostics = parse_godot_diagnostics(out) if selected == 'godot' else (parse_unreal_diagnostics(out) if selected == 'unreal' else [])
         # 子进程直接捕获的诊断优先；日志文件解析作为历史兜底
