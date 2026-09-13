@@ -719,7 +719,10 @@ def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
         outputs = []
         for node in (item.get("outputs") or {}).values():
             for img in (node.get("images") or []):
-                if isinstance(img, dict): outputs.append(img)
+                if isinstance(img, dict):
+                    x=dict(img); name=str(x.get('filename') or 'output.bin'); sub=str(x.get('subfolder') or '')
+                    x['preview_url']=url + '/view?' + urllib.parse.urlencode({'filename':name,'subfolder':sub,'type':x.get('type') or 'output'})
+                    x['mime']=mimetypes.guess_type(name)[0] or 'application/octet-stream'; outputs.append(x)
         return {"ok": True, "prompt_id": pid, "status": item.get("status", {}), "outputs": outputs, "done": bool(item.get("outputs"))}
     except Exception as e:
         return {"ok": False, "error": f"ComfyUI 状态查询失败：{e}"}
@@ -741,7 +744,7 @@ def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="
         if len(data) > COMFY_MAX_DOWNLOAD: return {"ok": False, "error": "资源超过 25MB 下载上限。"}
         with open(target, "wb") as f: f.write(data)
         meta_path = _file(root, rel + ".json")
-        meta = {"source": "comfyui", "url": url, "prompt_id": str(prompt_id), "filename": name, "subfolder": sub, "imported_at": datetime.now().isoformat(timespec="seconds"), "size": len(data)}
+        meta = {"source": "comfyui", "url": url, "prompt_id": str(prompt_id), "filename": name, "subfolder": sub, "mime": mimetypes.guess_type(name)[0] or 'application/octet-stream', "imported_at": datetime.now().isoformat(timespec="seconds"), "size": len(data)}
         with open(meta_path, "w", encoding="utf-8") as f: json.dump(meta, f, ensure_ascii=False, indent=2)
         return {"ok": True, "path": rel.replace("\\", "/"), "metadata": meta}
     except Exception as e: return {"ok": False, "error": f"资源下载失败：{e}"}
