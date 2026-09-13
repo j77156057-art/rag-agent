@@ -720,6 +720,11 @@ async def comfy_status_ep(url: str = "http://127.0.0.1:8188"):
 @app.get("/api/gpu/status")
 async def gpu_status_ep():
     return {"ok": True, **gpu_status()}
+
+@app.post("/api/gpu/cancel/{owner}")
+async def gpu_cancel_ep(owner: str):
+    from gpu_coordinator import cancel
+    return {"ok": True, "owner": owner, "cancelled": cancel(owner)}
 @app.post("/api/comfy/queue")
 async def comfy_queue_ep(req: ComfyReq):
     return comfy_queue(req.workflow, req.url)

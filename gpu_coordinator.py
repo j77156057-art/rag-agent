@@ -150,3 +150,12 @@ def force_release():
             _handover_locked()
             _cv.notify_all()
         return prev
+
+def cancel(owner):
+    """取消尚未获得租约的等待任务；已持有者不强制中断。"""
+    with _cv:
+        owner=str(owner); removed=0
+        for item in list(_waiters):
+            if item[0] == owner:
+                _waiters.remove(item); item[2].set(); removed += 1
+        return removed
