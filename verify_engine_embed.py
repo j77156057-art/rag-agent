@@ -848,6 +848,44 @@ def main():
             print('      → 鼠标点击：%d 次，其中疑似真实点击 %d 次（坐标>10）'
                   % (len(clicks), len(real)))
 
+        print('\n[11] HTTP 端点层：POST /api/engine/embed（曾因重复注册变成死代码）')
+        # 这条曾经同路径同方法注册了两次，旧版先注册 → 新版永远收不到请求；
+        # 删掉重复后它才真正生效，所以必须真打一遍确认落点，而不是只确认"不报错"。
+        import config as _config
+        import api as _api
+        from starlette.testclient import TestClient
+        prev_root = _config.get_runtime('code_root')
+        try:
+            _config.set_runtime('code_root', project)
+            client = TestClient(_api.app)
+            gw.engine_stop(project)
+            deadline = time.time() + 8
+            while time.time() < deadline and gw.engine_status(project).get('running'):
+                time.sleep(0.3)
+            started3 = gw.engine_start(project, godot, '', host.hwnd, False)
+            check('HTTP 用例：引擎已独立启动', started3.get('running') is True, started3.get('error', ''))
+            t0 = time.time()
+            while time.time() - t0 < 15 and not db.find_window(started3.get('pid') or 0):
+                time.sleep(0.2)
+            want = {'x': 30, 'y': 40, 'width': 400, 'height': 220}
+            resp = client.post('/api/engine/embed',
+                               json={'host_hwnd': host.hwnd, **want, 'offset_y': -1})
+            body = resp.json()
+            check('POST /api/engine/embed 200 且 ok:true',
+                  resp.status_code == 200 and body.get('ok') is True, body)
+            check('返回 mode=rect（说明走的是支持引擎视窗的新处理器）',
+                  body.get('mode') == 'rect', body.get('mode'))
+            child3 = gw.engine_status(project).get('child_hwnd')
+            r3 = db.window_rect(child3)
+            o3 = db.client_origin(host.hwnd)
+            got = {'x': r3['x'] - o3['x'], 'y': r3['y'] - o3['y'],
+                   'width': r3['width'], 'height': r3['height']}
+            check('HTTP 层嵌入落点与请求矩形一致（±3px）',
+                  all(abs(got[k] - want[k]) <= 3 for k in want),
+                  '期望 %s 实际 %s' % (want, got))
+        finally:
+            _config.set_runtime('code_root', prev_root or '')
+
         print('\n[10] UI 实际调用路径：engine_start(embed=True, rect=...)')
         # 前端「嵌入工作台」按钮走的就是这条路：一次请求里带矩形启动 + 嵌入。
         gw.engine_stop(project)

@@ -77,6 +77,8 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from engine_adapters import skill_for_engine
 from gpu_coordinator import status as gpu_status
+from agent_policy import route_for, permission_check, record_permission, approval_allows, apply_approved_external, routing_status, redact_for_cloud, create_external_approval, list_approvals, decide_approval
+import secrets_store
 _DESKTOP_HOST_HWND = None
 
 import workbench_fs
@@ -84,10 +86,88 @@ import mcp_client
 import web_export
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
-from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_prepare, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_queue, comfy_history, comfy_import, comfy_import_all, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
+from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_queue, comfy_history, comfy_import, comfy_import_all, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
 
 app = FastAPI(title="DocMind RAG Agent")
 agent = Agent()
+
+class AgentRouteReq(BaseModel):
+    prompt: str = ''
+    files: list = []
+    requested: str = 'auto'
+
+@app.post('/api/agent/route')
+async def agent_route_ep(req: AgentRouteReq):
+    return route_for(req.prompt, req.files, req.requested)
+
+@app.post('/api/agent/permission')
+async def agent_permission_ep(payload: dict):
+    root=_project_root_or_error()
+    if not root: return {'ok':False,'allowed':False,'reason':'未配置代码库'}
+    approved=bool(payload.get('approved',False))
+    if payload.get('approval_id'):
+        approved=approval_allows(root, payload.get('approval_id'), payload.get('path',''))
+    return record_permission(payload.get('path',''), root, bool(payload.get('allow_external',False)), approved)
+
+@app.get('/api/agent/routing')
+async def agent_routing_status_ep():
+    return {'ok': True, **routing_status()}
+
+@app.get('/api/agent/secrets')
+async def agent_secrets_ep():
+    root=_project_root_or_error()
+    return {'ok':bool(root),'providers':secrets_store.providers(root) if root else []}
+
+@app.get('/api/agent/approvals')
+async def agent_approvals_ep():
+    root=_project_root_or_error(); return {'ok':bool(root),'approvals':list_approvals(root) if root else []}
+
+@app.post('/api/agent/approvals')
+async def agent_approval_create_ep(payload: dict):
+    root=_project_root_or_error()
+    if not root: return {'ok':False,'error':'未配置代码库'}
+    return {'ok':True,'approval':create_external_approval(root,payload.get('paths',[]),payload.get('summary',''),payload.get('diff',''),payload.get('before',''),payload.get('after',''))}
+
+@app.post('/api/agent/approvals/decide')
+async def agent_approval_decide_ep(payload: dict):
+    root=_project_root_or_error(); status=payload.get('status','')
+    if status not in ('approved','rejected'): return {'ok':False,'error':'status 必须是 approved 或 rejected'}
+    row=decide_approval(root,payload.get('id',''),status) if root else None
+    return {'ok':bool(row),'approval':row}
+
+@app.get('/api/agent/approvals/{approval_id}')
+async def agent_approval_get_ep(approval_id: str):
+    root=_project_root_or_error()
+    if not root: return {'ok':False,'error':'未配置代码库'}
+    row=next((x for x in list_approvals(root) if x.get('id')==approval_id),None)
+    return {'ok':bool(row),'approval':row}
+
+@app.post('/api/agent/external-write')
+async def agent_external_write_ep(payload: dict):
+    root=_project_root_or_error()
+    if not root: return {'ok':False,'error':'未配置代码库'}
+    return apply_approved_external(root, payload.get('approval_id',''), payload.get('path',''), payload.get('content'))
+
+@app.delete('/api/agent/secrets/{provider}')
+async def agent_secret_delete_ep(provider: str):
+    root=_project_root_or_error()
+    return secrets_store.remove(root, provider) if root else {'ok':False,'error':'未配置代码库'}
+
+@app.get('/api/agent/connectors')
+async def agent_connectors_ep():
+    """返回可供 Agent 选择的连接器及其启用状态；不自动启动外部进程。"""
+    root = _project_root_or_error()
+    if not root: return {'ok': False, 'error': '未配置代码库', 'connectors': []}
+    try:
+        rows = mcp_client.server_configs(root)
+        return {'ok': True, 'connectors': [
+            {'key': x.get('key'), 'label': x.get('label'), 'transport': x.get('transport'),
+             'enabled': bool(x.get('enabled')), 'requires_approval': True,
+             'config_error': x.get('config_error')}
+            for x in rows
+        ]}
+    except Exception as e:
+        return {'ok': False, 'error': str(e), 'connectors': []}
 
 class DesktopHostReq(BaseModel):
     hwnd: int
@@ -402,19 +482,21 @@ async def engine_catalog_ep(): return engine_catalog()
 async def engine_scan_ep():
     root=_project_root_or_error(); return engine_scan(root) if root else {"ok":False,"error":"未配置代码库"}
 
+@app.get('/api/engine/inspect')
+async def engine_inspect_ep(engine: str = ''):
+    root=_project_root_or_error(); return engine_inspect(root, engine) if root else {'ok':False,'error':'未配置代码库'}
+
 @app.post('/api/engine/prepare')
 async def engine_prepare_ep(req: EngineReq):
     root=_project_root_or_error(); return engine_prepare(root, req.engine, req.executable) if root else {'ok':False,'error':'未配置代码库'}
 
-class EngineEmbedReq(BaseModel):
-    host_hwnd: int
-    width: int = 1280
-    height: int = 720
-    title_hint: str = 'Godot'
+# 注意：EngineEmbedReq 只在文件上方定义一次（带 x/y/offset_y 的完整版）。
+# 这里曾经又定义了一次窄版本，把上面的覆盖掉——处理器读 req.x 会 AttributeError，
+# 而因为当时还有一个重复的旧处理器在生效，这个错被完全掩盖了。
 
-@app.post('/api/engine/embed')
-async def engine_embed_ep(req: EngineEmbedReq):
-    root=_project_root_or_error(); return engine_embed(root, req.host_hwnd, req.width, req.height, req.title_hint) if root else {'ok':False,'error':'未配置代码库'}
+# 注意：/api/engine/embed 只保留下面这一个处理器（支持引擎视窗矩形）。
+# 曾经这里还有一个"不支持 rect"的旧版，导致同路径同方法注册两次——FastAPI 先注册的生效，
+# 新写的那个变成永远收不到请求的死代码，而且不会有任何报错。tests/test_api_routes.py 守着这条。
 @app.get("/api/engine/skill")
 async def engine_skill_ep(engine: str = "godot"):
     if engine not in {"godot", "unity", "unreal"}: return JSONResponse({"ok":False,"error":"不支持的引擎。"}, status_code=400)
@@ -870,6 +952,17 @@ async def chat(
             f"代码库已索引，根目录：{code_root}。关于代码/实现/函数/类/配置/报错的问题，"
             f"请用 search_code / read_file / grep 工具。"
         )
+    routing = route_for(question)
+    selected_agent = agent
+    if routing.get('route') == 'cloud' and routing.get('auto_cloud_enabled'):
+        cloud_provider = get_runtime('cloud_llm_provider') or os.getenv('AGENT_CLOUD_PROVIDER', 'deepseek')
+        if cloud_provider in PROVIDERS and PROVIDERS[cloud_provider].get('api_key_env'):
+            key = get_runtime('llm_api_key') or os.getenv(PROVIDERS[cloud_provider]['api_key_env'], '')
+            if key:
+                selected_agent = Agent(LLMClient(provider=cloud_provider, api_key=key))
+            else:
+                routing = {**routing, 'route': 'local', 'reason': '云端未配置 API Key，已回退本地'}
+    hints.append(f"模型路由建议：{routing['route']}（复杂度 {routing['complexity']}，{routing['reason']}）。若需云端模型，必须使用已配置且可审计的 provider。")
     if hints:
         grounded = "【系统提示】" + " ".join(hints) + f"\n\n用户问题：{question}"
     else:
@@ -877,7 +970,9 @@ async def chat(
 
     def event_stream():
         try:
-            for ev in agent.run(grounded, stream=True, images=b64_images or None):
+            yield f"data: {json.dumps({'type':'route','route':routing['route'],'complexity':routing['complexity'],'reason':routing['reason']}, ensure_ascii=False)}\n\n"
+            cloud_grounded = redact_for_cloud(grounded) if selected_agent is not agent else grounded
+            for ev in selected_agent.run(cloud_grounded, stream=True, images=b64_images or None):
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as e:
             # LLM 崩溃 / Ollama CUDA 错 / 网络中断等：给前端一个明确的错误 final，不要让前端把检索原文当答案。
@@ -1509,6 +1604,9 @@ async def set_config(req: ConfigReq):
         set_runtime("llm_model", req.model)
     if req.api_key:
         set_runtime("llm_api_key", req.api_key)
+        root_for_secret = _project_root_or_error()
+        if root_for_secret:
+            secrets_store.save(root_for_secret, req.provider, req.api_key)
 
     # 重建 Agent 的 LLM 客户端（即时生效），并清空多轮上下文避免旧回答混淆
     agent.llm = LLMClient(
@@ -1929,4 +2027,3 @@ app.mount("/static", StaticFiles(directory=PROJECT_WEB_DIR), name="static")
 _ASSETS_DIR = os.path.join(PROJECT_WEB_DIR, "assets")
 if os.path.isdir(_ASSETS_DIR):
     app.mount("/assets", StaticFiles(directory=_ASSETS_DIR), name="assets")
-

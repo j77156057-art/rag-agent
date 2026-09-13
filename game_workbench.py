@@ -31,6 +31,46 @@ def engine_scan(root):
             elif fn.endswith('.uproject'): found.append({'engine':'unreal','path':rel})
     return {'ok':True,'projects':found}
 
+def engine_inspect(root, engine=''):
+    """深度读取 Unity/Unreal 项目文本资产，建立可供 AI 定位的轻量索引。"""
+    base=_root(root); result={'ok':True,'engine':engine,'manifests':[],'scenes':[],'prefabs':[],'assets':[],'symbols':[]}
+    projects=engine_scan(base).get('projects',[])
+    if not engine and projects: engine=projects[0]['engine']; result['engine']=engine
+    if engine=='unity':
+        ver=os.path.join(base,'ProjectSettings','ProjectVersion.txt')
+        if os.path.isfile(ver):
+            result['manifests'].append({'path':'ProjectSettings/ProjectVersion.txt','version':next((x.split(':',1)[1].strip() for x in open(ver,encoding='utf-8',errors='replace') if x.startswith('m_EditorVersion:' )), '')})
+        for dp,_,files in os.walk(base):
+            if any(x in dp.split(os.sep) for x in ('.git','Library','Temp','Logs','obj')): continue
+            for fn in files:
+                rel=os.path.relpath(os.path.join(dp,fn),base).replace('\\','/')
+                if fn.endswith('.unity'): result['scenes'].append({'path':rel})
+                elif fn.endswith('.prefab'): result['prefabs'].append({'path':rel})
+                elif fn.endswith('.meta'):
+                    try:
+                        text=open(os.path.join(dp,fn),encoding='utf-8',errors='replace').read(4000)
+                        m=re.search(r'^guid:\s*([0-9a-fA-F]+)',text,re.M)
+                        if m: result['assets'].append({'path':rel[:-5],'meta':rel,'guid':m.group(1)})
+                    except OSError: pass
+    elif engine=='unreal':
+        for p in projects:
+            if p['engine']!='unreal': continue
+            path=os.path.join(base,p['path'])
+            try:
+                with open(path,encoding='utf-8',errors='replace') as f: data=json.load(f)
+                result['manifests'].append({'path':p['path'],'file_version':data.get('FileVersion'),'modules':[x.get('Name') for x in data.get('Modules',[]) if isinstance(x,dict)]})
+            except Exception: result['manifests'].append({'path':p['path'],'error':'invalid json'})
+        for dp,_,files in os.walk(os.path.join(base,'Source')) if os.path.isdir(os.path.join(base,'Source')) else []:
+            for fn in files:
+                if fn.endswith(('.h','.cpp','.cs','.Build.cs')):
+                    rel=os.path.relpath(os.path.join(dp,fn),base).replace('\\','/')
+                    result['symbols'].append({'path':rel,'kind':'source'})
+        for dp,_,files in os.walk(base):
+            if any(x in dp.split(os.sep) for x in ('.git','Intermediate','DerivedDataCache','Saved')): continue
+            for fn in files:
+                if fn.endswith('.uplugin'): result['assets'].append({'path':os.path.relpath(os.path.join(dp,fn),base).replace('\\','/'),'kind':'plugin'})
+    return result
+
 def engine_prepare(root, engine='godot', executable=''):
     """为 AI 提供幂等的引擎准备动作：探测可执行文件并写入项目配置。"""
     if engine not in {x['id'] for x in ENGINE_CATALOG}: return {'ok':False,'error':'不支持的游戏引擎。'}

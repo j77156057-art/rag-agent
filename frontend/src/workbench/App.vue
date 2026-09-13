@@ -17,6 +17,7 @@ import RegionMapDialog from './components/RegionMapDialog.vue'
 import TaskEnginePanel from './components/TaskEnginePanel.vue'
 import SceneRuntimePanel from './components/SceneRuntimePanel.vue'
 import ChatDock from './components/ChatDock.vue'
+import AgentPolicyPanel from './components/AgentPolicyPanel.vue'
 import { useWorkbench } from './composables/workbench'
 import { regionColor } from './theme'
 
@@ -80,6 +81,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
       </div>
       <div class="wb-topbar-right">
         <TaskEnginePanel />
+        <AgentPolicyPanel />
         <SceneRuntimePanel />
         <button
           v-if="tree"

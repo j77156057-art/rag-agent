@@ -100,9 +100,13 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 > 每项含【要做什么】【原因】【方案】【验收】。状态以 `809a3b9` 的代码为准，已核对。
 
+### Agent 模型路由与权限（基础层已落地）
+
+新增 `agent_policy.py`、`/api/agent/route`、`/api/agent/routing`、`/api/agent/connectors`、`/api/agent/permission` 和 Skill `agent-model-routing`。`/api/chat` 已在 SSE 首事件返回路由建议并注入 Agent 上下文；开启 `AGENT_AUTO_CLOUD=1` 且配置 `AGENT_CLOUD_PROVIDER` 对应密钥后，复杂请求会临时使用云端 Agent，缺少密钥自动回退本地。连接器清单可供 Agent 选择但不会自动启动。外部授权现写入项目内 `.docmind_permissions.jsonl` 审计日志。连接器 UI、云端密钥管理和 ReAct 内部连接器选择仍待完成。外部路径仅在显式授权下允许进入审批流程，Agent 自身项目始终拒绝写入。
+
 ### P1-2　Unity 深度适配
 
-解析 `.unity/.prefab/.meta` 建 GUID 引用图；Console、PlayMode 验证、Editor HTTP 插件；资产操作必须同步 `.meta`。
+已新增 `/api/engine/inspect?engine=unity`：读取 Unity 版本、`.unity/.prefab` 清单和 `.meta` GUID；Unreal 同接口读取 `.uproject/.uplugin` 与 Source 文件清单。仍待 GUID 引用图、Console/PlayMode、Editor 插件和 Unreal Blueprint/AutomationTool。
 
 ### P1-3　Unreal 深度适配
 
@@ -301,3 +305,23 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - §4：新增 P0-1 时间线行。
 - §5：**删除已完成的 P0-1**；把"100%/125% 未实测"与"前端自动嵌入开关未接线"作为残留写进其他改进点（铁律：未做实的不写成已完成）。
 - §7：补 `verify_engine_embed.py` 运行方式。§8：新增第 18 条引擎嵌入坑（6 个子项）。§9：补脚本归属。
+
+- Agent 连接器：ReAct 工具表已加入 dev_mcp_call，可在确认连接器启用并读取工具清单后调用 MCP 工具；调用失败会转为可审计文本，不会静默执行。
+
+- 云端密钥管理新增 /api/agent/secrets（仅返回 Provider 名称）及 DELETE /api/agent/secrets/{provider}，支持撤销/轮换，密钥内容不回传。
+
+- ReAct MCP 调用已增加连接器启用检查与可选 task_id 绑定，未启用连接器或不存在任务会拒绝调用。
+
+- dev_mcp_call 现在会检查 MCP 参数中的 path/file/scene/asset/script 是否落在 task_id 的 region/allowed_paths 内，越权参数直接拒绝。
+
+- 密钥存储新增 1 项回归测试：往返解密、明文不落盘、Provider 列表和撤销均已验证。全量测试 205 项。
+
+- 外部权限现支持 approval_id 绑定：只有对应审批记录为 approved 且路径精确匹配时，/api/agent/permission 才会记录授权；新增回归测试，测试总数 206。
+
+- 目标核对（本轮）：ReAct MCP 工具、云端密钥 DPAPI/Fernet 往返与撤销、外部审批创建/批准/approval_id 精确授权均有接口；全量测试 206 项通过。仍未完成云端请求脱敏与审批 Diff 驱动的实际外部写入执行器。
+
+- 云端 Agent 路由现接入 redact_for_cloud：发送云端前会脱敏 api_key/token/password/secret/private key 等凭据并截断上下文；新增回归测试，测试总数 207。
+
+- 外部审批已接入实际写入端点 /api/agent/external-write：需 approved approval_id + 精确路径，写入前生成 .docmind.bak，失败拒绝。
+
+- 审批请求支持 before/after 自动生成 unified diff，AgentPolicyPanel 审批列表可展示 Diff 并批准/拒绝；前端构建通过。

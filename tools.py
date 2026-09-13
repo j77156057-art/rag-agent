@@ -11,6 +11,7 @@ import sys
 import threading
 import urllib.request
 import urllib.parse
+import mcp_client
 
 from config import TOP_K, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime, edit_confirm_enabled, EXTERNAL_API_ALLOWLIST
 from embeddings import EmbeddingClient
@@ -25,6 +26,42 @@ def _get_emb():
     if _emb is None:
         _emb = EmbeddingClient()
     return _emb
+
+def dev_mcp_call(arg):
+    """Agent 受控调用已启用 MCP 连接器。输入 key/name/arguments(JSON)。"""
+    root = get_runtime('code_root') or CODE_ROOT
+    if not root: return 'MCP 调用失败：未配置代码库。'
+    lines = str(arg or '').splitlines(); data={}; body=[]
+    for line in lines:
+        if ':' in line and not body:
+            k,v=line.split(':',1); data[k.strip()]=v.strip()
+        else: body.append(line)
+    key=data.get('key',''); name=data.get('name',''); task_id=data.get('task_id','')
+    if not key or not name: return 'MCP 调用失败：需要 key 和 name。'
+    try:
+        cfg=mcp_client.get_server_config(root,key)
+        if not cfg.get('enabled'): return 'MCP 调用失败：连接器未启用，请先在工作台启用并审批。'
+        if task_id:
+            from game_workbench import list_tasks
+            task=next((t for t in list_tasks(root) if str(t.get('id'))==str(task_id)),None)
+            if not task:
+                return 'MCP 调用失败：task_id 不存在。'
+            raw_args=data.get('arguments','{}'); check_args=raw_args
+            if isinstance(raw_args,str):
+                try: check_args=json.loads(raw_args) if raw_args else {}
+                except Exception: check_args={}
+            paths=[]
+            if isinstance(check_args,dict):
+                for k,v in check_args.items():
+                    if k.lower() in ('path','file','scene','asset','script') and isinstance(v,str): paths.append(v.replace('res://','').lstrip('/'))
+            if paths:
+                from game_workbench import validate_task_scope
+                scope=validate_task_scope(root,{**task,'files':paths})
+                if not scope.get('ok'): return 'MCP 调用失败：参数路径超出任务分区。'
+        args=data.get('arguments','{}')
+        if isinstance(args,str): args=json.loads(args) if args else {}
+        return json.dumps(mcp_client.call_tool(root,key,name,args), ensure_ascii=False)[:6000]
+    except Exception as e: return f'MCP 调用失败：{e}'
 
 
 def search_knowledge(query):
@@ -2059,6 +2096,7 @@ def game_playtest(arg):
 
 
 TOOLS = {
+    "dev_mcp_call": {"description": "调用已启用的 MCP 游戏引擎连接器。输入 key: 服务器key、name: 工具名、arguments: JSON。先用 MCP 工具清单确认可用工具；外部连接器需已启用并遵守审批。", "func": dev_mcp_call},
     "search_knowledge": {
         "description": "在已上传的知识库中检索相关文档片段。输入应为检索关键词或问题。",
         "func": search_knowledge,

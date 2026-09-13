@@ -520,7 +520,7 @@ onUnmounted(() => {
 .pb-dl-bar { height: 7px; border-radius: 4px; background: #0008; overflow: hidden; }
 .pb-dl-bar i { display: block; height: 100%; background: linear-gradient(90deg, #3a7bd5, #5ea0ff); transition: width .3s; }
 
-.pb-framewrap { flex: 1; min-height: 0; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; background: #000; position: relative; }
+.pb-framewrap { flex: 0 1 auto; width: min(100%, 860px); height: 480px; min-height: 260px; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; background: #000; position: relative; }
 .pb-frame { width: 100%; height: 100%; border: 0; display: block; background: #000; }
 .pb-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--text-faint); font-size: 14px; text-align: center; padding: 30px; line-height: 1.8; }
 .pb-empty small { font-size: 11px; max-width: 380px; }
