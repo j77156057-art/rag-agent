@@ -1,6 +1,6 @@
 # DocMind 项目交接清单（给接手 AI）
 
-> **更新时间**：2026-09-14 ｜ **基线提交**：`1d9a691`（docs: consolidate handoff）+ 本次场景画布改动（见 §4）
+> **更新时间**：2026-09-14 ｜ **基线提交**：`809a3b9`（feat(workbench): scene canvas + runtime timeline）
 > **全量测试**：**202 项全部通过** ｜ **后端自检**：`verify_scene_canvas.py` 50/50 ｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` 23/23 ｜ **前端构建**：`npm run build` 通过
 > 本文是项目唯一权威交接文档，取代并删除了旧版 `HANDOFF.md`、`AI_BRIEF.md`、`DEV_WORKBENCH_AUDIT.md`、`HANDOFF_ENGINE_EMBEDDING.md`、`HANDOFF_REMAINING_WORK.md`（旧 HANDOFF.md 由本同名文件接管）。
 > **铁律：规划项一律写在第 5 节，不得描述为已完成；做完一项就把它移到第 4 节时间线并注明提交号。**
@@ -82,7 +82,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-11 | P0 工作台 IDE 任务 1–4 + git plumbing；Godot 文本资产索引（.gd/.tscn/.tres…）；随包 MinGit；code_root 持久化+vendor 分包；**P1 符号语义地图 → 关系图（继承/挂载边）→ 调用边（高置信、字符串注释掩码）**；P2 选区 AI（解释/Review/提问走 Agent、改写走直连快通道+LCS diff 接受）；P3 Git 历史/回滚+分区 DAG 治理；代码审查 11 项修复；第 4–11 次冻结构建 |
 | 2026-09-12 | 分区一键创建/补齐导出桩（scaffold/fill_exports，15 例新测）；Java 符号抽取；第 12–14 次冻结构建 |
 | 2026-09-13 | `c543047` Agent 代码优先路由+健壮动作解析+证据护栏；**`622fdbc` MCP bridge、Web player/导出、GPU lease 队列、native embedding、desktop_bridge focus、场景面板大改、ChatDock**（+4638 行，6 个新测试文件）；Vue Flow 区域画布 spike 验证通过（`b8e869c` 提交，已随 P0-2 转正后移除，见 §6） |
-| 2026-09-14 | **P0-2 场景画布转正 + P1-1 运行时时间线**：`scene_runtime.py` 重写为行块解析/图模型/受控编辑（+1035 行）；新增 `/api/scene/graph`、`/api/scene/op`、`/api/runtime/sessions`、`/api/runtime/clear`，`/api/runtime/events` 支持筛选；前端新增 `SceneCanvas.vue`/`SceneNodeCard.vue`/`SceneFileCard.vue`/`RuntimeTimeline.vue` 与 `sceneApi`；移除 spike 入口与 `src/spike/`；修 gpu 队列抖动用例；补 `/favicon.ico`；构建前清理 `web/assets`。测试 202/202、后端自检 50/50、浏览器冒烟 23/23 |
+| 2026-09-14 | **`809a3b9` P0-2 场景画布转正 + P1-1 运行时时间线**：`scene_runtime.py` 重写为行块解析/图模型/受控编辑（+1035 行）；新增 `/api/scene/graph`、`/api/scene/op`、`/api/runtime/sessions`、`/api/runtime/clear`，`/api/runtime/events` 支持筛选；前端新增 `SceneCanvas.vue`/`SceneNodeCard.vue`/`SceneFileCard.vue`/`RuntimeTimeline.vue` 与 `sceneApi`；移除 spike 入口与 `src/spike/`；修 gpu 队列抖动用例；补 `/favicon.ico`；构建前清理 `web/assets`。测试 202/202、后端自检 50/50、浏览器冒烟 23/23 |
 
 > 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（14 次完整记录，继续追加不要新建文件）。
 
@@ -90,7 +90,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 ## 5. 待办清单（规划项，未完成；按优先级）
 
-> 每项含【要做什么】【原因】【方案】【验收】。状态以 622fdbc 之后的代码为准，已核对。
+> 每项含【要做什么】【原因】【方案】【验收】。状态以 `809a3b9` 的代码为准，已核对。
 
 ### P0-1　Godot HWND 嵌入实机闭环（最高优先）
 
@@ -119,7 +119,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 ### P3　第 15 次冻结发布
 
-按 `docmind-frozen-release` Skill：py_compile → 162+ 测试 → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → Godot 实机验证 → 前端 6 文件 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加第十五次记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
+按 `docmind-frozen-release` Skill：py_compile → **202 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(23) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → Godot 实机验证 → 前端 6 文件 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加第十五次记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
 
 ### 其他已记录的改进点
 
