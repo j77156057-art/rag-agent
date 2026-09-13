@@ -19,6 +19,7 @@ _held_purpose = ""
 _held_since = None
 _held_ttl = 0.0
 _waiters = collections.deque()  # (owner, purpose, event)
+_waiter_priorities = {}  # event -> numeric priority (higher first, FIFO within priority)
 
 
 def memory_info():
@@ -53,6 +54,7 @@ def _handover_locked():
     global _held_owner, _held_purpose, _held_since, _held_ttl
     while _waiters:
         owner, purpose, event = _waiters.popleft()
+        _waiter_priorities.pop(event, None)
         if not event.is_set():
             _held_owner, _held_purpose = owner, purpose
             _held_since, _held_ttl = time.time(), DEFAULT_TTL
@@ -79,7 +81,7 @@ def status():
         }
 
 
-def acquire(owner, timeout=2, purpose="", ttl=None):
+def acquire(owner, timeout=2, purpose="", ttl=None, priority=0):
     """申请 GPU 租约。成功返回 True；超时/显存不足返回 False。
 
     - 同一 owner 重复申请直接放行（与旧版行为一致，调用方仍须配对 release）。
@@ -110,6 +112,9 @@ def acquire(owner, timeout=2, purpose="", ttl=None):
         if timeout <= 0:
             return False
         _waiters.append((owner, str(purpose), event))
+        _waiter_priorities[event] = float(priority)
+        ordered = sorted(list(_waiters), key=lambda item: -_waiter_priorities.get(item[2], 0))
+        _waiters.clear(); _waiters.extend(ordered)
 
     # 小步等待：TTL 过期是惰性检测的，等待者需周期性醒来触发回收与转交。
     deadline = time.time() + timeout
@@ -128,6 +133,7 @@ def acquire(owner, timeout=2, purpose="", ttl=None):
             for item in _waiters:
                 if item[2] is event:
                     _waiters.remove(item)
+                    _waiter_priorities.pop(event, None)
                     break
         return False
     with _cv:
@@ -160,5 +166,5 @@ def cancel(owner):
         owner=str(owner); removed=0
         for item in list(_waiters):
             if item[0] == owner:
-                _waiters.remove(item); item[2].set(); removed += 1
+                _waiters.remove(item); _waiter_priorities.pop(item[2], None); item[2].set(); removed += 1
         return removed
