@@ -337,3 +337,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - Unreal headless verify 现在自动传入扫描到的 .uproject 路径，避免 -ProjectOnly 校验错误项目。
 
 - GPU status 现返回 devices 全量列表，并支持 DOCMIND_GPU_INDEX 选择显存门控目标卡；保持旧 used/free 字段兼容。
+
+- TaskEnginePanel 现按 MIME 预览 ComfyUI 图片/音频/视频输出，并保留导入操作；独立 worktree 未安装 node_modules，需在主仓/frontend 环境构建验证。
