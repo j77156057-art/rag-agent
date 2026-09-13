@@ -335,3 +335,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - GPU 队列新增 /api/gpu/cancel/{owner}，可取消尚未获得租约的等待任务；持有中的任务不强制中断。
 
 - Unreal headless verify 现在自动传入扫描到的 .uproject 路径，避免 -ProjectOnly 校验错误项目。
+
+- GPU status 现返回 devices 全量列表，并支持 DOCMIND_GPU_INDEX 选择显存门控目标卡；保持旧 used/free 字段兼容。
