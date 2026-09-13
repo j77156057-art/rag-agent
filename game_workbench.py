@@ -510,7 +510,7 @@ def engine_resize(root, offset_y=None):
         return {'ok': False, 'error': str(e)}
 
 
-def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False):
+def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False, rect=None):
     root_abs = _root(root)
     if engine_status(root_abs)["running"]: return engine_status(root_abs)
     cfg=engine_config(root); selected=cfg.get('engine','godot'); executable=cfg.get('executable','godot') if not executable or (executable == 'godot' and selected != 'godot') else executable; executable=_resolve_engine_executable(selected, executable)
@@ -533,11 +533,11 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
         result = {"ok": True, "running": True, "pid": p.pid}
         if embed and host_hwnd:
             # 引擎建窗口是异步的：轮询直到找到窗口并嵌入成功，或超时。
-            # 尺寸按宿主客户区自动算，避免用固定的 1280x720 把画面裁掉。
+            # rect 给了就嵌到前端口算的"引擎视窗"，否则按宿主客户区铺满。
             last = ''
             for _ in range(30):
                 time.sleep(0.2)
-                er = engine_embed(root_abs, host_hwnd)
+                er = engine_embed(root_abs, host_hwnd, rect=rect)
                 if er.get('ok'):
                     result['embedded'] = True
                     result['hwnd'] = er.get('hwnd')

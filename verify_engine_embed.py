@@ -847,6 +847,36 @@ def main():
             real = [c for c in clicks if c.get('x', 0) > 10 or c.get('y', 0) > 10]
             print('      → 鼠标点击：%d 次，其中疑似真实点击 %d 次（坐标>10）'
                   % (len(clicks), len(real)))
+
+        print('\n[10] UI 实际调用路径：engine_start(embed=True, rect=...)')
+        # 前端「嵌入工作台」按钮走的就是这条路：一次请求里带矩形启动 + 嵌入。
+        gw.engine_stop(project)
+        deadline = time.time() + 8
+        while time.time() < deadline and gw.engine_status(project).get('running'):
+            time.sleep(0.3)
+        ui_rect = {'x': 60, 'y': 70, 'width': 480, 'height': 260}
+        started_embed = gw.engine_start(project, godot, '', host.hwnd, True, ui_rect)
+        check('engine_start(embed=True, rect) 返回 running', started_embed.get('running') is True,
+              started_embed.get('error', ''))
+        check('engine_start 报告 embedded:true', started_embed.get('embedded') is True,
+              started_embed.get('embed_error', ''))
+        check('回传的嵌入尺寸与请求的矩形一致',
+              started_embed.get('embed', {}).get('width') == ui_rect['width']
+              and started_embed.get('embed', {}).get('height') == ui_rect['height'],
+              started_embed.get('embed'))
+        new_child = gw.engine_status(project).get('child_hwnd')
+        rect_ui = db.window_rect(new_child)
+        origin_ui = db.client_origin(host.hwnd)
+        check('引擎窗口落在请求的矩形上（引擎视窗模式）',
+              abs((rect_ui['x'] - origin_ui['x']) - ui_rect['x']) <= 3
+              and abs((rect_ui['y'] - origin_ui['y']) - ui_rect['y']) <= 3
+              and abs(rect_ui['width'] - ui_rect['width']) <= 3
+              and abs(rect_ui['height'] - ui_rect['height']) <= 3,
+              '实际 (%s,%s) %sx%s'
+              % (rect_ui['x'] - origin_ui['x'], rect_ui['y'] - origin_ui['y'],
+                 rect_ui['width'], rect_ui['height']))
+        hwnd_child = new_child          # 后续断言沿用这个新窗口
+
     except Exception as exc:  # noqa: BLE001
         check('自检过程中未抛异常', False, str(exc))
         traceback.print_exc()
@@ -864,6 +894,9 @@ def main():
             print('\n临时工程保留在：%s' % project)
         else:
             shutil.rmtree(workdir, ignore_errors=True)
+
+
+
 
     print('\n' + '=' * 62)
     print('通过 %d 项，失败 %d 项，跳过 %d 项，未证实 %d 项'

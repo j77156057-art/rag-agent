@@ -40,7 +40,47 @@ export interface TaskScope {
   allowed_paths: string[]
 }
 
-export interface EngineStatus { ok: boolean; running: boolean; pid?: number | null; error?: string }
+export interface EngineStatus {
+  ok: boolean
+  running: boolean
+  pid?: number | null
+  error?: string
+  /** 引擎窗口是否已嵌进桌面宿主（浏览器模式下永远为 false） */
+  embedded?: boolean
+  child_hwnd?: number | null
+  host_hwnd?: number | null
+  embed_title?: string
+  embed_offset_y?: number
+  embed_dpi?: number
+  host_dpi?: number
+  embed_mode?: 'rect' | 'fill'
+  embed_size?: { width: number; height: number }
+  embed_error?: string
+  /** engine/start 成功嵌入时回传的实际落点与 DPI */
+  embed?: { width: number; height: number; offset_y: number; dpi: number; host_dpi: number; title: string }
+}
+
+/** 桌面宿主信息。浏览器模式下 desktop=false，前端据此降级（不显示"嵌入工作台"）。 */
+export interface DesktopHost {
+  ok: boolean
+  host_hwnd: number | null
+  desktop?: boolean
+  dpi_awareness?: string
+  /** 宿主客户区尺寸（物理像素）——把页面 CSS 坐标换算成引擎窗口坐标就靠它 */
+  client?: { width: number; height: number }
+  dpi?: number
+  embedded?: {
+    hwnd: number
+    host: number
+    mode?: 'rect' | 'fill'
+    placed?: { x: number; y: number; width: number; height: number }
+    alive: boolean
+  }[]
+  bridge_error?: string
+}
+
+/** 引擎视窗矩形：宿主客户区物理像素坐标 */
+export interface EmbedRect { x: number; y: number; width: number; height: number }
 
 export interface FileResp {
   ok: boolean
@@ -346,7 +386,18 @@ export const engineApi = {
   catalog() { return request<{ ok:boolean; engines:{id:string;name:string;executable:string;download:string}[] }>('/api/engine/catalog') },
   config(engine?: string, executable?: string) { return engine ? postJson<{ok:boolean;engine:string;executable:string}>('/api/engine/config',{engine,executable}) : request<{ok:boolean;engine:string;executable:string}>('/api/engine/config') },
   status() { return request<EngineStatus>('/api/engine/status') },
-  start(executable = 'godot', embed = true) { return postJson<EngineStatus>('/api/engine/start', { executable, embed }) },
+  start(executable = 'godot', embed = true, rect?: EmbedRect | null) {
+    return postJson<EngineStatus>('/api/engine/start', rect ? { executable, embed, rect } : { executable, embed })
+  },
+  host() { return request<DesktopHost>('/api/desktop/host') },
+  /** 把已运行的引擎窗口嵌进桌面宿主。rect 省略时按宿主客户区铺满。 */
+  embed(rect?: EmbedRect | null) { return postJson<{ ok: boolean; error?: string; width?: number; height?: number }>('/api/engine/embed', rect || {}) },
+  /** 引擎视窗随前端布局变化重新定位（弹窗移动、窗口缩放时调用）。 */
+  place(rect: EmbedRect) { return postJson<{ ok: boolean; error?: string }>('/api/engine/place', rect) },
+  detach() { return postJson<{ ok: boolean; was_embedded?: boolean; error?: string }>('/api/engine/detach', {}) },
+  focusEngine() { return postJson<{ ok: boolean; focused?: number; error?: string }>('/api/engine/focus', {}) },
+  /** 按宿主当前客户区重排"铺满模式"的嵌入窗口 */
+  resizeEngine() { return postJson<{ ok: boolean; error?: string }>('/api/engine/resize', {}) },
   stop() { return postJson<{ ok: boolean; stopped: boolean }>('/api/engine/stop', {}) },
   logs(limit = 200) { return request<{ ok: boolean; lines: string[]; errors: { path: string; line: number; message: string }[] }>(`/api/engine/logs?limit=${limit}`) },
   verify(executable = 'godot') { return postJson<{ ok: boolean; output?: string; error?: string }>('/api/engine/verify', { executable }) },

@@ -1,8 +1,8 @@
 # DocMind 项目交接清单（给接手 AI）
 
 > **更新时间**：2026-09-14（含 P0-1 实机闭环）｜ **基线提交**：`809a3b9` + 本次嵌入加固
-> **全量测试**：**202 项全部通过** ｜ **场景画布自检**：`verify_scene_canvas.py` 54/54 ｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` 23/23
-> **引擎嵌入实机自检**：`verify_engine_embed.py` **60/60**（真 Godot 4.7.2 + 真 Win32 宿主，含真实合成键鼠）｜ **前端构建**：`npm run build` 通过
+> **全量测试**：**202 项全部通过** ｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
+> **引擎嵌入实机自检**：`verify_engine_embed.py` **64/64**（真 Godot 4.7.2 + 真 Win32 宿主，含真实合成键鼠与 UI 调用路径）｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` **27/27** ｜ **前端构建**：`npm run build` 通过
 > 本文是项目唯一权威交接文档，取代并删除了旧版 `HANDOFF.md`、`AI_BRIEF.md`、`DEV_WORKBENCH_AUDIT.md`、`HANDOFF_ENGINE_EMBEDDING.md`、`HANDOFF_REMAINING_WORK.md`（旧 HANDOFF.md 由本同名文件接管）。
 > **铁律：规划项一律写在第 5 节，不得描述为已完成；做完一项就把它移到第 4 节时间线并注明提交号。**
 
@@ -29,9 +29,12 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   以及 2026-09-14 转正的 **场景画布** 与 **运行时时间线**（试玩器弹窗的第 2/3 个 tab）。
   两者都是 `defineAsyncComponent` 异步分块，首屏 JS 体积不受影响（工作台 130KB / gzip 49KB 不变）。
 - **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前第 14 次冻结构建，2026-09-12 18:26；**仍未重新打包**）；随包 MinGit。
-- **引擎嵌入（P0-1 已实机闭环）**：Godot 4.7.2（`D://Tools//Godot//Godot_v4.7.2-stable_win64.exe`）+ 真 Win32 宿主窗口下实测通过——
+- **引擎嵌入（P0-1 已实机闭环，且 UI 可用）**：Godot 4.7.2（`D://Tools//Godot//Godot_v4.7.2-stable_win64.exe`）+ 真 Win32 宿主窗口下实测通过——
   置父/样式摘除、按客户区（或前端指定矩形）对齐、宿主 resize 跟随、**真实合成键鼠（SendInput）送达引擎并回显**、
   解除嵌入后窗口原样还原、停止后无孤儿进程/窗口、父子 DPI 一致（本机 **150% 缩放 = 144 DPI** 实测）。
+  UI 侧试玩器有「嵌入工作台」开关：勾上后点「桌面窗口启动」，游戏画面直接落在弹窗里那块引擎视窗上，
+  界面照常可用；另有「聚焦 / 解除嵌入 / 停止桌面窗口」。关弹窗或切走 tab 会自动解除嵌入（视窗元素没了，
+  继续嵌着只会让引擎画到别处）。浏览器模式下开关自动禁用并提示需要桌面端。
 - **LLM/Embedding**：mock / qwen / deepseek / ollama / llamacpp 多 Provider，页面内免重启切换；本机 Ollama(`11434`, bge-m3) 与 llama.cpp(`8080`, Qwen 35B) 免 Key；622fdbc 新增 native embedding。
 - **验证基线**：后端 `unittest discover` **202/202 通过**（14 个测试文件，MinGit 在 PATH 时 git 用例实际执行）；
   `verify_scene_canvas.py` 走真实 HTTP 路由 **50/50**（含"每个 op 的 undo 逐字节还原"）；
@@ -116,17 +119,20 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 ### P3　第 15 次冻结发布
 
-按 `docmind-frozen-release` Skill：py_compile → **202 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(23) → `verify_engine_embed.py`(60) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → Godot 实机验证 → 前端 6 文件 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加第十五次记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
+按 `docmind-frozen-release` Skill：py_compile → **202 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(64) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → Godot 实机验证 → 前端 6 文件 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加第十五次记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
 
 ### 其他已记录的改进点
 
 - **B 档浅实现**（2026-09-11 审计结论，仍有效）：`impact_analysis` 是子串 grep、`generate_test_scene` 写死空壳、`simulate_growth` 等比数列玩具、`performance_sample` 仅计时、`approval` 只追加日志不拦截、默认分区 verify 空转。当演示可以，当真工具需要逐个做深或在 UI 标注能力边界。
 - **门面文档**：`README.md` 已于 2026-09-14 刷新（反映工作台/分区/引擎/画布现状）；`README_en.md` 与 `DEMO.md` **仍是 9 工具+单页演示时代的内容，择期重写**。
 - 新落地的 MCP bridge 与 Web player 目前缺产品级使用文档与边界说明。
-- **引擎嵌入的两点残留**（都不影响"已可用"，但别写成已覆盖）：① 本机显示器当前是 **150% 缩放**，100%/125% 未实测——
-  `verify_engine_embed.py` 会打印当前 DPI 并按实际坐标断言，改了缩放直接重跑即可补档；
-  ② UI 侧"自动嵌入"开关本轮尚未接线（前端仍写死 `embed=false`），目前嵌入靠 `POST /api/engine/embed` 触发——
-  这是用户可见能力的缺口，优先级高于 Unity/Unreal 适配。
+- **引擎嵌入的残留**（不影响"已可用"）：本机显示器当前是 **150% 缩放**，100%/125% 未实测——
+  `verify_engine_embed.py` 会打印当前 DPI 并按实际坐标断言，改了缩放直接重跑即可补档。
+- **桌面壳内的 UI 自动化没做成**（不是没做，是做不了）：pywebview 的 `evaluate_js` 在 WebView2 上不稳定
+  （实测第二次调用耗 15.7s 且返回 None），拿它当断言基础会得到假失败。目前覆盖方式是
+  「浏览器冒烟记 UI 降级 + `verify_engine_embed.py` 记后端契约（含 UI 的实际调用路径）」两段拼起来，
+  中间那层"真桌面壳里点一下"由**人工三步验收**兜：
+  桌面端启动 → 试玩器 → 勾「嵌入工作台」点「桌面窗口启动」→ 画面应出现在弹窗中。
 - **场景画布尚未支持的能力**（刻意留给后续，不是 bug）：Unity `.unity/.prefab` 场景图（P1-2）、节点属性引用边（`node_paths=PackedStringArray`）的自动跟随改写（改名/换父时只改 `parent` 前缀，NodePath 属性需人工核对）、多场景同时打开、画布上的 Undo/Redo 跨会话持久化。
 
 ---
@@ -243,7 +249,16 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
       并且**跑完统一核对**，不要和缓冲抢时间。
     - `PrintWindow` 在 **user32**（不在 gdi32）；而且它抓不到 Vulkan 内容（GPU 合成），
       截图能证明几何但不能证明渲染画面。
-19. **浏览器默认会请求 `/favicon.ico`**：不接这条路由，每个页面都留一条 404，浏览器冒烟的
+19. **pywebview 的坑（2026-09-14 想做桌面壳内 UI 自动化时踩的）**
+    - `webview.start(func, args)` 的 `args` **必须是元组**：写成 `start(drive, win)` 时 `win` 被当成 `args`，
+      `func(*args)` 抛 `missing 1 required positional argument`，窗口留在屏幕上没人管。
+    - **`evaluate_js` 在 WebView2 上不稳定**：实测第一次 2.5s 返回正常，第二次 15.7s 且返回 `None`。
+      拿它做轮询断言会得到"功能没生效"的假失败。要驱动页面就用 playwright 走 CDP，别用它。
+    - 页面 ready 之前调 `evaluate_js` 会把事件线程卡住（窗口一直白屏、脚本也不前进）。
+      即便只是自检脚本，也要挂 `loaded` 事件 + 看门狗 `win.destroy()`，别把白窗口留在用户屏幕上。
+    - 自检脚本里用临时工程起引擎时，**别把启动代码写到 `finally` 之后**——临时目录那时已被删，
+      `Popen(cwd=...)` 会抛 `FileNotFoundError`，报出来的却是"找不到引擎可执行文件"，极具误导性。
+20. **浏览器默认会请求 `/favicon.ico`**：不接这条路由，每个页面都留一条 404，浏览器冒烟的
     "无失败请求"断言永远红。图标走 `frontend/public/favicon.ico` → Vite 拷进 `web/` → 后端路由。
 
 ---

@@ -29,7 +29,7 @@ DocMind 的应对分两层：
 
 - 后端：Python · FastAPI（HTTP + SSE）· Chroma 双集合（文档 / 代码）· OpenAI 兼容多 Provider（qwen / deepseek / ollama / llamacpp / mock）· PyInstaller + pywebview
 - 前端：Vue 3.5 · Vite 5 · TypeScript · CodeMirror 6 · Vue Flow · 手写深色设计系统
-- 验证：`unittest` 202 项 · 后端自检 50 项 · 浏览器冒烟 23 项（Playwright + 系统 Edge）
+- 验证：`unittest` 202 项 · 场景画布自检 54 项 · 浏览器冒烟 27 项（Playwright + 系统 Edge）· 引擎嵌入实机自检 64 项
 
 ## 📁 目录结构
 
@@ -108,10 +108,12 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文
 ```
 
 - **引擎嵌入**：Godot / Unity / Unreal 的窗口按 Win32 HWND 规则嵌进工作台（`desktop_bridge.py`）。
-  **已在 Godot 4.7.2 + 真 Win32 宿主下实机验证**（`verify_engine_embed.py` 60 项全绿）：置父与样式摘除、按客户区（或前端指定的"引擎视窗"矩形）铺排、
+  **已在 Godot 4.7.2 + 真 Win32 宿主下实机验证**（`verify_engine_embed.py` 64 项全绿）：置父与样式摘除、按客户区（或前端指定的"引擎视窗"矩形）铺排、
   宿主 resize 跟随、**真实合成键鼠（SendInput）送达引擎并回显事件**、解除嵌入后窗口原样还原、停止后无孤儿进程/窗口、父子 DPI 一致（本机 150% 缩放实测）。
   嵌入是**可逆**的：`detach` 会恢复原始父窗口、窗口样式与屏幕位置——不保存这些状态直接 `SetParent(NULL)`，窗口会带着 `WS_CHILD` 变成看不见的顶层窗口。
-  两项未覆盖：100%/125% 缩放的实机数据（本机显示器当前是 150%，脚本会打印 DPI 并按实际坐标断言）、UI 侧的"自动嵌入"开关尚未接线（目前由 `POST /api/engine/embed` 触发）。
+  试玩器里有「嵌入工作台」开关：勾上后点「桌面窗口启动」，游戏画面直接落在弹窗的引擎视窗上，工作台界面照常可用；
+  另有「聚焦 / 解除嵌入 / 停止桌面窗口」；关弹窗或切走 tab 会自动解除嵌入。浏览器模式下开关自动禁用并提示需要桌面端。
+  未覆盖：100%/125% 缩放的实机数据（本机显示器当前是 150%，脚本会打印 DPI 并按实际坐标断言）。
 - **打包成独立 exe（onedir 目录分发）**：`docmind.spec` 一条命令产出 `dist\DocMind\DocMind.exe`，把整个 `dist\DocMind` 目录一起分发即可，目标机器无需安装 Python。完整流程见 [DocMind_BUILD.md](DocMind_BUILD.md) 与 `.trae/skills/docmind-frozen-release/SKILL.md`。
 - **分发版能力边界**：分包 `builtin:py` 校验在进程内做语法检查（exe 与源码行为一致）；但 playtest 自动测试、cProfile 剖析、`python_exec` 需要真实 Python 环境，请在源码 `.venv` 里用；分区的 git 操作要求目标机器装有 Git。
 

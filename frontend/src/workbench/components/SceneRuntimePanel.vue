@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
 import { runtimeApi, engineApi, playApi } from '../api'
-import type { WebTemplates, WebExportResult } from '../api'
+import type { WebTemplates, WebExportResult, DesktopHost, EmbedRect } from '../api'
 import { useWorkbench } from '../composables/workbench'
 // 画布与时间线都引了重依赖（@vue-flow 约 243KB / gzip 79KB），
 // 用异步组件延迟到真正切到对应 tab 再加载，工作台首屏体积不受影响。
@@ -21,7 +21,71 @@ const exportMsg = ref('')
 const lastExport = ref<WebExportResult | null>(null)
 const tpl = ref<WebTemplates | null>(null)
 const installing = ref(false)
+
+/* ---- 原生引擎：独立窗口 / 嵌入工作台 ----
+   嵌入的意义是"游戏跑在工作台窗口里"，边玩边让 AI 改代码；
+   独立窗口模式下 Web 工作台和游戏窗口是两个窗口，来回切很别扭。 */
 const nativeRunning = ref(false)
+const desktop = ref<DesktopHost | null>(null)
+const embedState = ref<'off' | 'embedded' | 'failed'>('off')
+const embedMsg = ref('')
+const engineViewport = ref<HTMLElement | null>(null)
+// 默认开：桌面端启动时"游戏嵌进工作台"才是预期行为；浏览器模式下会自动禁用并提示
+const autoEmbed = ref(localStorage.getItem('docmind.autoEmbed') !== '0')
+let lastRect = ''
+
+watch(autoEmbed, v => localStorage.setItem('docmind.autoEmbed', v ? '1' : '0'))
+
+const desktopReady = computed(() => !!desktop.value?.desktop)
+const hostDpi = computed(() => desktop.value?.dpi || 96)
+
+async function refreshDesktop() {
+  try { desktop.value = await engineApi.host() } catch { desktop.value = null }
+}
+
+/**
+ * 把"引擎视窗"元素换算成宿主客户区的物理像素矩形。
+ *
+ * 比例用 宿主客户区宽 / 页面视口宽 求，而不是直接用 devicePixelRatio：
+ * 窗口缩放、WebView 缩放、多屏不同 DPI 混用时 DPR 并不保证等于这个比例，
+ * 而比例一错引擎窗口就整体错位（150% 缩放下尤其明显）。
+ */
+function viewportRect(): EmbedRect | null {
+  const el = engineViewport.value
+  if (!el) return null
+  const box = el.getBoundingClientRect()
+  if (box.width < 40 || box.height < 40) return null
+  const clientW = desktop.value?.client?.width
+  const scale = clientW && window.innerWidth > 0
+    ? clientW / window.innerWidth
+    : (window.devicePixelRatio || 1)
+  return {
+    x: Math.round(box.left * scale),
+    y: Math.round(box.top * scale),
+    width: Math.round(box.width * scale),
+    height: Math.round(box.height * scale),
+  }
+}
+
+/** 布局变化后同步引擎视窗；矩形没变就不重复请求。 */
+async function syncEngineRect(force = false) {
+  if (embedState.value !== 'embedded') return
+  const rect = viewportRect()
+  if (!rect) return
+  const key = `${rect.x},${rect.y},${rect.width},${rect.height}`
+  if (!force && key === lastRect) return
+  lastRect = key
+  try { await engineApi.place(rect) } catch { /* 下一次布局变化会对齐 */ }
+}
+
+let resizeTimer: number | undefined
+function onWindowResize() {
+  if (resizeTimer) window.clearTimeout(resizeTimer)
+  resizeTimer = window.setTimeout(async () => {
+    await refreshDesktop()      // 客户区变了，比例要重算
+    await syncEngineRect()
+  }, 120)
+}
 
 async function refreshTemplates() {
   try { tpl.value = await playApi.templates() } catch { /* 忽略 */ }
@@ -82,18 +146,64 @@ function cmdReload() {
   iframeEl.value?.contentWindow?.postMessage({ source: 'docmind-cmd', cmd: 'reload' }, '*')
 }
 async function refreshNativeStatus() {
-  try { nativeRunning.value = (await engineApi.status()).running } catch { /* ignore */ }
-}
-async function nativeStart() {
   try {
-    const r = await engineApi.start('godot', false)
+    const st = await engineApi.status()
+    nativeRunning.value = !!st.running
+    // 刷新页面后要如实反映"现在是不是嵌着的"，不能只认本地变量
+    embedState.value = st.embedded ? 'embedded' : 'off'
+    if (st.embedded && st.embed_dpi) embedMsg.value = `已嵌入工作台（${st.host_dpi || st.embed_dpi} DPI 宿主）`
+  } catch { /* ignore */ }
+}
+
+async function nativeStart() {
+  exportMsg.value = ''
+  embedMsg.value = ''
+  const rect = autoEmbed.value && desktopReady.value ? viewportRect() : null
+  try {
+    const r = await engineApi.start('godot', !!rect, rect)
     nativeRunning.value = !!r.running
-    exportMsg.value = r.running ? '桌面游戏窗口已启动（事件将进入时间线）' : '启动失败'
+    if (!r.running) { exportMsg.value = r.error || '启动失败'; return }
+    if (rect && r.embedded) {
+      embedState.value = 'embedded'
+      lastRect = `${rect.x},${rect.y},${rect.width},${rect.height}`
+      const size = r.embed?.width && r.embed?.height ? `${r.embed.width}×${r.embed.height}` : '按视窗'
+      embedMsg.value = `已嵌入工作台（${size}，宿主 ${r.embed?.host_dpi || hostDpi.value} DPI）`
+      await engineApi.focusEngine().catch(() => {})
+    } else if (rect) {
+      embedState.value = 'failed'
+      embedMsg.value = '引擎已启动但嵌入失败：' + (r.embed_error || '未知原因') + '（已退化为独立窗口）'
+    } else {
+      embedState.value = 'off'
+      exportMsg.value = desktopReady.value
+        ? '桌面游戏窗口已启动（独立窗口）'
+        : '桌面游戏窗口已启动；浏览器模式下无法嵌入工作台'
+    }
   } catch (e) { exportMsg.value = (e as Error).message }
 }
+
 async function nativeStop() {
-  await engineApi.stop()
+  await engineApi.stop().catch(() => { /* 停不掉也要把界面状态归位 */ })
   nativeRunning.value = false
+  embedState.value = 'off'
+  embedMsg.value = ''
+  lastRect = ''
+}
+
+async function nativeDetach() {
+  try {
+    const r = await engineApi.detach()
+    embedState.value = 'off'
+    lastRect = ''
+    embedMsg.value = ''
+    exportMsg.value = r.was_embedded ? '已解除嵌入，引擎回到独立窗口（进程仍在运行）' : '引擎当前未嵌入'
+  } catch (e) { embedMsg.value = (e as Error).message }
+}
+
+async function nativeFocus() {
+  try {
+    const r = await engineApi.focusEngine()
+    embedMsg.value = r.ok ? '已把键盘焦点交给游戏窗口' : ('聚焦失败：' + (r.error || '系统拒绝设置前台窗口'))
+  } catch (e) { embedMsg.value = (e as Error).message }
 }
 
 function frameSrc() {
@@ -208,15 +318,28 @@ watch(open, v => {
   if (v) {
     void refreshTemplates()
     void refreshNativeStatus()
+    void refreshDesktop()
     startTimers()
   } else {
     stopTimers()
+    // 弹窗一关，那块"引擎视窗"就不存在了；继续嵌着只会让引擎画在工作台别的位置上
+    if (embedState.value === 'embedded') void nativeDetach()
   }
 })
 
-onMounted(() => window.addEventListener('message', onWindowMessage))
+// 切走试玩 tab 同理：视窗元素被 v-if 摘掉，必须解除
+watch(tab, v => {
+  if (v !== 'play' && embedState.value === 'embedded') void nativeDetach()
+})
+
+onMounted(() => {
+  window.addEventListener('message', onWindowMessage)
+  window.addEventListener('resize', onWindowResize)
+})
 onUnmounted(() => {
   window.removeEventListener('message', onWindowMessage)
+  window.removeEventListener('resize', onWindowResize)
+  if (resizeTimer) window.clearTimeout(resizeTimer)
   stopTimers()
 })
 </script>
@@ -247,11 +370,30 @@ onUnmounted(() => {
               <button class="pb-btn" :disabled="!iframeUrl" @click="reloadFrame">刷新框架</button>
               <button class="pb-btn" :disabled="!iframeUrl" @click="openExternal">新标签打开</button>
               <span class="pb-sep" />
+              <label
+                class="pb-check"
+                :class="{ off: !desktopReady }"
+                :title="desktopReady
+                  ? '嵌入后游戏画面直接跑在这块区域里，工作台界面照常可用'
+                  : '浏览器模式下无法嵌入原生窗口，请用桌面端启动 DocMind（desktop.py / 桌面快捷方式）'"
+              >
+                <input v-model="autoEmbed" type="checkbox" :disabled="!desktopReady" />
+                嵌入工作台
+              </label>
               <button v-if="!nativeRunning" class="pb-btn" @click="nativeStart">🖥 桌面窗口启动</button>
-              <button v-else class="pb-btn warn" @click="nativeStop">停止桌面窗口</button>
+              <template v-else>
+                <span class="pb-chip" :class="embedState">{{ embedState === 'embedded' ? '已嵌入' : embedState === 'failed' ? '嵌入失败' : '独立窗口' }}</span>
+                <button v-if="embedState === 'embedded'" class="pb-btn" title="把键盘焦点交给游戏窗口（点过工作台之后要还回去）" @click="nativeFocus">聚焦</button>
+                <button v-if="embedState === 'embedded'" class="pb-btn" title="引擎回到独立窗口，进程继续运行" @click="nativeDetach">解除嵌入</button>
+                <button class="pb-btn warn" @click="nativeStop">停止桌面窗口</button>
+              </template>
             </div>
 
             <div v-if="exportMsg" class="pb-msg" :class="{ err: exportMsg.includes('失败') }">{{ exportMsg }}</div>
+            <div v-if="embedMsg" class="pb-msg" :class="{ err: embedState === 'failed' }">{{ embedMsg }}</div>
+            <div v-if="!desktopReady" class="pb-hintline">
+              当前是浏览器模式：原生引擎只能开独立窗口。用桌面端启动 DocMind 后，勾上「嵌入工作台」即可让游戏跑在这块区域里。
+            </div>
 
             <div v-if="tpl && !tpl.installed && !iframeUrl" class="pb-notpl">
               <b>未检测到 Godot Web 导出模板</b>
@@ -276,7 +418,8 @@ onUnmounted(() => {
               </div>
             </div>
 
-            <div class="pb-framewrap">
+            <!-- 原生引擎嵌入时，Window 子窗口会盖在这一块矩形上（ref 用于算它的坐标） -->
+            <div ref="engineViewport" class="pb-framewrap">
               <iframe
                 v-if="iframeUrl"
                 ref="iframeEl"
@@ -395,6 +538,12 @@ onUnmounted(() => {
 .pb-ev.sys .pb-ev-type { color: var(--text-faint); }
 
 .pb-hint { color: var(--text-faint); font-size: 10.5px; }
+.pb-check { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-muted); cursor: pointer; white-space: nowrap; }
+.pb-check.off { opacity: .5; cursor: not-allowed; }
+.pb-chip { font-size: 10px; border: 1px solid var(--border-strong); border-radius: 4px; padding: 2px 6px; color: var(--text-muted); }
+.pb-chip.embedded { color: var(--green); border-color: #244d33; background: #0f1a14; }
+.pb-chip.failed { color: #e8a0a0; border-color: #6a2f2f; background: #241414; }
+.pb-hintline { font-size: 10.5px; color: var(--text-faint); line-height: 1.7; }
 .pb-empty2 { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--text-faint); border: 1px dashed var(--border); border-radius: 8px; text-align: center; line-height: 1.8; }
 .pb-empty2 small { font-size: 11px; }
 </style>

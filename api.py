@@ -321,6 +321,8 @@ class EngineReq(BaseModel):
     engine: str = "godot"
     embed: bool = False
     host_hwnd: int = 0
+    # 前端给的"引擎视窗"（宿主客户区物理像素）。给了它引擎只占那一块，工作台 UI 照常可用。
+    rect: dict = {}
 class ComfyReq(BaseModel):
     url: str = "http://127.0.0.1:8188"
     workflow: dict = {}
@@ -428,7 +430,8 @@ async def engine_config_post_ep(req: EngineReq):
 async def engine_start_ep(req: EngineReq):
     root=_project_root_or_error()
     host = req.host_hwnd or _DESKTOP_HOST_HWND
-    return engine_start(root,req.executable,req.scene,host,req.embed) if root else {"ok":False,"error":"未配置代码库"}
+    rect = req.rect if (req.rect or {}).get('width') and (req.rect or {}).get('height') else None
+    return engine_start(root,req.executable,req.scene,host,req.embed,rect) if root else {"ok":False,"error":"未配置代码库"}
 @app.post("/api/engine/stop")
 async def engine_stop_ep():
     root=_project_root_or_error(); return engine_stop(root) if root else {"ok":False,"error":"未配置代码库"}

@@ -27,8 +27,10 @@ from api import app
 from tools import dev_capture_bug
 
 HOST = "127.0.0.1"
-PORT = 8000
-URL = f"http://{HOST}:{PORT}/"
+# 端口可用环境变量覆盖：本机 8000 常被另一个实例占着，起验证实例（或自动化测试）时需要换个口
+PORT = int(os.getenv("DOCMIND_PORT", "8000"))
+API_BASE = f"http://{HOST}:{PORT}"
+URL = API_BASE + "/"
 
 if getattr(sys, "frozen", False):
     BASE = os.path.dirname(sys.executable)
@@ -94,98 +96,123 @@ def _open_browser() -> bool:
     except Exception:  # noqa: BLE001
         return False
 
+def build_host_window(api_base: str = "", title: str = "DocMind 开发工作台",
+                      width: int = 1440, height: int = 920):
+    """创建 pywebview 原生宿主窗口并绑定事件，返回 window 对象（**不启动事件循环**）。
+
+    抽成独立函数是为了让自动化测试能驱动同一套宿主逻辑（标题、最小尺寸、宿主 HWND 注册、
+    resized/shown/closing 事件接线），而不是在测试里各写一份——两份实现必然漂移。
+    """
+    import webview
+
+    base = (api_base or API_BASE).rstrip('/')
+    page = base + "/workbench/"
+
+    def _host_hwnd():
+        """通过标题枚举拿到 pywebview 的宿主 HWND（必须在窗口创建之后）。"""
+        from desktop_bridge import find_host
+        host = find_host("DocMind")
+        return host[0] if host else None
+
+    def _register_host():
+        hwnd = _host_hwnd()
+        if not hwnd:
+            _log("未找到 pywebview 宿主 HWND，Godot 保持独立窗口")
+            return None
+        _log("已找到 DocMind 宿主 HWND: %s" % hwnd)
+        import desktop_bridge
+        desktop_bridge.set_host(hwnd)
+        try:
+            body = ('{"hwnd": %d}' % hwnd).encode()
+            req = urllib.request.Request(base + "/api/desktop/host", data=body,
+                                        headers={'Content-Type': 'application/json'},
+                                        method='POST')
+            urllib.request.urlopen(req, timeout=2).read()
+        except Exception as e:
+            _log("宿主 HWND 注册后端失败：" + str(e))
+        return hwnd
+
+    def _loaded():
+        try:
+            _register_host()
+        except Exception as e:
+            _log("宿主 HWND 检测失败：" + str(e))
+
+    def _refill(reason):
+        """宿主尺寸/可见性变化时，把"铺满模式"的嵌入窗口按客户区重排。
+
+        注意用的是**客户区**而不是 win.width/win.height：外框包含标题栏与边框，
+        直接拿外框尺寸会把引擎画面裁掉一截（150% 缩放下裁得更多）。
+        rect 模式的引擎视窗由前端自己重新 place，这里不插手。
+        """
+        try:
+            from desktop_bridge import fill_all
+            results = fill_all()
+            if results:
+                _log("%s：已同步 %d 个嵌入窗口" % (reason, len(results)))
+        except Exception as e:
+            _log("嵌入窗口尺寸同步失败：" + str(e))
+
+    def _resized(*_args):
+        _refill("宿主 resize")
+
+    def _shown(*_args):
+        _refill("宿主显示")
+
+    def _closing(*_args):
+        """关窗即收尾：先解除嵌入再结束引擎进程，避免留下孤儿窗口/进程。
+
+        只在 finally 里清是不够的——pywebview 的主循环一退出，宿主 HWND 就没了，
+        此时子窗口还挂在它下面，引擎进程会继续跑，用户看到的是"关不掉的后台游戏"。
+        """
+        try:
+            from game_workbench import engine_stop_all
+            stopped = engine_stop_all()
+            if stopped:
+                _log("关窗前已停止引擎：" + str(sorted(stopped)))
+        except Exception as e:
+            _log("关窗前停止引擎失败：" + str(e))
+
+    win = webview.create_window(title, page, width=width, height=height,
+                                min_size=(1024, 680), text_select=True)
+    try:
+        # pywebview 事件属于具体窗口对象；绑定全局 webview.events 在部分版本不会触发。
+        # resized/shown/closed 在不同版本上名字与签名都不一样，逐个 hasattr 探测。
+        win.events.loaded += _loaded
+        for name, handler in (('resized', _resized), ('shown', _shown),
+                              ('closing', _closing), ('closed', _closing)):
+            event = getattr(win.events, name, None)
+            if event is None:
+                continue
+            try:
+                event += handler
+            except Exception:  # noqa: BLE001  个别版本的事件对象不支持 +=
+                pass
+    except Exception as e:  # noqa: BLE001
+        _log("绑定宿主事件失败（降级为不自动同步）：" + str(e))
+    return win
+
+
 def _open_native_window() -> bool:
     """Prefer a native pywebview window; return False when its runtime is unavailable."""
     try:
         import webview
         _log("检测到 pywebview %s，尝试创建 Edge 原生窗口" % getattr(webview, '__version__', 'unknown'))
 
-        def _host_hwnd():
-            """通过标题枚举拿到 pywebview 的宿主 HWND（必须在窗口创建之后）。"""
-            from desktop_bridge import find_host
-            host = find_host("DocMind")
-            return host[0] if host else None
-
-        def _register_host():
-            hwnd = _host_hwnd()
-            if not hwnd:
-                _log("未找到 pywebview 宿主 HWND，Godot 保持独立窗口")
-                return None
-            _log("已找到 DocMind 宿主 HWND: %s" % hwnd)
-            import desktop_bridge
-            desktop_bridge.set_host(hwnd)
-            try:
-                body = ('{"hwnd": %d}' % hwnd).encode()
-                req = urllib.request.Request(URL + "api/desktop/host", data=body,
-                                             headers={'Content-Type': 'application/json'},
-                                             method='POST')
-                urllib.request.urlopen(req, timeout=2).read()
-            except Exception as e:
-                _log("宿主 HWND 注册后端失败：" + str(e))
-            return hwnd
-
-        def _loaded():
-            try:
-                _register_host()
-            except Exception as e:
-                _log("宿主 HWND 检测失败：" + str(e))
-
-        def _refill(reason):
-            """宿主尺寸/可见性变化时，把"铺满模式"的嵌入窗口按客户区重排。
-
-            注意用的是**客户区**而不是 win.width/win.height：外框包含标题栏与边框，
-            直接拿外框尺寸会把引擎画面裁掉一截（150% 缩放下裁得更多）。
-            rect 模式的引擎视窗由前端自己重新 place，这里不插手。
-            """
-            try:
-                from desktop_bridge import fill_all
-                results = fill_all()
-                if results:
-                    _log("%s：已同步 %d 个嵌入窗口" % (reason, len(results)))
-            except Exception as e:
-                _log("嵌入窗口尺寸同步失败：" + str(e))
-
-        def _resized(*_args):
-            _refill("宿主 resize")
-
-        def _shown(*_args):
-            _refill("宿主显示")
-
-        def _closing(*_args):
-            """关窗即收尾：先解除嵌入再结束引擎进程，避免留下孤儿窗口/进程。
-
-            只在 finally 里清是不够的——pywebview 的主循环一退出，宿主 HWND 就没了，
-            此时子窗口还挂在它下面，引擎进程会继续跑，用户看到的是"关不掉的后台游戏"。
-            """
-            try:
-                from game_workbench import engine_stop_all
-                stopped = engine_stop_all()
-                if stopped:
-                    _log("关窗前已停止引擎：" + str(sorted(stopped)))
-            except Exception as e:
-                _log("关窗前停止引擎失败：" + str(e))
-
-        win = webview.create_window("DocMind 开发工作台", URL + "workbench/", width=1440, height=920,
-                                    min_size=(1024, 680), text_select=True)
-        try:
-            # pywebview 事件属于具体窗口对象；绑定全局 webview.events 在部分版本不会触发。
-            # resized/shown/closed 在不同版本上名字与签名都不一样，逐个 hasattr 探测。
-            win.events.loaded += _loaded
-            for name, handler in (('resized', _resized), ('shown', _shown),
-                                  ('closing', _closing), ('closed', _closing)):
-                event = getattr(win.events, name, None)
-                if event is None:
-                    continue
-                try:
-                    event += handler
-                except Exception:  # noqa: BLE001  个别版本的事件对象不支持 +=
-                    pass
-        except Exception as e:  # noqa: BLE001
-            _log("绑定宿主事件失败（降级为不自动同步）：" + str(e))
+        win = build_host_window(API_BASE)
         _log("开始运行 pywebview 事件循环")
         webview.start(gui="edgechromium", debug=False)
         _log("pywebview 事件循环已退出")
-        _closing()
+        # 事件循环退出后再兜一次：closing 事件在个别 pywebview 版本上不触发，
+        # 漏掉就会留下一个关不掉的后台引擎进程
+        try:
+            from game_workbench import engine_stop_all
+            stopped = engine_stop_all()
+            if stopped:
+                _log("事件循环退出后清理引擎：" + str(sorted(stopped)))
+        except Exception as e:  # noqa: BLE001
+            _log("退出后清理引擎失败：" + str(e))
+        _ = win
         return True
     except Exception as e:
         _log("原生桌面窗口不可用，回退浏览器：" + str(e))

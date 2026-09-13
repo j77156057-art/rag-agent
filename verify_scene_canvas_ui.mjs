@@ -86,6 +86,20 @@ try {
   await page.waitForSelector('.pb-pop', { timeout: 10000 })
   check('试玩器弹出', true)
 
+  // 试玩 tab：原生引擎的「嵌入工作台」开关在浏览器模式下必须降级（禁用 + 提示），
+  // 而不是让用户点了之后拿到一个含糊的失败。
+  const embedUi = await page.evaluate(() => ({
+    toggle: !!document.querySelector('.pb-check input'),
+    disabled: document.querySelector('.pb-check input')?.disabled ?? null,
+    checked: document.querySelector('.pb-check input')?.checked ?? null,
+    hint: document.querySelector('.pb-hintline')?.textContent?.trim() ?? '',
+    hasNativeBtn: [...document.querySelectorAll('.pb-btn')].some((b) => b.textContent.includes('桌面窗口启动')),
+  }))
+  check('试玩 tab 有「嵌入工作台」开关', embedUi.toggle === true, embedUi)
+  check('浏览器模式下开关被禁用（原生窗口嵌不进浏览器）', embedUi.disabled === true, embedUi.disabled)
+  check('浏览器模式下给出降级提示', embedUi.hint.includes('浏览器模式'), embedUi.hint.slice(0, 40))
+  check('「桌面窗口启动」按钮仍在（独立窗口可用）', embedUi.hasNativeBtn === true)
+
   await page.click('.pb-tabs button:has-text("场景画布")')
   await page.waitForSelector('input.pb-path', { timeout: 10000 })
   check('存在「场景画布」tab', true)
