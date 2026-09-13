@@ -754,7 +754,10 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188"):
     payload = json.dumps({"prompt": workflow}).encode()
     req = urllib.request.Request(url.rstrip('/') + '/prompt', data=payload, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as r: return {"ok": True, "response": json.loads(r.read().decode())}
+        with urllib.request.urlopen(req, timeout=10) as r:
+            response = json.loads(r.read().decode())
+        canonical = json.dumps(workflow, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+        return {"ok": True, "response": response, "workflow_sha256": hashlib.sha256(canonical).hexdigest()}
     except Exception as e: return {"ok": False, "error": f"ComfyUI 请求失败：{e}"}
     finally: _gpu_release("comfyui")
 
