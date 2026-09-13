@@ -87,6 +87,11 @@ def status():
             "memory": mem,
         }
 
+def process_environment(device_index=None):
+    """返回启动子进程时应使用的 CUDA 环境副本，不修改当前进程环境。"""
+    idx = _device_index() if device_index is None else int(device_index)
+    return {'CUDA_VISIBLE_DEVICES': str(idx), 'DOCMIND_GPU_INDEX': str(idx)}
+
 
 def acquire(owner, timeout=2, purpose="", ttl=None, priority=0):
     """申请 GPU 租约。成功返回 True；超时/显存不足返回 False。

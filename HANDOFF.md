@@ -372,3 +372,6 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - Unreal 新增桥接脚本安装 API：`POST /api/engine/unreal-bridge/install`（需 `confirm=true`，可 `force` 覆盖）。脚本写入 `Content/Python/docmind_bridge.py`，提供 Editor Python 下的 Blueprint 资产枚举和当前 Level Actor 枚举入口；不修改二进制 `.uasset`。
 - 已通过 API 路由与资产索引测试。
 仍待实现：在 Unreal Editor 中启用并运行桥接脚本的进程通信、Blueprint 节点级读写和 Actor 属性安全编辑；GPU 跨进程显存隔离/持久队列。
+- GPU 新增 `GET /api/gpu/environment`，返回启动 Ollama/ComfyUI/引擎子进程时建议注入的 `CUDA_VISIBLE_DEVICES` 与 `DOCMIND_GPU_INDEX`，不修改工作台自身环境。
+- 新增环境生成测试。
+仍待实现：将该环境实际传入各子进程启动器，以及真实跨进程显存监控/隔离。

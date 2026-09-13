@@ -76,7 +76,7 @@ from regions import (
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from engine_adapters import skill_for_engine
-from gpu_coordinator import status as gpu_status
+from gpu_coordinator import status as gpu_status, process_environment
 from agent_policy import route_for, permission_check, record_permission, approval_allows, apply_approved_external, routing_status, redact_for_cloud, create_external_approval, list_approvals, decide_approval
 import secrets_store
 _DESKTOP_HOST_HWND = None
@@ -741,6 +741,9 @@ async def comfy_status_ep(url: str = "http://127.0.0.1:8188"):
 @app.get("/api/gpu/status")
 async def gpu_status_ep():
     return {"ok": True, **gpu_status()}
+@app.get("/api/gpu/environment")
+async def gpu_environment_ep(device_index: int = -1):
+    return {"ok": True, "environment": process_environment(None if device_index < 0 else device_index)}
 
 @app.post("/api/gpu/cancel/{owner}")
 async def gpu_cancel_ep(owner: str):
