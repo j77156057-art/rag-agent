@@ -99,46 +99,93 @@ def _open_native_window() -> bool:
     try:
         import webview
         _log("检测到 pywebview %s，尝试创建 Edge 原生窗口" % getattr(webview, '__version__', 'unknown'))
-        win = webview.create_window("DocMind 开发工作台", URL + "workbench/", width=1440, height=920,
-                                    min_size=(1024, 680), text_select=True)
-        embedded_child = {'hwnd': None}
-        def _loaded():
-            # pywebview 已创建原生窗口后，通过 Win32 标题枚举获取宿主 HWND。
+
+        def _host_hwnd():
+            """通过标题枚举拿到 pywebview 的宿主 HWND（必须在窗口创建之后）。"""
+            from desktop_bridge import find_host
+            host = find_host("DocMind")
+            return host[0] if host else None
+
+        def _register_host():
+            hwnd = _host_hwnd()
+            if not hwnd:
+                _log("未找到 pywebview 宿主 HWND，Godot 保持独立窗口")
+                return None
+            _log("已找到 DocMind 宿主 HWND: %s" % hwnd)
+            import desktop_bridge
+            desktop_bridge.set_host(hwnd)
             try:
-                from desktop_bridge import find_host
-                host = find_host("DocMind")
-                if not host:
-                    _log("未找到 pywebview 宿主 HWND，Godot 保持独立窗口")
-                    return
-                _log("已找到 DocMind 宿主 HWND: %s" % host[0])
-                import desktop_bridge
-                desktop_bridge.set_host(host[0])
-                try:
-                    req = urllib.request.Request(URL + "api/desktop/host", data=(('{"hwnd": %d}' % host[0]).encode()), headers={'Content-Type':'application/json'}, method='POST')
-                    urllib.request.urlopen(req, timeout=2).read()
-                except Exception as e:
-                    _log("宿主 HWND 注册后端失败：" + str(e))
+                body = ('{"hwnd": %d}' % hwnd).encode()
+                req = urllib.request.Request(URL + "api/desktop/host", data=body,
+                                             headers={'Content-Type': 'application/json'},
+                                             method='POST')
+                urllib.request.urlopen(req, timeout=2).read()
+            except Exception as e:
+                _log("宿主 HWND 注册后端失败：" + str(e))
+            return hwnd
+
+        def _loaded():
+            try:
+                _register_host()
             except Exception as e:
                 _log("宿主 HWND 检测失败：" + str(e))
-        def _resized(*_args):
-            # pywebview 不同版本的事件参数不同；从窗口对象读取尺寸并转发给桥接层。
+
+        def _refill(reason):
+            """宿主尺寸/可见性变化时，把"铺满模式"的嵌入窗口按客户区重排。
+
+            注意用的是**客户区**而不是 win.width/win.height：外框包含标题栏与边框，
+            直接拿外框尺寸会把引擎画面裁掉一截（150% 缩放下裁得更多）。
+            rect 模式的引擎视窗由前端自己重新 place，这里不插手。
+            """
             try:
-                if not embedded_child.get('hwnd'): return
-                w, h = int(win.width), int(win.height)
-                from desktop_bridge import resize
-                resize(embedded_child['hwnd'], w, h)
+                from desktop_bridge import fill_all
+                results = fill_all()
+                if results:
+                    _log("%s：已同步 %d 个嵌入窗口" % (reason, len(results)))
             except Exception as e:
                 _log("嵌入窗口尺寸同步失败：" + str(e))
+
+        def _resized(*_args):
+            _refill("宿主 resize")
+
+        def _shown(*_args):
+            _refill("宿主显示")
+
+        def _closing(*_args):
+            """关窗即收尾：先解除嵌入再结束引擎进程，避免留下孤儿窗口/进程。
+
+            只在 finally 里清是不够的——pywebview 的主循环一退出，宿主 HWND 就没了，
+            此时子窗口还挂在它下面，引擎进程会继续跑，用户看到的是"关不掉的后台游戏"。
+            """
+            try:
+                from game_workbench import engine_stop_all
+                stopped = engine_stop_all()
+                if stopped:
+                    _log("关窗前已停止引擎：" + str(sorted(stopped)))
+            except Exception as e:
+                _log("关窗前停止引擎失败：" + str(e))
+
+        win = webview.create_window("DocMind 开发工作台", URL + "workbench/", width=1440, height=920,
+                                    min_size=(1024, 680), text_select=True)
         try:
             # pywebview 事件属于具体窗口对象；绑定全局 webview.events 在部分版本不会触发。
+            # resized/shown/closed 在不同版本上名字与签名都不一样，逐个 hasattr 探测。
             win.events.loaded += _loaded
-            if hasattr(win.events, 'resized'):
-                win.events.resized += _resized
-        except Exception:
-            pass
+            for name, handler in (('resized', _resized), ('shown', _shown),
+                                  ('closing', _closing), ('closed', _closing)):
+                event = getattr(win.events, name, None)
+                if event is None:
+                    continue
+                try:
+                    event += handler
+                except Exception:  # noqa: BLE001  个别版本的事件对象不支持 +=
+                    pass
+        except Exception as e:  # noqa: BLE001
+            _log("绑定宿主事件失败（降级为不自动同步）：" + str(e))
         _log("开始运行 pywebview 事件循环")
         webview.start(gui="edgechromium", debug=False)
         _log("pywebview 事件循环已退出")
+        _closing()
         return True
     except Exception as e:
         _log("原生桌面窗口不可用，回退浏览器：" + str(e))
@@ -176,6 +223,14 @@ def _emit_ollama_guidance():
 
 def main():
     _ensure_bundled_git()
+    # 必须在建宿主窗口之前把进程提到 per-monitor v2：否则在 125%/150% 缩放下
+    # 本进程拿到的是虚拟化坐标，而 Godot 是 DPI 感知的，父/子窗口坐标系不一致 → 嵌入错位。
+    try:
+        from desktop_bridge import dpi_awareness, ensure_dpi_awareness
+        ok, mode = ensure_dpi_awareness()
+        _log("进程 DPI 感知：%s（设置%s）" % (mode, '成功' if ok else '失败，可能错位'))
+    except Exception as e:  # noqa: BLE001
+        _log("设置 DPI 感知失败：" + str(e))
     if os.getenv("DOCMIND_SERVER_ONLY"):
         _log("服务模式启动")
         _emit_ollama_guidance()

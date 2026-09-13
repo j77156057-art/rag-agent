@@ -84,7 +84,7 @@ import mcp_client
 import web_export
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
-from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_prepare, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, install_runtime_probe, comfy_status, comfy_queue, comfy_history, comfy_import, comfy_import_all, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
+from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_prepare, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_queue, comfy_history, comfy_import, comfy_import_all, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
 
 app = FastAPI(title="DocMind RAG Agent")
 agent = Agent()
@@ -97,6 +97,30 @@ class DesktopResizeReq(BaseModel):
     width: int
     height: int
 
+class EngineEmbedReq(BaseModel):
+    """嵌入请求。
+
+    * 给了 x/y/width/height → **引擎视窗模式**：引擎只占工作台里那一块矩形，
+      界面照常可用（推荐，前端按 .pb-framewrap 的位置算出来）。
+    * 都不给 → **铺满模式**：按宿主客户区铺满，顶部留 ``offset_y`` 像素给工作台顶栏。
+    """
+    host_hwnd: int = 0
+    x: int = 0
+    y: int = 0
+    width: int = 0
+    height: int = 0
+    offset_y: int = -1
+    title_hint: str = ""
+
+class EnginePlaceReq(BaseModel):
+    x: int
+    y: int
+    width: int
+    height: int
+
+class EngineFocusReq(BaseModel):
+    pass
+
 @app.post('/api/desktop/host')
 async def desktop_host_ep(req: DesktopHostReq):
     global _DESKTOP_HOST_HWND
@@ -105,7 +129,21 @@ async def desktop_host_ep(req: DesktopHostReq):
 
 @app.get('/api/desktop/host')
 async def desktop_host_get_ep():
-    return {'ok': True, 'host_hwnd': _DESKTOP_HOST_HWND}
+    """桌面宿主信息。浏览器模式下 host_hwnd 为 null，前端据此降级（不显示"自动嵌入"）。"""
+    info = {'ok': True, 'host_hwnd': _DESKTOP_HOST_HWND}
+    try:
+        from desktop_bridge import (client_rect, dpi_awareness, dpi_of, embedded_children,
+                                    is_window)
+        info['desktop'] = bool(_DESKTOP_HOST_HWND) and is_window(_DESKTOP_HOST_HWND)
+        info['dpi_awareness'] = dpi_awareness()
+        if info['desktop']:
+            info['client'] = client_rect(_DESKTOP_HOST_HWND)
+            info['dpi'] = dpi_of(_DESKTOP_HOST_HWND)
+        info['embedded'] = embedded_children()
+    except Exception as e:  # noqa: BLE001  桥接层不可用时保持最小响应
+        info['desktop'] = False
+        info['bridge_error'] = str(e)
+    return info
 
 @app.post('/api/desktop/resize')
 async def desktop_resize_ep(req: DesktopResizeReq):
@@ -394,6 +432,36 @@ async def engine_start_ep(req: EngineReq):
 @app.post("/api/engine/stop")
 async def engine_stop_ep():
     root=_project_root_or_error(); return engine_stop(root) if root else {"ok":False,"error":"未配置代码库"}
+@app.post("/api/engine/embed")
+async def engine_embed_ep(req: EngineEmbedReq):
+    """把已运行的引擎窗口嵌进桌面宿主（引擎视窗模式优先，否则铺满宿主客户区）。"""
+    root=_project_root_or_error()
+    if not root: return {"ok":False,"error":"未配置代码库"}
+    host = req.host_hwnd or _DESKTOP_HOST_HWND
+    offset = EMBED_TOP_STRIP if req.offset_y < 0 else req.offset_y
+    rect = None
+    if req.width > 0 and req.height > 0:
+        rect = {'x': req.x, 'y': req.y, 'width': req.width, 'height': req.height}
+    return engine_embed(root, host, req.width or None, req.height or None,
+                        req.title_hint, offset, rect)
+
+@app.post("/api/engine/place")
+async def engine_place_ep(req: EnginePlaceReq):
+    """引擎视窗随前端布局变化重新定位（弹窗移动、窗口缩放时调用）。"""
+    root=_project_root_or_error()
+    if not root: return {"ok":False,"error":"未配置代码库"}
+    return engine_place(root, req.x, req.y, req.width, req.height)
+@app.post("/api/engine/detach")
+async def engine_detach_ep():
+    root=_project_root_or_error(); return engine_detach(root) if root else {"ok":False,"error":"未配置代码库"}
+@app.post("/api/engine/focus")
+async def engine_focus_ep():
+    root=_project_root_or_error(); return engine_focus(root) if root else {"ok":False,"error":"未配置代码库"}
+@app.post("/api/engine/resize")
+async def engine_resize_ep(offset_y: int = -1):
+    root=_project_root_or_error()
+    if not root: return {"ok":False,"error":"未配置代码库"}
+    return engine_resize(root, None if offset_y < 0 else offset_y)
 @app.get("/api/engine/logs")
 async def engine_logs_ep(limit: int = 200):
     root=_project_root_or_error(); return engine_logs(root, limit) if root else {"ok":False,"error":"未配置代码库"}

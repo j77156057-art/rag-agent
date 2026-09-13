@@ -6,6 +6,12 @@ from datetime import datetime
 
 _ENGINE_PROCS = {}
 _ENGINE_LOGS = {}
+# root_abs -> 嵌入状态 {child_hwnd, host_hwnd, offset_y, title, dpi, size}；
+# 保存它是为了"停止/解除嵌入"时能把引擎窗口原样还原，而不是留下一个失效的子窗口。
+_EMBED_STATE = {}
+# 嵌入时在宿主顶部留出的像素高度：保住工作台顶栏（试玩器 / 停止按钮都在那儿），
+# 否则引擎窗口铺满整个宿主，用户连"停止引擎"都点不到。
+EMBED_TOP_STRIP = 46
 ENGINE_CATALOG = [
  {'id':'godot','name':'Godot 4','executable':'godot','download':'https://godotengine.org/download/windows/','project_file':'project.godot'},
  {'id':'unity','name':'Unity','executable':'Unity.exe','download':'https://unity.com/download','project_file':'ProjectSettings/ProjectVersion.txt'},
@@ -387,17 +393,122 @@ def _safe_comfy_url(url):
 
 def engine_status(root):
     p = _ENGINE_PROCS.get(_root(root)); running = bool(p and p.poll() is None)
-    return {"ok": True, "running": running, "pid": p.pid if running else None}
+    embed = _EMBED_STATE.get(_root(root)) or {}
+    out = {"ok": True, "running": running, "pid": p.pid if running else None,
+           "embedded": bool(embed) and running}
+    if embed:
+        out.update({"child_hwnd": embed.get('child_hwnd'), "host_hwnd": embed.get('host_hwnd'),
+                    "embed_title": embed.get('title'), "embed_offset_y": embed.get('offset_y'),
+                    "embed_dpi": embed.get('dpi'), "host_dpi": embed.get('host_dpi'),
+                    "embed_size": embed.get('size'), "embed_mode": embed.get('mode')})
+    return out
 
-def engine_embed(root, host_hwnd, width=1280, height=720, title_hint=''):
-    st=engine_status(root)
-    if not st.get('running'): return {'ok':False,'error':'引擎尚未运行。'}
+
+def engine_embed(root, host_hwnd, width=None, height=None, title_hint='',
+                 offset_y=EMBED_TOP_STRIP, rect=None):
+    """把已运行的引擎窗口嵌进宿主窗口。
+
+    `rect` = 前端口算出的"引擎视窗"（宿主客户区坐标，物理像素）；给了它引擎就只占那一块，
+    工作台界面照常可用。不给则退化为按宿主客户区铺满（顶部留 `offset_y`）。
+    """
+    root_abs = _root(root)
+    st = engine_status(root_abs)
+    if not st.get('running'):
+        return {'ok': False, 'error': '引擎尚未运行。'}
+    if not host_hwnd:
+        return {'ok': False, 'error': '没有桌面宿主窗口（浏览器模式下无法嵌入，请用桌面端启动）。'}
     try:
-        from desktop_bridge import find_window, embed
-        child=find_window(st['pid'], title_hint)
-        if not child: return {'ok':False,'error':'尚未找到引擎窗口，请稍后重试。'}
-        r=embed(child[0], int(host_hwnd), width, height); r.update({'title':child[1]}); return r
-    except Exception as e: return {'ok':False,'error':str(e)}
+        from desktop_bridge import embed, ensure_dpi_awareness, find_window, is_window
+        ensure_dpi_awareness()   # 父/子窗口必须在同一套坐标空间，否则 150% 缩放下会错位
+        # 已经嵌进去过就直接复用旧句柄：嵌入之后窗口变成了宿主的子窗口，而 EnumWindows
+        # 只枚举顶层窗口——再走一遍 find_window 必然找不到，会误报"引擎窗口没出现"。
+        prev = _EMBED_STATE.get(root_abs) or {}
+        hwnd_prev = int(prev.get('child_hwnd') or 0)
+        if hwnd_prev and is_window(hwnd_prev):
+            child = (hwnd_prev, prev.get('title') or '')
+        else:
+            child = find_window(st['pid'], title_hint)
+        if not child:
+            return {'ok': False, 'error': '尚未找到引擎窗口，请稍后重试。'}
+        r = embed(child[0], int(host_hwnd), width, height, offset_y, title=child[1], rect=rect)
+        if not r.get('ok'):
+            return r
+        _EMBED_STATE[root_abs] = {'child_hwnd': r['hwnd'], 'host_hwnd': int(host_hwnd),
+                                  'offset_y': int(offset_y), 'title': child[1],
+                                  'dpi': r.get('dpi'), 'host_dpi': r.get('host_dpi'),
+                                  'mode': r.get('mode'),
+                                  'size': {'width': r.get('width'), 'height': r.get('height')}}
+        return r
+    except Exception as e:  # noqa: BLE001
+        return {'ok': False, 'error': str(e)}
+
+
+def engine_place(root, x, y, width, height):
+    """引擎视窗（rect 模式）随前端布局变化同步位置与尺寸。"""
+    root_abs = _root(root)
+    state = _EMBED_STATE.get(root_abs)
+    if not state:
+        return {'ok': False, 'error': '引擎未嵌入。'}
+    try:
+        from desktop_bridge import place as bridge_place
+        r = bridge_place(state['child_hwnd'], x, y, width, height)
+        if r.get('ok'):
+            state['mode'] = 'rect'
+            state['size'] = {'width': r.get('width'), 'height': r.get('height')}
+        return r
+    except Exception as e:  # noqa: BLE001
+        return {'ok': False, 'error': str(e)}
+
+
+def engine_stop_all():
+    """停止全部引擎（桌面壳关闭时调用，避免留下孤儿进程与窗口）。"""
+    roots = sorted(set(_ENGINE_PROCS) | set(_EMBED_STATE))
+    return {r: engine_stop(r) for r in roots}
+
+
+def engine_detach(root):
+    """解除嵌入，把引擎窗口还原成独立顶层窗口（引擎进程保持运行）。"""
+    root_abs = _root(root)
+    state = _EMBED_STATE.pop(root_abs, None)
+    if not state:
+        return {'ok': True, 'was_embedded': False}
+    try:
+        from desktop_bridge import detach
+        r = detach(state['child_hwnd'])
+        r['was_embedded'] = True
+        return r
+    except Exception as e:  # noqa: BLE001
+        return {'ok': False, 'was_embedded': True, 'error': str(e)}
+
+
+def engine_focus(root):
+    """把键盘焦点交给嵌入的引擎窗口（用户点工作台后要把焦点还给游戏）。"""
+    root_abs = _root(root)
+    state = _EMBED_STATE.get(root_abs)
+    if not state:
+        return {'ok': False, 'error': '引擎未嵌入，无需聚焦。'}
+    try:
+        from desktop_bridge import focus
+        return focus(state['child_hwnd'], state.get('host_hwnd'))
+    except Exception as e:  # noqa: BLE001
+        return {'ok': False, 'error': str(e)}
+
+
+def engine_resize(root, offset_y=None):
+    """按宿主当前客户区重排嵌入窗口（宿主 resize 后调用）。"""
+    root_abs = _root(root)
+    state = _EMBED_STATE.get(root_abs)
+    if not state:
+        return {'ok': False, 'error': '引擎未嵌入。'}
+    try:
+        from desktop_bridge import fill_host
+        r = fill_host(state['child_hwnd'], state['offset_y'] if offset_y is None else offset_y)
+        if r.get('ok'):
+            state['size'] = {'width': r.get('width'), 'height': r.get('height')}
+        return r
+    except Exception as e:  # noqa: BLE001
+        return {'ok': False, 'error': str(e)}
+
 
 def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False):
     root_abs = _root(root)
@@ -421,12 +532,25 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
         _ENGINE_LOGS[root_abs] = log
         result = {"ok": True, "running": True, "pid": p.pid}
         if embed and host_hwnd:
-            for _ in range(20):
-                time.sleep(0.15)
-                er = engine_embed(root_abs, host_hwnd, 1280, 720)
+            # 引擎建窗口是异步的：轮询直到找到窗口并嵌入成功，或超时。
+            # 尺寸按宿主客户区自动算，避免用固定的 1280x720 把画面裁掉。
+            last = ''
+            for _ in range(30):
+                time.sleep(0.2)
+                er = engine_embed(root_abs, host_hwnd)
                 if er.get('ok'):
-                    result['embedded'] = True; result['hwnd'] = er.get('hwnd'); break
-            else: result['embedded'] = False
+                    result['embedded'] = True
+                    result['hwnd'] = er.get('hwnd')
+                    result['embed'] = {k: er.get(k) for k in
+                                       ('width', 'height', 'offset_y', 'dpi', 'host_dpi', 'title')}
+                    break
+                last = er.get('error', '')
+            else:
+                result['embedded'] = False
+                result['embed_error'] = last or '等待引擎窗口超时。'
+        elif embed:
+            result['embedded'] = False
+            result['embed_error'] = '没有桌面宿主窗口（请用桌面端启动工作台）。'
         return result
     except FileNotFoundError:
         return {"ok": False, "error": f"找不到 {selected} 可执行文件。请安装引擎，或在 .docmind_engine.json 中配置 executable 的绝对路径。下载地址：{next((x['download'] for x in ENGINE_CATALOG if x['id']==selected), '')}"}
@@ -434,14 +558,43 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
         return {"ok": False, "error": f"无法启动 {selected}：{e}"}
 
 def engine_stop(root):
-    p = _ENGINE_PROCS.get(_root(root))
-    if not p or p.poll() is not None: return {"ok": True, "stopped": False}
-    p.terminate()
-    try: p.wait(timeout=5)
-    except subprocess.TimeoutExpired: p.kill()
-    log = _ENGINE_LOGS.pop(_root(root), None)
-    if log: log.close()
-    return {"ok": True, "stopped": True}
+    """停止引擎。**先解除嵌入再结束进程**——顺序反了会留下失效的子窗口。
+
+    另外要杀掉整棵进程树：Godot 的 `*_console.exe` 是转发器，只 terminate 直接子进程
+    会留下真正的 GUI 进程和它的窗口，也就是"孤儿窗口"。
+    """
+    root_abs = _root(root)
+    p = _ENGINE_PROCS.get(root_abs)
+    detached = engine_detach(root_abs)
+    if not p or p.poll() is not None:
+        _ENGINE_PROCS.pop(root_abs, None)
+        return {"ok": True, "stopped": False, "detached": detached.get('was_embedded', False)}
+    pid = p.pid
+    killed = []
+    try:
+        from desktop_bridge import terminate_tree
+        killed = terminate_tree(pid, timeout=5)
+    except Exception:  # noqa: BLE001  桥接层不可用时退回 Popen 终止
+        killed = []
+    if not killed:
+        p.terminate()
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        try:
+            p.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+    log = _ENGINE_LOGS.pop(root_abs, None)
+    if log:
+        try:
+            log.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _ENGINE_PROCS.pop(root_abs, None)
+    return {"ok": True, "stopped": True, "pid": pid,
+            "detached": detached.get('was_embedded', False), "killed": killed}
 
 def engine_logs(root, limit=200):
     path = _file(root, ".docmind_engine.log")

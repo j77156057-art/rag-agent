@@ -1,7 +1,8 @@
 # DocMind 项目交接清单（给接手 AI）
 
-> **更新时间**：2026-09-14 ｜ **基线提交**：`809a3b9`（feat(workbench): scene canvas + runtime timeline）
-> **全量测试**：**202 项全部通过** ｜ **后端自检**：`verify_scene_canvas.py` 50/50 ｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` 23/23 ｜ **前端构建**：`npm run build` 通过
+> **更新时间**：2026-09-14（含 P0-1 实机闭环）｜ **基线提交**：`809a3b9` + 本次嵌入加固
+> **全量测试**：**202 项全部通过** ｜ **场景画布自检**：`verify_scene_canvas.py` 54/54 ｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` 23/23
+> **引擎嵌入实机自检**：`verify_engine_embed.py` **60/60**（真 Godot 4.7.2 + 真 Win32 宿主，含真实合成键鼠）｜ **前端构建**：`npm run build` 通过
 > 本文是项目唯一权威交接文档，取代并删除了旧版 `HANDOFF.md`、`AI_BRIEF.md`、`DEV_WORKBENCH_AUDIT.md`、`HANDOFF_ENGINE_EMBEDDING.md`、`HANDOFF_REMAINING_WORK.md`（旧 HANDOFF.md 由本同名文件接管）。
 > **铁律：规划项一律写在第 5 节，不得描述为已完成；做完一项就把它移到第 4 节时间线并注明提交号。**
 
@@ -27,7 +28,10 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   → 工作台（`src/workbench/`）：CodeMirror 编辑器、文件树、符号/关系图、任务引擎面板、ChatDock，
   以及 2026-09-14 转正的 **场景画布** 与 **运行时时间线**（试玩器弹窗的第 2/3 个 tab）。
   两者都是 `defineAsyncComponent` 异步分块，首屏 JS 体积不受影响（工作台 130KB / gzip 49KB 不变）。
-- **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前第 14 次冻结构建，2026-09-12 18:26；**仍未重新打包**）；随包 MinGit；pywebview 原生窗口 + Win32 HWND 嵌入。
+- **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前第 14 次冻结构建，2026-09-12 18:26；**仍未重新打包**）；随包 MinGit。
+- **引擎嵌入（P0-1 已实机闭环）**：Godot 4.7.2（`D://Tools//Godot//Godot_v4.7.2-stable_win64.exe`）+ 真 Win32 宿主窗口下实测通过——
+  置父/样式摘除、按客户区（或前端指定矩形）对齐、宿主 resize 跟随、**真实合成键鼠（SendInput）送达引擎并回显**、
+  解除嵌入后窗口原样还原、停止后无孤儿进程/窗口、父子 DPI 一致（本机 **150% 缩放 = 144 DPI** 实测）。
 - **LLM/Embedding**：mock / qwen / deepseek / ollama / llamacpp 多 Provider，页面内免重启切换；本机 Ollama(`11434`, bge-m3) 与 llama.cpp(`8080`, Qwen 35B) 免 Key；622fdbc 新增 native embedding。
 - **验证基线**：后端 `unittest discover` **202/202 通过**（14 个测试文件，MinGit 在 PATH 时 git 用例实际执行）；
   `verify_scene_canvas.py` 走真实 HTTP 路由 **50/50**（含"每个 op 的 undo 逐字节还原"）；
@@ -82,6 +86,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-11 | P0 工作台 IDE 任务 1–4 + git plumbing；Godot 文本资产索引（.gd/.tscn/.tres…）；随包 MinGit；code_root 持久化+vendor 分包；**P1 符号语义地图 → 关系图（继承/挂载边）→ 调用边（高置信、字符串注释掩码）**；P2 选区 AI（解释/Review/提问走 Agent、改写走直连快通道+LCS diff 接受）；P3 Git 历史/回滚+分区 DAG 治理；代码审查 11 项修复；第 4–11 次冻结构建 |
 | 2026-09-12 | 分区一键创建/补齐导出桩（scaffold/fill_exports，15 例新测）；Java 符号抽取；第 12–14 次冻结构建 |
 | 2026-09-13 | `c543047` Agent 代码优先路由+健壮动作解析+证据护栏；**`622fdbc` MCP bridge、Web player/导出、GPU lease 队列、native embedding、desktop_bridge focus、场景面板大改、ChatDock**（+4638 行，6 个新测试文件）；Vue Flow 区域画布 spike 验证通过（`b8e869c` 提交，已随 P0-2 转正后移除，见 §6） |
+| 2026-09-14 | **P0-1 Godot HWND 嵌入实机闭环**（Godot 4.7.2 + 真 Win32 宿主）：`desktop_bridge.py` 加固为可逆嵌入 + 客户区/矩形两种尺寸模式 + DPI 感知 + 可靠的跨线程 focus；`engine_*` 增加嵌入状态机与 detach/focus/resize/place/stop_all（停止先解除父子再杀进程树，防孤儿）；`desktop.py` 接 resized/shown/closing 事件并在启动前声明 DPI 感知；新增 `verify_engine_embed.py`（60 项实机断言，含真实合成键鼠回显）。修 3 个真 bug：嵌入后无法二次 embed、`windows_of_pids` 永远返回空、resize 用外框尺寸裁画面 |
 | 2026-09-14 | **`809a3b9` P0-2 场景画布转正 + P1-1 运行时时间线**：`scene_runtime.py` 重写为行块解析/图模型/受控编辑（+1035 行）；新增 `/api/scene/graph`、`/api/scene/op`、`/api/runtime/sessions`、`/api/runtime/clear`，`/api/runtime/events` 支持筛选；前端新增 `SceneCanvas.vue`/`SceneNodeCard.vue`/`SceneFileCard.vue`/`RuntimeTimeline.vue` 与 `sceneApi`；移除 spike 入口与 `src/spike/`；修 gpu 队列抖动用例；补 `/favicon.ico`；构建前清理 `web/assets`。测试 202/202、后端自检 50/50、浏览器冒烟 23/23 |
 
 > 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（14 次完整记录，继续追加不要新建文件）。
@@ -91,14 +96,6 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 ## 5. 待办清单（规划项，未完成；按优先级）
 
 > 每项含【要做什么】【原因】【方案】【验收】。状态以 `809a3b9` 的代码为准，已核对。
-
-### P0-1　Godot HWND 嵌入实机闭环（最高优先）
-
-- 【现状】接口链已通且有单测：pywebview loaded → `desktop_bridge.find_host` → `POST /api/desktop/host` → `engine/start {embed:true}` → `find_window(pid)` → `SetParent + MoveWindow`；`focus()` 已新增（622fdbc）。**但从未在真实 Godot 4.7.2 + 实机窗口下验证输入/焦点/DPI/退出清理。**
-- 【原因】嵌入是桌面工作台区别于网页玩具的核心卖点；浏览器标签页不能当 Win32 宿主，未实测不能宣称可用。
-- 【方案】① 保存宿主/子窗口状态，停止引擎时先解除父子关系再结束进程，防孤儿窗口；② 接 pywebview `resized/shown/closed` 事件（不同版本事件签名需实测分支）；③ focus 接口在前端引擎面板接线（自动嵌入/独立窗口模式切换与 embedded 状态展示）；④ Godot 4.7.2 下验证 100/125/150% DPI 缩放与键鼠输入。
-- 【验收】返回 `embedded:true`；引擎窗口内可正常键鼠操作；宿主 resize 子窗口同步；退出后无孤儿进程；3 档 DPI 不错位。
-- 【依据】`.trae/skills/desktop-engine-embedding/SKILL.md`。
 
 ### P1-2　Unity 深度适配
 
@@ -119,13 +116,17 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 ### P3　第 15 次冻结发布
 
-按 `docmind-frozen-release` Skill：py_compile → **202 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(23) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → Godot 实机验证 → 前端 6 文件 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加第十五次记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
+按 `docmind-frozen-release` Skill：py_compile → **202 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(23) → `verify_engine_embed.py`(60) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → Godot 实机验证 → 前端 6 文件 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加第十五次记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
 
 ### 其他已记录的改进点
 
 - **B 档浅实现**（2026-09-11 审计结论，仍有效）：`impact_analysis` 是子串 grep、`generate_test_scene` 写死空壳、`simulate_growth` 等比数列玩具、`performance_sample` 仅计时、`approval` 只追加日志不拦截、默认分区 verify 空转。当演示可以，当真工具需要逐个做深或在 UI 标注能力边界。
 - **门面文档**：`README.md` 已于 2026-09-14 刷新（反映工作台/分区/引擎/画布现状）；`README_en.md` 与 `DEMO.md` **仍是 9 工具+单页演示时代的内容，择期重写**。
 - 新落地的 MCP bridge 与 Web player 目前缺产品级使用文档与边界说明。
+- **引擎嵌入的两点残留**（都不影响"已可用"，但别写成已覆盖）：① 本机显示器当前是 **150% 缩放**，100%/125% 未实测——
+  `verify_engine_embed.py` 会打印当前 DPI 并按实际坐标断言，改了缩放直接重跑即可补档；
+  ② UI 侧"自动嵌入"开关本轮尚未接线（前端仍写死 `embed=false`），目前嵌入靠 `POST /api/engine/embed` 触发——
+  这是用户可见能力的缺口，优先级高于 Unity/Unreal 适配。
 - **场景画布尚未支持的能力**（刻意留给后续，不是 bug）：Unity `.unity/.prefab` 场景图（P1-2）、节点属性引用边（`node_paths=PackedStringArray`）的自动跟随改写（改名/换父时只改 `parent` 前缀，NodePath 属性需人工核对）、多场景同时打开、画布上的 Undo/Redo 跨会话持久化。
 
 ---
@@ -174,6 +175,10 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 # 前端（frontend/ 目录）
 npm run dev      # vite dev server :5173
 npm run build    # 产物输出 ../web，emptyOutDir:false
+
+# 引擎嵌入：实机自检（真 Godot + 真 Win32 宿主；会短暂弹窗并把鼠标移回原处）
+.\.venv\Scripts\python.exe verify_engine_embed.py
+.\.venv\Scripts\python.exe verify_engine_embed.py --godot "D:\Tools\Godot\Godot_v4.7.2-stable_win64.exe" --keep
 
 # 场景画布：后端自检（进程内起 FastAPI + 临时 Godot 工程，走真实路由，不打端口）
 .\.venv\Scripts\python.exe verify_scene_canvas.py
@@ -225,7 +230,20 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
     路径失效，报出来的错还很误导。每个用例从同一份原始场景重新写盘。
 17. **`getBoundingClientRect` 量不出"节点位置对不对"之前，先确认 CSS 加载了**：第 11 条的现场就是
     靠"矩形差值 ÷ 布局坐标差值"反推出来的——比例不是常数就说明有东西没生效。
-18. **浏览器默认会请求 `/favicon.ico`**：不接这条路由，每个页面都留一条 404，浏览器冒烟的
+18. **引擎嵌入的坑（2026-09-14 实机踩齐）**
+    - `EnumWindows` 只枚举**顶层**窗口。引擎一旦嵌进去就变成子窗口，再 `find_window` 永远找不到 ——
+      "二次嵌入/重新定位"必须复用已保存的子窗口句柄，否则会误报"引擎窗口没出现"。
+    - 宿主 resize 不能用**窗口外框**尺寸给子窗口定尺寸（外框含标题栏与边框，会把画面裁掉一截）；
+      要用 `GetClientRect`。150% 缩放下差异更明显。
+    - 后台进程 `SetForegroundWindow` 会被系统拒绝；要先把本线程 `AttachThreadInput` 到**当前前台线程**再设，
+      否则合成/真实输入都不会到目标窗口。
+    - `keybd_event` 没有返回值，无法区分"没插进去"和"插进去了但没送达"。用 `SendInput`（返回实际插入条数）。
+    - **Godot 的 stdout 重定向到文件时是块缓冲**：事件明明发生了，日志里要等很久才可见。
+      只读 stdout 做输入断言会得到"功能没生效"的假失败。自检探针要**自己 flush 一份事件文件**，
+      并且**跑完统一核对**，不要和缓冲抢时间。
+    - `PrintWindow` 在 **user32**（不在 gdi32）；而且它抓不到 Vulkan 内容（GPU 合成），
+      截图能证明几何但不能证明渲染画面。
+19. **浏览器默认会请求 `/favicon.ico`**：不接这条路由，每个页面都留一条 404，浏览器冒烟的
     "无失败请求"断言永远红。图标走 `frontend/public/favicon.ico` → Vite 拷进 `web/` → 后端路由。
 
 ---
@@ -242,6 +260,7 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 | `.trae/skills/*/SKILL.md` | 发布、引擎装配/适配、HWND 嵌入的操作规范 |
 | `verify_scene_canvas.py` | 场景画布后端自检（50 项，走真实 HTTP 路由）；`--serve` 模式可开一个指向临时 Godot 工程的演示服务 |
 | `verify_scene_canvas_ui.mjs` | 场景画布浏览器冒烟（23 项，Playwright + 系统 Edge/Chrome）；截图产物在 `docs/screenshots/` |
+| `verify_engine_embed.py` | 引擎嵌入实机自检（60 项）：真 Godot + ctypes 真 Win32 宿主，覆盖置父/几何/resize/真实合成键鼠/解绑还原/无孤儿/DPI |
 | `sample_docs/docmind_product.md`、`uploads/*` | 产品资料与上传件（uploads 不进版本控制） |
 
 ---
@@ -261,3 +280,9 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - §6：由"spike 现状与去留决策"改写为"画布方案决策记录"，说明为什么最终用扁平节点+四类边而不是容器嵌套（spike 4 条结论与 4 个坑保留留档）。
 - §8：新增第 11–18 条前端/画布坑（Vue Flow 样式与 manualChunks、事件载荷、tscn 空行归属、undo 同形、fixture 隔离、favicon）。
 - §9：补两条验证脚本与 `docs/screenshots/` 的归属说明。
+
+**2026-09-14 追加（P0-1 实机闭环）**
+- §2：新增"引擎嵌入"条目，写明实测环境与结论（含 150% DPI 实测数据）。
+- §4：新增 P0-1 时间线行。
+- §5：**删除已完成的 P0-1**；把"100%/125% 未实测"与"前端自动嵌入开关未接线"作为残留写进其他改进点（铁律：未做实的不写成已完成）。
+- §7：补 `verify_engine_embed.py` 运行方式。§8：新增第 18 条引擎嵌入坑（6 个子项）。§9：补脚本归属。

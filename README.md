@@ -107,7 +107,11 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文
 .venv\Scripts\python.exe desktop.py                 # 或双击 run_desktop.bat
 ```
 
-- **引擎嵌入**：Godot / Unity / Unreal 的窗口可以按 Win32 HWND 规则嵌进工作台（`desktop_bridge.py`），嵌入状态下键鼠输入直接作用于引擎窗口。⚠️ **该链路的接口与单测已齐，但尚未在真实引擎 + 实机窗口下验证 DPI / 焦点 / 退出清理**，详见 `HANDOFF.md` §5 的 P0-1。
+- **引擎嵌入**：Godot / Unity / Unreal 的窗口按 Win32 HWND 规则嵌进工作台（`desktop_bridge.py`）。
+  **已在 Godot 4.7.2 + 真 Win32 宿主下实机验证**（`verify_engine_embed.py` 60 项全绿）：置父与样式摘除、按客户区（或前端指定的"引擎视窗"矩形）铺排、
+  宿主 resize 跟随、**真实合成键鼠（SendInput）送达引擎并回显事件**、解除嵌入后窗口原样还原、停止后无孤儿进程/窗口、父子 DPI 一致（本机 150% 缩放实测）。
+  嵌入是**可逆**的：`detach` 会恢复原始父窗口、窗口样式与屏幕位置——不保存这些状态直接 `SetParent(NULL)`，窗口会带着 `WS_CHILD` 变成看不见的顶层窗口。
+  两项未覆盖：100%/125% 缩放的实机数据（本机显示器当前是 150%，脚本会打印 DPI 并按实际坐标断言）、UI 侧的"自动嵌入"开关尚未接线（目前由 `POST /api/engine/embed` 触发）。
 - **打包成独立 exe（onedir 目录分发）**：`docmind.spec` 一条命令产出 `dist\DocMind\DocMind.exe`，把整个 `dist\DocMind` 目录一起分发即可，目标机器无需安装 Python。完整流程见 [DocMind_BUILD.md](DocMind_BUILD.md) 与 `.trae/skills/docmind-frozen-release/SKILL.md`。
 - **分发版能力边界**：分包 `builtin:py` 校验在进程内做语法检查（exe 与源码行为一致）；但 playtest 自动测试、cProfile 剖析、`python_exec` 需要真实 Python 环境，请在源码 `.venv` 里用；分区的 git 操作要求目标机器装有 Git。
 
@@ -119,6 +123,9 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文
 
 # 场景画布 —— 后端自检：进程内起 FastAPI + 临时 Godot 工程，走真实路由，不占端口
 .venv\Scripts\python.exe verify_scene_canvas.py
+
+# 引擎嵌入 —— 实机自检（真 Godot + 真 Win32 宿主；会短暂弹窗并自动把鼠标移回原处）
+.venv\Scripts\python.exe verify_engine_embed.py
 
 # 场景画布 —— 浏览器冒烟：先在另一个终端起演示服务，再用托管 node 执行
 .venv\Scripts\python.exe verify_scene_canvas.py --serve 8011
