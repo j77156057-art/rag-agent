@@ -796,6 +796,20 @@ def comfy_watch_status(prompt_id):
         job = _COMFY_JOBS.get(str(prompt_id))
         return {'ok': bool(job), 'job': dict(job) if job else None}
 
+def comfy_cancel(prompt_id, url="http://127.0.0.1:8188"):
+    """请求 ComfyUI 中断当前执行；ComfyUI 原生 interrupt 是全局当前执行任务。"""
+    try: url = _safe_comfy_url(url)
+    except ValueError as e: return {'ok': False, 'error': str(e)}
+    req = urllib.request.Request(url.rstrip('/') + '/interrupt', data=b'{}', headers={'Content-Type':'application/json'}, method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r: body = r.read().decode(errors='replace')
+        with _COMFY_JOBS_LOCK:
+            job = _COMFY_JOBS.get(str(prompt_id))
+            if job: job.update({'cancel_requested': True, 'cancel_requested_at': datetime.now().isoformat(timespec='seconds')})
+        return {'ok': True, 'prompt_id': str(prompt_id), 'cancel_requested': True, 'response': body[:1000]}
+    except Exception as e:
+        return {'ok': False, 'prompt_id': str(prompt_id), 'error': f'ComfyUI 取消请求失败：{e}'}
+
 def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="assets/generated"):
     """Download one ComfyUI output into a project asset directory with metadata."""
     try: url = _safe_comfy_url(url)

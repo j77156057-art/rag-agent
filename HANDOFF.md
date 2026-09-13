@@ -366,3 +366,6 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - GPU 租约现在记录 `device_index`，状态接口暴露当前 owner 的设备绑定；由 `DOCMIND_GPU_INDEX` 选择。该绑定用于后续子进程 CUDA 环境注入，仍不等同于 CUDA 显存隔离。
 - 新增设备绑定测试。
 仍待实现：将设备绑定实际注入 Ollama/ComfyUI/引擎子进程，以及跨进程显存监控和持久任务队列。
+- ComfyUI 新增显式取消：`POST /api/comfy/cancel/{prompt_id}` 调用原生 `/interrupt`，并在 watcher 状态记录 `cancel_requested`；返回值明确表示“已请求中断”，不会伪装成任务完成。
+- 新增取消请求测试。
+仍待实现：按 prompt_id 的精确取消（ComfyUI 原生 interrupt 是全局当前任务）、Unreal Editor 深度读写桥接、GPU 跨进程显存隔离与持久队列。
