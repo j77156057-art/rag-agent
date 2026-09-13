@@ -76,7 +76,7 @@ from regions import (
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from engine_adapters import skill_for_engine
-from gpu_coordinator import status as gpu_status, process_environment
+from gpu_coordinator import status as gpu_status, process_environment, acquire as gpu_acquire, release as gpu_release
 from agent_policy import route_for, permission_check, record_permission, approval_allows, apply_approved_external, routing_status, redact_for_cloud, create_external_approval, list_approvals, decide_approval
 import secrets_store
 _DESKTOP_HOST_HWND = None
@@ -1022,7 +1022,12 @@ async def chat(
         grounded = question
 
     def event_stream():
+        lease = False
         try:
+            if (get_runtime('llm_provider') or LLM_PROVIDER) == 'ollama':
+                lease = gpu_acquire('ollama:chat', timeout=2, purpose='ollama-chat')
+                if not lease:
+                    yield f"data: {json.dumps({'type':'final','text':'GPU 正忙：Ollama 正在使用中，请稍后重试。'}, ensure_ascii=False)}\n\n"; return
             yield f"data: {json.dumps({'type':'route','route':routing['route'],'complexity':routing['complexity'],'reason':routing['reason']}, ensure_ascii=False)}\n\n"
             cloud_grounded = redact_for_cloud(grounded) if selected_agent is not agent else grounded
             for ev in selected_agent.run(cloud_grounded, stream=True, images=b64_images or None):
@@ -1036,6 +1041,8 @@ async def chat(
             except Exception:
                 pass
             yield f"data: {json.dumps({'type':'final','text':f'模型无响应：{err_msg[:300]}。请到「⚙ 模型设置」换一个能加载的模型再试。'}, ensure_ascii=False)}\n\n"
+        finally:
+            if lease: gpu_release('ollama:chat')
         yield "data: {\"type\":\"done\"}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -1215,7 +1222,13 @@ async def selection_ai_ep(req: SelectionAiReq):
     messages = _selection_rewrite_messages(req)
 
     def event_stream():
+        lease = False
         try:
+            if provider == 'ollama':
+                lease = gpu_acquire('ollama:selection', timeout=2, purpose='ollama-selection')
+                if not lease:
+                    yield f"data: {json.dumps({'type': 'final', 'text': 'GPU 正忙：Ollama 正在使用中，请稍后重试。'}, ensure_ascii=False)}\n\n"
+                    return
             client = LLMClient()
             acc: list[str] = []
             for tok in client.chat(messages, stream=True, temperature=0.2):
@@ -1229,6 +1242,8 @@ async def selection_ai_ep(req: SelectionAiReq):
             err_msg = f"{type(e).__name__}: {e}"
             print(f"[selection_ai] LLM stream failed: {err_msg}", flush=True)
             yield f"data: {json.dumps({'type': 'final', 'text': f'模型无响应：{err_msg[:300]}。请到「⚙ 模型设置」换一个能加载的模型再试。'}, ensure_ascii=False)}\n\n"
+        finally:
+            if lease: gpu_release('ollama:selection')
         yield 'data: {"type":"done"}\n\n'
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

@@ -420,3 +420,4 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 新增 `/api/comfy/templates` 与前端模板按钮，显示本机 Z-Image Turbo 和 MiniMax H3 参考图视频模型及 workflow 路径，作为工作台模板入口（当前按钮展示元数据，完整 JSON 仍从本地官方 workflow 加载）。
 - ComfyUI 模板现在可直接加载 workflow：`GET /api/comfy/templates/{template_id}`；Z-Image 返回 API prompt 骨架，H3 读取本机官方 UI workflow。前端模板按钮会自动填充 JSON 编辑器。
 - 新增模板加载测试。
+- Ollama 本地聊天与选区 AI 的流式请求现在纳入 GPU 租约：请求开始申请、SSE 完成/异常时释放；GPU 忙时返回清晰提示，避免与 ComfyUI/H3 抢占。
