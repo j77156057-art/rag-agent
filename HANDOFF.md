@@ -360,3 +360,6 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI 资源管理新增只读重复检测：`comfy_resource_duplicates()` 按 SHA-256 对生成目录分组，并通过 `GET /api/comfy/resources/duplicates` 提供报告；不会自动删除资源。
 - 新增哈希分组测试。
 仍待实现：ComfyUI 任务取消、许可证/来源元数据完善、未使用资源分析；GPU 跨进程显存隔离与持久队列；Unreal Editor 深度读写桥接。
+- ComfyUI 新增未使用资源分析：`GET /api/comfy/resources/unused` 扫描生成目录并与项目文本引用比对，输出疑似未引用文件；仅供审计，不自动删除。
+- 新增对应测试。
+仍待实现：Unreal Editor Python/HTTP Blueprint/Level 深度桥接；GPU 跨进程显存隔离、设备绑定和持久队列；ComfyUI 任务取消与许可证来源管理。

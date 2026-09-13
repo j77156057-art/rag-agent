@@ -845,6 +845,26 @@ def comfy_resource_duplicates(root, directory="assets/generated"):
     dup = [{'sha256': h, 'paths': paths, 'duplicate_count': len(paths)-1} for h, paths in groups.items() if len(paths) > 1]
     return {'ok': True, 'directory': directory, 'groups': dup, 'duplicate_files': sum(x['duplicate_count'] for x in dup), 'files': count}
 
+def comfy_unused_resources(root, directory="assets/generated"):
+    """查找生成目录中未被项目文本文件引用的资源（仅提供疑似列表）。"""
+    base_root = _root(root); asset_root = _file(root, directory)
+    if not os.path.isdir(asset_root): return {'ok': True, 'directory': directory, 'unused': [], 'files': 0}
+    haystack = []
+    for dp, _, files in os.walk(base_root):
+        if any(x in dp.split(os.sep) for x in ('.git','node_modules','.venv','Library','Intermediate','DerivedDataCache')): continue
+        for fn in files:
+            if fn.endswith(('.json','.meta','.import')) or fn.endswith(('.png','.jpg','.jpeg','.webp','.wav','.mp3','.ogg','.mp4','.webm')): continue
+            try:
+                with open(os.path.join(dp,fn), encoding='utf-8', errors='ignore') as f: haystack.append(f.read())
+            except OSError: pass
+    text='\n'.join(haystack); unused=[]; count=0
+    for dp, _, files in os.walk(asset_root):
+        for fn in files:
+            if fn.endswith('.json'): continue
+            count += 1; rel=os.path.relpath(os.path.join(dp,fn),base_root).replace('\\','/')
+            if fn not in text and rel not in text and ('/' + rel) not in text: unused.append(rel)
+    return {'ok': True, 'directory': directory, 'unused': unused, 'files': count, 'unused_count': len(unused)}
+
 # Dedicated module keeps scene inspection and runtime capture independently testable.
 from scene_runtime import scene_tree, runtime_events, set_scene_property
 
