@@ -6,6 +6,8 @@ from datetime import datetime
 
 _ENGINE_PROCS = {}
 _ENGINE_LOGS = {}
+_COMFY_JOBS = {}
+_COMFY_JOBS_LOCK = __import__('threading').Lock()
 # root_abs -> 嵌入状态 {child_hwnd, host_hwnd, offset_y, title, dpi, size}；
 # 保存它是为了"停止/解除嵌入"时能把引擎窗口原样还原，而不是留下一个失效的子窗口。
 _EMBED_STATE = {}
@@ -763,6 +765,28 @@ def comfy_wait(prompt_id, url="http://127.0.0.1:8188", timeout=120, interval=1.0
             return result
         time.sleep(delay)
     return {'ok': False, 'prompt_id': str(prompt_id), 'timed_out': True, 'error': 'ComfyUI 任务轮询超时。'}
+
+def comfy_watch(prompt_id, url="http://127.0.0.1:8188", timeout=900, interval=1.0):
+    """启动后台 ComfyUI 轮询；返回可查询的 job 状态，不阻塞 API 请求。"""
+    import threading
+    key = str(prompt_id)
+    with _COMFY_JOBS_LOCK:
+        existing = _COMFY_JOBS.get(key)
+        if existing and existing.get('running'):
+            return {'ok': True, 'job': existing}
+        job = {'prompt_id': key, 'running': True, 'done': False, 'result': None, 'started_at': datetime.now().isoformat(timespec='seconds')}
+        _COMFY_JOBS[key] = job
+    def worker():
+        result = comfy_wait(key, url, timeout, interval)
+        with _COMFY_JOBS_LOCK:
+            job.update({'running': False, 'done': bool(result.get('done')), 'result': result, 'finished_at': datetime.now().isoformat(timespec='seconds')})
+    threading.Thread(target=worker, name='comfy-watch', daemon=True).start()
+    return {'ok': True, 'job': job}
+
+def comfy_watch_status(prompt_id):
+    with _COMFY_JOBS_LOCK:
+        job = _COMFY_JOBS.get(str(prompt_id))
+        return {'ok': bool(job), 'job': dict(job) if job else None}
 
 def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="assets/generated"):
     """Download one ComfyUI output into a project asset directory with metadata."""

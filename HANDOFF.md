@@ -348,3 +348,6 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 新增 Unreal 诊断单元测试；独立 worktree 全量测试 215 项通过。
 
 仍待实现：Unreal Blueprint/Level 深度桥接、GPU 跨进程真实显存隔离与优先级持久队列、ComfyUI 后台自动轮询 UI/取消任务/许可证与重复资源分析。
+- ComfyUI 新增后台 watcher：`POST /api/comfy/watch/{prompt_id}` 启动有界后台轮询，`GET` 查询状态；前端可持续显示完成结果而不阻塞请求。
+- watcher 生命周期已加入单元测试；全量测试基线仍为 215 项通过（另加 watcher 测试通过）。
+仍待实现：GPU 跨进程真实显存隔离、多 GPU 任务绑定/优先级持久队列；Unreal Blueprint/Level Editor 插件桥接；ComfyUI 取消任务、结果网格、许可证/来源与重复资源分析。
