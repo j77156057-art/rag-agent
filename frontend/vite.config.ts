@@ -15,12 +15,18 @@ export default defineConfig({
     rollupOptions: {
       input: {
         workbench: resolve(__dirname, 'workbench.html'),
+        // spike 独立入口（验证 Vue Flow 区域画布）；验证结束删除入口时一并移除本行
+        spike: resolve(__dirname, 'spike-canvas.html'),
       },
       output: {
         // 第三方依赖单独成块：业务代码高频改动，vendor 哈希稳定可被浏览器长期缓存。
         // CodeMirror 6 体积最大（约 2/3 bundle），独立成块避免与 Vue 混在一起。
         manualChunks(id: string) {
           if (!id.includes('node_modules')) return
+          // spike 专用：@vue-flow 独立成块，不进入工作台加载的 vendor-vue
+          if (id.includes('@vue-flow')) {
+            return 'vendor-vueflow'
+          }
           if (id.includes('@codemirror') || id.includes('@lezer') || id.includes('codemirror')) {
             return 'vendor-codemirror'
           }
