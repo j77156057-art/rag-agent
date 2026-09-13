@@ -833,7 +833,10 @@ def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
                     x=dict(img); name=str(x.get('filename') or 'output.bin'); sub=str(x.get('subfolder') or '')
                     x['preview_url']=url + '/view?' + urllib.parse.urlencode({'filename':name,'subfolder':sub,'type':x.get('type') or 'output'})
                     x['mime']=mimetypes.guess_type(name)[0] or 'application/octet-stream'; outputs.append(x)
-        return {"ok": True, "prompt_id": pid, "status": item.get("status", {}), "outputs": outputs, "done": bool(item.get("outputs"))}
+        status = item.get("status", {}) or {}; messages = status.get('messages') or []
+        executed = sum(1 for m in messages if isinstance(m, list) and m and m[0] in ('execution_cached','executed'))
+        total = len(item.get('prompt', {}) or {})
+        return {"ok": True, "prompt_id": pid, "status": status, "outputs": outputs, "done": bool(item.get("outputs")), "progress": {"executed_nodes": executed, "total_nodes": total, "percent": round(executed * 100 / total, 1) if total else (100.0 if item.get('outputs') else 0.0)}}
     except Exception as e:
         return {"ok": False, "error": f"ComfyUI 状态查询失败：{e}"}
 

@@ -426,3 +426,4 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 尚需在真实 Unreal Editor 中启用 Python 插件并运行脚本后做通信实测；未宣称节点级编辑已完成。
 - Unreal 桥接新增工作台代理接口：`GET /api/engine/unreal-bridge/assets` 与 `/actors`，转发本地 Editor bridge 的 Blueprint 资产和当前关卡 Actor 数据；不可达时返回 `available=false`，不伪造结果。
 - 前端引擎面板新增 Unreal 桥接状态、Blueprint 资产数量和 Level Actor 数量展示，并通过 `/api/engine/unreal-bridge/*` 查询。
+- ComfyUI history 响应新增 `progress.executed_nodes/total_nodes/percent`，前端自动刷新时显示节点进度百分比。
