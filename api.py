@@ -501,6 +501,14 @@ async def unreal_bridge_install_ep(req: UnrealBridgeReq):
     if not req.confirm: return JSONResponse({'ok': False, 'error': '安装 Unreal 桥接脚本需要明确确认。'}, status_code=400)
     return install_unreal_bridge(root, req.force)
 
+@app.get('/api/engine/unreal-bridge/status')
+async def unreal_bridge_status_ep(url: str = 'http://127.0.0.1:8765'):
+    try:
+        with urllib.request.urlopen(url.rstrip('/') + '/', timeout=2) as r: data = json.loads(r.read().decode())
+        return {'ok': True, 'available': True, 'bridge': data}
+    except Exception as e:
+        return {'ok': True, 'available': False, 'error': str(e)}
+
 # 注意：EngineEmbedReq 只在文件上方定义一次（带 x/y/offset_y 的完整版）。
 # 这里曾经又定义了一次窄版本，把上面的覆盖掉——处理器读 req.x 会 AttributeError，
 # 而因为当时还有一个重复的旧处理器在生效，这个错被完全掩盖了。

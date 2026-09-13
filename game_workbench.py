@@ -95,7 +95,24 @@ def install_unreal_bridge(root, force=False):
     rel = 'Content/Python/docmind_bridge.py'; path = _file(base, rel)
     if os.path.exists(path) and not force: return {'ok': False, 'error': '桥接脚本已存在，请使用 force 覆盖。', 'path': rel}
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    source = '"""DocMind Unreal Editor Python bridge."""\nimport unreal\n\ndef list_assets(asset_class="Blueprint"):\n    ar = unreal.AssetRegistryHelpers.get_asset_registry()\n    return [str(x.object_path) for x in ar.get_assets_by_class(asset_class)]\n\ndef list_level_actors():\n    return [{"name": a.get_name(), "class": a.get_class().get_name()} for a in unreal.EditorLevelLibrary.get_all_level_actors()]\n'
+    source = '''"""DocMind Unreal Editor Python HTTP bridge."""
+import json, unreal
+from http.server import BaseHTTPRequestHandler, HTTPServer
+def list_assets(asset_class="Blueprint"):
+    ar = unreal.AssetRegistryHelpers.get_asset_registry()
+    return [str(x.object_path) for x in ar.get_assets_by_class(asset_class)]
+def list_level_actors():
+    return [{"name": a.get_name(), "class": a.get_class().get_name()} for a in unreal.EditorLevelLibrary.get_all_level_actors()]
+class _Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        data = {"ok": True, "service": "docmind-unreal"}
+        if self.path.startswith("/assets"): data["assets"] = list_assets()
+        elif self.path.startswith("/actors"): data["actors"] = list_level_actors()
+        body=json.dumps(data).encode(); self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *_): pass
+def run_server(port=8765):
+    HTTPServer(("127.0.0.1", int(port)), _Handler).serve_forever()
+'''
     with open(path, 'w', encoding='utf-8', newline='\n') as f: f.write(source)
     return {'ok': True, 'path': rel, 'created': True, 'note': '需启用 Unreal Editor Python Script Plugin 后执行。'}
 
