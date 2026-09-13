@@ -816,12 +816,19 @@ def comfy_watch(prompt_id, url="http://127.0.0.1:8188", timeout=900, interval=1.
         existing = _COMFY_JOBS.get(key)
         if existing and existing.get('running'):
             return {'ok': True, 'job': existing}
+    lease_owner = 'comfy:' + key
+    if not _gpu_acquire(lease_owner, timeout=2, purpose='comfyui-watch'):
+        return {'ok': False, 'error': 'GPU 资源正忙，无法监控 ComfyUI 任务。'}
+    with _COMFY_JOBS_LOCK:
         job = {'prompt_id': key, 'running': True, 'done': False, 'result': None, 'started_at': datetime.now().isoformat(timespec='seconds')}
         _COMFY_JOBS[key] = job
     def worker():
-        result = comfy_wait(key, url, timeout, interval)
-        with _COMFY_JOBS_LOCK:
-            job.update({'running': False, 'done': bool(result.get('done')), 'result': result, 'finished_at': datetime.now().isoformat(timespec='seconds')})
+        try:
+            result = comfy_wait(key, url, timeout, interval)
+            with _COMFY_JOBS_LOCK:
+                job.update({'running': False, 'done': bool(result.get('done')), 'result': result, 'finished_at': datetime.now().isoformat(timespec='seconds')})
+        finally:
+            _gpu_release(lease_owner)
     threading.Thread(target=worker, name='comfy-watch', daemon=True).start()
     return {'ok': True, 'job': job}
 
