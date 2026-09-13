@@ -331,3 +331,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - Unreal inspect 现在额外返回 .uproject 插件/目标平台，并解析 Build.cs 依赖。
 
 - ComfyUI history 输出现在包含 preview_url 与 MIME，导入元数据记录 mime，便于前端多媒体预览。
+
+- GPU 队列新增 /api/gpu/cancel/{owner}，可取消尚未获得租约的等待任务；持有中的任务不强制中断。
