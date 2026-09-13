@@ -851,6 +851,8 @@ def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="
         with open(target, "wb") as f: f.write(data)
         meta_path = _file(root, rel + ".json")
         meta = {"source": "comfyui", "url": url, "prompt_id": str(prompt_id), "filename": name, "subfolder": sub, "mime": mimetypes.guess_type(name)[0] or 'application/octet-stream', "imported_at": datetime.now().isoformat(timespec="seconds"), "size": len(data)}
+        for key in ('license', 'source_url', 'author', 'workflow_sha256'):
+            if image.get(key): meta[key] = str(image[key])[:1000]
         with open(meta_path, "w", encoding="utf-8") as f: json.dump(meta, f, ensure_ascii=False, indent=2)
         return {"ok": True, "path": rel.replace("\\", "/"), "metadata": meta}
     except Exception as e: return {"ok": False, "error": f"资源下载失败：{e}"}
