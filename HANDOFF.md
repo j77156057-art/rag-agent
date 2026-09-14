@@ -552,4 +552,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 最新环境复核：Ollama 进程与 API 在线；ComfyUI 端口 8188 当前不可用；未发现 Unity/Unreal 进程。未启动外部服务，避免未经用户操作改变 GPU 负载。
 - 2026-09-15 收尾复核：使用项目 `.venv` 执行 Python 全量测试 **293/293 通过**；`frontend\npm run build` 使用 Vite 5.4.21 成功；工作区 clean。新增提交 `65f5fbf` 修复 ComfyUI watcher/history 终态持久化：状态、进度、输出、完成时间和取消终态会写入 `.docmind/comfy_history.json`。当前 `main` 比 `origin/main` 超前 123 个提交。物理多 GPU、Unity/Unreal 编辑器联机及 ComfyUI 当前端口生成闭环仍缺实机条件，不能宣称已验收。
 - 2026-09-15 实时环境复核：Ollama `/api/tags` 在线，本机 `qwen2.5:7b` 非流式生成返回 `OK`，随后 `/api/ps` 为空（`keep_alive=0`）；Godot 控制台版返回 `4.7.2.stable.official.ed1daf0bf`。ComfyUI `127.0.0.1:8188` 当前连接被拒绝；未发现 Unity 或 UnrealEditor 可执行文件，因此这三项仍未完成实机验收。
+- 追加回归：ComfyUI 项目配置优先级测试通过；项目 `.venv` 全量测试 **294/294 通过**（忽略既存 ResourceWarning），工作区保持 clean。
 
