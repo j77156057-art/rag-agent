@@ -565,4 +565,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 已修复 Chroma 维度错误可诊断性：`vectorstore.add_documents` 现在将维度冲突转换为明确中文错误，并指导切回原 embedding 配置或显式 `reset_collection()`；不会自动删除现有索引。全量测试 **295/295 通过**。
 - Chroma 维度诊断新增专项回归测试（模拟 1024/256 冲突并断言包含 `reset_collection` 指引）；专项测试通过。
 - ComfyUI 重启语义已收紧：加载持久化历史时，`queued/running` 远端任务标记为 `recovered` 并停止显示为 live；保留完成/失败记录，避免服务重启后重复提交或永久占用租约。专项测试通过。
+- 前端 `ComfyWatchJob` 类型已覆盖 `recovered`、取消状态、超时和进度字段；Vite 构建通过，UI 可安全消费重启恢复状态。
 
