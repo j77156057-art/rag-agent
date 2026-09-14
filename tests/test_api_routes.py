@@ -166,6 +166,14 @@ class ApiRouteTests(unittest.TestCase):
         self.assertNotIn("gpu_acquire('ollama:selection'", source)
         self.assertNotIn('gpu_release', source)
 
+    def test_comfy_provenance_route(self):
+        from starlette.testclient import TestClient
+        c=TestClient(api.app)
+        good=c.post('/api/comfy/provenance/validate', json={'author':'a','license':'MIT','source_url':'https://example.com'})
+        self.assertTrue(good.json()['ok']); self.assertFalse(good.json()['review_required'])
+        bad=c.post('/api/comfy/provenance/validate', json={'source_url':'javascript:bad'})
+        self.assertFalse(bad.json()['ok'])
+
 
 if __name__ == '__main__':
     unittest.main()
