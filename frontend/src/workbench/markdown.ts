@@ -12,6 +12,7 @@ export function escapeHtml(s: string): string {
 
 export function inlineHtml(s: string): string {
   let t = escapeHtml(s)
+  t = t.replace(/(https?:\/\/[^\s<]+)/g, '<a class="md-link" href="$1" target="_blank" rel="noopener noreferrer">$1</a>')
   t = t.replace(/`([^`\n]+?)`/g, (_m, c) => `<code class="md-ic">${c}</code>`)
   t = t.replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>')
   return t
