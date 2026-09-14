@@ -170,7 +170,7 @@ def _recover_processes(now):
 
 def process_status():
     with _lock:
-        return {"available": _process_probe_cache["available"], "processes": [dict(v) for v in _processes.values()],
+        return {"available": _process_probe_cache["available"], "compute_apps": list(_process_probe_cache.get("rows") or []), "processes": [dict(v) for v in _processes.values()],
                 "recovery_events": list(_recovery_events)}
 
 
@@ -609,6 +609,7 @@ def status():
         "samples": recent_samples(),
         "processes": ps["processes"],
         "process_probe": {"available": ps["available"]},
+        "compute_apps": ps["compute_apps"],
         "recovery_events": ps["recovery_events"],
         "ollama_keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "0"),
         "ollama_idle": {
