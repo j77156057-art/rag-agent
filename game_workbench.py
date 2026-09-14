@@ -1,7 +1,8 @@
 """Game-development helpers built on top of the region workspace."""
-import json, os, re, subprocess, math, time, mimetypes, sys, ast as _ast, urllib.request, urllib.parse, urllib.error, shutil, zipfile, tempfile, uuid
+import json, os, re, subprocess, math, time, mimetypes, sys, ast as _ast, urllib.request, urllib.parse, urllib.error, shutil, zipfile, tempfile, uuid, hashlib, threading
 import mcp_client
 import gpu_coordinator as _gpu
+from gpu_coordinator import process_environment as _gpu_process_environment
 from datetime import datetime
 
 # ComfyUI 作业租约 TTL：提交后到生成完成之间即使 DocMind 崩了/不再轮询，
@@ -13,6 +14,10 @@ COMFY_MIN_FREE_MB = float(os.getenv("DOCMIND_COMFY_MIN_FREE_MB", "1024") or 0)
 
 _ENGINE_PROCS = {}
 _ENGINE_LOGS = {}
+# prompt_id -> 后台 watch 作业状态（轮询线程维护，不再单独持有 GPU 租约：
+# 租约由 comfy_queue 提交后 reown 给 comfyui:{prompt_id}，终态时由 history 释放）
+_COMFY_JOBS = {}
+_COMFY_JOBS_LOCK = threading.Lock()
 # root_abs -> 嵌入状态 {child_hwnd, host_hwnd, offset_y, title, dpi, size}；
 # 保存它是为了"停止/解除嵌入"时能把引擎窗口原样还原，而不是留下一个失效的子窗口。
 _EMBED_STATE = {}
@@ -40,7 +45,7 @@ def engine_scan(root):
 
 def engine_inspect(root, engine=''):
     """深度读取 Unity/Unreal 项目文本资产，建立可供 AI 定位的轻量索引。"""
-    base=_root(root); result={'ok':True,'engine':engine,'manifests':[],'scenes':[],'prefabs':[],'assets':[],'symbols':[]}
+    base=_root(root); result={'ok':True,'engine':engine,'manifests':[],'scenes':[],'prefabs':[],'assets':[],'symbols':[],'blueprints':[],'levels':[]}
     projects=engine_scan(base).get('projects',[])
     if not engine and projects: engine=projects[0]['engine']; result['engine']=engine
     if engine=='unity':
@@ -65,18 +70,63 @@ def engine_inspect(root, engine=''):
             path=os.path.join(base,p['path'])
             try:
                 with open(path,encoding='utf-8',errors='replace') as f: data=json.load(f)
-                result['manifests'].append({'path':p['path'],'file_version':data.get('FileVersion'),'modules':[x.get('Name') for x in data.get('Modules',[]) if isinstance(x,dict)]})
+                result['manifests'].append({'path':p['path'],'file_version':data.get('FileVersion'),
+                    'modules':[x.get('Name') for x in data.get('Modules',[]) if isinstance(x,dict)],
+                    'plugins':[x.get('Name') for x in data.get('Plugins',[]) if isinstance(x,dict)],
+                    'targets':data.get('TargetPlatforms',[])})
             except Exception: result['manifests'].append({'path':p['path'],'error':'invalid json'})
         for dp,_,files in os.walk(os.path.join(base,'Source')) if os.path.isdir(os.path.join(base,'Source')) else []:
             for fn in files:
                 if fn.endswith(('.h','.cpp','.cs','.Build.cs')):
                     rel=os.path.relpath(os.path.join(dp,fn),base).replace('\\','/')
-                    result['symbols'].append({'path':rel,'kind':'source'})
+                    item={'path':rel,'kind':'build' if fn.endswith('.Build.cs') else 'source'}
+                    if fn.endswith('.Build.cs'):
+                        try:
+                            text=open(os.path.join(dp,fn),encoding='utf-8',errors='replace').read(12000)
+                            item['dependencies']=re.findall(r'"([A-Za-z0-9_]+)"', text)
+                        except OSError: pass
+                    result['symbols'].append(item)
         for dp,_,files in os.walk(base):
             if any(x in dp.split(os.sep) for x in ('.git','Intermediate','DerivedDataCache','Saved')): continue
             for fn in files:
-                if fn.endswith('.uplugin'): result['assets'].append({'path':os.path.relpath(os.path.join(dp,fn),base).replace('\\','/'),'kind':'plugin'})
+                rel=os.path.relpath(os.path.join(dp,fn),base).replace('\\','/')
+                if fn.endswith('.uplugin'): result['assets'].append({'path':rel,'kind':'plugin'})
+                elif fn.endswith('.umap'):
+                    result['levels'].append({'path':rel,'kind':'level'})
+                elif fn.endswith('.uasset'):
+                    low=fn.lower()
+                    kind='blueprint' if ('blueprint' in low or low.startswith('bp_') or low.endswith('_bp.uasset')) else 'asset'
+                    result['blueprints' if kind=='blueprint' else 'assets'].append({'path':rel,'kind':kind})
     return result
+
+def install_unreal_bridge(root, force=False):
+    """安装 Unreal Editor Python 桥接脚本；不修改 .uasset。"""
+    base = _root(root)
+    if not any(x.get('engine') == 'unreal' for x in engine_scan(base).get('projects', [])):
+        return {'ok': False, 'error': '未找到 Unreal .uproject。'}
+    rel = 'Content/Python/docmind_bridge.py'; path = _file(base, rel)
+    if os.path.exists(path) and not force: return {'ok': False, 'error': '桥接脚本已存在，请使用 force 覆盖。', 'path': rel}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    source = '''"""DocMind Unreal Editor Python HTTP bridge."""
+import json, unreal
+from http.server import BaseHTTPRequestHandler, HTTPServer
+def list_assets(asset_class="Blueprint"):
+    ar = unreal.AssetRegistryHelpers.get_asset_registry()
+    return [str(x.object_path) for x in ar.get_assets_by_class(asset_class)]
+def list_level_actors():
+    return [{"name": a.get_name(), "class": a.get_class().get_name()} for a in unreal.EditorLevelLibrary.get_all_level_actors()]
+class _Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        data = {"ok": True, "service": "docmind-unreal"}
+        if self.path.startswith("/assets"): data["assets"] = list_assets()
+        elif self.path.startswith("/actors"): data["actors"] = list_level_actors()
+        body=json.dumps(data).encode(); self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *_): pass
+def run_server(port=8765):
+    HTTPServer(("127.0.0.1", int(port)), _Handler).serve_forever()
+'''
+    with open(path, 'w', encoding='utf-8', newline='\n') as f: f.write(source)
+    return {'ok': True, 'path': rel, 'created': True, 'note': '需启用 Unreal Editor Python Script Plugin 后执行。'}
 
 def engine_prepare(root, engine='godot', executable=''):
     """为 AI 提供幂等的引擎准备动作：探测可执行文件并写入项目配置。"""
@@ -146,6 +196,26 @@ def _resolve_engine_executable(engine, executable):
     return next((p for p in candidates if os.path.isfile(p)), executable or '')
 
 # ---------------------------------------------------------------- Godot 静态诊断
+# Unreal/MSVC 编译诊断：D:\p\Foo.cpp(12,3): error C2065: msg
+_UNREAL_DIAG_RX = re.compile(r'^\s*(?P<path>(?:[A-Za-z]:[\\/])?[^():\r\n]+\.(?:cpp|h|inl|cs|Build\.cs))\((?P<line>\d+)(?:,\d+)?\)\s*:\s*(?P<kind>error|warning)\s*(?P<msg>.*)$', re.I)
+
+
+def parse_unreal_diagnostics(text):
+    """解析 Unreal/MSVC 编译输出，返回与 Godot 统一的诊断结构。"""
+    out, seen = [], set()
+    for raw in (text or '').splitlines():
+        m = _UNREAL_DIAG_RX.match(raw)
+        if not m:
+            continue
+        path = m.group('path').replace('\\', '/').strip()
+        msg = ' '.join(m.group('msg').split())
+        item = (path, int(m.group('line')), m.group('kind').lower(), msg)
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append({'path': path, 'line': int(m.group('line')), 'severity': item[2], 'message': msg})
+    return out
+
 # 格式 1（同行）：res://x.gd:22 - Parse Error: msg ／ x.gd:10: ERROR: msg
 _GODOT_DIAG_RX = re.compile(
     r'(?:res://)?(?P<path>[A-Za-z0-9_./\\-]+\.gd):(?P<line>\d+)\s*[-:]\s*'
@@ -571,13 +641,21 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
     elif selected == 'unreal': args=[executable, os.path.join(root_abs, scene)] if scene else [executable, root_abs]
     else: args=[executable, '--path', root_abs]
     if scene and selected == 'godot': args += ['--editor']
+    # 引擎是长生命周期 GPU 占用方：启动前先拿租约（ttl=0 不限期，由 engine_stop 释放），
+    # 并在 Popen 前把租约卡号注入 CUDA_VISIBLE_DEVICES——这是物理设备隔离的接线点。
+    lease_owner = 'engine:' + root_abs
+    lease = _gpu.acquire_lease(lease_owner, timeout=2, purpose=selected, ttl=0)
+    if not lease.get("ok"):
+        return {'ok': False, 'error': 'GPU 资源正忙，无法启动引擎。', 'reason': lease.get('reason')}
+    child_env = os.environ.copy()
+    child_env.update(_gpu_process_environment(lease.get("gpu")))
     try:
         log_path = _file(root_abs, ".docmind_engine.log")
         log = open(log_path, "a", encoding="utf-8")
-        p = subprocess.Popen(args, cwd=root_abs, stdout=log, stderr=subprocess.STDOUT, text=True)
+        p = subprocess.Popen(args, cwd=root_abs, stdout=log, stderr=subprocess.STDOUT, text=True, env=child_env)
         _ENGINE_PROCS[root_abs] = p
         _ENGINE_LOGS[root_abs] = log
-        result = {"ok": True, "running": True, "pid": p.pid}
+        result = {"ok": True, "running": True, "pid": p.pid, "gpu": lease.get("gpu")}
         if embed and host_hwnd:
             # 引擎建窗口是异步的：轮询直到找到窗口并嵌入成功，或超时。
             # rect 给了就嵌到前端口算的"引擎视窗"，否则按宿主客户区铺满。
@@ -600,8 +678,10 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
             result['embed_error'] = '没有桌面宿主窗口（请用桌面端启动工作台）。'
         return result
     except FileNotFoundError:
+        _gpu.release(lease_owner)
         return {"ok": False, "error": f"找不到 {selected} 可执行文件。请安装引擎，或在 .docmind_engine.json 中配置 executable 的绝对路径。下载地址：{next((x['download'] for x in ENGINE_CATALOG if x['id']==selected), '')}"}
     except Exception as e:
+        _gpu.release(lease_owner)
         return {"ok": False, "error": f"无法启动 {selected}：{e}"}
 
 def engine_stop(root):
@@ -615,6 +695,7 @@ def engine_stop(root):
     detached = engine_detach(root_abs)
     if not p or p.poll() is not None:
         _ENGINE_PROCS.pop(root_abs, None)
+        _gpu.release('engine:' + root_abs)
         return {"ok": True, "stopped": False, "detached": detached.get('was_embedded', False)}
     pid = p.pid
     killed = []
@@ -640,6 +721,7 @@ def engine_stop(root):
         except Exception:  # noqa: BLE001
             pass
     _ENGINE_PROCS.pop(root_abs, None)
+    _gpu.release('engine:' + root_abs)
     return {"ok": True, "stopped": True, "pid": pid,
             "detached": detached.get('was_embedded', False), "killed": killed}
 
@@ -663,22 +745,36 @@ def engine_verify(root, executable="godot", timeout=30):
     cfg=engine_config(root); selected=cfg.get('engine','godot'); executable=cfg.get('executable','godot') if not executable or (executable == 'godot' and selected != 'godot') else executable
     executable = _resolve_engine_executable(selected, executable)
     if selected == 'unity': cmd=[executable,'-batchmode','-nographics','-quit','-projectPath',root_abs]
-    elif selected == 'unreal': cmd=[executable,'-Unattended','-NullRHI','-ProjectOnly']
+    elif selected == 'unreal':
+        projects=[x['path'] for x in engine_scan(root_abs).get('projects',[]) if x.get('engine')=='unreal']
+        project_path=os.path.join(root_abs, projects[0]) if projects else root_abs
+        cmd=[executable, project_path, '-Unattended','-NullRHI','-ProjectOnly']
     else: cmd=[executable,'--headless','--path',root_abs,'--editor','--quit']
+    # 校验是短时 GPU 占用：拿租约（失败直接报错，不排队 30 秒）+ 注入卡号环境
+    lease_owner = 'verify:' + root_abs
+    lease = _gpu.acquire_lease(lease_owner, timeout=2, purpose='engine-verify', ttl=max(30, int(timeout) + 30))
+    if not lease.get("ok"):
+        return {'ok': False, 'error': 'GPU 资源正忙，无法执行引擎校验。', 'reason': lease.get('reason')}
+    verify_env = os.environ.copy()
+    verify_env.update(_gpu_process_environment(lease.get("gpu")))
     try:
         p = subprocess.run(cmd, cwd=root_abs, capture_output=True, text=True, timeout=max(3, min(int(timeout), 180)),
-                           encoding='utf-8', errors='replace')
+                           encoding='utf-8', errors='replace', env=verify_env)
         out = ((p.stdout or '') + '\n' + (p.stderr or ''))[-6000:]
-        diagnostics = parse_godot_diagnostics(out) if selected == 'godot' else []
+        diagnostics = parse_godot_diagnostics(out) if selected == 'godot' else (parse_unreal_diagnostics(out) if selected == 'unreal' else [])
         # 子进程直接捕获的诊断优先；日志文件解析作为历史兜底
         log_errors = engine_logs(root_abs).get("errors", [])
         return {"ok": p.returncode == 0 and not any(d['severity'] == 'error' for d in diagnostics),
-                "returncode": p.returncode, "output": out,
+                "returncode": p.returncode, "output": out, "gpu": lease.get("gpu"),
                 "diagnostics": diagnostics, "errors": diagnostics or log_errors}
     except FileNotFoundError:
         return {"ok": False, "error": f"未找到 {selected} 可执行文件，请配置路径或将其加入 PATH。"}
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": f"{selected} headless 校验超时。"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"引擎校验失败：{e}"}
+    finally:
+        _gpu.release(lease_owner)
 
 def install_runtime_probe(root, dest='addons/docmind_runtime/probe.gd'):
     path = _file(root, dest)
@@ -708,6 +804,31 @@ def _gpu_busy_error(res):
     if res.get("evicted"):
         msg += "（已尝试卸载 Ollama 驻留模型后重试）"
     return msg
+
+# ---------------------------------------------------------------- ComfyUI 模板
+def comfy_templates():
+    return {'ok': True, 'templates': [
+        {'id':'z-image-turbo','name':'Z-Image Turbo 图片','model':'z_image_turbo-Q8_0.gguf','kind':'image'},
+        {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','workflow':'D:/ComfyUI/ComfyUI/user/default/workflows/minimax_h3_t2v.json'}
+    ]}
+
+def comfy_template_workflow(template_id):
+    # TODO 配置化：硬编码本机路径来自开发机 ComfyUI 安装，后续改为模板注册表/环境变量
+    if template_id == 'minimax-h3-i2v':
+        path = r'D:\ComfyUI\ComfyUI\user\default\workflows\minimax_h3_t2v.json'
+        try:
+            with open(path, encoding='utf-8') as f: return {'ok': True, 'id': template_id, 'workflow': json.load(f), 'format': 'ui'}
+        except Exception as e: return {'ok': False, 'error': f'无法读取 H3 workflow：{e}'}
+    if template_id == 'z-image-turbo':
+        return {'ok': True, 'id': template_id, 'format': 'api', 'workflow': {
+            '1': {'class_type':'UnetLoaderGGUF','inputs':{'unet_name':'z_image_turbo-Q8_0.gguf'}},
+            '2': {'class_type':'CLIPLoaderGGUF','inputs':{'clip_name':'Qwen3-4B-Q8_0.gguf','type':'lumina2'}},
+            '3': {'class_type':'TextEncodeZImageOmni','inputs':{'clip':['2',0],'prompt':'a cinematic game character concept','auto_resize_images':True}},
+            '4': {'class_type':'TextEncodeZImageOmni','inputs':{'clip':['2',0],'prompt':'blurry, low quality','auto_resize_images':True}},
+            '5': {'class_type':'EmptyLatentImage','inputs':{'width':512,'height':512,'batch_size':1}},
+            '6': {'class_type':'KSampler','inputs':{'model':['1',0],'seed':42,'steps':8,'cfg':1.0,'sampler_name':'euler','scheduler':'simple','positive':['3',0],'negative':['4',0],'latent_image':['5',0],'denoise':1.0}},
+            '7': {'class_type':'VAELoader','inputs':{'vae_name':'ae.safetensors'}}, '8': {'class_type':'VAEDecode','inputs':{'samples':['6',0],'vae':['7',0]}}, '9': {'class_type':'SaveImage','inputs':{'images':['8',0],'filename_prefix':'docmind_zimage'}}}}
+    return {'ok': False, 'error': '未知模板。'}
 
 
 def comfy_queue(workflow, url="http://127.0.0.1:8188"):
@@ -743,10 +864,15 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188"):
         _gpu.reown(submit_owner, _comfy_job_owner(prompt_id), purpose="comfyui", ttl=COMFY_JOB_TTL)
     else:
         _gpu.release(submit_owner)
-    return {"ok": True, "response": resp,
-            "lease": {"owner": _comfy_job_owner(prompt_id) if prompt_id else "",
-                      "ttl": COMFY_JOB_TTL, "gpu": lease.get("gpu"),
-                      "evicted": bool(lease.get("evicted"))}}
+    canonical = json.dumps(workflow, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+    result = {"ok": True, "response": resp, "workflow_sha256": hashlib.sha256(canonical).hexdigest(),
+              "lease": {"owner": _comfy_job_owner(prompt_id) if prompt_id else "",
+                        "ttl": COMFY_JOB_TTL, "gpu": lease.get("gpu"),
+                        "evicted": bool(lease.get("evicted"))}}
+    if prompt_id:
+        # 后台 watch 只负责轮询状态，不再单独持租约（租约已 reown 给本作业 owner）
+        result["watch"] = comfy_watch(prompt_id, url)
+    return result
 
 def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
     try: url = _safe_comfy_url(url)
@@ -761,13 +887,26 @@ def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
         outputs = []
         for node in (item.get("outputs") or {}).values():
             for img in (node.get("images") or []):
-                if isinstance(img, dict): outputs.append(img)
-        status = item.get("status", {})
+                if isinstance(img, dict):
+                    x = dict(img)
+                    name = str(x.get('filename') or 'output.bin')
+                    sub = str(x.get('subfolder') or '')
+                    x['preview_url'] = url + '/view?' + urllib.parse.urlencode(
+                        {'filename': name, 'subfolder': sub, 'type': x.get('type') or 'output'})
+                    x['mime'] = mimetypes.guess_type(name)[0] or 'application/octet-stream'
+                    outputs.append(x)
+        status = item.get("status", {}) or {}
+        messages = status.get('messages') or []
+        executed = sum(1 for m in messages if isinstance(m, list) and m and m[0] in ('execution_cached', 'executed'))
+        total = len(item.get('prompt', {}) or {})
+        progress = {"executed_nodes": executed, "total_nodes": total,
+                    "percent": round(executed * 100 / total, 1) if total else (100.0 if item.get('outputs') else 0.0)}
         status_str = str(status.get("status_str") or "")
-        finished = bool(item.get("outputs")) or bool(status.get("completed")) or status_str in ("error", "failed")
+        finished = bool(item.get("outputs")) or bool(status.get("completed")) or status_str in ("success", "error", "failed")
         failed = status_str in ("error", "failed")
         result = {"ok": True, "prompt_id": pid, "status": status, "outputs": outputs,
-                  "done": bool(item.get("outputs")), "finished": finished, "failed": failed}
+                  "done": bool(item.get("outputs")), "finished": finished, "failed": failed,
+                  "progress": progress}
         if finished:
             # 生成结束（成功/失败都算）：释放作业租约，让排队的 Ollama/下一作业上卡
             result["lease_released"] = _gpu.force_release(_comfy_job_owner(pid)) is not None
@@ -791,6 +930,11 @@ def comfy_cancel(prompt_id, url="http://127.0.0.1:8188"):
             interrupted = 200 <= r.status < 300
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
+    with _COMFY_JOBS_LOCK:
+        job = _COMFY_JOBS.get(pid)
+        if job:
+            job.update({'cancel_requested': True,
+                        'cancel_requested_at': datetime.now().isoformat(timespec='seconds')})
     released = _gpu.force_release(_comfy_job_owner(pid)) is not None
     # ComfyUI 没在跑时 /interrupt 可能 400/404——租约释放仍算取消成功
     return {"ok": released or interrupted, "prompt_id": pid,
@@ -809,6 +953,36 @@ def comfy_wait(prompt_id, url="http://127.0.0.1:8188", timeout=120, interval=1.0
     # 轮询超时不释放租约：ComfyUI 侧可能仍在生成，交给作业 TTL 兜底回收
     return {"ok":False,"prompt_id":str(prompt_id),"timeout":True,"error":"ComfyUI 生成轮询超时。"}
 
+def comfy_watch(prompt_id, url="http://127.0.0.1:8188", timeout=900, interval=1.0):
+    """启动后台 ComfyUI history 轮询；返回可查询的 job 状态，不阻塞 API 请求。
+
+    注意：watch 线程自身**不持有 GPU 租约**。整作业周期的租约由 comfy_queue
+    提交成功后 reown 为 comfyui:{prompt_id}，终态由 history/cancel 释放——
+    watch 再申请同名/异名租约都会造成重复占卡或自锁。
+    """
+    key = str(prompt_id)
+    with _COMFY_JOBS_LOCK:
+        existing = _COMFY_JOBS.get(key)
+        if existing and existing.get('running'):
+            return {'ok': True, 'job': dict(existing)}
+    with _COMFY_JOBS_LOCK:
+        job = {'prompt_id': key, 'running': True, 'done': False, 'result': None,
+               'started_at': datetime.now().isoformat(timespec='seconds')}
+        _COMFY_JOBS[key] = job
+    def worker():
+        result = comfy_wait(key, url, timeout, interval)
+        with _COMFY_JOBS_LOCK:
+            job.update({'running': False, 'done': bool(result.get('finished') or result.get('done')),
+                        'result': result,
+                        'finished_at': datetime.now().isoformat(timespec='seconds')})
+    threading.Thread(target=worker, name='comfy-watch', daemon=True).start()
+    return {'ok': True, 'job': dict(job)}
+
+def comfy_watch_status(prompt_id):
+    with _COMFY_JOBS_LOCK:
+        job = _COMFY_JOBS.get(str(prompt_id))
+        return {'ok': bool(job), 'job': dict(job) if job else None}
+
 def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="assets/generated"):
     """Download one ComfyUI output into a project asset directory with metadata."""
     try: url = _safe_comfy_url(url)
@@ -826,7 +1000,9 @@ def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="
         if len(data) > COMFY_MAX_DOWNLOAD: return {"ok": False, "error": "资源超过 25MB 下载上限。"}
         with open(target, "wb") as f: f.write(data)
         meta_path = _file(root, rel + ".json")
-        meta = {"source": "comfyui", "url": url, "prompt_id": str(prompt_id), "filename": name, "subfolder": sub, "imported_at": datetime.now().isoformat(timespec="seconds"), "size": len(data)}
+        meta = {"source": "comfyui", "url": url, "prompt_id": str(prompt_id), "filename": name, "subfolder": sub, "mime": mimetypes.guess_type(name)[0] or 'application/octet-stream', "imported_at": datetime.now().isoformat(timespec="seconds"), "size": len(data)}
+        for key in ('license', 'source_url', 'author', 'workflow_sha256'):
+            if image.get(key): meta[key] = str(image[key])[:1000]
         with open(meta_path, "w", encoding="utf-8") as f: json.dump(meta, f, ensure_ascii=False, indent=2)
         return {"ok": True, "path": rel.replace("\\", "/"), "metadata": meta}
     except Exception as e: return {"ok": False, "error": f"资源下载失败：{e}"}
@@ -834,6 +1010,49 @@ def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="
 def comfy_import_all(root, prompt_id, images, url="http://127.0.0.1:8188", dest_dir="assets/generated"):
     results = [comfy_import(root, prompt_id, image, url, dest_dir) for image in (images or [])[:32]]
     return {"ok": all(x.get("ok") for x in results), "results": results, "imported": sum(1 for x in results if x.get("ok"))}
+
+def comfy_resource_duplicates(root, directory="assets/generated"):
+    """按 SHA-256 查找 ComfyUI 导入目录中的重复资源，只读。"""
+    base = _file(root, directory)
+    groups = {}
+    if not os.path.isdir(base):
+        return {'ok': True, 'directory': directory, 'groups': [], 'files': 0}
+    count = 0
+    for dp, _, files in os.walk(base):
+        for fn in files:
+            if fn.endswith('.json'):
+                continue
+            path = os.path.join(dp, fn)
+            try:
+                h = hashlib.sha256()
+                with open(path, 'rb') as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b''): h.update(chunk)
+                rel = os.path.relpath(path, _root(root)).replace('\\', '/')
+                groups.setdefault(h.hexdigest(), []).append(rel); count += 1
+            except OSError:
+                continue
+    dup = [{'sha256': h, 'paths': paths, 'duplicate_count': len(paths)-1} for h, paths in groups.items() if len(paths) > 1]
+    return {'ok': True, 'directory': directory, 'groups': dup, 'duplicate_files': sum(x['duplicate_count'] for x in dup), 'files': count}
+
+def comfy_unused_resources(root, directory="assets/generated"):
+    """查找生成目录中未被项目文本文件引用的资源（仅提供疑似列表）。"""
+    base_root = _root(root); asset_root = _file(root, directory)
+    if not os.path.isdir(asset_root): return {'ok': True, 'directory': directory, 'unused': [], 'files': 0}
+    haystack = []
+    for dp, _, files in os.walk(base_root):
+        if any(x in dp.split(os.sep) for x in ('.git','node_modules','.venv','Library','Intermediate','DerivedDataCache')): continue
+        for fn in files:
+            if fn.endswith(('.json','.meta','.import')) or fn.endswith(('.png','.jpg','.jpeg','.webp','.wav','.mp3','.ogg','.mp4','.webm')): continue
+            try:
+                with open(os.path.join(dp,fn), encoding='utf-8', errors='ignore') as f: haystack.append(f.read())
+            except OSError: pass
+    text='\n'.join(haystack); unused=[]; count=0
+    for dp, _, files in os.walk(asset_root):
+        for fn in files:
+            if fn.endswith('.json'): continue
+            count += 1; rel=os.path.relpath(os.path.join(dp,fn),base_root).replace('\\','/')
+            if fn not in text and rel not in text and ('/' + rel) not in text: unused.append(rel)
+    return {'ok': True, 'directory': directory, 'unused': unused, 'files': count, 'unused_count': len(unused)}
 
 # Dedicated module keeps scene inspection and runtime capture independently testable.
 from scene_runtime import scene_tree, runtime_events, set_scene_property

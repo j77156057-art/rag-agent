@@ -14,6 +14,7 @@ import collections
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -123,6 +124,47 @@ class ApiRouteTests(unittest.TestCase):
                               '期望走到"引擎尚未运行"，实际：%s' % body)
         finally:
             config.set_runtime('code_root', previous or '')
+
+    def test_sse_streams_without_extra_gpu_lease(self):
+        """问答 SSE 层不得自己申请 GPU 租约（P1-3 合并抓出的致命自锁）。
+
+        llm.py 的 _ollama_chat 已以 owner='ollama' 持租约；SSE 再以 ollama:chat
+        申请，serial 模式不同 owner 不可重入 → 每次等 2s 后必报"GPU 正忙"。
+        这里把 ollama 探活与 agent.run 全部打桩：只要 SSE 流能正常吐出 token、
+        协调器里没有残留 holder，就证明锁不在 SSE 层。
+        """
+        import config
+        from starlette.testclient import TestClient
+
+        old_provider = config.get_runtime('llm_provider')
+        config.set_runtime('llm_provider', 'ollama')
+        try:
+            with patch.object(
+                    api, 'check_ollama', return_value={'reachable': True, 'guidance': ''}), \
+                 patch.object(
+                    api.agent, 'run', return_value=iter([
+                        {'type': 'token', 'text': '正常回答'},
+                        {'type': 'final', 'text': '正常回答'},
+                    ])):
+                client = TestClient(api.app)
+                resp = client.post('/api/chat', data={'question': '你好'})
+            self.assertEqual(resp.status_code, 200, resp.text)
+            body = resp.text
+            self.assertIn('正常回答', body)
+            self.assertNotIn('GPU 正忙', body)
+            holders = api.gpu_status().get('holders') or []
+            self.assertEqual(holders, [], 'SSE 结束后残留租约：%s' % holders)
+        finally:
+            config.set_runtime('llm_provider', old_provider or '')
+
+    def test_no_ollama_lease_in_sse_sources(self):
+        """静态护栏：两个 event_stream 里不得再出现 ollama:* 的二次租约 owner。"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, 'api.py'), encoding='utf-8') as f:
+            source = f.read()
+        self.assertNotIn("gpu_acquire('ollama:chat'", source)
+        self.assertNotIn("gpu_acquire('ollama:selection'", source)
+        self.assertNotIn('gpu_release', source)
 
 
 if __name__ == '__main__':
