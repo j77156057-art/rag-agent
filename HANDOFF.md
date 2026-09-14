@@ -532,4 +532,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI 状态探测现在尝试通过监听端口解析外部服务 PID，并将其登记为 `comfyui:service`，因此 GPU 面板可显示常驻服务进程；服务不可达时不登记、不伪造可用状态。当前本次探测 `127.0.0.1:8188` 不可达，未做生成实测。
 - Unreal 新增受控写回代理 `POST /api/engine/unreal-bridge/write`：必须提供任务 ID、目标路径和 `confirm=true`，`.uasset/.umap` 直接拒绝；当前 bridge 仍返回 `available=false`，未实现二进制资产写回。
 - ComfyUI 取消现在区分“已请求中断”和“已终止”：存在 watcher 时 `/interrupt` 成功只标记 `cancel_state=requested`，等待 history 返回终态后再释放租约；取消专项与 GPU 生命周期测试通过。
+- GPU 状态文件现在同时保存等待队列快照；重启恢复时将旧租约标记为 `recovered`、旧等待项标记为 `recovered_waiting`，只记录审计事件，不自动重启任务，避免重复执行。
 
