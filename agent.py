@@ -116,6 +116,11 @@ Action Input: 工具输入（单行文本；多行代码也直接写在这里）
 Thought: 你的思考过程
 Final Answer: 你的最终回答
 
+格式硬边界：
+- 当你不打算调用工具、或当前没有有效 Action 可执行时，必须直接以 `Final Answer:` 开头给出答案，禁止先写 Thought。不要以 `Thought:` 开头把思考过程冒充成最终答案。
+- `Final Answer:` 段落内严禁再出现 `Thought:` / `Action:` / `Action Input:` / `Observation:` 等标记；用户只能看到干净结论。
+- 如果还有工具可调，请用一句 Thought 说明后紧跟 Action，不要用长篇 Thought 替代工具调用。
+
 每次只执行一个 Action，不要编造工具不存在时的结果。
 当某个工具未返回有效结果时，你应当自我反思并换用其他工具或改写查询，而不是立刻给出 Final Answer。"""
 
@@ -126,6 +131,35 @@ _RE_THOUGHT = re.compile(r"Thought:\s*(.*?)(?=Action:|Final Answer:|$)", re.S)
 _RE_ACTION = re.compile(r"Action:\s*(\w+)\s*(?:[（(]\s*(.*?)\s*[)）]\s*)?(?:\n|$)")
 _RE_ACTION_INPUT = re.compile(r"Action Input:\s*(.*?)(?=\n\s*(?:Thought|Action|Final Answer)\s*:|$)", re.S)
 _RE_FINAL = re.compile(r"Final Answer:\s*(.*)", re.S)
+
+
+def _clean_fallback_answer(raw):
+    """
+    兜底清洗：模型经多次纠偏后仍只给出 Thought/Action 等 ReAct 残句时，
+    不要把原始标记抛给用户。优先提取 Final Answer；否则循环剥掉开头 ReAct 块，
+    仍无实质内容则返回友好提示。
+    """
+    text = (raw or "").strip()
+    # 1) 如果里面出现过 Final Answer，直接取它之后的内容
+    m = _RE_FINAL.search(text)
+    if m:
+        return m.group(1).strip()
+    # 2) 循环剥掉开头的 Thought / Action / Action Input / Observation 块
+    leading_block = re.compile(
+        r"^(?:Thought|Action|Action Input|Observation)\s*:\s*"
+        r"(.*?)(?=\n\s*(?:Thought|Action|Action Input|Observation|Final Answer)\s*:|$)",
+        re.S,
+    )
+    while True:
+        mm = leading_block.match(text)
+        if not mm:
+            break
+        text = text[mm.end():].strip()
+    # 3) 清理残留空行
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+    if len(text) > 30 and not re.search(r"^(?:Thought|Action|Action Input|Observation)\s*:", text, re.M):
+        return text
+    return "模型未能按格式完成检索，只返回了中间思考过程。请重试或换一个更具体的问题。"
 
 
 def parse_response(text):
@@ -780,9 +814,10 @@ class Agent:
             elif not acc.strip():
                 final_text = "模型本轮未返回有效正文（可能在思考阶段耗尽输出长度）。请重试或换一个更具体的问题。"
             else:
-                # 连纠偏后仍不合格式的残句：原样兜底（保持旧行为），但记入历史
-                self.history.append({"user": question, "assistant": acc})
-                yield {"type": "final", "text": acc}
+                # 连纠偏后仍不合格式的残句：清洗 ReAct 标记后再兜底，不再把 Thought/Action 原样抛给用户
+                final_text = _clean_fallback_answer(acc)
+                self.history.append({"user": question, "assistant": final_text})
+                yield {"type": "final", "text": final_text}
                 return
             yield {"type": "final", "text": final_text}
             return
