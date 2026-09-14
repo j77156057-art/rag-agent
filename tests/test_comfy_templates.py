@@ -18,4 +18,10 @@ class T(unittest.TestCase):
  def test_provenance_validation_requires_review_without_license(self):
   self.assertTrue(gw.comfy_validate_provenance({'author':'a','source_url':'https://example.com'})['review_required'])
   self.assertFalse(gw.comfy_validate_provenance({'source_url':'javascript:bad'})['ok'])
+ def test_retry_limits_and_requires_failed_status(self):
+  gw._COMFY_JOBS['old']={'status':'completed','workflow':{}}
+  self.assertFalse(gw.comfy_retry('old')['ok'])
+  gw._COMFY_JOBS['bad']={'status':'failed','workflow':{},'retry_count':2}
+  self.assertFalse(gw.comfy_retry('bad')['ok'])
+  gw._COMFY_JOBS.pop('old',None); gw._COMFY_JOBS.pop('bad',None)
 if __name__=='__main__': unittest.main()
