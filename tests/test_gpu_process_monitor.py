@@ -11,6 +11,10 @@ class GpuProcessMonitorTests(unittest.TestCase):
         rec=g.register_process(321,'engine:test',1,'godot')
         self.assertEqual(rec['pid'],321); self.assertTrue(g.heartbeat_process(321))
         self.assertEqual(g.process_status()['processes'][0]['owner'],'engine:test')
+    def test_register_is_idempotent_and_preserves_start(self):
+        first=g.register_process(322,'comfyui:service',0,'comfyui')
+        second=g.register_process(322,'comfyui:service',0,'comfyui')
+        self.assertEqual(first['started_at'], second['started_at'])
     def test_dead_process_is_recovered_and_lease_released(self):
         g._leases[0]={'owner':'engine:test','purpose':'godot','since':0,'ttl':0}
         g.register_process(999,'engine:test',0,'godot')

@@ -158,10 +158,18 @@ def _default_process_probe():
 
 def register_process(pid, owner, gpu=None, purpose="", heartbeat=None):
     """注册实际子进程，返回注册记录。"""
-    rec = {"pid": int(pid), "owner": str(owner), "gpu": gpu, "purpose": str(purpose),
-           "started_at": time.time(), "status": "running", "heartbeat_required": heartbeat is not None,
-           "last_heartbeat": heartbeat if heartbeat is not None else time.time()}
-    with _lock: _processes[int(pid)] = rec
+    now = time.time(); key = int(pid)
+    with _lock:
+        old = _processes.get(key)
+        if old:
+            old.update({"owner": str(owner), "gpu": gpu, "purpose": str(purpose), "status": "running",
+                        "heartbeat_required": heartbeat is not None,
+                        "last_heartbeat": heartbeat if heartbeat is not None else old.get("last_heartbeat", now)})
+            return dict(old)
+        rec = {"pid": key, "owner": str(owner), "gpu": gpu, "purpose": str(purpose),
+               "started_at": now, "status": "running", "heartbeat_required": heartbeat is not None,
+               "last_heartbeat": heartbeat if heartbeat is not None else now}
+        _processes[key] = rec
     return dict(rec)
 
 def heartbeat_process(pid):
