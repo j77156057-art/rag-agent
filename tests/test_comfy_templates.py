@@ -36,6 +36,11 @@ class T(unittest.TestCase):
   ui={'nodes':[{'id':105,'type':'4c314f31-ecda-4b08-ae98-faaba1bf613f','inputs':[],'widgets_values':[]}], 'links':[]}
   r=gw.comfy_ui_to_api_workflow(ui)
   self.assertEqual(r['workflow']['105']['class_type'],'TESpeedMiniMaxH3')
+ def test_ui_conversion_skips_markdown_annotations(self):
+  ui={'nodes':[{'id':1,'type':'MarkdownNote','inputs':[],'widgets_values':['help']},
+               {'id':2,'type':'RealNode','inputs':[],'widgets_values':[]}], 'links':[]}
+  r=gw.comfy_ui_to_api_workflow(ui)
+  self.assertTrue(r['ok']); self.assertNotIn('1', r['workflow']); self.assertIn('2', r['workflow'])
  def test_project_workflow_path_precedes_environment(self):
   with tempfile.TemporaryDirectory() as d:
    project=os.path.join(d,'project'); os.makedirs(project)
