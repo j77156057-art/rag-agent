@@ -15,4 +15,7 @@ class T(unittest.TestCase):
   import inspect
   src=inspect.getsource(gw.comfy_import)
   self.assertIn("asset_kind", src); self.assertIn(".glb", src)
+ def test_provenance_validation_requires_review_without_license(self):
+  self.assertTrue(gw.comfy_validate_provenance({'author':'a','source_url':'https://example.com'})['review_required'])
+  self.assertFalse(gw.comfy_validate_provenance({'source_url':'javascript:bad'})['ok'])
 if __name__=='__main__': unittest.main()
