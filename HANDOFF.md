@@ -557,4 +557,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 最新验证：在 `frontend` 目录正确执行 `npm run build`（Vite 5.4.21）成功；项目 `.venv` 全量测试 **295/295 通过**；工作区 clean。根目录没有 `package.json`，构建必须从 `frontend` 目录执行。
 - 最新 GPU 只读实测：`nvidia-smi` 读取 RTX 5070 Ti Laptop 单卡，12227 MB 总显存、约 2.4 GB 使用、52–53°C；compute-apps 仍返回 `[N/A]`，协调器正确报告 `process_probe.available=false`。本次独立状态读取 `holders=[]`、`queue=[]`、`recovery_events=[]`，没有伪造进程显存或多卡数据。
 - ComfyUI 前端任务历史新增“刷新历史”按钮，显式重新请求后端分页接口；构建已通过，避免仅依赖浏览器 localStorage 的旧任务列表。
+- 3D 输出能力口径已收紧：`.glb/.gltf/.fbx/.obj/.stl/.ply/.usd/.usdz` 仅标记为 `asset_kind=3d` 并提供导入元数据，`preview_supported=false`，直到接入引擎渲染器；前端显示相应的导入提示。
 
