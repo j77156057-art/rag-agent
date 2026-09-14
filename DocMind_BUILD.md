@@ -371,3 +371,7 @@
 - **Git 前置依赖**：第七次构建起分发包**自带 MinGit**（`DocMind/MinGit/`，frozen 启动自动加入 PATH），用户机器无需安装 Git；仅源码运行（.venv / dev）仍需系统装有 git。分区工作台的初始化/提交/回滚基于每个分区独立 git 仓库；git 不可用时初始化会在写文件前给出明确提示，不产生半成品。
 - **分发版不含 Python 解释器**：分区 `builtin:py` 校验在进程内做语法编译检查（exe/源码均可用）；但 pytest/unittest 试玩（playtest auto）与 cProfile 剖析需要真实 Python 环境，请在源码 `.venv` 中运行，exe 内会直接返回明确提示而不会静默失败。
 - 第七次构建起 `docmind.spec` 含 MinGit 随包步骤（见上文）；早期「临时构建 spec 已清理」的说明不再适用。
+
+### Inno Setup 安装器
+
+可使用 installer\\DocMind.iss 构建安装器。安装器支持覆盖升级、开始菜单/桌面快捷方式和标准卸载；当前机器未安装 ISCC，因此尚未生成 Setup.exe。
