@@ -1,26 +1,32 @@
 @echo off
-chcp 65001 >nul
+chcp 936 >nul
+REM ============================================================================
+REM ±àÂëÒªÇó£º±¾ÎÄ¼þ±ØÐë±£´æÎª ANSI/GBK(cp936)¡£Ô­ÒòÍ¬ run_desktop.bat£º
+REM ÓÃ UTF-8 ±£´æÊ± cmd »á°´Ä¬ÈÏ´úÂëÒ³(936)Îó¶ÁÖÐÎÄ×¢ÊÍ£¬ÂÒÂë×Ö½Ú»á³ÔµôÐÐÎ²
+REM CRLF ÉõÖÁÏÂÒ»ÐÐ¿ªÍ·µÄ×Ö·û£¬±¨³ö 'op.py' ²»ÊÇÄÚ²¿»òÍâ²¿ÃüÁî ÕâÀà¹Ö´í¡£
+REM ============================================================================
 setlocal
 cd /d "%~dp0dist\DocMind"
 if not exist DocMind.exe (
-  echo [é”™è¯¯] åœ¨ %~dp0dist\DocMind æ‰¾ä¸åˆ° DocMind.exe
-  echo è¯·ç¡®è®¤æœ¬æ‰¹å¤„ç†ä½äºŽ rag-agent ç›®å½•ï¼Œä¸”å·²æˆåŠŸæž„å»ºã€‚
+  echo [´íÎó] ÔÚ %~dp0dist\DocMind ÕÒ²»µ½ DocMind.exe
+  echo ÇëÈ·ÈÏ±¾Åú´¦ÀíÎ»ÓÚ rag-agent Ä¿Â¼£¬ÇÒÒÑ³É¹¦¹¹½¨¡£
   pause
   exit /b 1
 )
 echo ============================================
-echo   DocMind å¯åŠ¨å™¨ï¼ˆè¯Šæ–­æ¨¡å¼ï¼‰
+echo   DocMind Æô¶¯Æ÷£¨Õï¶ÏÄ£Ê½£©
 echo ============================================
-echo æ­£åœ¨å¯åŠ¨ DocMind.exe ...
+echo ÕýÔÚÆô¶¯ DocMind.exe ...
 start "" DocMind.exe
-echo å·²å‘èµ·å¯åŠ¨ï¼Œç­‰å¾… 6 ç§’åŽæ£€æµ‹æœ¬åœ°æœåŠ¡...
+echo ÒÑ·¢ÆðÆô¶¯£¬µÈ´ý 6 Ãëºó¼ì²â±¾µØ·þÎñ...
 timeout /t 6 >nul
-curl --noproxy * -s -o nul -w "æœ¬åœ°æœåŠ¡(api/config): HTTP %{http_code}\n" http://127.0.0.1:8000/api/config 2>nul
+echo ¼ì²â±¾µØ·þÎñ api/config£º
+curl --noproxy "*" -s -o nul -w "HTTP %%{http_code}\n" http://127.0.0.1:8000/api/config 2>nul
 echo.
-echo ---- å¯åŠ¨æ—¥å¿— docmind_desktop.log ----
-if exist docmind_desktop.log (type docmind_desktop.log) else (echo æš‚æ— æ—¥å¿—)
+echo ---- Æô¶¯ÈÕÖ¾ docmind_desktop.log ----
+if exist docmind_desktop.log (type docmind_desktop.log) else (echo ÔÝÎÞÈÕÖ¾)
 echo ----------------------------------------
-echo è‹¥ä¸Šé¢æ˜¾ç¤º HTTP 200ï¼Œè¯·åœ¨æµè§ˆå™¨æ‰“å¼€: http://127.0.0.1:8000/
-echo è‹¥ä»æ˜¯ç©ºç™½/æ— ååº”ï¼Œè¯·æŠŠä»¥ä¸Šå…¨éƒ¨å†…å®¹å‘ç»™æˆ‘ã€‚
-echo ï¼ˆæ³¨æ„ï¼šå…³é—­æœ¬çª—å£ä¸ä¼šåœæ­¢ DocMindï¼Œåœæ­¢è¯·åœ¨ä»»åŠ¡ç®¡ç†å™¨ç»“æŸ DocMind.exe è¿›ç¨‹ï¼‰
+echo ÈôÉÏÃæÏÔÊ¾ HTTP 200£¬ÇëÔÚä¯ÀÀÆ÷´ò¿ª: http://127.0.0.1:8000/
+echo ÈôÈÔÊÇ¿Õ°×/ÎÞ·´Ó¦£¬Çë°ÑÒÔÉÏÈ«²¿ÄÚÈÝ·¢¸øÎÒ¡£
+echo £¨×¢Òâ£º¹Ø±Õ±¾´°¿Ú²»»áÍ£Ö¹ DocMind£¬Í£Ö¹ÇëÔÚÈÎÎñ¹ÜÀíÆ÷½áÊø DocMind.exe ½ø³Ì£©
 pause

@@ -1,6 +1,23 @@
 @echo off
-REM DocMind æ¡Œé¢ç«¯ä¸€é”®å¯åŠ¨ï¼šæ¿€æ´» venv å¹¶è¿è¡Œ desktop.py
-REM è·¯å¾„å«å•å¼•å·ç”¨æˆ·åæ—¶åŠ¡å¿…ç”¨åŒå¼•å·åŒ…è£¹ï¼ˆ%dp0 å·²è‡ªå¸¦ç»“å°¾åæ–œæ ï¼‰
+chcp 936 >nul
+REM ============================================================================
+REM ±àÂëÒªÇó£º±¾ÎÄ¼þ±ØÐë±£´æÎª ANSI/GBK(cp936)¡£
+REM ÈôÓÃ UTF-8 ±£´æ£¬cmd »á°´Ä¬ÈÏ´úÂëÒ³(936)Îó¶ÁÖÐÎÄ×¢ÊÍ£¬ÂÒÂë×Ö½Ú»á³ÔµôÐÐÎ² CRLF¡¢
+REM ÉõÖÁ³ÔµôÏÂÒ»ÐÐ¿ªÍ·µÄ×Ö·û£¬±íÏÖ¾ÍÊÇÕâÐ©"¿´²»¶®"µÄ±¨´í£º
+REM   'op.py' ²»ÊÇÄÚ²¿»òÍâ²¿ÃüÁî            <- desktop.py ±»´ÓÖÐ¼äÇÐ¿ª
+REM   'åŒå¼•å·åŒ…è£¹ï¼ˆ~dp0"' ²»ÊÇÄÚ²¿»òÍâ²¿ÃüÁî   <- ÖÐÎÄ×¢ÊÍÂÒÂëºó % ±»³Ôµô
+REM ============================================================================
+REM DocMind ×ÀÃæ¶ËÒ»¼üÆô¶¯£ºÓÃÏîÄ¿ venv ÔËÐÐ desktop.py
+REM Â·¾¶º¬µ¥ÒýºÅÓÃ»§ÃûÊ±Îñ±ØÓÃË«ÒýºÅ°ü¹ü£¨%~dp0 ÒÑ×Ô´ø½áÎ²·´Ð±¸Ü£©
+setlocal
 cd /d "%~dp0"
-.venv\Scripts\python.exe desktop.py
+if not exist ".venv\Scripts\python.exe" (
+  echo [´íÎó] ÕÒ²»µ½ .venv\Scripts\python.exe
+  echo ÇëÏÈÔÚ±¾Ä¿Â¼Ö´ÐÐ£ºpython -m venv .venv ^&^& .venv\Scripts\pip install -r requirements.txt
+  pause
+  exit /b 1
+)
+".venv\Scripts\python.exe" desktop.py
+echo.
+echo [ÌáÊ¾] desktop.py ÒÑÍË³ö£¨ÍË³öÂë %errorlevel%£©¡£
 pause

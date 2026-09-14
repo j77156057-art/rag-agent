@@ -718,6 +718,17 @@ def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
     except Exception as e:
         return {"ok": False, "error": f"ComfyUI 状态查询失败：{e}"}
 
+def comfy_wait(prompt_id, url="http://127.0.0.1:8188", timeout=120, interval=1.0):
+    deadline=time.time()+max(1,min(int(timeout),600))
+    while time.time()<deadline:
+        result=comfy_history(prompt_id,url)
+        if not result.get("ok"): return result
+        status=result.get("status") or {}
+        if result.get("done") or status.get("completed") or status.get("status_str") in ("error","failed"):
+            result["finished"]=True; return result
+        time.sleep(max(.1,min(float(interval),10)))
+    return {"ok":False,"prompt_id":str(prompt_id),"timeout":True,"error":"ComfyUI 生成轮询超时。"}
+
 def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="assets/generated"):
     """Download one ComfyUI output into a project asset directory with metadata."""
     try: url = _safe_comfy_url(url)
@@ -1379,3 +1390,4 @@ def require_approval(root, action, target):
             f"审批通过后 {APPROVAL_TTL_SECONDS // 60} 分钟内该操作放行。"
         ),
     }
+

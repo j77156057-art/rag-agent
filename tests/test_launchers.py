@@ -1,0 +1,135 @@
+# -*- coding: utf-8 -*-
+"""启动器（.bat）编码护栏。
+
+## 这个坑长什么样（2026-09-14 真实踩过）
+
+批处理文件里的非 ASCII 字符，cmd 会用**当前代码页**去解析字节。文件按 UTF-8 保存、而系统
+默认代码页是 936(GBK) 时，中文注释被误读成乱码；乱码的"前导字节"还会**吃掉行尾 CRLF、
+甚至吃掉下一行开头的字符**，于是报出这些完全指不到根因的错：
+
+    'op.py' 不是内部或外部命令                 <- desktop.py 被从中间切开
+    '鍙屽紩鍙峰寘瑁癸紙~dp0"' 不是内部或外部命令    <- 中文注释乱码后 % 被吃掉
+
+静态检查、语法检查全看不出来，只有双击运行时才炸。
+
+## 护栏规则
+
+1. 每个 .bat 必须能按 cp936 无损解码（中文 Windows 的默认代码页）；
+2. **不能是"存成 UTF-8 却在 GBK 下解析"**——这是原始 bug 的判别器：
+   同一份字节分别按 UTF-8 和 GBK 解一遍，数谁解出来的常用汉字多，就能判定真实编码；
+3. **会执行的命令行里不允许出现非 ASCII**（中文只允许待在 REM / echo 文本里）。
+   命令行是 ASCII 就与代码页无关，解析一定正确；echo 里的中文最坏只是显示乱码，不会执行错；
+4. 含中文的文件必须显式 `chcp 936`，否则中文显示成乱码。
+"""
+import glob
+import os
+import re
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 只用 REM / 这些关键字开头的行允许带中文
+_TOLERANT_PREFIXES = ('rem', '@echo', 'echo', '::')
+# 常用汉字：用来判别"这份字节到底是 UTF-8 还是 GBK"（乱码里几乎不会出现它们）
+_COMMON_CJK = set('的一是不了在人有我你他这中文件本错误路径启动运行请先用检失败成功提示注意'
+                  '保存编码注释命令执行程序语言测试通过项目目录版本')
+
+
+def _launchers():
+    return sorted(glob.glob(os.path.join(ROOT, '*.bat')) +
+                  glob.glob(os.path.join(ROOT, '*.cmd')))
+
+
+def _cjk_score(text):
+    return sum(1 for ch in text if ch in _COMMON_CJK)
+
+
+def _has_non_ascii(text):
+    return any(ord(ch) > 127 for ch in text)
+
+
+class LauncherEncodingTests(unittest.TestCase):
+    def test_bat_files_decode_as_cp936(self):
+        for path in _launchers():
+            with open(path, 'rb') as f:
+                raw = f.read()
+            try:
+                raw.decode('gbk')
+            except UnicodeDecodeError as e:
+                self.fail('%s 无法按 cp936 解码（%s）。批处理必须存为 ANSI/GBK，'
+                          '否则 cmd 会误读中文并可能吃掉后续字符。' % (os.path.basename(path), e))
+
+    def test_not_utf8_saved_but_gbk_parsed(self):
+        """判别器：不能"存成 UTF-8 但没声明 65001"——这正是原始 bug。"""
+        for path in _launchers():
+            name = os.path.basename(path)
+            with open(path, 'rb') as f:
+                raw = f.read()
+            if not any(b >= 0x80 for b in raw):
+                continue                                   # 纯 ASCII，任何代码页都一样
+            text_gbk = raw.decode('gbk')
+            declares_cp = re.search(r'chcp\s+(\d+)', text_gbk[:400].lower())
+            declares = declares_cp.group(1) if declares_cp else ''
+            try:
+                text_utf8 = raw.decode('utf-8')
+                utf8_decodable = True
+            except UnicodeDecodeError:
+                utf8_decodable = False
+
+            if declares == '65001':
+                self.assertTrue(utf8_decodable,
+                                '%s 声明了 chcp 65001，但字节不是合法 UTF-8' % name)
+                continue
+
+            # 没声明 65001：它必须是 GBK。若按 UTF-8 能解出**更多常用汉字**，
+            # 说明这份文件其实是 UTF-8 保存的 —— cmd 会按 GBK 读，必然乱码。
+            if utf8_decodable:
+                score_utf8, score_gbk = _cjk_score(text_utf8), _cjk_score(text_gbk)
+                self.assertLessEqual(
+                    score_utf8, score_gbk,
+                    '%s 看起来是 UTF-8 保存的（UTF-8 解读命中常用汉字 %d 个，GBK 只有 %d 个），'
+                    '但它没有声明 chcp 65001 —— cmd 会按默认代码页(936)误读中文，'
+                    '乱码字节能吃掉行尾 CRLF 甚至下一行开头，报出 "xx 不是内部或外部命令" 这类怪错。'
+                    '请用 ANSI/GBK 另存，或加 chcp 65001 并改用 UTF-8。'
+                    % (name, score_utf8, score_gbk))
+
+    def test_executable_lines_are_pure_ascii(self):
+        """会执行的命令行必须纯 ASCII（中文只允许在 REM/echo 文本里）。"""
+        for path in _launchers():
+            name = os.path.basename(path)
+            with open(path, 'rb') as f:
+                text = f.read().decode('gbk')
+            for lineno, line in enumerate(text.splitlines(), 1):
+                stripped = line.strip()
+                if not stripped or stripped.lower().startswith(_TOLERANT_PREFIXES):
+                    continue
+                # `) else (echo 暂无日志)` 这类：中文在 echo 参数里，属于显示内容，放行
+                if 'echo' in stripped.lower() and not _has_non_ascii(
+                        stripped.split('echo', 1)[0]):
+                    continue
+                if _has_non_ascii(line):
+                    self.fail('%s:%d 是命令行但含非 ASCII 字符：%r\n'
+                              '中文请挪进 REM/echo 文本——命令行一旦含多字节字符，'
+                              'cmd 在不同代码页下会解析成完全不同的东西。' % (name, lineno, line))
+
+    def test_non_ascii_launchers_declare_codepage(self):
+        for path in _launchers():
+            name = os.path.basename(path)
+            with open(path, 'rb') as f:
+                raw = f.read()
+            if not any(b >= 0x80 for b in raw):
+                continue
+            head = '\n'.join(raw.decode('gbk').splitlines()[:6]).lower()
+            self.assertIn('chcp 936', head,
+                          '%s 含中文但前几行没有 `chcp 936`，中文会显示成乱码' % name)
+
+    def test_no_replacement_characters(self):
+        for path in _launchers():
+            with open(path, 'rb') as f:
+                text = f.read().decode('gbk', errors='replace')
+            bad = [i for i, ln in enumerate(text.splitlines(), 1) if '\ufffd' in ln]
+            self.assertEqual(bad, [], '%s 在第 %s 行解码出乱码字符' % (os.path.basename(path), bad))
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,8 +1,8 @@
 # DocMind 项目交接清单（给接手 AI）
 
 > **更新时间**：2026-09-14（含 P0-1 实机闭环）｜ **基线提交**：`809a3b9` + 本次嵌入加固
-> **全量测试**：**202 项全部通过** ｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
-> **引擎嵌入实机自检**：`verify_engine_embed.py` **64/64**（真 Godot 4.7.2 + 真 Win32 宿主，含真实合成键鼠与 UI 调用路径）｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` **27/27** ｜ **前端构建**：`npm run build` 通过
+> **全量测试**：**218 项全部通过** ｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
+> **引擎嵌入实机自检**：`verify_engine_embed.py` **68/68**（真 Godot 4.7.2 + 真 Win32 宿主，含真实合成键鼠与 UI 调用路径）｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` **27/27** ｜ **前端构建**：`npm run build` 通过
 > 本文是项目唯一权威交接文档，取代并删除了旧版 `HANDOFF.md`、`AI_BRIEF.md`、`DEV_WORKBENCH_AUDIT.md`、`HANDOFF_ENGINE_EMBEDDING.md`、`HANDOFF_REMAINING_WORK.md`（旧 HANDOFF.md 由本同名文件接管）。
 > **铁律：规划项一律写在第 5 节，不得描述为已完成；做完一项就把它移到第 4 节时间线并注明提交号。**
 
@@ -123,7 +123,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 ### P3　第 15 次冻结发布
 
-按 `docmind-frozen-release` Skill：py_compile → **202 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(64) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → Godot 实机验证 → 前端 6 文件 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加第十五次记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
+按 `docmind-frozen-release` Skill：py_compile → **218 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(64) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → Godot 实机验证 → 前端 6 文件 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加第十五次记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
 
 ### 其他已记录的改进点
 
@@ -262,7 +262,20 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
       即便只是自检脚本，也要挂 `loaded` 事件 + 看门狗 `win.destroy()`，别把白窗口留在用户屏幕上。
     - 自检脚本里用临时工程起引擎时，**别把启动代码写到 `finally` 之后**——临时目录那时已被删，
       `Popen(cwd=...)` 会抛 `FileNotFoundError`，报出来的却是"找不到引擎可执行文件"，极具误导性。
-20. **浏览器默认会请求 `/favicon.ico`**：不接这条路由，每个页面都留一条 404，浏览器冒烟的
+21. **批处理文件（.bat）必须存为 ANSI/GBK 并显式 `chcp 936`**（2026-09-14 实机踩）：
+    cmd 按**当前代码页**解析 .bat 字节。文件若按 UTF-8 保存、系统默认代码页是 936，
+    中文注释会被误读成乱码，乱码的“前导字节”还会**吃掉行尾 CRLF、甚至吃掉下一行开头的字符**，
+    于是报出这些完全指不到根因的错：
+    `'op.py' 不是内部或外部命令`（`desktop.py` 被从中间切开）、
+    `'鍙屽紩鍙峰寘瑁癸紙~dp0"' 不是内部或外部命令`（中文乱码后 `%` 被吃掉）。
+    **两条硬规则**：① 会执行的命令行只能是纯 ASCII（中文只放 REM/echo 文本里，最坏只是显示乱码）；
+    ② 含中文就写 `chcp 936` 并按 ANSI/GBK 另存。`tests/test_launchers.py` 守着这两条。
+22. **用外层脚本工具往 Python 里写代码时，换行可能被吞成字面量转义**：
+    曾出现整个函数被压成一行、用 `` `r`n `` 当换行写进 `game_workbench.py` → `SyntaxError`，
+    应用直接起不来。**改完 .py 必须 `py_compile` 一次**；写完带反斜杠转义的字符串（如 `
+`）
+    尤其要回读文件确认，别只看脚本“执行成功”。自检脚本里写文件也同理，用原始字符串更稳。
+23. **浏览器默认会请求 `/favicon.ico`**：不接这条路由，每个页面都留一条 404，浏览器冒烟的
     "无失败请求"断言永远红。图标走 `frontend/public/favicon.ico` → Vite 拷进 `web/` → 后端路由。
 
 ---
