@@ -213,6 +213,10 @@ onBeforeUnmount(() => {
           <div v-for="p in st?.processes || []" :key="p.pid" class="gp-faint">PID {{ p.pid }} · {{ p.owner }} · GPU {{ p.gpu ?? '—' }} · {{ p.status }}</div>
           <div v-for="p in st?.compute_apps || []" :key="'c'+p.pid" class="gp-faint">计算进程 {{ p.pid }} · {{ p.process_name }} · {{ p.used_mb }} MB</div>
         </div>
+        <div v-if="st?.recovery_events?.length" class="gp-idle">
+          <div class="gp-idle-title">最近回收事件</div>
+          <div v-for="(e,i) in st.recovery_events.slice(-8).reverse()" :key="i" class="gp-faint">{{ e.status || 'recovered' }} · {{ e.owner || 'unknown' }} · GPU {{ e.gpu ?? '—' }}</div>
+        </div>
 
         <!-- Ollama 空闲自动卸载 -->
         <div class="gp-idle">
