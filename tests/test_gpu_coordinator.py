@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import gpu_coordinator as g  # noqa: E402
 import game_workbench as gw  # noqa: E402
+import api  # noqa: E402
 
 
 def _fake_gpus(used0=10000, used1=1000, total=12000):
@@ -73,6 +74,38 @@ class GpuCoordinatorTest(unittest.TestCase):
         self.assertIsNone(g.memory_info())
         # 无探测时 serial 仍可工作（退化为单卡视图）
         self.assertTrue(g.acquire_lease("a", 0.1)["ok"])
+
+    def test_real_probe_ttl_cache(self):
+        """真实探测路径（非注入）在 TTL 内只调一次 nvidia-smi 替代函数。"""
+        g.set_gpu_probe(None)  # 回到"真实探测"路径
+        orig_default = g._default_probe
+        orig_ttl = g.PROBE_CACHE_TTL
+        calls = {"n": 0}
+        try:
+            g.PROBE_CACHE_TTL = 0.3
+
+            def fake_default():
+                calls["n"] += 1
+                return _fake_gpus(used0=1000)
+
+            g._default_probe = fake_default
+            g._probe_cache.update(t=0.0, rows=None)
+            g.query_gpus(); g.query_gpus(); g.memory_info()
+            self.assertEqual(calls["n"], 1)  # TTL 内全部复用
+            time.sleep(0.35)
+            g.query_gpus()
+            self.assertEqual(calls["n"], 2)  # 过期后重探
+        finally:
+            g._default_probe = orig_default
+            g.PROBE_CACHE_TTL = orig_ttl
+            g._probe_cache.update(t=0.0, rows=None)
+
+    def test_injected_probe_never_cached(self):
+        state = {"used": 1000}
+        g.set_gpu_probe(lambda: _fake_gpus(used0=state["used"]))
+        self.assertEqual(g.memory_info()["used_mb"], 2000)   # 卡0 1000 + 卡1 1000
+        state["used"] = 9000  # 立即生效，无 TTL 延迟
+        self.assertEqual(g.memory_info()["used_mb"], 10000)  # 卡0 9000 + 卡1 1000
 
     # ---- multi 模式 ------------------------------------------------------
 
@@ -162,6 +195,30 @@ class GpuCoordinatorTest(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertFalse(r.get("evicted"))
         self.assertEqual(calls, [])
+
+    def test_evict_hook_not_called_when_active_holder(self):
+        """有任务正持租约（卡忙）时排队者不得触发卸载：卸载不释放租约，
+        只会让用户白付一次模型冷加载。"""
+        g.set_gpu_probe(lambda: _fake_gpus(used0=1000))  # 显存本身充足
+        self.assertTrue(g.acquire_lease("export-job", 0.1)["ok"])
+        calls = []
+        g.register_hook("ollama", lambda: calls.append(1) or True)
+        r = g.acquire_lease("b", 0.3, min_free_mb=5000, evict=("ollama",))
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "timeout")
+        self.assertEqual(calls, [])
+        g.force_release("export-job")
+
+    def test_reentrant_flag_matches_real_state(self):
+        g.set_gpu_probe(lambda: _fake_gpus(used0=1000))
+        r1 = g.acquire_lease("a", 0.1)
+        self.assertTrue(r1["ok"])
+        self.assertFalse(r1["reentrant"])
+        r2 = g.acquire_lease("a", 0.1)  # 同 owner 再来一次=重入
+        self.assertTrue(r2["ok"])
+        self.assertTrue(r2["reentrant"])
+        r3 = g.acquire_lease("a", 0.1, gpu=None)
+        self.assertTrue(r3["reentrant"])
 
     # ---- 取消/改名/定向回收 ----------------------------------------------
 
@@ -361,7 +418,9 @@ class ComfyLeaseLifecycleTest(unittest.TestCase):
         g._activities.clear()
         g._hooks.clear()
         g._last_idle_unload = 0.0
-        g.set_gpu_probe(None)
+        # 注入"显存充足"的假探测：本机真实余量常 < COMFY_MIN_FREE_MB(1024)，
+        # 生命周期测试只关心租约流转，不应被真实显存门槛干扰
+        g.set_gpu_probe(lambda: _fake_gpus(used0=1000, used1=1000))
         self.state = _ComfyState()
         self.srv = _make_comfy_server(self.state)
         self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
@@ -417,6 +476,69 @@ class ComfyLeaseLifecycleTest(unittest.TestCase):
         r = gw.comfy_queue({}, "http://127.0.0.1:1")
         self.assertFalse(r["ok"])
         self.assertIsNone(g.status()["active"])
+
+    def test_queue_rejected_low_vram_without_evict_hook(self):
+        """显存余量低于 COMFY_MIN_FREE_MB 且没有驱逐钩子：直接拒绝，不排队。"""
+        g.set_gpu_probe(lambda: _fake_gpus(used0=11500))  # 仅剩 500MB
+        r = gw.comfy_queue({}, self.url)
+        self.assertFalse(r["ok"])
+        self.assertIn("显存不足", r["error"])
+        self.assertEqual(g.status()["queue_length"], 0)
+        self.assertIsNone(g.status()["active"])
+
+    def test_queue_evicts_ollama_then_grants(self):
+        """余量不足但驱逐钩子能腾出显存：卸载一次后提交成功。"""
+        state = {"rows": _fake_gpus(used0=11500)}  # 起手只剩 500MB
+        g.set_gpu_probe(lambda: state["rows"])
+        g.register_hook("ollama", lambda: state.__setitem__(
+            "rows", _fake_gpus(used0=1000)) or True)
+        r = gw.comfy_queue({}, self.url)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["lease"]["owner"], "comfyui:pid-1")
+        self.assertTrue(r["lease"]["evicted"])
+
+
+class OllamaEvictHookRetryTest(unittest.TestCase):
+    """api._gpu_ollama_evict_hook 两轮卸载：模拟多模型同驻时嵌入模型首次被吞。"""
+
+    def setUp(self):
+        self.resident = ["qwen3.6:35b-a3b", "bge-m3:latest"]
+        self.calls = []
+        self._orig_ps = api._ollama_ps
+        self._orig_ka = api._ollama_keep_alive
+        self._orig_sleep = api.time.sleep
+        api._ollama_ps = lambda timeout=8.0: [{"name": n} for n in self.resident]
+        api.time.sleep = lambda _s: None
+
+        def fake_keep_alive(model, keep_alive, timeout=600.0):
+            nth = sum(1 for c in self.calls if c[0] == model) + 1
+            self.calls.append((model, keep_alive))
+            # 复刻真机现象：bge 第一次 keep_alive=0 返回成功但仍驻留（大模型卸载竞争）
+            if model == "bge-m3:latest" and nth == 1:
+                return True, ""
+            if model in self.resident:
+                self.resident.remove(model)
+            return True, ""
+
+        api._ollama_keep_alive = fake_keep_alive
+
+    def tearDown(self):
+        api._ollama_ps = self._orig_ps
+        api._ollama_keep_alive = self._orig_ka
+        api.time.sleep = self._orig_sleep
+
+    def test_second_round_unloads_survivor(self):
+        self.assertTrue(api._gpu_ollama_evict_hook())
+        self.assertEqual(self.resident, [])
+        bge = [c for c in self.calls if c[0] == "bge-m3:latest"]
+        self.assertEqual(len(bge), 2)  # 首次被吞，复查后补一次
+        qwen = [c for c in self.calls if c[0] == "qwen3.6:35b-a3b"]
+        self.assertEqual(len(qwen), 1)  # 一次成功不重复
+
+    def test_no_models_means_no_calls(self):
+        self.resident.clear()
+        self.assertFalse(api._gpu_ollama_evict_hook())
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":

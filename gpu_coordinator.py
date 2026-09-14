@@ -25,6 +25,9 @@ POLL_INTERVAL = float(os.getenv("DOCMIND_GPU_POLL_INTERVAL", "5") or 5)  # 显�
 SAMPLE_MAX = 240  # 240 个采样点 ×5s ≈ 20 分钟迷你曲线
 IDLE_UNLOAD_DEFAULT = float(os.getenv("DOCMIND_OLLAMA_IDLE_UNLOAD", "0") or 0)  # 秒，0=关闭
 IDLE_UNLOAD_COOLDOWN = 60.0
+# 真实 nvidia-smi 探测的短 TTL 缓存：status() 轮询 + 后台 pump + acquire/release
+# 会在同一瞬间扎堆调用，一次 nvidia-smi 子进程 50~200ms，0.5s 内复用结果即可。
+PROBE_CACHE_TTL = float(os.getenv("DOCMIND_GPU_PROBE_CACHE_TTL", "0.5") or 0.5)
 
 _lock = threading.Lock()
 _cv = threading.Condition(_lock)
@@ -44,6 +47,8 @@ _bg_stop = threading.Event()
 
 # 测试注入点：fn() -> [gpu 行] 或 None
 _probe_override = None
+# 仅缓存真实 nvidia-smi 探测；注入探测（测试）永不缓存，保证假数据即时生效
+_probe_cache = {"t": 0.0, "rows": None}
 
 
 # --------------------------------------------------------------------------- 探测
@@ -86,12 +91,26 @@ def set_gpu_probe(fn):
 
 
 def query_gpus():
-    """返回全部 GPU 行（list[dict]）；探测不可用返回 None。"""
-    fn = _probe_override or _default_probe
+    """返回全部 GPU 行（list[dict]）；探测不可用返回 None。
+
+    注入探测实时调用；真实 nvidia-smi 探测在 ``PROBE_CACHE_TTL`` 秒内复用缓存，
+    避免状态轮询与队列 pump 在同一瞬间反复拉起子进程。
+    """
+    if _probe_override is not None:
+        try:
+            return _probe_override()
+        except Exception:
+            return None
+    now = time.monotonic()
+    if now - _probe_cache["t"] <= PROBE_CACHE_TTL:
+        return _probe_cache["rows"]
     try:
-        return fn()
+        rows = _default_probe()
     except Exception:
-        return None
+        rows = None
+    _probe_cache["t"] = now
+    _probe_cache["rows"] = rows
+    return rows
 
 
 def memory_info():
@@ -193,30 +212,30 @@ def _order_keys(mem):
 
 
 def _try_grant_locked(owner, purpose, ttl, gpu, min_free, now, mem):
-    """一次性尝试：返回 ('granted', key) / ('mem-deny', key) / ('wait', None)。"""
+    """一次性尝试：返回 ('granted', key, reentrant) / ('mem-deny', key, False) / ('wait', None, False)。"""
     if GPU_MODE == "parallel":
-        return ("granted", None)
+        return ("granted", None, False)
     held = next((k for k, v in _leases.items() if v["owner"] == owner), None)
     if held is not None:
-        return ("granted", held)
+        return ("granted", held, True)
     keys = [gpu] if gpu is not None else _order_keys(mem)
     for key in keys:
         if key in _leases:
             continue
         g = _mem_of(mem, key)
         if min_free and g and g["total_mb"] - g["used_mb"] < min_free:
-            return ("mem-deny", key)
+            return ("mem-deny", key, False)
     # 严格 FIFO：已有等待者时，新请求哪怕在 multi 模式看到别的空闲卡，也不许
     # 插队（队首要的卡没释放前，后面的卡留给队列顺序转交，避免饥饿）。
     if _waiters:
-        return ("wait", None)
+        return ("wait", None, False)
     busy_keys = [k for k in keys if k in _leases]
     free_keys = [k for k in keys if k not in _leases]
     if free_keys:
         key = free_keys[0]
         _leases[key] = {"owner": owner, "purpose": purpose, "since": now, "ttl": ttl}
-        return ("granted", key)
-    return ("wait", busy_keys[0] if busy_keys else None)
+        return ("granted", key, False)
+    return ("wait", busy_keys[0] if busy_keys else None, False)
 
 
 # --------------------------------------------------------------------------- 租约 API
@@ -245,27 +264,29 @@ def acquire_lease(owner, timeout=2.0, purpose="", ttl=None, gpu=None,
     now = time.time()
     with _cv:
         _drop_expired_locked(now)
-        verdict, key = _try_grant_locked(owner, purpose, lease_ttl, want_gpu, threshold, now, mem)
+        verdict, key, reentrant = _try_grant_locked(owner, purpose, lease_ttl, want_gpu, threshold, now, mem)
         if verdict == "granted":
-            return {"ok": True, "gpu": key, "mode": GPU_MODE,
-                    "reentrant": _leases.get(key, {}).get("owner") == owner and key in _leases}
+            return {"ok": True, "gpu": key, "mode": GPU_MODE, "reentrant": reentrant}
 
-    # 卡忙或显存不足：先给驱逐钩子一次机会（只跑一次），再重新探测
-    hooks = [name for name in evict if name in _hooks]
+    # 只有"显存门槛拒绝"才值得跑驱逐钩子：此时没有租约挡路，显存是被外部驻留
+    # （Ollama keep_alive 长驻但不持租约）吃掉的，卸载后重试才有意义。
+    # verdict=="wait" 说明有任务正在用卡（租约在手），卸载 Ollama 既不会释放
+    # 租约也抢不到卡，只会让用户白付一次冷加载——不跑。
     evicted = False
-    if hooks:
-        for name in hooks:
-            try:
-                evicted = bool(_hooks[name]()) or evicted
-            except Exception:
-                evicted = evicted or False
-    if hooks:
-        mem = memory_info()
-        now = time.time()
-        with _cv:
-            _drop_expired_locked(now)
-            _pump_locked(now, mem)
-            verdict, key = _try_grant_locked(owner, purpose, lease_ttl, want_gpu, threshold, now, mem)
+    if verdict == "mem-deny":
+        hooks = [name for name in evict if name in _hooks]
+        if hooks:
+            for name in hooks:
+                try:
+                    evicted = bool(_hooks[name]()) or evicted
+                except Exception:
+                    evicted = evicted or False
+            mem = memory_info()
+            now = time.time()
+            with _cv:
+                _drop_expired_locked(now)
+                _pump_locked(now, mem)
+                verdict, key, _ = _try_grant_locked(owner, purpose, lease_ttl, want_gpu, threshold, now, mem)
             if verdict == "granted":
                 return {"ok": True, "gpu": key, "mode": GPU_MODE, "evicted": evicted}
 

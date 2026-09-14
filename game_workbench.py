@@ -7,6 +7,9 @@ from datetime import datetime
 # ComfyUI 作业租约 TTL：提交后到生成完成之间即使 DocMind 崩了/不再轮询，
 # 租约也会在该秒数后自动回收，不会把 GPU 锁死（DOCMIND_COMFY_JOB_TTL 可调）。
 COMFY_JOB_TTL = float(os.getenv("DOCMIND_COMFY_JOB_TTL", "600") or 600)
+# 提交 ComfyUI 作业要求的显存余量（MB）：余量不足时先触发 Ollama 卸载钩子，
+# 腾不出来就直接拒绝（不排队）。0=不检查（DOCMIND_GPU_MIN_FREE_MB 同名语义）。
+COMFY_MIN_FREE_MB = float(os.getenv("DOCMIND_COMFY_MIN_FREE_MB", "1024") or 0)
 
 _ENGINE_PROCS = {}
 _ENGINE_LOGS = {}
@@ -714,7 +717,9 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188"):
     # 不能像旧版只在 POST /prompt 期间持有（请求返回时代码还在 GPU 上跑）。
     submit_owner = f"comfyui:submit:{uuid.uuid4().hex[:12]}"
     lease = _gpu.acquire_lease(submit_owner, timeout=2, purpose="comfyui",
-                               ttl=COMFY_JOB_TTL, evict=("ollama",))
+                               ttl=COMFY_JOB_TTL,
+                               min_free_mb=COMFY_MIN_FREE_MB or None,
+                               evict=("ollama",))
     if not lease.get("ok"):
         return {"ok": False, "error": _gpu_busy_error(lease)}
     payload = json.dumps({"prompt": workflow}).encode()

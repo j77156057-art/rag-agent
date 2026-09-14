@@ -1524,23 +1524,37 @@ def _ollama_keep_alive(model: str, keep_alive, timeout: float = 600.0):
 def _gpu_ollama_evict_hook():
     """GPU 协调器驱逐钩子：把所有驻留的 Ollama 模型立即卸载，给新作业腾显存。
 
-    由 gpu_coordinator 在租约排队时触发一次（锁外执行）；Ollama 不在线或没有
+    由 gpu_coordinator 在显存门槛拒绝时触发（锁外执行）；Ollama 不在线或没有
     驻留模型都算"没腾出东西"，返回 False。任何异常都吞掉，绝不能拖死协调线程。
+
+    实测多模型同驻（如 qwen3.6:35b 生成模型 + bge-m3 嵌入模型）时，紧接大模型
+    卸载后立刻发出的嵌入模型 keep_alive=0 可能被 Ollama 吞掉（HTTP 成功但模型
+    仍在 /api/ps 中），因此卸载后短暂等待，用新 /api/ps 对幸存者再补一轮（最多两轮）。
     """
     try:
-        models = _ollama_ps()
+        pending = [m.get("name") or m.get("model") for m in _ollama_ps()]
+        pending = [n for n in pending if n]
     except Exception:  # noqa: BLE001
         return False
+    if not pending:
+        return False
     freed = False
-    for m in models:
-        name = m.get("name") or m.get("model")
-        if not name:
-            continue
-        try:
-            ok, _err = _ollama_keep_alive(name, 0, timeout=120)
-        except Exception:  # noqa: BLE001
-            ok = False
-        freed = freed or ok
+    for round_no in range(2):
+        for name in pending:
+            try:
+                ok, _err = _ollama_keep_alive(name, 0, timeout=120)
+            except Exception:  # noqa: BLE001
+                ok = False
+            freed = freed or ok
+        if round_no == 0:
+            time.sleep(0.8)  # 给 Ollama 的异步卸载留处理时间
+            try:
+                pending = [m.get("name") or m.get("model") for m in _ollama_ps()]
+                pending = [n for n in pending if n]
+            except Exception:  # noqa: BLE001
+                pending = []
+            if not pending:
+                break
     return freed
 
 
