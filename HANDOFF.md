@@ -585,3 +585,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 2026-09-15：完整 H3 Example_Workflow.json 转换复核 PASS。过滤说明/预览/标签及缺失 LoadImage 分支后，得到 18 个可执行节点，保留完整采样、双 VAE 解码、CreateVideo、SaveVideo 链路；当前无有效参考图片时按 T2V/无参考模式提交仍需真实服务端验收。
 
 - 2026-09-15：按当前决策暂缓 ComfyUI H3 实机生成验收。已完成路径探测、UI→API 转换、说明节点过滤、模型路径归一化、悬空依赖清理和错误诊断；真实 H3 生成留待后续专用 T2V workflow/有效参考资源准备后再验收。
+
+- 2026-09-15：PyInstaller 发布目录已成功构建（dist\\DocMind\\DocMind.exe，约 19MB，含 MinGit）。桌面专项测试 8/8；当前系统执行策略对独立 EXE 启动返回 Access is denied，故独立启动健康检查未宣称通过。仓库没有 MSI/NSIS/Inno Setup 卸载器，覆盖升级/卸载需后续增加安装器后验证。
