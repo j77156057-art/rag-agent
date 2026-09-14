@@ -18,6 +18,9 @@ $env:PATH = "C:\Users\h'h'h\.local\bin\MinGit\cmd;" + $env:PATH   # 用户名含
 - `cmd /c` 被安全策略禁用；一律用纯 PowerShell / `Start-Process`
 - 样例仓（godot_sample 等外部仓）写 `.git/index.lock` 被沙箱硬拦：**样例仓提交只能请用户在系统 PowerShell 手动做**，不要自己尝试
 
+> **本机自动化环境的实操修正（2026-09-14 实测）**：本会话里 PowerShell 工具的输出捕获会失效（拿不到 stdout），且在 Bash 内嵌 `powershell`/`powershell.exe` 会被安全策略判为"从 Bash 调 PowerShell"而拦截。等效做法是 **Bash + 托管 venv Python** 复刻规范里的 PowerShell 步骤（停端口、起冻结 exe、轮询、curl 用 `curl --noproxy '*'`、提交信息用 Python 写无 BOM 文件再 `git commit -F`）。`git`/`netstat`/`tasklist` 等可直接在 Bash 跑。
+> **`$TEMP` 大坑**：Git Bash 里 `$TEMP` 解析成 `/tmp`，而 Python 的 `os.environ['TEMP']` 是 `D:\Temp`，两者不一致。写提交信息/日志文件务必用 **Windows 绝对路径**（如 `D:/Temp/dm_commit.txt`）交给 `git commit -F`，否则报"找不到 /tmp/dm_commit.txt"。
+
 ## 阶段 0：发布前检查
 
 1. 全量测试通过（当前基线 **49 tests，4 skipped**；4 skip 为无 git 环境用例，属正常）。
