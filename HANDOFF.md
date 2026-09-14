@@ -544,6 +544,7 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 最新回归（任务历史接入后）：Python 全量 **288/288 通过**；前端 `npm run build` 成功；工作区 clean。当前 main 比 origin/main 超前 103 个提交。
 - 来源校验接入导入流程后的最新回归：Python 全量 **291/291 通过**；前端 `npm run build` 成功；工作区 clean。当前 main 比 origin/main 超前 111 个提交。
 - API 可变默认值修正后复核：Python 全量 **291/291 通过**，`api.py` 编译通过；ComfyUI 参数请求不会共享跨请求状态。
+- 来源校验 API 路由测试加入后的最新回归：Python 全量 **292/292 通过**；来源校验、ComfyUI 参数化、GPU 监控和 Unreal 安全边界均有自动化覆盖。
 - 生成 Unreal bridge 脚本已扩展 `/health`、`/assets`、`/actors`、`/blueprint/{path}`、`/actor/{name}` 路由，并通过 `py_compile`；真实 Editor 节点/属性仍需 Unreal Python 插件运行验证。
 - 最新环境复核：Ollama 进程与 API 在线；ComfyUI 端口 8188 当前不可用；未发现 Unity/Unreal 进程。未启动外部服务，避免未经用户操作改变 GPU 负载。
 
