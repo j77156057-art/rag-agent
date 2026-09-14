@@ -1,8 +1,12 @@
 """Game-development helpers built on top of the region workspace."""
-import json, os, re, subprocess, math, time, mimetypes, sys, ast as _ast, urllib.request, urllib.parse, urllib.error, shutil, zipfile, tempfile
+import json, os, re, subprocess, math, time, mimetypes, sys, ast as _ast, urllib.request, urllib.parse, urllib.error, shutil, zipfile, tempfile, uuid
 import mcp_client
-from gpu_coordinator import acquire as _gpu_acquire, release as _gpu_release
+import gpu_coordinator as _gpu
 from datetime import datetime
+
+# ComfyUI 作业租约 TTL：提交后到生成完成之间即使 DocMind 崩了/不再轮询，
+# 租约也会在该秒数后自动回收，不会把 GPU 锁死（DOCMIND_COMFY_JOB_TTL 可调）。
+COMFY_JOB_TTL = float(os.getenv("DOCMIND_COMFY_JOB_TTL", "600") or 600)
 
 _ENGINE_PROCS = {}
 _ENGINE_LOGS = {}
@@ -689,16 +693,49 @@ def comfy_status(url="http://127.0.0.1:8188"):
     except Exception as e:
         return {"ok": True, "available": False, "url": url, "error": str(e)}
 
+def _comfy_job_owner(prompt_id):
+    return f"comfyui:{prompt_id}"
+
+
+def _gpu_busy_error(res):
+    if res.get("reason") == "insufficient_memory":
+        msg = "显存不足，低于 DOCMIND_GPU_MIN_FREE_MB 门槛，已拒绝（未排队）。"
+    else:
+        msg = "GPU 正忙：其他任务占用中，请稍后重试或在 GPU 面板取消排队。"
+    if res.get("evicted"):
+        msg += "（已尝试卸载 Ollama 驻留模型后重试）"
+    return msg
+
+
 def comfy_queue(workflow, url="http://127.0.0.1:8188"):
     try: url = _safe_comfy_url(url)
     except ValueError as e: return {"ok": False, "error": str(e)}
-    if not _gpu_acquire("comfyui", 2): return {"ok": False, "error": "GPU 正忙：Ollama 正在使用中，请稍后重试。"}
+    # 租约必须覆盖"提交 → ComfyUI 异步生成 → history 轮询到完成"整个周期，
+    # 不能像旧版只在 POST /prompt 期间持有（请求返回时代码还在 GPU 上跑）。
+    submit_owner = f"comfyui:submit:{uuid.uuid4().hex[:12]}"
+    lease = _gpu.acquire_lease(submit_owner, timeout=2, purpose="comfyui",
+                               ttl=COMFY_JOB_TTL, evict=("ollama",))
+    if not lease.get("ok"):
+        return {"ok": False, "error": _gpu_busy_error(lease)}
     payload = json.dumps({"prompt": workflow}).encode()
     req = urllib.request.Request(url.rstrip('/') + '/prompt', data=payload, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as r: return {"ok": True, "response": json.loads(r.read().decode())}
-    except Exception as e: return {"ok": False, "error": f"ComfyUI 请求失败：{e}"}
-    finally: _gpu_release("comfyui")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            resp = json.loads(r.read().decode())
+    except Exception as e:
+        _gpu.release(submit_owner)
+        return {"ok": False, "error": f"ComfyUI 请求失败：{e}"}
+    # 提交成功：把租约改名成作业 owner，TTL 从这一刻重新起算；
+    # 之后由 comfy_history 见终态释放、comfy_cancel 中断释放，或 TTL 兜底回收。
+    prompt_id = str(resp.get("prompt_id") or "")
+    if prompt_id:
+        _gpu.reown(submit_owner, _comfy_job_owner(prompt_id), purpose="comfyui", ttl=COMFY_JOB_TTL)
+    else:
+        _gpu.release(submit_owner)
+    return {"ok": True, "response": resp,
+            "lease": {"owner": _comfy_job_owner(prompt_id) if prompt_id else "",
+                      "ttl": COMFY_JOB_TTL, "gpu": lease.get("gpu"),
+                      "evicted": bool(lease.get("evicted"))}}
 
 def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
     try: url = _safe_comfy_url(url)
@@ -714,9 +751,40 @@ def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
         for node in (item.get("outputs") or {}).values():
             for img in (node.get("images") or []):
                 if isinstance(img, dict): outputs.append(img)
-        return {"ok": True, "prompt_id": pid, "status": item.get("status", {}), "outputs": outputs, "done": bool(item.get("outputs"))}
+        status = item.get("status", {})
+        status_str = str(status.get("status_str") or "")
+        finished = bool(item.get("outputs")) or bool(status.get("completed")) or status_str in ("error", "failed")
+        failed = status_str in ("error", "failed")
+        result = {"ok": True, "prompt_id": pid, "status": status, "outputs": outputs,
+                  "done": bool(item.get("outputs")), "finished": finished, "failed": failed}
+        if finished:
+            # 生成结束（成功/失败都算）：释放作业租约，让排队的 Ollama/下一作业上卡
+            result["lease_released"] = _gpu.force_release(_comfy_job_owner(pid)) is not None
+        return result
     except Exception as e:
         return {"ok": False, "error": f"ComfyUI 状态查询失败：{e}"}
+
+def comfy_cancel(prompt_id, url="http://127.0.0.1:8188"):
+    """中断当前生成并释放作业租约（用户取消 / 排队取消的落地动作）。"""
+    try: url = _safe_comfy_url(url)
+    except ValueError as e: return {"ok": False, "error": str(e)}
+    pid = str(prompt_id or "").strip()
+    if not pid or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", pid):
+        return {"ok": False, "error": "无效的 ComfyUI prompt_id。"}
+    interrupted = False
+    err = ""
+    try:
+        req = urllib.request.Request(url.rstrip('/') + '/interrupt',
+                                     data=b"{}", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            interrupted = 200 <= r.status < 300
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    released = _gpu.force_release(_comfy_job_owner(pid)) is not None
+    # ComfyUI 没在跑时 /interrupt 可能 400/404——租约释放仍算取消成功
+    return {"ok": released or interrupted, "prompt_id": pid,
+            "interrupted": interrupted, "lease_released": released,
+            "error": err if (err and not released) else ""}
 
 def comfy_wait(prompt_id, url="http://127.0.0.1:8188", timeout=120, interval=1.0):
     deadline=time.time()+max(1,min(int(timeout),600))
@@ -724,9 +792,10 @@ def comfy_wait(prompt_id, url="http://127.0.0.1:8188", timeout=120, interval=1.0
         result=comfy_history(prompt_id,url)
         if not result.get("ok"): return result
         status=result.get("status") or {}
-        if result.get("done") or status.get("completed") or status.get("status_str") in ("error","failed"):
-            result["finished"]=True; return result
+        if result.get("finished"):
+            return result
         time.sleep(max(.1,min(float(interval),10)))
+    # 轮询超时不释放租约：ComfyUI 侧可能仍在生成，交给作业 TTL 兜底回收
     return {"ok":False,"prompt_id":str(prompt_id),"timeout":True,"error":"ComfyUI 生成轮询超时。"}
 
 def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="assets/generated"):

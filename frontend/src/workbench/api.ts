@@ -247,6 +247,55 @@ export interface RelationGraphResp {
   }
 }
 
+/** P1-2：Unity GUID 引用图节点（资产 / 缺失外部引用） */
+export interface UnityNode {
+  id: string
+  guid: string
+  label: string
+  sub: string
+  /** scene/prefab/script/material/texture/.../missing */
+  kind: string
+  rel: string
+  line: number
+  external: boolean
+  doc: string
+}
+
+export interface UnityEdge {
+  source: string
+  target: string
+  kind: 'guid-ref' | string
+  label: string
+  line: number
+  /** 同一 (源,目标) 的引用处数（已聚合） */
+  count: number
+}
+
+export interface UnityGraphResp {
+  ok: boolean
+  root?: string
+  nodes: UnityNode[]
+  edges: UnityEdge[]
+  stats: {
+    unity_project: boolean
+    scanned_root: string
+    metas: number
+    serialized_files: number
+    assets_total: number
+    nodes: number
+    asset_nodes: number
+    missing_nodes: number
+    orphan_meta: number
+    duplicate_guids: number
+    edges: number
+    resolved_edges: number
+    missing_edges: number
+    skipped: number
+    by_kind: Record<string, number>
+  }
+  error?: string
+}
+
 /** 业务/HTTP 错误；status=0 表示网络层失败（服务未启动） */
 export class FsApiError extends Error {
   status: number
@@ -352,6 +401,9 @@ export const fsApi = {
   },
   relationGraph(): Promise<RelationGraphResp> {
     return request<RelationGraphResp>('/api/fs/relation-graph')
+  },
+  unityGuidGraph(): Promise<UnityGraphResp> {
+    return request<UnityGraphResp>('/api/unity/guid-graph')
   },
   sceneTree(path: string) { return request<{ ok: boolean; nodes: { name: string; type: string; parent: string; line: number; node_path?: string; properties?: {name:string;value:string;line:number}[] }[] }>(`/api/fs/scene-tree?path=${encodeURIComponent(path)}`) },
   setSceneProperty(path: string, node: string, property: string, value: string) { return postJson<{ ok: boolean; error?: string }>('/api/fs/scene-property', { path, node, property, value }) },
@@ -592,10 +644,69 @@ export const playApi = {
 
 export const comfyApi = {
   status(url = 'http://127.0.0.1:8188') { return request<{ ok: boolean; available: boolean; url: string; error?: string }>(`/api/comfy/status?url=${encodeURIComponent(url)}`) },
-  queue(workflow: Record<string, unknown>, url = 'http://127.0.0.1:8188') { return postJson<{ ok: boolean; response?: Record<string, unknown>; error?: string }>('/api/comfy/queue', { url, workflow }) },
-  history(promptId: string, url = 'http://127.0.0.1:8188') { return request<{ ok: boolean; done?: boolean; outputs?: { filename?: string; subfolder?: string; type?: string }[]; error?: string }>(`/api/comfy/history/${encodeURIComponent(promptId)}?url=${encodeURIComponent(url)}`) },
+  queue(workflow: Record<string, unknown>, url = 'http://127.0.0.1:8188') { return postJson<{ ok: boolean; response?: Record<string, unknown>; lease?: { owner: string; ttl: number; gpu: number | null; evicted: boolean }; error?: string }>('/api/comfy/queue', { url, workflow }) },
+  history(promptId: string, url = 'http://127.0.0.1:8188') { return request<{ ok: boolean; done?: boolean; finished?: boolean; failed?: boolean; lease_released?: boolean; outputs?: { filename?: string; subfolder?: string; type?: string }[]; error?: string }>(`/api/comfy/history/${encodeURIComponent(promptId)}?url=${encodeURIComponent(url)}`) },
+  cancel(promptId: string, url = 'http://127.0.0.1:8188') { return postJson<{ ok: boolean; prompt_id: string; interrupted: boolean; lease_released: boolean; error?: string }>('/api/comfy/cancel', { url, prompt_id: promptId }) },
   import(promptId: string, image: Record<string, unknown>, url = 'http://127.0.0.1:8188', destDir = 'assets/generated') { return postJson<{ ok: boolean; path?: string; error?: string }>('/api/comfy/import', { prompt_id: promptId, image, url, dest_dir: destDir }) },
   importAll(promptId: string, images: Record<string, unknown>[], url = 'http://127.0.0.1:8188', destDir = 'assets/generated') { return postJson<{ ok: boolean; imported: number; results: { ok: boolean; path?: string; error?: string }[] }>('/api/comfy/import-all', { prompt_id: promptId, images, url, dest_dir: destDir }) },
+}
+
+/** GPU 协调器（gpu_coordinator.py / /api/gpu/*） */
+export interface GpuHolder {
+  owner: string
+  purpose: string
+  held_for_seconds: number | null
+  lease_ttl: number
+}
+export interface GpuQueueItem {
+  owner: string
+  purpose: string
+  /** 指定卡序号；null=自动挑最空的卡 */
+  gpu: number | null
+  waiting_gpu: boolean
+}
+export interface GpuInfo {
+  index: number
+  name: string | null
+  used_mb: number | null
+  total_mb: number | null
+  free_mb: number | null
+  utilization: number | null
+  temperature_c: number | null
+  holder: GpuHolder | null
+  queue: GpuQueueItem[]
+}
+export interface GpuSamplePoint {
+  t: number
+  gpus: { index: number; used_mb: number; total_mb: number; utilization: number }[]
+}
+export interface GpuStatus {
+  ok?: boolean
+  mode: 'serial' | 'parallel' | 'multi'
+  coordinating: boolean
+  active: string | null
+  purpose: string
+  held_for_seconds: number | null
+  holders: (GpuHolder & { gpu: number })[]
+  queue: GpuQueueItem[]
+  queue_length: number
+  memory: { used_mb: number; total_mb: number; free_mb: number; utilization: number } | null
+  gpus: GpuInfo[]
+  samples: GpuSamplePoint[]
+  ollama_idle: { unload_seconds: number; last_activity_ago: number | null; last_unload_ago: number | null }
+  hooks: string[]
+}
+
+export const gpuApi = {
+  status() { return request<GpuStatus>('/api/gpu/status') },
+  cancel(owner: string) { return postJson<{ ok: boolean; canceled?: number; error?: string }>('/api/gpu/cancel', { owner }) },
+  forceRelease(owner?: string) { return postJson<{ ok: boolean; released?: string; error?: string }>('/api/gpu/force-release', { owner: owner ?? '' }) },
+  configure(idleUnloadSeconds?: number, pollInterval?: number) {
+    return postJson<GpuStatus & { ok: boolean }>('/api/gpu/configure', {
+      idle_unload_seconds: idleUnloadSeconds,
+      poll_interval: pollInterval,
+    })
+  },
 }
 
 /** P3：分区状态（GET /api/regions → regions.list_regions） */

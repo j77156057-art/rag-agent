@@ -6,7 +6,7 @@ OpenAI chat/completions 接口后面，运行时切换 provider 即可，业务�
 import json
 import os
 import urllib.request
-from gpu_coordinator import acquire as _gpu_acquire, release as _gpu_release
+from gpu_coordinator import acquire as _gpu_acquire, release as _gpu_release, note_activity as _gpu_note_activity
 
 from openai import OpenAI
 
@@ -183,6 +183,9 @@ class LLMClient:
 
     def _ollama_chat(self, messages, stream=False, temperature=0.3):
         if not _gpu_acquire("ollama", 2): raise RuntimeError("GPU 正忙：ComfyUI 正在使用中，请稍后重试。")
+        # 打点：空闲卸载计时器以"真正发起 Ollama 推理"为活动依据，
+        # 仅持有租约（排队等待）不算活动，避免把等待误判成模型在用。
+        _gpu_note_activity("ollama")
         payload = {
             "model": self.model,
             "messages": messages,
@@ -212,8 +215,13 @@ class LLMClient:
             _gpu_release("ollama")
             raise
         if stream:
-            return _OllamaStream(resp, lambda: _gpu_release("ollama"))
+            def _stream_done():
+                # 流式收尾再打一次点：长回答结束时间作为"最后活动"更准确
+                _gpu_note_activity("ollama")
+                _gpu_release("ollama")
+            return _OllamaStream(resp, _stream_done)
         body = json.loads(resp.read().decode("utf-8"))
+        _gpu_note_activity("ollama")
         _gpu_release("ollama")
         return (body.get("message") or {}).get("content", "")
 

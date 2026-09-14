@@ -23,6 +23,7 @@ from config import (
     PROVIDERS,
     get_runtime,
 )
+from gpu_coordinator import note_activity as _gpu_note_activity
 
 
 class EmbeddingClient:
@@ -69,6 +70,12 @@ class EmbeddingClient:
     def _remote_embed(self, texts):
         if isinstance(texts, str):
             texts = [texts]
+        # 本地 Ollama 嵌入模型同样驻留显存：打点让 GPU 空闲卸载计时器知道它刚被用过
+        if self.provider == "ollama":
+            try:
+                _gpu_note_activity("ollama")
+            except Exception:  # noqa: BLE001
+                pass
         resp = self.client.embeddings.create(model=self.model, input=texts)
         return [d.embedding for d in resp.data]
 

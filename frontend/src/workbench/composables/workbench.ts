@@ -302,6 +302,15 @@ function closeRelationGraph() {
   relationGraphOpen.value = false
 }
 
+const unityGraphOpen = ref(false)
+
+function openUnityGraph() {
+  unityGraphOpen.value = true
+}
+function closeUnityGraph() {
+  unityGraphOpen.value = false
+}
+
 /** 打开文件（必要时等待异步加载与 CM 挂载）并把光标定位/滚动到指定行。 */
 async function jumpToLine(path: string, line: number): Promise<void> {
   await openPath(path)
@@ -1230,6 +1239,8 @@ export function useWorkbench() {
     // P1 符号地图 / 行跳转
     jumpToLine, symbolMapOpen, openSymbolMap, closeSymbolMap,
     relationGraphOpen, openRelationGraph, closeRelationGraph,
+    // P1-2 Unity GUID 引用图
+    unityGraphOpen, openUnityGraph, closeUnityGraph,
     // tabs
     activateTab, closeTab, saveTab, saveActive, registerContentGetter, registerDocReplacer,
     // P3 git 回滚 / 历史版本

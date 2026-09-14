@@ -165,6 +165,16 @@ def save_state(key, value):
         pass
 
 
+def load_state(key, default=None):
+    """读取跨重启持久化状态中的单个键；缺失/损坏返回 default。"""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return default
+    return data.get(key, default)
+
+
 def _apply_persisted_state():
     """进程启动（import config）时恢复上次的本地选择；路径失效自动忽略。"""
     try:
@@ -175,6 +185,11 @@ def _apply_persisted_state():
     root = data.get("code_root")
     if isinstance(root, str) and root and os.path.isdir(root):
         _RUNTIME["code_root"] = root
+    # GPU 空闲卸载/采样间隔为用户在 GPU 面板设置的本机偏好，跟随状态文件恢复
+    for key in ("gpu_idle_unload_seconds", "gpu_poll_interval"):
+        val = data.get(key)
+        if isinstance(val, (int, float)) and val >= 0:
+            _RUNTIME[key] = float(val)
 
 
 _apply_persisted_state()

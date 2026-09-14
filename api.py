@@ -13,6 +13,7 @@ import time
 import urllib.request
 import urllib.error
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 from typing import Optional
@@ -35,6 +36,7 @@ from config import (
     set_runtime,
     get_runtime,
     save_state,
+    load_state,
     edit_confirm_enabled,
     API_TOKEN,
     DOCMIND_CORS_ORIGINS,
@@ -76,6 +78,7 @@ from regions import (
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from engine_adapters import skill_for_engine
+import gpu_coordinator as gpu
 from gpu_coordinator import status as gpu_status
 from agent_policy import route_for, permission_check, record_permission, approval_allows, apply_approved_external, routing_status, redact_for_cloud, create_external_approval, list_approvals, decide_approval
 import secrets_store
@@ -84,11 +87,29 @@ _DESKTOP_HOST_HWND = None
 import workbench_fs
 import mcp_client
 import web_export
+import unity_graph
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
-from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_queue, comfy_history, comfy_import, comfy_import_all, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
+from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_queue, comfy_history, comfy_cancel, comfy_import, comfy_import_all, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
 
-app = FastAPI(title="DocMind RAG Agent")
+
+@asynccontextmanager
+async def _app_lifespan(app):
+    # GPU 协调后台线程：显存采样环、TTL 回收/FIFO pump、Ollama 空闲卸载。
+    # Ollama 卸载钩子定义在下方（模块级函数，启动时已就绪）；用户在 GPU 面板
+    # 保存的空闲卸载秒数/采样间隔从 .docmind_state.json 恢复。
+    idle_s = get_runtime("gpu_idle_unload_seconds")
+    poll_s = get_runtime("gpu_poll_interval")
+    gpu.configure(idle_unload_seconds=idle_s, poll_interval=poll_s)
+    gpu.register_hook("ollama", _gpu_ollama_evict_hook)
+    gpu.start_background()
+    try:
+        yield
+    finally:
+        gpu.stop_background()
+
+
+app = FastAPI(title="DocMind RAG Agent", lifespan=_app_lifespan)
 agent = Agent()
 
 class AgentRouteReq(BaseModel):
@@ -406,6 +427,14 @@ class EngineReq(BaseModel):
 class ComfyReq(BaseModel):
     url: str = "http://127.0.0.1:8188"
     workflow: dict = {}
+class ComfyCancelReq(BaseModel):
+    url: str = "http://127.0.0.1:8188"
+    prompt_id: str
+class GpuOwnerReq(BaseModel):
+    owner: str = ""
+class GpuConfigureReq(BaseModel):
+    idle_unload_seconds: Optional[float] = None
+    poll_interval: Optional[float] = None
 class ComfyImportReq(BaseModel):
     url: str = "http://127.0.0.1:8188"
     prompt_id: str
@@ -485,6 +514,12 @@ async def engine_scan_ep():
 @app.get('/api/engine/inspect')
 async def engine_inspect_ep(engine: str = ''):
     root=_project_root_or_error(); return engine_inspect(root, engine) if root else {'ok':False,'error':'未配置代码库'}
+
+@app.get('/api/unity/guid-graph')
+async def unity_guid_graph_ep():
+    """P1-2：Unity .meta GUID 引用图（纯文本静态分析，不启动编辑器）。"""
+    root=_project_root_or_error()
+    return await run_in_threadpool(unity_graph.build_unity_graph, root) if root else {'ok':False,'error':'未配置代码库'}
 
 @app.post('/api/engine/prepare')
 async def engine_prepare_ep(req: EngineReq):
@@ -720,12 +755,43 @@ async def comfy_status_ep(url: str = "http://127.0.0.1:8188"):
 @app.get("/api/gpu/status")
 async def gpu_status_ep():
     return {"ok": True, **gpu_status()}
+@app.post("/api/gpu/cancel")
+async def gpu_cancel_ep(req: GpuOwnerReq):
+    """取消指定 owner 的排队请求（不影响已持有的租约）。"""
+    owner = (req.owner or "").strip()
+    if not owner:
+        return {"ok": False, "error": "缺少 owner"}
+    return {"ok": True, "canceled": gpu.cancel_wait(owner)}
+@app.post("/api/gpu/force-release")
+async def gpu_force_release_ep(req: GpuOwnerReq):
+    """强制回收租约：给了 owner 只收它，没给则回收全部。"""
+    owner = (req.owner or "").strip() or None
+    prev = await run_in_threadpool(gpu.force_release, owner)
+    if prev is None:
+        return {"ok": False, "error": "没有可回收的租约"}
+    return {"ok": True, "released": prev}
+@app.post("/api/gpu/configure")
+async def gpu_configure_ep(req: GpuConfigureReq):
+    """设置 Ollama 空闲自动卸载秒数（0=关闭）与显存采样间隔，并持久化本机偏好。"""
+    gpu.configure(idle_unload_seconds=req.idle_unload_seconds,
+                  poll_interval=req.poll_interval)
+    if req.idle_unload_seconds is not None:
+        set_runtime("gpu_idle_unload_seconds", float(req.idle_unload_seconds))
+        save_state("gpu_idle_unload_seconds", float(req.idle_unload_seconds))
+    if req.poll_interval is not None:
+        set_runtime("gpu_poll_interval", float(req.poll_interval))
+        save_state("gpu_poll_interval", float(req.poll_interval))
+    return {"ok": True, **gpu_status()}
 @app.post("/api/comfy/queue")
 async def comfy_queue_ep(req: ComfyReq):
     return comfy_queue(req.workflow, req.url)
 @app.get("/api/comfy/history/{prompt_id}")
 async def comfy_history_ep(prompt_id: str, url: str = "http://127.0.0.1:8188"):
     return comfy_history(prompt_id, url)
+@app.post("/api/comfy/cancel")
+async def comfy_cancel_ep(req: ComfyCancelReq):
+    """中断 ComfyUI 当前生成（/interrupt）并释放该作业的 GPU 租约。"""
+    return await run_in_threadpool(comfy_cancel, req.prompt_id, req.url)
 @app.post("/api/comfy/import")
 async def comfy_import_ep(req: ComfyImportReq):
     root=_project_root_or_error()
@@ -1453,6 +1519,29 @@ def _ollama_keep_alive(model: str, keep_alive, timeout: float = 600.0):
         )
         return ok2, err2
     return False, err
+
+
+def _gpu_ollama_evict_hook():
+    """GPU 协调器驱逐钩子：把所有驻留的 Ollama 模型立即卸载，给新作业腾显存。
+
+    由 gpu_coordinator 在租约排队时触发一次（锁外执行）；Ollama 不在线或没有
+    驻留模型都算"没腾出东西"，返回 False。任何异常都吞掉，绝不能拖死协调线程。
+    """
+    try:
+        models = _ollama_ps()
+    except Exception:  # noqa: BLE001
+        return False
+    freed = False
+    for m in models:
+        name = m.get("name") or m.get("model")
+        if not name:
+            continue
+        try:
+            ok, _err = _ollama_keep_alive(name, 0, timeout=120)
+        except Exception:  # noqa: BLE001
+            ok = False
+        freed = freed or ok
+    return freed
 
 
 def _ollama_expires_minutes(expires_at: str):

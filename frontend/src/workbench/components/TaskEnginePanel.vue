@@ -24,6 +24,7 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer) })
 async function checkComfy() { try { const r = await comfyApi.status(comfyUrl.value); comfyState.value = r.available ? '可用' : '不可用' } catch { comfyState.value = '不可用' } }
 async function queueComfy() { try { const w = JSON.parse(workflow.value); const r = await comfyApi.queue(w, comfyUrl.value); promptId.value = String(r.response?.prompt_id || ''); comfyResult.value = r.ok ? `已提交 ${promptId.value}` : (r.error || '提交失败') } catch { comfyResult.value = 'Workflow JSON 无效' } }
 async function pollComfy() { if (!promptId.value) return; const r = await comfyApi.history(promptId.value, comfyUrl.value); outputs.value = r.outputs || []; comfyResult.value = r.done ? `生成完成（${outputs.value.length} 个结果）` : '生成中' }
+async function cancelComfy() { if (!promptId.value) return; const r = await comfyApi.cancel(promptId.value, comfyUrl.value); comfyResult.value = r.ok ? `已取消 ${promptId.value}（租约${r.lease_released ? '已释放' : '未持有'}）` : (r.error || '取消失败') }
 async function importOutput(o: Record<string, unknown>) { const x = await comfyApi.import(promptId.value, o, comfyUrl.value); comfyResult.value = x.ok ? `已导入 ${x.path}` : (x.error || '导入失败') }
 </script>
 <template>
@@ -41,12 +42,13 @@ async function importOutput(o: Record<string, unknown>) { const x = await comfyA
       <div class="te-engine"><span :class="{ live: running }" /> Godot {{ running ? '运行中' : '未运行' }} <button @click="verifyEngine">校验</button><button @click="toggleEngine">{{ running ? '停止' : '启动' }}</button></div>
       <pre v-if="logs.length" class="te-logs">{{ logs.join('\n') }}</pre>
       <button v-for="e in errors" :key="`${e.path}:${e.line}`" class="te-error" @click="jumpToLine(e.path, e.line)">{{ e.path }}:{{ e.line }} · {{ e.message }}</button>
-      <div class="te-comfy"><b>ComfyUI 资源</b><input v-model="comfyUrl" @change="checkComfy" /><textarea v-model="workflow" placeholder="粘贴 workflow JSON" /><button @click="queueComfy">提交生成</button><button v-if="promptId" @click="pollComfy">查询结果</button><span>{{ comfyState }} {{ comfyResult }}</span></div>
+      <div class="te-comfy"><b>ComfyUI 资源</b><input v-model="comfyUrl" @change="checkComfy" /><textarea v-model="workflow" placeholder="粘贴 workflow JSON" /><button @click="queueComfy">提交生成</button><button v-if="promptId" @click="pollComfy">查询结果</button><button v-if="promptId" class="te-cancel" @click="cancelComfy">取消生成</button><span>{{ comfyState }} {{ comfyResult }}</span></div>
       <div v-if="outputs.length" class="te-outputs"><button v-for="o in outputs" :key="o.filename" @click="importOutput(o)">{{ o.filename }} · 导入</button></div>
     </div>
   </div>
 </template>
 <style scoped>
 .te-panel{position:relative}.te-trigger{border:1px solid var(--border-strong);background:transparent;color:var(--text-muted);border-radius:5px;padding:5px 9px;cursor:pointer}.te-pop{position:absolute;right:0;top:34px;width:310px;padding:12px;background:var(--bg-raised);border:1px solid var(--border-strong);border-radius:7px;box-shadow:0 10px 30px #0008;z-index:20}.te-head{display:flex;justify-content:space-between;margin-bottom:9px}.te-head button{background:none;border:0;color:var(--text-muted);font-size:18px}.te-pop input,.te-pop textarea{width:100%;margin:4px 0;padding:7px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;font:inherit}.te-pop textarea{height:55px;resize:vertical}.te-action,.te-engine button{background:#17304b;border:1px solid #315c86;color:#b9d8f5;border-radius:4px;padding:5px 8px;cursor:pointer}.te-result{color:var(--green);font-size:11px}.te-list{max-height:100px;overflow:auto;padding-left:18px;font:11px var(--font-mono);color:var(--text-muted)}.te-engine{margin-top:10px;padding-top:9px;border-top:1px solid var(--border);display:flex;align-items:center;gap:7px;color:var(--text-muted);font-size:11px}.te-engine button{margin-left:auto}.te-engine span{width:7px;height:7px;border-radius:50%;background:#687587}.te-engine span.live{background:var(--green);box-shadow:0 0 7px var(--green)}
+.te-comfy button{background:#17304b;border:1px solid #315c86;color:#b9d8f5;border-radius:4px;padding:4px 8px;cursor:pointer;margin:2px 4px 2px 0;font-size:11px}.te-comfy button.te-cancel{background:#3a2020;border-color:#8a4a4a;color:#e8a5a5}
 </style>
 

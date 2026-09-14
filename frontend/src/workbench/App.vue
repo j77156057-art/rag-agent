@@ -9,6 +9,7 @@ import AppDialog from './components/AppDialog.vue'
 import SymbolOutline from './components/SymbolOutline.vue'
 import SymbolMap from './components/SymbolMap.vue'
 import RelationGraph from './components/RelationGraph.vue'
+import UnityGraph from './components/UnityGraph.vue'
 import SelectionToolbar from './components/SelectionToolbar.vue'
 import SelectionAiPanel from './components/SelectionAiPanel.vue'
 import GitHistoryDialog from './components/GitHistoryDialog.vue'
@@ -18,6 +19,7 @@ import TaskEnginePanel from './components/TaskEnginePanel.vue'
 import SceneRuntimePanel from './components/SceneRuntimePanel.vue'
 import ChatDock from './components/ChatDock.vue'
 import AgentPolicyPanel from './components/AgentPolicyPanel.vue'
+import GpuPanel from './components/GpuPanel.vue'
 import { useWorkbench } from './composables/workbench'
 import { regionColor } from './theme'
 
@@ -25,6 +27,7 @@ const {
   tree, treeLoading, treeError, loadTree,
   tabs, activeTab, selectedPath, openNode, saveActive,
   openSymbolMap, openRelationGraph,
+  openUnityGraph,
   revertPath, openHistory,
   openRegionMap,
   aiPanelOpen,
@@ -82,6 +85,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
       <div class="wb-topbar-right">
         <a class="wb-question-link" href="/" title="回到 RAG 问答页（检索问答 / 索引代码目录）">问答</a>
         <TaskEnginePanel />
+        <GpuPanel />
         <AgentPolicyPanel />
         <SceneRuntimePanel />
         <button
@@ -111,6 +115,20 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
             <path d="M4.4 4.2 L8.8 4.2 M4 4.8 L5.8 8.8 M9.2 4.8 L7.4 8.8" stroke="currentColor" stroke-width="0.85" />
           </svg>
           关系图
+        </button>
+        <button
+          v-if="tree"
+          class="wb-map-btn"
+          title="Unity 工程：.meta GUID 引用图（场景/预制体/脚本/贴图依赖，断裂引用检测）"
+          @click="openUnityGraph"
+        >
+          <svg width="13" height="13" viewBox="0 0 13 13">
+            <rect x="1.2" y="1.8" width="4.4" height="3.6" rx="0.8" fill="none" stroke="currentColor" stroke-width="0.9" />
+            <rect x="7.8" y="1.8" width="4.2" height="3.6" rx="0.8" fill="none" stroke="currentColor" stroke-width="0.9" />
+            <rect x="4.6" y="8.2" width="4.2" height="3.6" rx="0.8" fill="none" stroke="currentColor" stroke-width="0.9" />
+            <path d="M5.4 3.2 L8 2.8 M3.6 5.3 L5.8 8.1 M9.6 5.4 L7.8 8.2" fill="none" stroke="currentColor" stroke-width="0.8" />
+          </svg>
+          Unity 图
         </button>
         <button
           v-if="activeTab && canHistoryActive"
@@ -202,6 +220,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
     <RegionMapDialog />
     <SymbolMap />
     <RelationGraph />
+    <UnityGraph />
     <SelectionToolbar />
   </div>
 </template>

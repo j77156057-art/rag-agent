@@ -1,7 +1,7 @@
 # DocMind 项目交接清单（给接手 AI）
 
-> **更新时间**：2026-09-14（含 P0-1 实机闭环 + 接手校准）｜ **基线提交**：`eeb73ab`
-> **全量测试**：**223 项全部通过** ｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
+> **更新时间**：2026-09-14（P2-1 GPU 协调补完落地 + P1-2 Unity GUID 引用图，均尚未提交）｜ **基线提交**：`eeb73ab`（本地另有校准提交 `981b116` 未推送）
+> **全量测试**：**250 项全部通过** ｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
 > **引擎嵌入实机自检**：`verify_engine_embed.py` **68/68**（真 Godot 4.7.2 + 真 Win32 宿主，含真实合成键鼠与 UI 调用路径）｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` **27/27** ｜ **前端构建**：`npm run build` 通过
 > 本文是项目唯一权威交接文档，取代并删除了旧版 `HANDOFF.md`、`AI_BRIEF.md`、`DEV_WORKBENCH_AUDIT.md`、`HANDOFF_ENGINE_EMBEDDING.md`、`HANDOFF_REMAINING_WORK.md`（旧 HANDOFF.md 由本同名文件接管）。
 > **铁律：规划项一律写在第 5 节，不得描述为已完成；做完一项就把它移到第 4 节时间线并注明提交号。**
@@ -43,7 +43,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   界面照常可用；另有「聚焦 / 解除嵌入 / 停止桌面窗口」。关弹窗或切走 tab 会自动解除嵌入（视窗元素没了，
   继续嵌着只会让引擎画到别处）。浏览器模式下开关自动禁用并提示需要桌面端。
 - **LLM/Embedding**：mock / qwen / deepseek / ollama / llamacpp 多 Provider，页面内免重启切换；本机 Ollama(`11434`, bge-m3) 与 llama.cpp(`8080`, Qwen 35B) 免 Key；622fdbc 新增 native embedding。
-- **验证基线**：后端 `unittest discover` **223/223 通过**；
+- **验证基线**：后端 `unittest discover` **250/250 通过**（含 `test_unity_graph.py` 4 例、`test_gpu_coordinator.py` 23 例）；
   `verify_scene_canvas.py` 走真实 HTTP 路由 **54/54**（含"每个 op 的 undo 逐字节还原"）；
   `verify_engine_embed.py` 真 Godot + 真 Win32 宿主 **68/68**；
   `verify_scene_canvas_ui.mjs` 真浏览器 **27/27**（含"空间布局落点与场景坐标严格成比例"）；前端 build 通过。
@@ -60,15 +60,16 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | `agent.py` | ReAct 循环（Thought→Action→Observation）、反思重试、弱模型 terminal 工具、代码优先路由（c543047） |
 | `tools.py`（105KB） | 工具注册表 `TOOLS`：9 基础 + 受控写（apply_edit/create_file/run_command）+ 11 个 dev_* 分区工具 + 研判分区工具 |
 | `regions.py`（47KB） | 分区 2.0：DEFAULT_REGIONS 8 区、regions.json 覆盖、契约校验（DAG 无环/导出存在）、init/scaffold/fill_exports、变更集与回滚 |
-| `game_workbench.py`（60KB） | Godot/Unity/Unreal catalog、引擎启停与自动嵌入、运行时事件、任务/资产/bug 工作流 |
+| `game_workbench.py`（60KB） | Godot/Unity/Unreal catalog、引擎启停与自动嵌入、运行时事件、任务/资产/bug 工作流；**P2-1 ComfyUI 租约覆盖完整生成周期**：`comfy_queue` 用一次性提交 owner 拿租约（带 Ollama 驱逐钩子）→ 成功后 `reown` 为 `comfyui:{prompt_id}`（TTL 600s `DOCMIND_COMFY_JOB_TTL` 兜底），`comfy_history` 见终态（outputs/completed/error/failed）幂等释放，`comfy_cancel` 调 ComfyUI `/interrupt` 后释放 |
 | `workbench_fs.py`（56KB） | 沙箱文件树、读写、git 状态/历史/回滚/恢复、符号地图、关系图（继承/挂载/调用边） |
+| `unity_graph.py`（新） | **P1-2 Unity GUID 引用图**：扫 `.meta` 建 guid 索引（含文件夹/孤儿 meta/冲突检测），解析 `.unity/.prefab/.asset/.mat` 等序列化文本的 guid 引用（大小写归一、同源聚合 ×N），产出与关系图同构的 nodes/edges；缺失 guid 聚合为外部节点（Packages 包资源与真断裂引用同口径，不夸大为错误） |
 | `symbols.py`（40KB） | 多语言符号抽取（Python ast / GDScript / Java 等），代码感知分块 |
 | `ingest.py`（22KB） | 文档/代码摄取与递归分块；跳过 .chroma/dist/.venv/_archived_builds/uploads 等 |
 | `mcp_client.py`（20KB，新） | MCP（Model Context Protocol）桥接客户端，168 行测试 |
 | `web_export.py`（18KB，新） | 游戏 Web 导出与本地预览（Web player） |
 | `scene_runtime.py`（1198 行） | **场景画布内核**：.tscn 行块解析 → 图模型（节点/外部引用/四类边/几何量）＋受控编辑（add/delete/rename/reparent/duplicate/set_props/move/restore，写完自检失败自动回滚，每个 op 回传可原样回放的 undo）＋运行时事件检索（筛选/统计/会话切分/游标清空） |
 | `desktop_bridge.py`（6.4KB） | Win32：find_host/find_window/embed/resize/**focus（新增）** |
-| `gpu_coordinator.py`（5.2KB） | GPU lease：acquire/release/status + TTL 过期/移交 + nvidia-smi 显存阈值（**单 GPU 串行起步**） |
+| `gpu_coordinator.py`（重写） | **P2-1 GPU 协调**：三模式 `DOCMIND_GPU_MODE=serial（默认，全机 FIFO 锁）/parallel（不协调，仅采样）/multi（每卡独立租约）`；`acquire_lease()` 返回 `{ok,gpu,reason,evicted}`，显存门槛不足直接拒绝不排队，**严格 FIFO（multi 下队首要的卡忙时后续者不得用别的空闲卡插队）**；`reown/force_release(owner)/cancel_wait/queue_position/register_hook/note_activity/configure/recent_samples`；后台守护线程做 5s 采样环（240 点≈20 分钟）、TTL 回收、Ollama 空闲卸载（`DOCMIND_OLLAMA_IDLE_UNLOAD`，60s 冷却，有非 ollama 租约时不卸）；探测可 `set_gpu_probe` 注入。**multi 只返回卡号，CUDA_VISIBLE_DEVICES 隔离必须由调用方在子进程启动层做，本机单卡从未实测隔离，不得宣称** |
 | `desktop.py` | 控制台启动器、单实例保护、pywebview 窗口与宿主 HWND 注册 |
 | `llm.py` / `embeddings.py` / `vectorstore.py` / `config.py` | 多 Provider LLM、嵌入、Chroma 封装、配置与 frozen 资源定位 |
 | `engine_adapters.py` | 引擎适配薄封装；`verify*.py` 是独立校验脚本 |
@@ -81,6 +82,8 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 - **场景画布与时间线（2026-09-14）**：`SceneRuntimePanel.vue` 是弹窗外壳（试玩 / 场景画布 / 运行时时间线 三 tab）；
   `SceneCanvas.vue`（Vue Flow 画布主控：布局、编辑、撤销栈、检查器）+ `SceneNodeCard.vue`（场景节点卡）+ `SceneFileCard.vue`（脚本/实例化/资源文件卡）；
   `RuntimeTimeline.vue`（多轨道时间线）。`api.ts` 新增 `sceneApi`（走 `rawJson` 非抛错通道，因为 `ok:false` 里带着 stale/rolled_back 分支信息）。
+- **`UnityGraph.vue`（P1-2）**：零依赖力导向 Unity GUID 引用图（顶栏「Unity 图」）。
+- **`GpuPanel.vue`（P2-1）**：顶栏 GPU 按钮（实时显占用 GB，持租约时变琥珀色）+ 自管 5s 轮询浮层——每卡显存条/利用率/温度、20 分钟占用 SVG 迷你曲线、持有者一键回收、排队项一键取消、Ollama 空闲卸载秒数设置（持久化）；`api.ts` 新增 `gpuApi` 与 `comfyApi.cancel`（TaskEnginePanel 新增「取消生成」按钮，调 `/interrupt` 并释放作业租约）。
 
 ### 3.3 Skill（`.trae/skills/`，接手必读）
 
@@ -99,7 +102,9 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-13 | `c543047` Agent 代码优先路由+健壮动作解析+证据护栏；**`622fdbc` MCP bridge、Web player/导出、GPU lease 队列、native embedding、desktop_bridge focus、场景面板大改、ChatDock**（+4638 行，6 个新测试文件）；Vue Flow 区域画布 spike 验证通过（`b8e869c` 提交，已随 P0-2 转正后移除，见 §6） |
 | 2026-09-14 | **P0-1 Godot HWND 嵌入实机闭环**（Godot 4.7.2 + 真 Win32 宿主）：`desktop_bridge.py` 加固为可逆嵌入 + 客户区/矩形两种尺寸模式 + DPI 感知 + 可靠的跨线程 focus；`engine_*` 增加嵌入状态机与 detach/focus/resize/place/stop_all（停止先解除父子再杀进程树，防孤儿）；`desktop.py` 接 resized/shown/closing 事件并在启动前声明 DPI 感知；新增 `verify_engine_embed.py`（60 项实机断言，含真实合成键鼠回显）。修 3 个真 bug：嵌入后无法二次 embed、`windows_of_pids` 永远返回空、resize 用外框尺寸裁画面 |
 | 2026-09-14 | **`809a3b9` P0-2 场景画布转正 + P1-1 运行时时间线**：`scene_runtime.py` 重写为行块解析/图模型/受控编辑（+1035 行）；新增 `/api/scene/graph`、`/api/scene/op`、`/api/runtime/sessions`、`/api/runtime/clear`，`/api/runtime/events` 支持筛选；前端新增 `SceneCanvas.vue`/`SceneNodeCard.vue`/`SceneFileCard.vue`/`RuntimeTimeline.vue` 与 `sceneApi`；移除 spike 入口与 `src/spike/`；修 gpu 队列抖动用例；补 `/favicon.ico`；构建前清理 `web/assets`。测试 202/202、后端自检 50/50、浏览器冒烟 23/23 |
-| 2026-09-14 | **RAG 问答质量收紧（第 17 次冻结构建，20:56）**：`d4d8820` Agent 提示词五项硬纪律（文档类先查知识库 / 收敛护栏 / 兄弟仓库指路 / 清单逐项 N/A / Thought 只写决策）；`11d7d91` 问答页「深度思考」标注 + 文件路径可点击看源码；`82ac6e4` 修复 ReAct 思考过程泄漏到最终答案。构建验证：单测 223/223、场景画布 54/54 + 浏览器 27/27、引擎嵌入真机 68/68、`npm run build` vendor 哈希不变、冻结态最小 PATH 冷启动冒烟全过、playwright+Edge 真机点链接高亮目标行。产品位于 `D:/Temp/docmind_rel15/DocMind/`，待用户关闭第 16 次运行实例（PID 15520，锁 `dist/DocMind`）后换入 `dist/DocMind` 完成交付 |
+| 2026-09-14 | **`981b116` 接手校准**：基线对齐 `eeb73ab` 后的 10 个外部提交；全量测试核对、HANDOFF 数字/状态修正（未推送） |
+| 2026-09-14 | **P1-2 Unity GUID 引用图（纯文本静态分析，不启动编辑器，尚未提交）**：新增 `unity_graph.py` 与 `GET /api/unity/guid-graph`；`.meta` 建 GUID 索引（类型分类、文件夹/孤儿 meta、GUID 冲突检测），`.unity/.prefab/.asset/.mat/.controller/.anim` 等序列化文本按行提取引用（大小写归一、同对聚合计数、首行号），Library/Temp 等跳过，2 万文件上限与 skipped 统计；产出与关系图同构 nodes/edges，工程内解析不到的 guid 聚合成"缺失/外部"节点（默认折叠，口径包含 Packages 包资源，不夸大为断裂）。前端新增 `UnityGraph.vue`（零依赖力导向、类型 chips 过滤、搜索邻接高亮、缺失红虚线、节点详情侧栏含出/入边清单与 GUID 复制、双击/按钮打开文件），顶栏「Unity 图」入口。新增 `tests/test_unity_graph.py` 4 例（223 → **227** 全绿）；合成 Unity 工程浏览器冒烟全过（默认图/缺失展开/侧栏出入边/搜索/类型过滤），`npm run build` 通过。**仍待**（本机未装 Unity 编辑器）：Editor HTTP 插件、Console/PlayMode、资产改动同步 `.meta` |
+| 2026-09-14 | **P2-1 GPU 协调补完（尚未提交）**：`gpu_coordinator.py` 重写为 serial/parallel/multi 三模式 + `acquire_lease/reown/cancel_wait/force_release(owner)/register_hook/note_activity/configure/recent_samples`，严格 FIFO（multi 下也不许跨空闲卡插队），显存门槛直接拒绝不排队，驱逐钩子锁外只跑一次；后台守护线程（FastAPI lifespan 启停）做 5s 采样环（240 点）、TTL 回收、Ollama 空闲卸载（`api.py` 钩子对 `/api/ps` 驻留模型逐一 `keep_alive=0`，嵌入模型走 `/api/embeddings` 兜底；空闲秒数/采样间隔经 `.docmind_state.json` 跨重启恢复）。ComfyUI 租约覆盖完整生成周期（提交临时 owner→`reown comfyui:{prompt_id}`，TTL 600s 兜底；`comfy_history` 终态释放；新增 `comfy_cancel` 打 `/interrupt` 与 `POST /api/comfy/cancel`）；`llm.py`/`embeddings.py` 在 Ollama 推理前后 `note_activity`。新增 `POST /api/gpu/cancel|force-release|configure`；前端新增 `GpuPanel.vue`（每卡占用/温度/迷你曲线/队列取消/强制回收/空闲卸载设置）+ `gpuApi`，TaskEnginePanel 加「取消生成」。新增 `tests/test_gpu_coordinator.py` 23 例（含假双卡 HTTP ComfyUI 服务的完整作业生命周期；227 → **250** 全绿），`npm run build` 通过；真机 RTX 5070 Ti 浏览器冒烟：真实显存/温度/采样曲线/设置持久化/遮罩开关全过。**未实测，不得宣称**：multi 模式 CUDA 进程隔离（协调器只返回卡号，需调用方在子进程启动层设 `CUDA_VISIBLE_DEVICES`）、多卡物理环境 |
 
 > 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（17 次完整记录，继续追加不要新建文件）。
 
@@ -114,18 +119,21 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 `agent_policy.py`、`/api/agent/route`、`/api/agent/routing`、`/api/agent/connectors`、`/api/agent/permission`、`/api/agent/secrets`(GET/DELETE)、`/api/agent/approvals`(含 decide 与 before/after unified diff)、`/api/agent/external-write` 和 Skill `agent-model-routing` 均已落地；前端 `AgentPolicyPanel.vue` 已在工作台顶栏接线（路由状态/连接器清单/外部路径审批/Diff 批准拒绝）。`/api/chat` SSE 首事件返回路由建议并注入上下文；`AGENT_AUTO_CLOUD=1` + 云端密钥时复杂请求走云端 Agent，缺密钥自动回退本地；云端发送前经 `redact_for_cloud` 脱敏并截断上下文；`dev_mcp_call` 校验连接器启用状态、可选 task_id 绑定与参数路径越权；外部写入需 approved approval_id + 精确路径，写前生成 `.docmind.bak`；密钥 DPAPI/Fernet 往返、撤销、授权均有回归测试。外部授权写项目内 `.docmind_permissions.jsonl` 审计日志，Agent 自身项目始终拒绝写入。
 **仍待做（非阻塞）**：连接器 UI 目前只展示清单与启用状态，启停/配置管理界面未做；ReAct 内部连接器选择依赖工具清单读取，尚无"Agent 自主切换连接器"的策略层。
 
-### P1-2　Unity 深度适配
+### P1-2　Unity 深度适配（GUID 引用图已落地，编辑器联机未做）
 
-已新增 `/api/engine/inspect?engine=unity`：读取 Unity 版本、`.unity/.prefab` 清单和 `.meta` GUID；Unreal 同接口读取 `.uproject/.uplugin` 与 Source 文件清单。仍待 GUID 引用图、Console/PlayMode、Editor 插件和 Unreal Blueprint/AutomationTool。
+已完成：`/api/engine/inspect?engine=unity`（Unity 版本、`.unity/.prefab` 清单、`.meta` GUID）与 **`/api/unity/guid-graph` GUID 引用图**（`unity_graph.py` + 工作台「Unity 图」弹窗，见 §4 2026-09-14 条目；纯文本分析，无需编辑器）。仍待（本机未安装 Unity 编辑器，无法实机验收）：Editor HTTP 插件、Console/PlayMode 控制、资产增删改时同步维护 `.meta` GUID（资产操作必须成对处理 meta）。
 
 ### P1-3　Unreal 深度适配
 
 扫描 `.uproject/.uplugin/Source/Build.cs` 建 C++ 符号图；Editor Python/HTTP 插件查 Level Actor/Blueprint；AutomationTool 编译验证；**禁止直接改 `.uasset`**。
 
-### P2-1　GPU 协调补完
+### P2-1　GPU 协调补完（主体已落地 2026-09-14，剩多卡隔离实测）
 
-- 【现状】lease/acquire/release/status + TTL 过期与移交 + nvidia-smi 阈值已有实现与 `test_gpu_queue.py`（622fdbc）。
-- 【待做】显存占用轮询、Ollama `keep_alive=0` 空闲释放、ComfyUI 完成后释放、排队取消/超时、**多 GPU 选择**。**没有实测 CUDA 隔离前，任何文档/UI 不得宣称已隔离。**
+已完成（尚未提交，详见 §4 2026-09-14 P2-1 条目）：显存占用轮询采样（5s×240 点环）、Ollama `keep_alive=0` 空闲自动卸载（活动打点 + 60s 冷却 + 有其他租约不卸）、ComfyUI 租约覆盖整个生成周期（提交 reown/终态释放/取消打 `/interrupt`，TTL 600s 兜底）、排队取消/超时/强制回收、三模式与 multi 多卡租约选择、GPU 面板 UI 与配置持久化。
+**仍待（环境限制，禁止提前宣称）**：
+- multi 模式的 **CUDA 隔离未实测**：协调器只在租约结果里返回卡号，真正隔离要调用方在启动子进程时设 `CUDA_VISIBLE_DEVICES`（当前 ComfyUI/Ollama 均为外部常驻服务，不会读这个变量；后续若由 DocMind 拉起子进程才需接线）；
+- 本机单卡（RTX 5070 Ti Laptop），多卡调度只有假探测单测覆盖，没有物理多卡验收；
+- Ollama 空闲卸载钩子已注册但本机 OLLAMA_KEEP_ALIVE=24h，真实"空闲→自动卸载"链路只做了单测（钩子直调 keep_alive=0 的路径在 `/api/model_power` 上有人工验证先例），未在面板上端到端等待触发。
 
 ### P2-2　ComfyUI 流水线
 
@@ -133,7 +141,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 ### P3　冻结发布（标准流程，已执行至第 17 次）
 
-按 `docmind-frozen-release` Skill：py_compile → **223 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(68) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → 前端产物 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
+按 `docmind-frozen-release` Skill：py_compile → **250 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(68) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → 前端产物 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
 第 15/16/17 次均已执行（最新 `344007e`=第 16 次、`DocMind_BUILD.md` 第 17 次章节=20:56 构建）。
 **第 17 次交付卡点已解除（2026-09-14 接手核证）**：第 16 次旧实例已关闭、无 DocMind 进程残留；第 17 次产物（`dist/DocMind/DocMind.exe`，mtime 2026-09-14 20:56，19,673,210 字节）已换入 `dist/DocMind`，临时目录 `D:/Temp/docmind_rel15` 已清理。下次发布直接从第 18 次流程开始。
 
@@ -149,7 +157,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   「浏览器冒烟记 UI 降级 + `verify_engine_embed.py` 记后端契约（含 UI 的实际调用路径）」两段拼起来，
   中间那层"真桌面壳里点一下"由**人工三步验收**兜：
   桌面端启动 → 试玩器 → 勾「嵌入工作台」点「桌面窗口启动」→ 画面应出现在弹窗中。
-- **场景画布尚未支持的能力**（刻意留给后续，不是 bug）：Unity `.unity/.prefab` 场景图（P1-2）、节点属性引用边（`node_paths=PackedStringArray`）的自动跟随改写（改名/换父时只改 `parent` 前缀，NodePath 属性需人工核对）、多场景同时打开、画布上的 Undo/Redo 跨会话持久化。
+- **场景画布尚未支持的能力**（刻意留给后续，不是 bug）：Unity `.unity/.prefab` 的 GameObject 层级画布（P1-2 已完成的是资产级 GUID 引用图，不是对象级场景树）、节点属性引用边（`node_paths=PackedStringArray`）的自动跟随改写（改名/换父时只改 `parent` 前缀，NodePath 属性需人工核对）、多场景同时打开、画布上的 Undo/Redo 跨会话持久化。
 
 ---
 
@@ -347,3 +355,15 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 基线提交更新为 `eeb73ab`；核对全量测试 **223/223**，修正 §2 旧数字（202/50/23 → 223/54/27，补 68 项引擎实机）。
 - Agent 路由与权限段由"待办"改写为"已落地 + 剩余非阻塞项（连接器启停 UI、ReAct 自主切换策略层）"。
 - 核证第 17 次冻结构建交付卡点已解除（exe mtime 20:56 已在 `dist/DocMind`，旧实例与临时目录均已清）。
+
+**2026-09-14 追加（P1-2 Unity GUID 引用图，尚未提交）**
+- 新增 `unity_graph.py`（meta GUID 索引 + 序列化文本引用解析 + 冲突/孤儿/缺失统计）、`GET /api/unity/guid-graph`（run_in_threadpool）、前端 `UnityGraph.vue` 与顶栏「Unity 图」入口、`tests/test_unity_graph.py`（4 例）。
+- 口径决策：工程 Assets 内解析不到的 guid 一律标"缺失/外部"且默认折叠——Packages 包资源与真断裂引用在无 Library/PackageCache 时无法区分，不夸大为错误；GUID 冲突单独红色统计（Unity 中属致命问题）。
+- 全量测试 223 → **227**；§3.1 补模块行，§5 P1-2 改为"GUID 图已落地 + 编辑器联机待装 Unity"，§4 补时间线行（含 981b116 校准行）。合成 Unity 工程经真浏览器冒烟：图渲染/缺失展开/详情侧栏出入边/搜索高亮/类型 chips 过滤全过。
+
+**2026-09-14 追加（P2-1 GPU 协调补完，尚未提交）**
+- `gpu_coordinator.py` 重写：serial/parallel/multi 三模式、`acquire_lease` 结构化结果、严格 FIFO（修掉 multi 下新请求绕过队列占空闲卡的漏洞）、显存门槛拒绝不排队、`reown/force_release(owner)/cancel_wait`、驱逐钩子（锁外、一次）、采样环、TTL pump、Ollama 空闲卸载；nvidia-smi 探测一律移到锁外，避免 2s 子进程卡住条件变量。
+- 接线：`api.py` lifespan 启停后台线程并注册 Ollama 卸载钩子（复用 `_ollama_ps`/`_ollama_keep_alive`），新增 `/api/gpu/cancel|force-release|configure` 与 `/api/comfy/cancel`；`config.py` 新增 `load_state` 并恢复 gpu 两项偏好；`game_workbench.py` ComfyUI 租约改为覆盖完整生成周期；`llm.py`/`embeddings.py` 加 `note_activity("ollama")`。
+- 前端：`GpuPanel.vue` + `gpuApi`（含 TS 类型），TaskEnginePanel 加「取消生成」。
+- 新增 `tests/test_gpu_coordinator.py` 23 例（双卡假探测/严格 FIFO/取消/驱逐一次/门槛拒绝/reown/定向回收/空闲规则与冷却/采样环+后台线程/parallel/状态结构/假 HTTP ComfyUI 服务的 queue→history→释放与 cancel 生命周期/提交失败释放）；全量 **227 → 250**，`npm run build` 通过；真机 RTX 5070 Ti 浏览器冒烟 9 项全过（控制台仅有既有的导航中断请求噪声，非本次接口）。
+- §5 P2-1 改为"主体已落地 + 三条未实测残留"（CUDA 隔离、物理多卡、空闲卸载端到端等待），§3.1/§3.2 补模块与组件行。
