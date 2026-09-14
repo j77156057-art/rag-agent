@@ -8,4 +8,7 @@ class T(unittest.TestCase):
   r=gw.comfy_apply_parameters(w, {'prompt':'good','negative_prompt':'bad'})
   self.assertEqual(r['workflow']['3']['inputs']['prompt'],'good')
   self.assertEqual(r['workflow']['4']['inputs']['prompt'],'bad')
+ def test_template_exposes_provenance(self):
+  t=gw.comfy_templates()['templates'][0]
+  self.assertTrue(t['author']); self.assertTrue(t['source_url']); self.assertTrue(t['license'])
 if __name__=='__main__': unittest.main()
