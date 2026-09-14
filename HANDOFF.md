@@ -542,6 +542,7 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 当前发布状态复核：工作区 clean，`HEAD=5596b82`，`origin/main=d130646`，本地 main 超前 96 个提交；已确认 D 盘存在 `D:\ComfyUI\ComfyUI\main.py` 与 Godot GUI 可执行文件，但本轮未自行启动 ComfyUI 或引擎以避免改变用户 GPU/桌面状态。
 - ComfyUI 前端结果区已改为自适应多媒体网格，图片/音频/视频保持原 MIME 预览与导入操作。
 - 最新回归（任务历史接入后）：Python 全量 **288/288 通过**；前端 `npm run build` 成功；工作区 clean。当前 main 比 origin/main 超前 103 个提交。
+- 来源校验接入导入流程后的最新回归：Python 全量 **291/291 通过**；前端 `npm run build` 成功；工作区 clean。当前 main 比 origin/main 超前 111 个提交。
 - 生成 Unreal bridge 脚本已扩展 `/health`、`/assets`、`/actors`、`/blueprint/{path}`、`/actor/{name}` 路由，并通过 `py_compile`；真实 Editor 节点/属性仍需 Unreal Python 插件运行验证。
 - 最新环境复核：Ollama 进程与 API 在线；ComfyUI 端口 8188 当前不可用；未发现 Unity/Unreal 进程。未启动外部服务，避免未经用户操作改变 GPU 负载。
 
