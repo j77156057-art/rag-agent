@@ -12,6 +12,13 @@
 其余能力：排队等待可取消（``cancel_wait``）；显存探测可注入（测试用
 ``set_gpu_probe``）；后台线程做显存采样、TTL 惰性回收与 Ollama 空闲卸载；
 显存竞争时调用方可指名触发"驱逐钩子"（如把 Ollama 驻留模型 keep_alive=0）。
+
+硬件验收状态（截至 2026-09-14，提交 ``82d092c``）：本机为**单卡**
+RTX 5070 Ti Laptop。serial 全部能力、真实 nvidia-smi 采样、Ollama 双模型
+空闲卸载均已真机验证；multi 调度仅由 ``set_gpu_probe`` 假双卡单测覆盖，
+**物理多卡调度与 CUDA 设备隔离均未实测，禁止在任何 UI/文档中宣称已实现**。
+多卡到位后的逐项验收步骤（含负对照）见 HANDOFF.md 第 5 节 P2-1
+"待验收项 A/B"。
 """
 import collections
 import os
@@ -246,9 +253,17 @@ def acquire_lease(owner, timeout=2.0, purpose="", ttl=None, gpu=None,
 
     - ``gpu``：multi 模式指定卡号，None=自动挑最空的卡；
     - ``min_free_mb``：要求该卡至少空余多少 MB（0/None 不检查）；
-    - ``evict``：显存/卡不足且需要排队或拒绝时，先按名调用已注册的驱逐钩子
-      （锁外执行，例如卸载 Ollama 驻留模型），探测后只重试一次；
+    - ``evict``：仅当因显存门槛被拒绝（无租约挡路、显存被外部驻留占用）时，
+      按名调用已注册的驱逐钩子（锁外执行，例如卸载 Ollama 驻留模型），
+      重新探测后只重试一次；有活跃持有者导致的排队等待不触发驱逐；
     - ``ttl``：秒，0/None 取 DEFAULT_TTL。
+
+    返回的 ``gpu`` 只是协调层选出的物理卡号，**本身不产生任何设备隔离**：
+    消费方若自行 ``Popen`` GPU 子进程，必须在启动前往其环境写入
+    ``CUDA_VISIBLE_DEVICES=<gpu>``（CUDA 仅在进程初始化时读取一次）。
+    当前代码库没有此类消费方（ComfyUI/Ollama 均为外部 HTTP 服务），
+    因此 multi 模式现网无运行时隔离效果——接线与验收口径见
+    HANDOFF.md 第 5 节 P2-1 待验收项 B。
     """
     owner = str(owner)
     purpose = str(purpose)

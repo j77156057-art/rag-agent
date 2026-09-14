@@ -128,12 +128,23 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 扫描 `.uproject/.uplugin/Source/Build.cs` 建 C++ 符号图；Editor Python/HTTP 插件查 Level Actor/Blueprint；AutomationTool 编译验证；**禁止直接改 `.uasset`**。
 
-### P2-1　GPU 协调补完（已完成可测项 2026-09-14，仅剩物理多卡环境项）
+### P2-1　GPU 协调补完（软件侧已全部完成 `6e9b95b`+`82d092c`，剩两项纯硬件验收）
 
-已完成（主体 `6e9b95b`，收尾硬化 `82d092c`，详见 §4 2026-09-14 两条 P2-1 条目）：显存占用轮询采样（5s×240 点环，真实探测 0.5s TTL 缓存）、Ollama `keep_alive=0` 空闲自动卸载（活动打点 + 60s 冷却 + 有其他租约不卸 + 卸载后 ps 复查两轮）、**该链路已于真机端到端验证 PASS**（qwen3.6:35b + bge-m3 双模型同驻，后台空闲触发后 `/api/ps` 清空，RTX 5070 Ti）、ComfyUI 租约覆盖整个生成周期（提交 reown/终态释放/取消打 `/interrupt`，TTL 600s 兜底，默认 1024MB 余量门槛 + 显存不足先驱逐 Ollama）、排队取消/超时/强制回收、三模式与 multi 多卡租约选择、驱逐时机收窄（活跃持有者排队不白卸）、GPU 面板 UI 与配置持久化。
-**仍待（纯环境限制，硬件具备前禁止宣称完成）**：
-- multi 模式的 **CUDA 隔离未实测**：协调器只在租约结果里返回卡号，真正隔离要调用方在启动子进程时设 `CUDA_VISIBLE_DEVICES`（当前 ComfyUI/Ollama 均为外部常驻服务，不会读这个变量；后续若由 DocMind 拉起子进程才需接线）；
-- 本机单卡（RTX 5070 Ti Laptop），多卡调度只有假探测单测覆盖，没有物理多卡验收。
+软件侧已交付并验证（2026-09-14，**单卡** NVIDIA GeForce RTX 5070 Ti Laptop，12227MB）：serial 全链路（租约/FIFO/TTL/取消/定向回收/显存门槛/精准驱逐）、5s×240 采样环、Ollama 双模型空闲自动卸载**真机端到端 PASS**（qwen3.6:35b + bge-m3 同驻→后台触发→`/api/ps` 清空，含卸载后 ps 复查两轮）、ComfyUI 全作业周期租约（含 `/interrupt` 取消）、GpuPanel 真机冒烟、`test_gpu_coordinator.py` 31 例（258/258 全绿）。
+
+下列两项本机**不具备验收条件**。硬件到位前，HANDOFF/GpuPanel/任何提交信息或对外表述**都不得宣称"多卡调度已验证"或"已做 CUDA 隔离"**；现状口径统一为：多卡选择只存在于租约层（假双卡单测覆盖），运行时无任何设备隔离。
+
+**待验收项 A：物理多卡租约调度（只缺真硬件，无需写功能代码）**
+- 【要做什么】在 ≥2 张 NVIDIA GPU 的 Windows 机器上，用真实 `nvidia-smi` 验收 multi 模式的调度行为。
+- 【原因】现有多卡用例全部通过 `set_gpu_probe` 注入假探测数据，未覆盖真实多卡 CSV 解析、两卡真实占用差与多进程真实竞争时序。
+- 【方案】设置环境变量 `DOCMIND_GPU_MODE=multi` 后启动服务（采样间隔保持默认 `DOCMIND_GPU_POLL_INTERVAL=5`；其余代码不需要改动）。
+- 【验收】①`GET /api/gpu/status` 返回的 `gpus[]` 条数、index/name/显存/利用率/温度与 `nvidia-smi` 一一对应；②两个不带 `gpu` 参数的并发 `acquire_lease` 分别落在两张物理卡（自动挑空余量大者），第三请求按卡忙情况排队或拒绝；③队首指定的卡忙时，释放**另一张**卡不得让队首跨卡获得（严格 FIFO 的真机版，对应用例 `test_fifo_head_blocks_later_waiter`）；④`POST /api/gpu/cancel {owner}` 只取消排队不动持有租约，`POST /api/gpu/force-release {owner}` 只回收指定卡、另一卡 holder 不变；⑤GpuPanel 出现每卡一条的迷你曲线与独立 holder/queue 展示；⑥退化检查：单卡机器把模式误设为 multi 时 `gpus[]` 长度 1，租约功能不报错。
+
+**待验收项 B：CUDA 设备隔离的接线与验收（当前没有消费方，属未来功能）**
+- 【要做什么】协调器的边界是"在 `acquire_lease` 返回值里给出 `gpu` 物理序号"；真正的设备隔离必须由**拉起 GPU 子进程的调用方**在进程启动前把该序号写进子进程环境（NVIDIA 为 `CUDA_VISIBLE_DEVICES=<gpu>`，AMD 对应 `HIP_VISIBLE_DEVICES`）。
+- 【原因】CUDA 只在进程初始化瞬间读这个变量，启动后再改无效；而当前唯一的 GPU 重负载方 ComfyUI（127.0.0.1:8188）与 Ollama（11434）都是**用户自管的外部常驻服务**，DocMind 只发 HTTP、从不 `Popen` 它们——现在代码库内没有任何地方消费租约的 `gpu` 字段，所以 multi 模式在运行时**不产生任何隔离效果**，这不是缺陷而是尚未有此调用方。
+- 【方案】未来若由 DocMind 直接 spawn GPU worker（如本地批量出图/内置推理），在唯一的进程启动封装处用租约结果构造子进程环境后再启动（接口级描述：以父进程环境为底，覆写单键 `CUDA_VISIBLE_DEVICES` 为 `lease["gpu"]`，并发 worker 各持各的租约序号）；`game_workbench.comfy_queue` 注释里已标注该接线点。
+- 【验收】①两 worker 分别取得 k0/k1，各自在子进程内枚举可见设备：设备数为 1 且设备 UUID/名称与物理 k0、k1 对应（注意隔离后进程内设备序号会被重映射为 0，只能用 UUID/名称核对物理身份）；②负对照：给子进程一个不存在的序号（如 `CUDA_VISIBLE_DEVICES=99`）时子进程明确报告无可见设备——以此证明变量真正生效，而非"机器本来就只有一卡"；③worker 异常退出后其租约由 TTL 回收，对应卡重新可被分配，无需人工 force-release；④serial 模式（不设该变量）下原有单卡流程行为不变；⑤验收完成后再同步更新本文件与 GpuPanel 文案口径。
 
 ### P2-2　ComfyUI 流水线
 

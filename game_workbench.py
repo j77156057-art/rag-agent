@@ -715,6 +715,12 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188"):
     except ValueError as e: return {"ok": False, "error": str(e)}
     # 租约必须覆盖"提交 → ComfyUI 异步生成 → history 轮询到完成"整个周期，
     # 不能像旧版只在 POST /prompt 期间持有（请求返回时代码还在 GPU 上跑）。
+    #
+    # 【CUDA 隔离接线点（待实现，勿提前宣称）】lease 里的 gpu 只是协调层卡号，
+    # 对外部常驻 ComfyUI 服务不产生隔离——它不会继承 DocMind 进程的环境。
+    # 未来若改为由 DocMind 直接 Popen ComfyUI/worker，必须在启动前往子进程
+    # 环境写入 CUDA_VISIBLE_DEVICES=<lease["gpu"]>（进程初始化后改无效）。
+    # 验收口径见 HANDOFF.md 第 5 节 P2-1 待验收项 B。
     submit_owner = f"comfyui:submit:{uuid.uuid4().hex[:12]}"
     lease = _gpu.acquire_lease(submit_owner, timeout=2, purpose="comfyui",
                                ttl=COMFY_JOB_TTL,
