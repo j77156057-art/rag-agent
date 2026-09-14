@@ -208,6 +208,11 @@ onBeforeUnmount(() => {
             <button class="gp-mini" :disabled="busy" @click="cancelQueue(q.owner)">取消排队</button>
           </div>
         </div>
+        <div v-if="st?.processes?.length || st?.compute_apps?.length" class="gp-idle">
+          <div class="gp-idle-title">进程显存</div>
+          <div v-for="p in st?.processes || []" :key="p.pid" class="gp-faint">PID {{ p.pid }} · {{ p.owner }} · GPU {{ p.gpu ?? '—' }} · {{ p.status }}</div>
+          <div v-for="p in st?.compute_apps || []" :key="'c'+p.pid" class="gp-faint">计算进程 {{ p.pid }} · {{ p.process_name }} · {{ p.used_mb }} MB</div>
+        </div>
 
         <!-- Ollama 空闲自动卸载 -->
         <div class="gp-idle">

@@ -717,6 +717,9 @@ export interface GpuStatus {
   samples: GpuSamplePoint[]
   ollama_idle: { unload_seconds: number; last_activity_ago: number | null; last_unload_ago: number | null }
   hooks: string[]
+  processes?: { pid:number; owner:string; gpu:number|null; purpose:string; status:string; last_heartbeat:number }[]
+  compute_apps?: { pid:number; process_name:string; used_mb:number }[]
+  recovery_events?: Record<string, unknown>[]
 }
 
 export const gpuApi = {
