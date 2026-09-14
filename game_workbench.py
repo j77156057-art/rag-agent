@@ -952,7 +952,7 @@ def comfy_ui_to_api_workflow(ui_workflow):
             name = str(inp['name']); link_id = inp.get('link')
             if link_id is not None and str(link_id) in links:
                 src, slot = links[str(link_id)]; inputs[name] = [src, slot]
-            elif wi < len(widgets):
+            elif wi < len(widgets) and isinstance(inp.get('widget'), dict):
                 inputs[name] = widgets[wi]; wi += 1
         # SaveVideo keeps its widget-only fields outside the serialized input
         # list in the editor JSON.  The /prompt API still requires them.
@@ -962,6 +962,11 @@ def comfy_ui_to_api_workflow(ui_workflow):
                 inputs.setdefault('format', widgets[1])
             if len(widgets) > 2:
                 inputs.setdefault('codec', widgets[2])
+        # UI exports often persist model selections with a directory prefix;
+        # the API combo values are basenames relative to ComfyUI/models.
+        for key, value in list(inputs.items()):
+            if isinstance(value, str) and ('\\' in value or '/' in value) and key.endswith(('_name', '_name_1', 'clip_name', 'unet_name')):
+                inputs[key] = value.replace('\\', '/').rsplit('/', 1)[-1]
         out[nid] = {'class_type': type_aliases.get(str(typ), str(typ)), 'inputs': inputs}
     # Validate editor links before submitting.  Some distributed H3 UI
     # workflows are documentation-only graphs whose SaveVideo node is wired
