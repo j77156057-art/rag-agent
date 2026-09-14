@@ -53,7 +53,15 @@ def add_documents(chunks, embeddings, metadatas, ids, collection=COLLECTION_NAME
 
 def query(text_embedding, k=4, collection=COLLECTION_NAME):
     col = get_collection(collection)
-    return col.query(query_embeddings=[text_embedding], n_results=k)
+    try:
+        return col.query(query_embeddings=[text_embedding], n_results=k)
+    except Exception as exc:  # noqa: BLE001
+        if "dimension" in str(exc).lower():
+            raise ValueError(
+                f"查询向量维度与集合不匹配（当前输入 {len(text_embedding)} 维）。"
+                "请切换 embedding 配置，或显式 reset_collection() 重建索引。"
+            ) from exc
+        raise
 
 
 def reset_collection(name=COLLECTION_NAME):

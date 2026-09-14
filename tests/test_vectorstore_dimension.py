@@ -14,6 +14,15 @@ class VectorDimensionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "reset_collection"):
                 vectorstore.add_documents(["x"], [[0.0, 1.0]], [{}], ["id"])
 
+    def test_query_dimension_conflict_has_actionable_message(self):
+        class Collection:
+            def query(self, **kwargs):
+                raise RuntimeError("dimension mismatch: expected 1024")
+
+        with patch.object(vectorstore, "get_collection", return_value=Collection()):
+            with self.assertRaisesRegex(ValueError, "reset_collection"):
+                vectorstore.query([0.0, 1.0])
+
 
 if __name__ == "__main__":
     unittest.main()
