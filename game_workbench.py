@@ -660,6 +660,7 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
         log = open(log_path, "a", encoding="utf-8")
         p = subprocess.Popen(args, cwd=root_abs, stdout=log, stderr=subprocess.STDOUT, text=True, env=child_env)
         _ENGINE_PROCS[root_abs] = p
+        _gpu.register_process(p.pid, lease_owner, lease.get('gpu'), selected)
         _ENGINE_LOGS[root_abs] = log
         result = {"ok": True, "running": True, "pid": p.pid, "gpu": lease.get("gpu")}
         if embed and host_hwnd:
@@ -700,6 +701,7 @@ def engine_stop(root):
     p = _ENGINE_PROCS.get(root_abs)
     detached = engine_detach(root_abs)
     if not p or p.poll() is not None:
+        if p: _gpu.unregister_process(p.pid, "exited")
         _ENGINE_PROCS.pop(root_abs, None)
         _gpu.release('engine:' + root_abs)
         return {"ok": True, "stopped": False, "detached": detached.get('was_embedded', False)}
@@ -727,6 +729,7 @@ def engine_stop(root):
         except Exception:  # noqa: BLE001
             pass
     _ENGINE_PROCS.pop(root_abs, None)
+    _gpu.unregister_process(pid, "stopped")
     _gpu.release('engine:' + root_abs)
     return {"ok": True, "stopped": True, "pid": pid,
             "detached": detached.get('was_embedded', False), "killed": killed}
