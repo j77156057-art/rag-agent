@@ -145,7 +145,9 @@ def _default_process_probe():
             if len(parts) >= 3:
                 try: out.append({"pid": int(parts[0]), "process_name": parts[1], "used_mb": int(float(parts[2]))})
                 except ValueError: pass
-        return {"available": True, "processes": out}
+        # nvidia-smi 在权限不足或驱动不支持时会返回进程名但显存为 [N/A]；
+        # 这不构成可用的进程级显存数据，必须明确报告不可用。
+        return {"available": bool(out), "processes": out}
     except Exception:
         return {"available": False, "processes": []}
 
