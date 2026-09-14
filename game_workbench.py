@@ -975,6 +975,21 @@ def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
         result = {"ok": True, "prompt_id": pid, "status": status, "outputs": outputs,
                   "done": bool(item.get("outputs")), "finished": finished, "failed": failed,
                   "progress": progress}
+        # Keep the durable local history aligned with the authoritative ComfyUI
+        # response.  This is intentionally best effort: a history read must
+        # still succeed when the state file cannot be written.
+        with _COMFY_JOBS_LOCK:
+            job = _COMFY_JOBS.get(pid)
+            if job is not None:
+                status_value = "failed" if failed else ("completed" if finished else "running")
+                job.update({"status": status_value, "progress": progress,
+                            "outputs": outputs, "result": result})
+                if finished:
+                    job.update({"running": False, "done": True,
+                                "finished_at": job.get("finished_at") or datetime.now().isoformat(timespec="seconds")})
+                    if job.get("cancel_requested"):
+                        job["cancel_state"] = "terminated"
+                _save_comfy_history()
         if finished:
             # 生成结束（成功/失败都算）：释放作业租约，让排队的 Ollama/下一作业上卡
             result["lease_released"] = _gpu.force_release(_comfy_job_owner(pid)) is not None
@@ -1049,7 +1064,13 @@ def comfy_watch(prompt_id, url="http://127.0.0.1:8188", timeout=900, interval=1.
         with _COMFY_JOBS_LOCK:
             job.update({'running': False, 'done': bool(result.get('finished') or result.get('done')),
                         'result': result,
+                        'status': ('failed' if result.get('failed') else ('completed' if result.get('finished') else 'timeout')),
+                        'outputs': result.get('outputs') or [],
+                        'progress': result.get('progress') or {},
                         'finished_at': datetime.now().isoformat(timespec='seconds')})
+            if job.get('cancel_requested') and result.get('finished'):
+                job['cancel_state'] = 'terminated'
+            _save_comfy_history()
     threading.Thread(target=worker, name='comfy-watch', daemon=True).start()
     return {'ok': True, 'job': dict(job)}
 
