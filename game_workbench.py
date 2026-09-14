@@ -834,8 +834,8 @@ def _gpu_busy_error(res):
 # ---------------------------------------------------------------- ComfyUI 模板
 def comfy_templates():
     return {'ok': True, 'templates': [
-        {'id':'z-image-turbo','name':'Z-Image Turbo 图片','model':'z_image_turbo-Q8_0.gguf','kind':'image','schema':{'prompt':'string','width':'integer','height':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}},
-        {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','workflow':_comfy_workflow_path(),'schema':{'prompt':'string','width':'integer','height':'integer','frames':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}}
+        {'id':'z-image-turbo','name':'Z-Image Turbo 图片','model':'z_image_turbo-Q8_0.gguf','kind':'image','author':'Tongyi-MAI','source_url':'https://github.com/Tongyi-MAI/Z-Image','license':'Apache-2.0','schema':{'prompt':'string','width':'integer','height':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}},
+        {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','author':'MiniMax','source_url':'https://github.com/MiniMax-AI','license':'check-model-card','workflow':_comfy_workflow_path(),'schema':{'prompt':'string','width':'integer','height':'integer','frames':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}}
     ]}
 
 def _comfy_workflow_path():
@@ -1079,7 +1079,9 @@ def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="
         if len(data) > COMFY_MAX_DOWNLOAD: return {"ok": False, "error": "资源超过 25MB 下载上限。"}
         with open(target, "wb") as f: f.write(data)
         meta_path = _file(root, rel + ".json")
-        meta = {"source": "comfyui", "url": url, "prompt_id": str(prompt_id), "filename": name, "subfolder": sub, "mime": mimetypes.guess_type(name)[0] or 'application/octet-stream', "imported_at": datetime.now().isoformat(timespec="seconds"), "size": len(data)}
+        ext = os.path.splitext(name)[1].lower()
+        kind = '3d' if ext in {'.glb','.gltf','.fbx','.obj','.stl','.ply','.usd','.usdz'} else ('image' if ext in {'.png','.jpg','.jpeg','.webp'} else ('video' if ext in {'.mp4','.webm','.mov'} else 'other'))
+        meta = {"source": "comfyui", "url": url, "prompt_id": str(prompt_id), "filename": name, "subfolder": sub, "mime": mimetypes.guess_type(name)[0] or 'application/octet-stream', "asset_kind": kind, "preview_supported": kind in {'image','video'}, "imported_at": datetime.now().isoformat(timespec="seconds"), "size": len(data)}
         for key in ('license', 'source_url', 'author', 'workflow_sha256'):
             if image.get(key): meta[key] = str(image[key])[:1000]
         with open(meta_path, "w", encoding="utf-8") as f: json.dump(meta, f, ensure_ascii=False, indent=2)
