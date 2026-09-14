@@ -17,7 +17,9 @@ a = Analysis(
     pathex=[],
     binaries=chromadb_binaries + webview_binaries,
     datas=[
-        (".chroma", ".chroma"),
+        # 注意：不要打包 .chroma！它是用户本地代码索引库（含用户代码向量），
+        # 随包分发会泄漏开发者的本地索引、徒增约 377MB 体积，且对用户自己的代码库毫无用处。
+        # 冻结版首次启动由 chromadb 自动创建空 .chroma 目录，用户自行 /api/ingest_code 索引自己的代码。
         ("web", "web"),
     ] + chromadb_datas + webview_datas,
     hiddenimports=[

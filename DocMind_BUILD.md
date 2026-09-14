@@ -1,13 +1,32 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第十五次重建（桌面入口改 RAG 问答页 + 引擎嵌入实机闭环 + 场景画布/运行时时间线 + Agent 路由收敛）」；历史构建清单保留在下文。
+> 最新构建见下方「第十六次重建（模型预加载驻留修复 + 索引库 .chroma 泄漏修复）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 19.7 MB，控制台模式，启动时自动开浏览器）
-- 整体体积：约 682.5 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB/365 文件）
-- **当前构建时间：`2026-09-14 17:14:57`（第十五次重建，桌面入口改 RAG 问答页 + 引擎嵌入 + 场景画布 + Agent 路由收敛，exe 19,670,124 字节）**
-- 上一版：`2026-09-12 18:26:30`（第十四次重建，分区可视化增强，exe 19,412,925 字节）
+- 整体体积：约 309 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 91 MB/365 文件；**第十六次起不再打包开发者 `.chroma` 索引库，较第十五次 682.5 MB 降约 374 MB**）
+- **当前构建时间：`2026-09-14 18:16:52`（第十六次重建，模型预加载驻留修复 + 索引库 .chroma 泄漏修复，exe 19,670,711 字节）**
+- 上一版：`2026-09-14 17:14:57`（第十五次重建，桌面入口改 RAG 问答页 + 引擎嵌入 + 场景画布 + Agent 路由收敛，exe 19,670,124 字节）
+
+---
+
+## 第十六次重建：模型预加载驻留修复 + 索引库 .chroma 泄漏修复（2026-09-14 18:16）
+
+### 改动
+- **模型预加载驻留时长修复**（62c0b9b，用户反馈「刚预加载就自动卸载」）：`api.py` 的 `model_power_ep` 预加载分支硬编码 `_ollama_keep_alive(name, "30m")`，覆盖了用户 `OLLAMA_KEEP_ALIVE=24h` 的服务端默认，导致预加载后约 30 分钟即被自动卸载。新增 `_preload_keep_alive()`——预加载只负责把模型加载进显存，驻留时长一律跟随 `OLLAMA_KEEP_ALIVE`（为空或 `0/-1/inf/infinite/none` 时回退 24h），不再写死。dev 实测：`/api/ps` 的 `expires_at` 从 30m 回到 24h（`expires_minutes` 29→1439）。
+- **分发版索引库（`.chroma`）泄漏修复**（本次构建发现并修）：`docmind.spec` 的 datas 含 `(".chroma", ".chroma")`，会把**开发者本机已索引的代码向量（约 377 MB）原样烤进每个分发版**——既泄漏开发者本地索引、又徒增约 374 MB 体积，且对用户自己的代码库毫无用处（用户须自行 `/api/ingest_code` 重建索引）。该行为与 `DocMind_BUILD.md`「重要说明」里「未打包 .chroma」的既定约定相悖（疑为后续某次误加回 spec 导致回潮，第三/七/八次构建均明确不打包）。修复：`docmind.spec` 删除该 datas 项；`config.py` 在 `CHROMA_DIR` 解析后补 `os.makedirs(CHROMA_DIR, exist_ok=True)`，由 chromadb 首次启动自动建空索引目录。整包体积从约 682.5 MB 降至 **309 MB**。
+
+### 验证
+- 单测：全量 `unittest discover` **223/223 通过**（与第十五次持平，含 config.py 改动回归）。
+- 冻结态（最小 PATH 仅 System32，DOCMIND_SERVER_ONLY=1，PyInstaller 退出码 0）：
+  - 冷启动 ~1s 服务就绪；`build_time=2026-09-14 18:16:52`（exe mtime，确认本轮）；
+  - 默认 `/` 是 RAG 问答页且返回体含 `toplink`（指向 `/workbench`）；`/workbench` 200；`/api/health` 200；`/api/model_status` 200；
+  - **12 个前端产物经 HTTP 返回体字节与 `web/` 源逐字节一致**（SHA-256 全部 match）；`web/assets/workbench-BOV3qPvm.js` 字节数 145,833 与源一致；
+  - **包内不再含 `.chroma`**（本次修复核心证据：此前每版都烤进 377 MB 开发者索引）；包内无 `python*.exe`/`.env`/`.docmind_state.json` 泄漏；MinGit 91 MB/365 文件；冒烟后已删状态文件、进程结束、端口释放。
+- 阶段 2 哈希一致性：12 个前端产物逐个 SHA-256 与 `web/` 源一致；卫生扫描无状态/索引/密钥泄漏（含 `.chroma` 不复存在）。
+- 模型预加载修复：dev 生产态实测 `expires_minutes` 29→1439（24h 驻留恢复）；冻结冒烟仅确认 `/api/model_status` 端点可达、相关逻辑已编入 exe。
+- 源码对应提交：`62c0b9b fix(api): 模型预加载驻留时长跟随 OLLAMA_KEEP_ALIVE（不再写死 30m）`；`.chroma` 泄漏修复见 `docmind.spec` / `config.py`（与本文档同次提交）。
 
 ---
 
@@ -318,7 +337,7 @@
 - 源码层综合验证 `C:/tmp/verify_fixes_123.py`：**21/21 全过**（四路门禁拦截+审批后放行、`generate_test_scene` 引用真实符号且生成测试经 unittest 通过、`check_ollama` 结构化返回、`/api/health`、config 含 `ollama_status`、`/api/approval check`、`/api/dev_commit` 未审批 403）。
 
 ## 重要说明
-- **未打包 `.chroma`**：不把开发期测试索引烤进分发版。运行时 Chroma 会在 `dist/DocMind/.chroma` 自动建空索引，用户自行对目标项目执行索引即可。
+- **不打包 `.chroma`（第十六次起重申并落实）**：分发版不含开发者本机已索引的代码向量（早期某次误把 `(".chroma", ".chroma")` 加回 `docmind.spec` datas，导致 377 MB 开发者索引被烤进每版；第十六次已删除该项）。`config.py` 在 `CHROMA_DIR` 解析后 `os.makedirs(..., exist_ok=True)`，运行时 chromadb 在 `dist/DocMind/_internal/.chroma` 自动建空索引，用户自行 `/api/ingest_code` 索引自己的代码库即可。
 - **旧项目 `regions.json` 残留**：若某项目根目录已有旧版 `regions.json`（早期默认无 `verify`），其优先级高于 `DEFAULT_REGIONS`，会显示 `verify` 为空。解决办法：删除该项目下的 `regions.json` 让其回落到新默认，或在其 `regions.json` 每个分区补 `"verify"` 字段。
 - **启用外部调用 DocMind API**：设置环境变量 `DOCMIND_API_TOKEN=<你的令牌>`（启用后 `/api/*` 需带 `x-docmind-token` 或 `Authorization: Bearer`）；如需浏览器跨域调用，设 `DOCMIND_CORS_ORIGINS=https://你的前端域名`（默认 `*` 允许任意来源）。
 - **启用 Agent 调外部 API**：必须设置 `EXTERNAL_API_ALLOWLIST`，否则 `dev_http_request` 一律拒绝——这是防 SSRF 的安全闸门，非空不可放行。写法：`api.example.com`（精确匹配且含其子域）、`*.example.com`（仅子域，不含裸域）、`*`（任意 host，协议仍限 http/https）；30x 重定向的每一跳都会重新校验白名单。

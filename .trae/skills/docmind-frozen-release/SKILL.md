@@ -44,7 +44,7 @@ Start-Sleep -Seconds 2   # 确认端口已释放再继续
 
 - `dist\DocMind\DocMind.exe`：大小（约 18.5–19.4 MB）与 mtime=本轮构建时间；整包约 663 MB。
 - **前端哈希一致性**：`web\` 与 `dist\DocMind\_internal\web\` 的 assets（5 个左右）+ `workbench.html` 逐个 SHA-256 比对，全 match。
-- 卫生扫描 `dist\DocMind\`：无 `python*.exe`、无 `.env`、无 `.docmind_state.json`；`MinGit\` 随包存在（约 89.5 MB）。
+- 卫生扫描 `dist\DocMind\`：无 `python*.exe`、无 `.env`、无 `.docmind_state.json`、无 `.chroma`（或仅空库 `chroma.sqlite3`，**绝不可含开发者已索引的代码向量**——`docmind.spec` 的 datas 不得写 `(".chroma", ".chroma")`，否则会烤进每版分发版，泄漏本地索引并徒增约 374 MB）；`MinGit\` 随包存在（约 89.5 MB）。
 
 ## 阶段 3：冻结态冷启动冒烟（关键：最小 PATH）
 
@@ -108,3 +108,4 @@ git commit -F $tmp; Remove-Item -Force $tmp
 - 状态泄漏：冻结冒烟后忘删 `_internal/.docmind_state.json` 会把本机 code_root 分发给用户（第八版起纳入清单）。
 - 前端旧 hash：`emptyOutDir:false` → 每次手动清 `web/assets/workbench-*`（第八版起）。
 - 冻结冒烟 PATH 必须真的只剩 System32，否则无法证明随包 MinGit 自足。
+- `.chroma` 索引库泄漏：若 `docmind.spec` 的 datas 写成 `(".chroma", ".chroma")`，开发者本机已索引的代码向量（约 377 MB）会被烤进每个分发版——既泄漏本地索引、又徒增约 374 MB 体积，且对用户自己的代码库毫无用处。第十六次重建已删除该项；冒烟后 `_internal/.chroma` 应为空（chromadb 首次启动自建），分发前务必确认包内无 `.chroma` 或仅含空库。

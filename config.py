@@ -73,11 +73,14 @@ LOCAL_EMBED_DIM = 256  # 本地兜底向量维度（仅离线演示用，非语�
 
 # ---- 路径 / 参数 ----
 if getattr(sys, "frozen", False):
-    # 打包后强制使用随 exe 的资源目录里的 .chroma（含预索引数据），
-    # 不受外部 .env 的相对路径覆盖影响。BASE_DIR 已按 onedir/onefile 正确定位。
+    # 打包后使用随 exe 资源目录里的 .chroma。该目录**不随包分发**（见 docmind.spec，
+    # 否则会泄漏开发者的本地代码索引并额外增加约 377MB 体积），由 chromadb 首次启动时
+    # 自动创建空目录，用户通过 /api/ingest_code 索引自己的代码库。
     CHROMA_DIR = os.path.join(BASE_DIR, ".chroma")
 else:
     CHROMA_DIR = os.getenv("CHROMA_DIR", os.path.join(BASE_DIR, ".chroma"))
+# 确保索引目录存在（干净分发 / 首次启动时 chromadb 可能尚未建目录）
+os.makedirs(CHROMA_DIR, exist_ok=True)
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "docmind")
 CODE_COLLECTION_NAME = os.getenv("CODE_COLLECTION_NAME", "docmind_code")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
