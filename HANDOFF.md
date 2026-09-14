@@ -547,6 +547,7 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - API 可变默认值修正后复核：Python 全量 **291/291 通过**，`api.py` 编译通过；ComfyUI 参数请求不会共享跨请求状态。
 - 来源校验 API 路由测试加入后的最新回归：Python 全量 **292/292 通过**；来源校验、ComfyUI 参数化、GPU 监控和 Unreal 安全边界均有自动化覆盖。
 - ComfyUI 重试边界测试加入后：Python 全量 **293/293 通过**；已覆盖完成任务禁止重试、失败任务最多两次重试和来源校验路由。
+- ComfyUI 取消现向 `/interrupt` 发送目标 `prompt_id`，使用 ComfyUI 的定向中断能力；测试确认请求体带目标 ID，避免恢复为全局中断。
 - 生成 Unreal bridge 脚本已扩展 `/health`、`/assets`、`/actors`、`/blueprint/{path}`、`/actor/{name}` 路由，并通过 `py_compile`；真实 Editor 节点/属性仍需 Unreal Python 插件运行验证。
 - 最新环境复核：Ollama 进程与 API 在线；ComfyUI 端口 8188 当前不可用；未发现 Unity/Unreal 进程。未启动外部服务，避免未经用户操作改变 GPU 负载。
 
