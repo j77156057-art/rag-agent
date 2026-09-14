@@ -24,6 +24,13 @@ def _save_comfy_history():
         os.makedirs(os.path.dirname(_COMFY_HISTORY_FILE) or '.', exist_ok=True)
         with open(_COMFY_HISTORY_FILE, 'w', encoding='utf-8') as f: json.dump(_COMFY_JOBS, f, ensure_ascii=False)
     except Exception: pass
+def _load_comfy_history():
+    try:
+        with open(_COMFY_HISTORY_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict): _COMFY_JOBS.update(data)
+    except Exception: pass
+_load_comfy_history()
 # root_abs -> 嵌入状态 {child_hwnd, host_hwnd, offset_y, title, dpi, size}；
 # 保存它是为了"停止/解除嵌入"时能把引擎窗口原样还原，而不是留下一个失效的子窗口。
 _EMBED_STATE = {}
