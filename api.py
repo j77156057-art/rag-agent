@@ -75,7 +75,7 @@ from regions import (
     region_git_info,
     propose_regions,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from engine_adapters import skill_for_engine
 import gpu_coordinator as gpu
@@ -820,7 +820,7 @@ async def comfy_templates_ep(): return comfy_templates()
 async def comfy_template_ep(template_id: str): return comfy_template_workflow(template_id)
 class ComfyParametersReq(BaseModel):
     workflow: dict
-    parameters: dict = {}
+    parameters: dict = Field(default_factory=dict)
 @app.post("/api/comfy/templates/apply")
 async def comfy_template_apply_ep(req: ComfyParametersReq):
     return comfy_apply_parameters(req.workflow, req.parameters)
