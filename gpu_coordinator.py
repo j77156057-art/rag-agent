@@ -76,7 +76,8 @@ STATE_FILE = Path(os.getenv("DOCMIND_GPU_STATE_FILE", str(Path(".docmind") / "gp
 def _persist_runtime_locked():
     try:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps({'leases': {str(k): v for k,v in _leases.items()}, 'updated_at': time.time()}, ensure_ascii=False), encoding='utf-8')
+        queue=[{'owner': t['owner'], 'purpose': t['purpose'], 'gpu': t['gpu'], 'min_free': t['min_free'], 'status': 'waiting'} for t in _waiters if not t.get('canceled')]
+        STATE_FILE.write_text(json.dumps({'leases': {str(k): v for k,v in _leases.items()}, 'queue': queue, 'updated_at': time.time()}, ensure_ascii=False), encoding='utf-8')
     except Exception: pass
 
 def restore_runtime_state():
@@ -84,6 +85,7 @@ def restore_runtime_state():
     try:
         data=json.loads(STATE_FILE.read_text(encoding='utf-8'))
         leases=data.get('leases') or {}
+        queue=data.get('queue') or []
     except Exception:
         return 0
     recovered=0; now=time.time()
@@ -92,6 +94,9 @@ def restore_runtime_state():
             item=dict(lease); item['gpu']=int(key) if str(key).isdigit() else key
             item['status']='recovered'; item['recovered_at']=now
             _recovery_events.append(item); recovered += 1
+        for item in queue:
+            if isinstance(item, dict):
+                _recovery_events.append({**item, 'status':'recovered_waiting', 'recovered_at':now}); recovered += 1
     try:
         STATE_FILE.unlink()
     except Exception: pass
