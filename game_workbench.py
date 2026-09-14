@@ -861,7 +861,7 @@ def _comfy_workflow_path():
     return next((p for p in candidates if p), '')
 
 def comfy_template_workflow(template_id):
-    # TODO 配置化：硬编码本机路径来自开发机 ComfyUI 安装，后续改为模板注册表/环境变量
+    # H3 路径由 _comfy_workflow_path 按项目配置、环境变量和常见目录解析。
     if template_id == 'minimax-h3-i2v':
         path = _comfy_workflow_path()
         try:
