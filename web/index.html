@@ -7,6 +7,7 @@
 <title>DocMind · 本地 RAG 代码问答</title>
 <style>
   :root {
+    color-scheme: dark;
     --bg: #0b0f15;
     --bg-grad: radial-gradient(1200px 600px at 80% -10%, #111824 0%, #0b0f15 55%);
     --panel: #0f141c;
@@ -272,19 +273,21 @@
   .cfg-msg { font-size: 12px; line-height: 1.5; flex: 1; }
   .cfg-msg.ok { color: var(--ok); } .cfg-msg.warn { color: var(--warn); } .cfg-msg.error { color: var(--err); }
   .modal-note { margin-top: 14px; font-size: 11px; color: var(--txt-faint); line-height: 1.6; border-top: 1px solid var(--line); padding-top: 12px; }
-  .modal::-webkit-scrollbar { width: 8px; }
-  .modal::-webkit-scrollbar-thumb { background: #232e3c; border-radius: 8px; }
-  .modal::-webkit-scrollbar-track { background: transparent; }
-
-  .sidebar::-webkit-scrollbar, #chat::-webkit-scrollbar { width: 8px; }
-  .sidebar::-webkit-scrollbar-thumb, #chat::-webkit-scrollbar-thumb { background: #232e3c; border-radius: 8px; }
+  /* 滚动条：与工作台一致，深色细拇指 + 透明轨道；Firefox 兜底 */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #232e3c; border: 3px solid var(--bg); border-radius: 6px; }
+  ::-webkit-scrollbar-thumb:hover { background: #304053; }
+  ::-webkit-scrollbar-corner { background: transparent; }
+  #chat, .sidebar, .modal, #devRegions, #devChangesets, #devBugs {
+    scrollbar-width: thin;
+    scrollbar-color: #232e3c transparent;
+  }
 
   /* ---------- 分区开发工作台 ---------- */
   .dev-sec-title { font-size:12px;color:var(--txt-dim);margin-bottom:8px;letter-spacing:.3px; }
   /* 可变长度列表：随条目增加只在该段内滚动，避免撑爆模态 */
   #devRegions, #devChangesets, #devBugs { max-height: 260px; overflow-y: auto; padding-right: 4px; }
-  #devRegions::-webkit-scrollbar, #devChangesets::-webkit-scrollbar, #devBugs::-webkit-scrollbar { width: 6px; }
-  #devRegions::-webkit-scrollbar-thumb, #devChangesets::-webkit-scrollbar-thumb, #devBugs::-webkit-scrollbar-thumb { background: #232e3c; border-radius: 6px; }
   .dev-region { background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:9px 11px;display:flex;flex-direction:column;gap:6px; }
   .dev-region .r1 { display:flex;align-items:center;gap:8px; }
   .dev-region .rname { font-size:13px;font-weight:600; }
