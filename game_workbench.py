@@ -1108,6 +1108,16 @@ def comfy_import_all(root, prompt_id, images, url="http://127.0.0.1:8188", dest_
     results = [comfy_import(root, prompt_id, image, url, dest_dir) for image in (images or [])[:32]]
     return {"ok": all(x.get("ok") for x in results), "results": results, "imported": sum(1 for x in results if x.get("ok"))}
 
+def comfy_validate_provenance(meta):
+    """校验资源来源元数据；不替代人工许可证审阅。"""
+    m=meta or {}; errors=[]
+    for key in ('author','license'):
+        if m.get(key) is not None and (not isinstance(m[key], str) or len(m[key])>1000): errors.append(f'{key} 格式无效')
+    if m.get('source_url'):
+        u=str(m['source_url'])
+        if not re.match(r'^https?://[^\s]{1,1000}$',u): errors.append('source_url 必须是 http(s) URL')
+    return {'ok': not errors, 'errors': errors, 'review_required': not bool(m.get('license'))}
+
 def comfy_resource_duplicates(root, directory="assets/generated"):
     """按 SHA-256 查找 ComfyUI 导入目录中的重复资源，只读。"""
     base = _file(root, directory)
