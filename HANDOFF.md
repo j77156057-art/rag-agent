@@ -535,4 +535,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - GPU 状态文件现在同时保存等待队列快照；重启恢复时将旧租约标记为 `recovered`、旧等待项标记为 `recovered_waiting`，只记录审计事件，不自动重启任务，避免重复执行。
 - 发布前回归（2026-09-15）：Python 全量测试 **282/282 通过**；`frontend/npm run build` 使用 Vite 5.4.21 成功；工作区 clean。当前 `main` 比 `origin/main` 超前 86 个提交，尚未推送。
 - 追加实机探测：`D:\Tools\Godot\Godot_v4.7.2-stable_win64_console.exe --version` 返回 `4.7.2.stable.official.ed1daf0bf`；Ollama `127.0.0.1:11434/api/tags` 可用并列出本地模型；本次 ComfyUI `127.0.0.1:8188` 不可用；未发现 Unity Hub 或 UnrealEditor 可执行文件，故 Unity/Unreal 启动和端到端桥接仍未验证。
+- 最新回归复核：Python 全量 **282/282 通过**；工作区 clean；当前 `main` 比 `origin/main` 超前 88 个提交。由于 ComfyUI/Unity/Unreal 实机条件当前不可用，暂不推送发布分支。
 
