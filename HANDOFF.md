@@ -536,4 +536,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 发布前回归（2026-09-15）：Python 全量测试 **282/282 通过**；`frontend/npm run build` 使用 Vite 5.4.21 成功；工作区 clean。当前 `main` 比 `origin/main` 超前 86 个提交，尚未推送。
 - 追加实机探测：`D:\Tools\Godot\Godot_v4.7.2-stable_win64_console.exe --version` 返回 `4.7.2.stable.official.ed1daf0bf`；Ollama `127.0.0.1:11434/api/tags` 可用并列出本地模型；本次 ComfyUI `127.0.0.1:8188` 不可用；未发现 Unity Hub 或 UnrealEditor 可执行文件，故 Unity/Unreal 启动和端到端桥接仍未验证。
 - 最新回归复核：Python 全量 **282/282 通过**；工作区 clean；当前 `main` 比 `origin/main` 超前 88 个提交。由于 ComfyUI/Unity/Unreal 实机条件当前不可用，暂不推送发布分支。
+- 参数修复后的最新回归：Python 全量 **283/283 通过**；前端构建成功。ComfyUI 正/负提示词、尺寸、steps、seed 和输出前缀已分别校验；当前 `main` 比远端超前 91 个提交。
 
