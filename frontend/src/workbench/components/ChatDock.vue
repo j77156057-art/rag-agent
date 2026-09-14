@@ -178,7 +178,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onDocKey))
 async function probe(key: string) {
   probing.value = key
   try {
-    const r = await mcpApi.probe(key)
+    const r = await Promise.race([
+      mcpApi.probe(key),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('连接超时：请先在 Godot 编辑器中打开项目并启用 godot-ai 插件')), 8000)),
+    ])
     probeResults.value[key] = { ok: !!r.ok && !(r as { error?: string }).error, tool_count: r.tool_count, error: r.error }
   } catch (e) {
     probeResults.value[key] = { ok: false, error: (e as Error).message }
