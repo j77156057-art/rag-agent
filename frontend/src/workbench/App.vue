@@ -80,6 +80,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
         </button>
       </div>
       <div class="wb-topbar-right">
+        <a class="wb-question-link" href="/" title="回到 RAG 问答页（检索问答 / 索引代码目录）">问答</a>
         <TaskEnginePanel />
         <AgentPolicyPanel />
         <SceneRuntimePanel />

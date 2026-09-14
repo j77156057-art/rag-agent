@@ -1,7 +1,7 @@
 # DocMind 项目交接清单（给接手 AI）
 
 > **更新时间**：2026-09-14（含 P0-1 实机闭环）｜ **基线提交**：`809a3b9` + 本次嵌入加固
-> **全量测试**：**218 项全部通过** ｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
+> **全量测试**：**223 项全部通过** ｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
 > **引擎嵌入实机自检**：`verify_engine_embed.py` **68/68**（真 Godot 4.7.2 + 真 Win32 宿主，含真实合成键鼠与 UI 调用路径）｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` **27/27** ｜ **前端构建**：`npm run build` 通过
 > 本文是项目唯一权威交接文档，取代并删除了旧版 `HANDOFF.md`、`AI_BRIEF.md`、`DEV_WORKBENCH_AUDIT.md`、`HANDOFF_ENGINE_EMBEDDING.md`、`HANDOFF_REMAINING_WORK.md`（旧 HANDOFF.md 由本同名文件接管）。
 > **铁律：规划项一律写在第 5 节，不得描述为已完成；做完一项就把它移到第 4 节时间线并注明提交号。**
@@ -24,10 +24,17 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 ## 2. 当前基线（2026-09-14）
 
 - **后端**：Python + FastAPI（`api.py`，SSE），入口 `api:app`；Chroma 双集合（文档 `docmind` / 代码 `docmind_code`）。
-- **前端**：Vue 3.5 + Vite 5，目录 `frontend/`，构建产物输出到 `../web/`。**单入口** `frontend/workbench.html`
-  → 工作台（`src/workbench/`）：CodeMirror 编辑器、文件树、符号/关系图、任务引擎面板、ChatDock，
-  以及 2026-09-14 转正的 **场景画布** 与 **运行时时间线**（试玩器弹窗的第 2/3 个 tab）。
-  两者都是 `defineAsyncComponent` 异步分块，首屏 JS 体积不受影响（工作台 130KB / gzip 49KB 不变）。
+- **前端两个页面**（都不是 SPA 路由，是独立 HTML 入口）：
+
+  | 页面 | 路径 | 来源 | 定位 |
+  |---|---|---|---|
+  | **RAG 问答页** | `/` | 手写 `web/index.html`（不经 Vite 构建） | **默认入口**：问答 / 上传 / 索引代码目录 / 模型设置 |
+  | **开发工作台** | `/workbench` | Vite 构建 `frontend/workbench.html` → `web/workbench.html` | 第二入口：CodeMirror、文件树、符号/关系图、分区与 Git、引擎面板、**场景画布**、**运行时时间线**、ChatDock |
+
+  **两页必须能互跳**：问答页顶栏有「开发工作台 →」，工作台顶栏有「问答」回链（`tests/test_desktop_entry.py` 钉住）。
+  桌面壳默认打开问答页；入口可用 `DOCMIND_HOME` 覆盖（例如 `/workbench`）。
+  桌面壳历史包袱：它曾经硬编码打开 `/workbench/`，而浏览器回退路径打开 `/`，两条路进不同页面，用户看懵过。
+  工作台的重组件用 `defineAsyncComponent` 异步分块，首屏 JS 体积不受影响（工作台 137KB / gzip 52KB）。
 - **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前第 14 次冻结构建，2026-09-12 18:26；**仍未重新打包**）；随包 MinGit。
 - **引擎嵌入（P0-1 已实机闭环，且 UI 可用）**：Godot 4.7.2（`D://Tools//Godot//Godot_v4.7.2-stable_win64.exe`）+ 真 Win32 宿主窗口下实测通过——
   置父/样式摘除、按客户区（或前端指定矩形）对齐、宿主 resize 跟随、**真实合成键鼠（SendInput）送达引擎并回显**、
@@ -123,7 +130,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 ### P3　第 15 次冻结发布
 
-按 `docmind-frozen-release` Skill：py_compile → **218 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(64) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → Godot 实机验证 → 前端 6 文件 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加第十五次记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
+按 `docmind-frozen-release` Skill：py_compile → **223 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(64) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → Godot 实机验证 → 前端 6 文件 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加第十五次记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
 
 ### 其他已记录的改进点
 
@@ -275,7 +282,13 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
     应用直接起不来。**改完 .py 必须 `py_compile` 一次**；写完带反斜杠转义的字符串（如 `
 `）
     尤其要回读文件确认，别只看脚本“执行成功”。自检脚本里写文件也同理，用原始字符串更稳。
-23. **浏览器默认会请求 `/favicon.ico`**：不接这条路由，每个页面都留一条 404，浏览器冒烟的
+24. **打包版与源码版是两套互不相通的本地状态**（2026-09-14 用户踩，以为功能丢了）：
+    `STATE_FILE = BASE_DIR/.docmind_state.json`，而 `BASE_DIR` 冻结时是 `dist/DocMind/_internal`、
+    源码时是仓库根。同理 `.chroma` 索引、上传目录都各自一套。
+    于是「用打包版打开 → 工作台报『未配置代码库根目录』」不是功能坏了，是**换了个从没配过的实例**。
+    判断方法：看日志落在哪（`docmind_desktop.log` 在仓库根 = 源码版；在 `dist/DocMind/` = 打包版）。
+    别把源码树的状态文件塞进包里当默认值——里面是绝对路径，换机器就失效。
+25. **浏览器默认会请求 `/favicon.ico`**：不接这条路由，每个页面都留一条 404，浏览器冒烟的
     "无失败请求"断言永远红。图标走 `frontend/public/favicon.ico` → Vite 拷进 `web/` → 后端路由。
 
 ---

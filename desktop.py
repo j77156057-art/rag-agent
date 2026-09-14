@@ -32,6 +32,11 @@ PORT = int(os.getenv("DOCMIND_PORT", "8000"))
 API_BASE = f"http://{HOST}:{PORT}"
 URL = API_BASE + "/"
 
+# 桌面壳打开哪个页面。默认是 **RAG 问答页**：它才是产品原点入口（"点开就能问"）；
+# 开发工作台是第二个入口——问答页顶栏有「开发工作台 →」，工作台顶栏有「问答」回链。
+# 想换默认入口不必改代码：DOCMIND_HOME=/workbench 即可（浏览器回退路径同理走 URL）。
+HOME_PATH = os.getenv("DOCMIND_HOME", "/")
+
 if getattr(sys, "frozen", False):
     BASE = os.path.dirname(sys.executable)
 else:
@@ -106,7 +111,7 @@ def build_host_window(api_base: str = "", title: str = "DocMind 开发工作台"
     import webview
 
     base = (api_base or API_BASE).rstrip('/')
-    page = base + "/workbench/"
+    page = base + HOME_PATH
 
     def _host_hwnd():
         """通过标题枚举拿到 pywebview 的宿主 HWND（必须在窗口创建之后）。"""

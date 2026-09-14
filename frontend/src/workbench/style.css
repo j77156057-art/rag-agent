@@ -430,6 +430,11 @@ button { font-family: inherit; }
 
 /* ---------- 顶栏保存按钮 ---------- */
 .wb-topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+/* 回 RAG 问答页的入口（工作台是第二入口，默认首页是问答页） */
+.wb-question-link { color: var(--text-muted); text-decoration: none; font-size: 11px; line-height: 1;
+  border: 1px solid var(--border-strong); border-radius: 5px; padding: 6px 10px; white-space: nowrap;
+  transition: border-color .15s, background .15s, color .15s; }
+.wb-question-link:hover { color: var(--text); border-color: #2c4a6b; background: #58a6ff0d; }
 .wb-map-btn {
   display: inline-flex;
   align-items: center;

@@ -133,6 +133,11 @@
   .topbar .title { font-size: 14px; font-weight: 600; }
   .topbar .title small { color: var(--txt-faint); font-weight: 400; margin-left: 8px; font-size: 12px; }
   .topbar .spacer { flex: 1; }
+  /* 通往开发工作台的入口。问答页是默认首页，工作台是第二入口，这里给个显式出口 */
+  .topbar .toplink { color: var(--accent); text-decoration: none; font-size: 12px; line-height: 1;
+    border: 1px solid var(--line); border-radius: 6px; padding: 7px 11px; white-space: nowrap;
+    transition: border-color .15s, background .15s, color .15s; }
+  .topbar .toplink:hover { border-color: var(--accent); background: #6366f114; color: #a5b4fc; }
   .status-pill {
     font-size: 12px; color: var(--txt-dim); max-width: 46%; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap;
@@ -358,6 +363,7 @@
     <div class="topbar" data-page-node-id="j4sirg3FpmYx2FBbOSEtU9">
       <div class="title" data-page-node-id="jDjdHpAfLvjKfv9y3y1tS2">本地 RAG 问答 <small data-page-node-id="GggkEUjAMdPnuYLYPQ1r7x">ReAct 推理 · 检索增强 · 工具调用</small></div>
       <div class="spacer" data-page-node-id="mUp4elVMi0fMV7L75znmvy"></div>
+      <a class="toplink" href="/workbench" title="打开开发工作台：分区治理 · 引擎/试玩 · 场景画布 · 运行时时间线">开发工作台 →</a>
       <div class="status-pill" id="status" data-page-node-id="0uTeAZIXXoo6g4X1y6Obij">就绪。默认 mock 模式无需 Key，可直接提问示例知识库。</div>
     </div>
 
