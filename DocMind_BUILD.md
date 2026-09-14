@@ -375,3 +375,10 @@
 ### Inno Setup 安装器
 
 可使用 installer\\DocMind.iss 构建安装器。安装器支持覆盖升级、开始菜单/桌面快捷方式和标准卸载；当前机器未安装 ISCC，因此尚未生成 Setup.exe。
+
+### 便携版生命周期脚本
+
+- installer\\upgrade_portable.ps1：停止旧进程后增量覆盖升级，保留日志。
+- installer\\uninstall_portable.ps1：明确输入 YES 后删除便携版目录。
+
+这两个脚本不依赖 Inno Setup，适合当前机器做升级/卸载演练。
