@@ -589,3 +589,9 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 2026-09-15：PyInstaller 发布目录已成功构建（dist\\DocMind\\DocMind.exe，约 19MB，含 MinGit）。桌面专项测试 8/8；当前系统执行策略对独立 EXE 启动返回 Access is denied，故独立启动健康检查未宣称通过。仓库没有 MSI/NSIS/Inno Setup 卸载器，覆盖升级/卸载需后续增加安装器后验证。
 
 - 2026-09-15：已安装 Inno Setup 6.7.3 并成功生成 dist\\installer\\DocMind-Setup.exe（约 0.85MB，压缩目录包）。安装器脚本包含覆盖安装、快捷方式和标准卸载。当前执行策略拒绝直接运行安装 EXE（Access denied），因此安装/升级/卸载实机结果未宣称通过；需在用户桌面双击或解除策略后执行。
+
+### 2026-09-15 联网搜索能力交接状态
+
+已完成：web_search（DuckDuckGo）、web_fetch（公开 HTML 正文读取）、web_research（搜索+最多 3 个来源抓取）、标题/最终 URL/正文清理、非 HTML 与网络失败降级、回答中的来源 URL 可点击。
+
+未完善：B 站专用搜索与字幕提取、GitHub API 专用搜索、搜索结果缓存、来源可信度评分、多来源冲突检测、前端来源卡片/正文展开、登录/验证码/付费墙处理。当前能力可用于普通教程、GitHub 资料和引擎文档查询，但不可宣称达到 Perplexity/Claude Research 级别。
