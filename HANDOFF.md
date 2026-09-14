@@ -1,7 +1,7 @@
 # DocMind 项目交接清单（给接手 AI）
 
-> **更新时间**：2026-09-14（P2-1 GPU 协调补完 + P1-2 Unity GUID 引用图，已随 `6e9b95b` 提交，尚未推送）｜ **基线提交**：`eeb73ab`（本地另有校准提交 `981b116` 未推送）
-> **全量测试**：**250 项全部通过** ｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
+> **更新时间**：2026-09-14（P2-1 GPU 协调收尾硬化 + 真机空闲卸载验证，`82d092c`；P2-1 主体与 P1-2 在 `6e9b95b`，均尚未推送）｜ **基线提交**：`eeb73ab`（本地另有校准提交 `981b116` 未推送）
+> **全量测试**：**258 项全部通过** ｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
 > **引擎嵌入实机自检**：`verify_engine_embed.py` **68/68**（真 Godot 4.7.2 + 真 Win32 宿主，含真实合成键鼠与 UI 调用路径）｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` **27/27** ｜ **前端构建**：`npm run build` 通过
 > 本文是项目唯一权威交接文档，取代并删除了旧版 `HANDOFF.md`、`AI_BRIEF.md`、`DEV_WORKBENCH_AUDIT.md`、`HANDOFF_ENGINE_EMBEDDING.md`、`HANDOFF_REMAINING_WORK.md`（旧 HANDOFF.md 由本同名文件接管）。
 > **铁律：规划项一律写在第 5 节，不得描述为已完成；做完一项就把它移到第 4 节时间线并注明提交号。**
@@ -43,7 +43,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   界面照常可用；另有「聚焦 / 解除嵌入 / 停止桌面窗口」。关弹窗或切走 tab 会自动解除嵌入（视窗元素没了，
   继续嵌着只会让引擎画到别处）。浏览器模式下开关自动禁用并提示需要桌面端。
 - **LLM/Embedding**：mock / qwen / deepseek / ollama / llamacpp 多 Provider，页面内免重启切换；本机 Ollama(`11434`, bge-m3) 与 llama.cpp(`8080`, Qwen 35B) 免 Key；622fdbc 新增 native embedding。
-- **验证基线**：后端 `unittest discover` **250/250 通过**（含 `test_unity_graph.py` 4 例、`test_gpu_coordinator.py` 23 例）；
+- **验证基线**：后端 `unittest discover` **258/258 通过**（含 `test_unity_graph.py` 4 例、`test_gpu_coordinator.py` 31 例）；
   `verify_scene_canvas.py` 走真实 HTTP 路由 **54/54**（含"每个 op 的 undo 逐字节还原"）；
   `verify_engine_embed.py` 真 Godot + 真 Win32 宿主 **68/68**；
   `verify_scene_canvas_ui.mjs` 真浏览器 **27/27**（含"空间布局落点与场景坐标严格成比例"）；前端 build 通过。
@@ -60,7 +60,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | `agent.py` | ReAct 循环（Thought→Action→Observation）、反思重试、弱模型 terminal 工具、代码优先路由（c543047） |
 | `tools.py`（105KB） | 工具注册表 `TOOLS`：9 基础 + 受控写（apply_edit/create_file/run_command）+ 11 个 dev_* 分区工具 + 研判分区工具 |
 | `regions.py`（47KB） | 分区 2.0：DEFAULT_REGIONS 8 区、regions.json 覆盖、契约校验（DAG 无环/导出存在）、init/scaffold/fill_exports、变更集与回滚 |
-| `game_workbench.py`（60KB） | Godot/Unity/Unreal catalog、引擎启停与自动嵌入、运行时事件、任务/资产/bug 工作流；**P2-1 ComfyUI 租约覆盖完整生成周期**：`comfy_queue` 用一次性提交 owner 拿租约（带 Ollama 驱逐钩子）→ 成功后 `reown` 为 `comfyui:{prompt_id}`（TTL 600s `DOCMIND_COMFY_JOB_TTL` 兜底），`comfy_history` 见终态（outputs/completed/error/failed）幂等释放，`comfy_cancel` 调 ComfyUI `/interrupt` 后释放 |
+| `game_workbench.py`（60KB） | Godot/Unity/Unreal catalog、引擎启停与自动嵌入、运行时事件、任务/资产/bug 工作流；**P2-1 ComfyUI 租约覆盖完整生成周期**：`comfy_queue` 用一次性提交 owner 拿租约（带 Ollama 驱逐钩子）→ 成功后 `reown` 为 `comfyui:{prompt_id}`（TTL 600s `DOCMIND_COMFY_JOB_TTL` 兜底），`comfy_history` 见终态（outputs/completed/error/failed）幂等释放，`comfy_cancel` 调 ComfyUI `/interrupt` 后释放。提交默认要求 `DOCMIND_COMFY_MIN_FREE_MB=1024` 显存余量：余量不足先触发 Ollama 卸载钩子，腾不出则直接拒绝不排队 |
 | `workbench_fs.py`（56KB） | 沙箱文件树、读写、git 状态/历史/回滚/恢复、符号地图、关系图（继承/挂载/调用边） |
 | `unity_graph.py`（新） | **P1-2 Unity GUID 引用图**：扫 `.meta` 建 guid 索引（含文件夹/孤儿 meta/冲突检测），解析 `.unity/.prefab/.asset/.mat` 等序列化文本的 guid 引用（大小写归一、同源聚合 ×N），产出与关系图同构的 nodes/edges；缺失 guid 聚合为外部节点（Packages 包资源与真断裂引用同口径，不夸大为错误） |
 | `symbols.py`（40KB） | 多语言符号抽取（Python ast / GDScript / Java 等），代码感知分块 |
@@ -69,7 +69,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | `web_export.py`（18KB，新） | 游戏 Web 导出与本地预览（Web player） |
 | `scene_runtime.py`（1198 行） | **场景画布内核**：.tscn 行块解析 → 图模型（节点/外部引用/四类边/几何量）＋受控编辑（add/delete/rename/reparent/duplicate/set_props/move/restore，写完自检失败自动回滚，每个 op 回传可原样回放的 undo）＋运行时事件检索（筛选/统计/会话切分/游标清空） |
 | `desktop_bridge.py`（6.4KB） | Win32：find_host/find_window/embed/resize/**focus（新增）** |
-| `gpu_coordinator.py`（重写） | **P2-1 GPU 协调**：三模式 `DOCMIND_GPU_MODE=serial（默认，全机 FIFO 锁）/parallel（不协调，仅采样）/multi（每卡独立租约）`；`acquire_lease()` 返回 `{ok,gpu,reason,evicted}`，显存门槛不足直接拒绝不排队，**严格 FIFO（multi 下队首要的卡忙时后续者不得用别的空闲卡插队）**；`reown/force_release(owner)/cancel_wait/queue_position/register_hook/note_activity/configure/recent_samples`；后台守护线程做 5s 采样环（240 点≈20 分钟）、TTL 回收、Ollama 空闲卸载（`DOCMIND_OLLAMA_IDLE_UNLOAD`，60s 冷却，有非 ollama 租约时不卸）；探测可 `set_gpu_probe` 注入。**multi 只返回卡号，CUDA_VISIBLE_DEVICES 隔离必须由调用方在子进程启动层做，本机单卡从未实测隔离，不得宣称** |
+| `gpu_coordinator.py`（重写+收尾） | **P2-1 GPU 协调**：三模式 `DOCMIND_GPU_MODE=serial（默认，全机 FIFO 锁）/parallel（不协调，仅采样）/multi（每卡独立租约）`；`acquire_lease()` 返回 `{ok,gpu,reason,evicted,reentrant}`，显存门槛不足直接拒绝不排队，**严格 FIFO（multi 下队首要的卡忙时后续者不得用别的空闲卡插队）**；`reown/force_release(owner)/cancel_wait/queue_position/register_hook/note_activity/configure/recent_samples`；后台守护线程做 5s 采样环（240 点≈20 分钟）、TTL 回收、Ollama 空闲卸载（`DOCMIND_OLLAMA_IDLE_UNLOAD`，60s 冷却，有非 ollama 租约时不卸）；探测可 `set_gpu_probe` 注入。**驱逐钩子只在"显存门槛拒绝"（无租约的外部驻留）时跑，活跃持有者排队不白卸**；真实 nvidia-smi 探测 0.5s TTL 缓存（`DOCMIND_GPU_PROBE_CACHE_TTL`，注入探测不缓存）。**multi 只返回卡号，CUDA_VISIBLE_DEVICES 隔离必须由调用方在子进程启动层做，本机单卡从未实测隔离，不得宣称** |
 | `desktop.py` | 控制台启动器、单实例保护、pywebview 窗口与宿主 HWND 注册 |
 | `llm.py` / `embeddings.py` / `vectorstore.py` / `config.py` | 多 Provider LLM、嵌入、Chroma 封装、配置与 frozen 资源定位 |
 | `engine_adapters.py` | 引擎适配薄封装；`verify*.py` 是独立校验脚本 |
@@ -105,6 +105,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-14 | **`981b116` 接手校准**：基线对齐 `eeb73ab` 后的 10 个外部提交；全量测试核对、HANDOFF 数字/状态修正（未推送） |
 | 2026-09-14 | **`6e9b95b` P1-2 Unity GUID 引用图（纯文本静态分析，不启动编辑器）**：新增 `unity_graph.py` 与 `GET /api/unity/guid-graph`；`.meta` 建 GUID 索引（类型分类、文件夹/孤儿 meta、GUID 冲突检测），`.unity/.prefab/.asset/.mat/.controller/.anim` 等序列化文本按行提取引用（大小写归一、同对聚合计数、首行号），Library/Temp 等跳过，2 万文件上限与 skipped 统计；产出与关系图同构 nodes/edges，工程内解析不到的 guid 聚合成"缺失/外部"节点（默认折叠，口径包含 Packages 包资源，不夸大为断裂）。前端新增 `UnityGraph.vue`（零依赖力导向、类型 chips 过滤、搜索邻接高亮、缺失红虚线、节点详情侧栏含出/入边清单与 GUID 复制、双击/按钮打开文件），顶栏「Unity 图」入口。新增 `tests/test_unity_graph.py` 4 例（223 → **227** 全绿）；合成 Unity 工程浏览器冒烟全过（默认图/缺失展开/侧栏出入边/搜索/类型过滤），`npm run build` 通过。**仍待**（本机未装 Unity 编辑器）：Editor HTTP 插件、Console/PlayMode、资产改动同步 `.meta` |
 | 2026-09-14 | **`6e9b95b` P2-1 GPU 协调补完（与 P1-2 同提交）**：`gpu_coordinator.py` 重写为 serial/parallel/multi 三模式 + `acquire_lease/reown/cancel_wait/force_release(owner)/register_hook/note_activity/configure/recent_samples`，严格 FIFO（multi 下也不许跨空闲卡插队），显存门槛直接拒绝不排队，驱逐钩子锁外只跑一次；后台守护线程（FastAPI lifespan 启停）做 5s 采样环（240 点）、TTL 回收、Ollama 空闲卸载（`api.py` 钩子对 `/api/ps` 驻留模型逐一 `keep_alive=0`，嵌入模型走 `/api/embeddings` 兜底；空闲秒数/采样间隔经 `.docmind_state.json` 跨重启恢复）。ComfyUI 租约覆盖完整生成周期（提交临时 owner→`reown comfyui:{prompt_id}`，TTL 600s 兜底；`comfy_history` 终态释放；新增 `comfy_cancel` 打 `/interrupt` 与 `POST /api/comfy/cancel`）；`llm.py`/`embeddings.py` 在 Ollama 推理前后 `note_activity`。新增 `POST /api/gpu/cancel|force-release|configure`；前端新增 `GpuPanel.vue`（每卡占用/温度/迷你曲线/队列取消/强制回收/空闲卸载设置）+ `gpuApi`，TaskEnginePanel 加「取消生成」。新增 `tests/test_gpu_coordinator.py` 23 例（含假双卡 HTTP ComfyUI 服务的完整作业生命周期；227 → **250** 全绿），`npm run build` 通过；真机 RTX 5070 Ti 浏览器冒烟：真实显存/温度/采样曲线/设置持久化/遮罩开关全过。**未实测，不得宣称**：multi 模式 CUDA 进程隔离（协调器只返回卡号，需调用方在子进程启动层设 `CUDA_VISIBLE_DEVICES`）、多卡物理环境 |
+| 2026-09-14 | **`82d092c` P2-1 GPU 协调收尾硬化 + 真机空闲卸载闭环**：①驱逐时机收窄——钩子只在显存门槛拒绝（无租约的外部驻留）时触发，活跃持有者排队不再白卸载 Ollama（卸载不释放租约）；②`comfy_queue` 默认要求 `DOCMIND_COMFY_MIN_FREE_MB=1024` 余量，使"显存不够→卸载 Ollama→重试授予"链路真正有牙；③真实 nvidia-smi 探测加 0.5s TTL 缓存（注入探测不缓存，避免状态轮询/pump 扎堆拉子进程）；④`acquire_lease` 返回真实 `reentrant`。真机端到端抓出并修掉一个 Ollama 竞态：qwen3.6:35b + bge-m3 同驻时，紧跟大模型卸载的嵌入模型 `keep_alive=0` 返回成功但仍驻留——钩子改为卸载后 0.8s 复查 `/api/ps` 对幸存者补一轮（最多两轮）；**真机复验 PASS（双模型后台空闲触发→/api/ps 清空，RTX 5070 Ti）**。新增 8 例测试（精准驱逐/缓存/reentrant/低显存拒绝/钩子两轮重试等；250 → **258** 全绿）。**仍未实测**：物理多卡与 multi 的 CUDA 隔离（本机单卡，保持不宣称） |
 
 > 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（17 次完整记录，继续追加不要新建文件）。
 
@@ -127,13 +128,12 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 扫描 `.uproject/.uplugin/Source/Build.cs` 建 C++ 符号图；Editor Python/HTTP 插件查 Level Actor/Blueprint；AutomationTool 编译验证；**禁止直接改 `.uasset`**。
 
-### P2-1　GPU 协调补完（主体已落地 2026-09-14，剩多卡隔离实测）
+### P2-1　GPU 协调补完（已完成可测项 2026-09-14，仅剩物理多卡环境项）
 
-已完成（`6e9b95b`，详见 §4 2026-09-14 P2-1 条目）：显存占用轮询采样（5s×240 点环）、Ollama `keep_alive=0` 空闲自动卸载（活动打点 + 60s 冷却 + 有其他租约不卸）、ComfyUI 租约覆盖整个生成周期（提交 reown/终态释放/取消打 `/interrupt`，TTL 600s 兜底）、排队取消/超时/强制回收、三模式与 multi 多卡租约选择、GPU 面板 UI 与配置持久化。
-**仍待（环境限制，禁止提前宣称）**：
+已完成（主体 `6e9b95b`，收尾硬化 `82d092c`，详见 §4 2026-09-14 两条 P2-1 条目）：显存占用轮询采样（5s×240 点环，真实探测 0.5s TTL 缓存）、Ollama `keep_alive=0` 空闲自动卸载（活动打点 + 60s 冷却 + 有其他租约不卸 + 卸载后 ps 复查两轮）、**该链路已于真机端到端验证 PASS**（qwen3.6:35b + bge-m3 双模型同驻，后台空闲触发后 `/api/ps` 清空，RTX 5070 Ti）、ComfyUI 租约覆盖整个生成周期（提交 reown/终态释放/取消打 `/interrupt`，TTL 600s 兜底，默认 1024MB 余量门槛 + 显存不足先驱逐 Ollama）、排队取消/超时/强制回收、三模式与 multi 多卡租约选择、驱逐时机收窄（活跃持有者排队不白卸）、GPU 面板 UI 与配置持久化。
+**仍待（纯环境限制，硬件具备前禁止宣称完成）**：
 - multi 模式的 **CUDA 隔离未实测**：协调器只在租约结果里返回卡号，真正隔离要调用方在启动子进程时设 `CUDA_VISIBLE_DEVICES`（当前 ComfyUI/Ollama 均为外部常驻服务，不会读这个变量；后续若由 DocMind 拉起子进程才需接线）；
-- 本机单卡（RTX 5070 Ti Laptop），多卡调度只有假探测单测覆盖，没有物理多卡验收；
-- Ollama 空闲卸载钩子已注册但本机 OLLAMA_KEEP_ALIVE=24h，真实"空闲→自动卸载"链路只做了单测（钩子直调 keep_alive=0 的路径在 `/api/model_power` 上有人工验证先例），未在面板上端到端等待触发。
+- 本机单卡（RTX 5070 Ti Laptop），多卡调度只有假探测单测覆盖，没有物理多卡验收。
 
 ### P2-2　ComfyUI 流水线
 
@@ -367,3 +367,10 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 前端：`GpuPanel.vue` + `gpuApi`（含 TS 类型），TaskEnginePanel 加「取消生成」。
 - 新增 `tests/test_gpu_coordinator.py` 23 例（双卡假探测/严格 FIFO/取消/驱逐一次/门槛拒绝/reown/定向回收/空闲规则与冷却/采样环+后台线程/parallel/状态结构/假 HTTP ComfyUI 服务的 queue→history→释放与 cancel 生命周期/提交失败释放）；全量 **227 → 250**，`npm run build` 通过；真机 RTX 5070 Ti 浏览器冒烟 9 项全过（控制台仅有既有的导航中断请求噪声，非本次接口）。
 - §5 P2-1 改为"主体已落地 + 三条未实测残留"（CUDA 隔离、物理多卡、空闲卸载端到端等待），§3.1/§3.2 补模块与组件行。
+
+**2026-09-14 追加（P2-1 收尾硬化，`82d092c`）**
+- 驱逐时机收窄：`acquire_lease` 只在 verdict=mem-deny（显存被无租约的外部驻留吃掉）时跑钩子；verdict=wait（有活跃持有者）时不跑——卸载不释放租约，重试必然失败，旧逻辑会让用户白付一次 22GB 级冷加载。
+- `game_workbench.py` 新增 `DOCMIND_COMFY_MIN_FREE_MB`（默认 1024MB）并在 `comfy_queue` 传 `min_free_mb`，显存不足→驱逐 Ollama→重试授予/拒绝，门槛链路从 env 可选项变成默认生效。
+- `query_gpus` 真实探测 0.5s TTL 缓存（注入探测永不缓存）；`_try_grant_locked` 返回真实 reentrant。
+- **真机端到端抓 bug**：双模型（qwen3.6:35b + bge-m3）同驻时空闲卸载首次真机运行，bge-m3 的 `keep_alive=0` 在紧跟大模型卸载后 HTTP 成功但模型仍驻留；`_gpu_ollama_evict_hook` 改为卸载后等 0.8s 用新 `/api/ps` 对幸存者补一轮（最多两轮）。修复后真机复验 PASS（后台空闲触发→两模型全部清空）。
+- 新增 8 例测试（wait 不触发驱逐、mem-deny 才触发、真实探测 TTL 缓存与注入不缓存、reentrant、ComfyUI 低显存拒绝与驱逐后授予、钩子两轮重试/无驻留不调用）；全量 **250 → 258**；§5 P2-1 残留只剩"物理多卡 + CUDA 隔离"两条纯硬件项。
