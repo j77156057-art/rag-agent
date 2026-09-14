@@ -156,7 +156,7 @@
   .ob-close { background: transparent; border: 0; color: #f3d9a8; font-size: 18px; cursor: pointer; line-height: 1; padding: 0 2px; }
 
   #chat { flex: 1; overflow-y: auto; padding: 22px 22px 8px; display: flex; flex-direction: column; gap: 16px; }
-  .msg { display: flex; gap: 11px; max-width: 86%; animation: rise .25s ease; }
+  .msg { display: flex; gap: 11px; max-width: 92%; animation: rise .25s ease; }
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
   .msg .av {
     width: 32px; height: 32px; flex: 0 0 32px; border-radius: 9px; display: grid; place-items: center;
@@ -203,21 +203,23 @@
   @keyframes blink { 0%,60%,100%{ opacity:.25 } 30%{ opacity:1 } }
 
   footer {
-    flex: 0 0 auto; display: flex; gap: 10px; padding: 14px 18px;
-    border-top: 1px solid var(--line); background: rgba(11,16,32,.6); backdrop-filter: blur(6px);
+    flex: 0 0 auto; display: flex; flex-direction: column; gap: 10px;
+    padding: 14px 18px 16px;
+    border-top: 1px solid var(--line); background: rgba(11,16,32,.72); backdrop-filter: blur(8px);
   }
   footer #q {
-    flex: 1; resize: none; height: 46px; padding: 12px 14px; border-radius: 12px;
+    width: 100%; resize: vertical; min-height: 86px; max-height: 220px;
+    padding: 12px 14px; border-radius: 12px;
     border: 1px solid var(--line); background: var(--panel-2); color: var(--txt); font-size: 14px;
-    font-family: inherit; line-height: 1.4;
+    font-family: inherit; line-height: 1.55;
   }
   footer #q:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(99,102,241,.18); }
-  footer { flex-wrap: wrap; }
-  footer .send-row { display: flex; flex-direction: column; gap: 6px; flex: 0 0 auto; }
-  footer .send-row .btn { white-space: nowrap; min-width: 72px; }
+  .composer-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .composer-left { display: flex; align-items: center; gap: 8px; }
+  .composer-bar .btn { white-space: nowrap; }
 
   /* 图片附件预览条 */
-  .img-preview { flex: 1 1 100%; display: flex; gap: 8px; flex-wrap: wrap; }
+  .img-preview { display: flex; gap: 8px; flex-wrap: wrap; }
   .img-preview.hidden { display: none; }
   .img-chip {
     position: relative; width: 68px; height: 68px; border-radius: 10px; overflow: hidden;
@@ -381,10 +383,12 @@
     <footer data-page-node-id="SWPJ3nNNQK5WQ1HjvQIgmq">
       <div id="imgPreview" class="img-preview hidden"></div>
       <textarea id="q" placeholder="例如：这张截图里的报错是什么意思？UI 这张设计稿帮我还原成代码…  (可直接粘贴/拖入图片，Enter 发送 / Shift+Enter 换行)"></textarea>
-      <div class="send-row">
-        <button class="btn ghost sm" id="imgBtn" title="附加图片（也可直接 Ctrl+V 粘贴截图或拖入，最多 4 张）">🖼 图片</button>
-        <input type="file" id="imgInput" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
-        <button class="btn ghost sm" id="enhanceBtn" title="调用 LLM 把草稿重写成更清晰的提示词（需配置模型；离线时本地规则增强）">✨ 增强</button>
+      <div class="composer-bar">
+        <div class="composer-left">
+          <button class="btn ghost sm" id="imgBtn" title="附加图片（也可直接 Ctrl+V 粘贴截图或拖入，最多 4 张）">🖼 图片</button>
+          <input type="file" id="imgInput" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
+          <button class="btn ghost sm" id="enhanceBtn" title="调用 LLM 把草稿重写成更清晰的提示词（需配置模型；离线时本地规则增强）">✨ 增强</button>
+        </div>
         <button class="btn" id="sendBtn" data-page-node-id="hqk6SKVn2pC3A8uyTElTEh">发送</button>
       </div>
     </footer>
