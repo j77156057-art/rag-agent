@@ -25,6 +25,8 @@ import os
 import subprocess
 import threading
 import time
+import json
+from pathlib import Path
 
 GPU_MODE = os.getenv("DOCMIND_GPU_MODE", "serial").lower()  # serial|parallel|multi
 DEFAULT_TTL = float(os.getenv("DOCMIND_GPU_LEASE_TTL", "0") or 0)  # 秒，0=不限
@@ -66,6 +68,11 @@ _bg_stop = threading.Event()
 _probe_override = None
 # 仅缓存真实 nvidia-smi 探测；注入探测（测试）永不缓存，保证假数据即时生效
 _probe_cache = {"t": 0.0, "rows": None}
+_processes = {}  # pid -> owner/gpu/purpose/status/heartbeat
+_recovery_events = collections.deque(maxlen=200)
+_process_probe_cache = {"t": 0.0, "rows": None, "available": False}
+PROCESS_HEARTBEAT_TTL = float(os.getenv("DOCMIND_GPU_PROCESS_HEARTBEAT_TTL", "30") or 30)
+STATE_FILE = Path(os.getenv("DOCMIND_GPU_STATE_FILE", str(Path(".docmind") / "gpu_state.json")))
 
 
 # --------------------------------------------------------------------------- 探测
@@ -99,6 +106,72 @@ def _default_probe():
         return rows or None
     except Exception:
         return None
+
+def _default_process_probe():
+    """读取真实计算进程显存；失败时明确 available=False。"""
+    try:
+        p = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=2)
+        if p.returncode != 0:
+            return {"available": False, "processes": []}
+        out = []
+        for line in p.stdout.splitlines():
+            parts = [x.strip() for x in line.split(',')]
+            if len(parts) >= 3:
+                try: out.append({"pid": int(parts[0]), "process_name": parts[1], "used_mb": int(float(parts[2]))})
+                except ValueError: pass
+        return {"available": True, "processes": out}
+    except Exception:
+        return {"available": False, "processes": []}
+
+def register_process(pid, owner, gpu=None, purpose="", heartbeat=None):
+    """注册实际子进程，返回注册记录。"""
+    rec = {"pid": int(pid), "owner": str(owner), "gpu": gpu, "purpose": str(purpose),
+           "started_at": time.time(), "status": "running", "last_heartbeat": heartbeat or time.time()}
+    with _lock: _processes[int(pid)] = rec
+    return dict(rec)
+
+def heartbeat_process(pid):
+    with _lock:
+        rec = _processes.get(int(pid))
+        if not rec: return False
+        rec["last_heartbeat"] = time.time(); return True
+
+def unregister_process(pid, status="stopped"):
+    with _lock:
+        rec = _processes.pop(int(pid), None)
+        if rec:
+            rec["status"] = status
+            return rec
+    return None
+
+def _pid_alive(pid):
+    try:
+        import ctypes
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+        if h: ctypes.windll.kernel32.CloseHandle(h); return True
+    except Exception: pass
+    try:
+        os.kill(int(pid), 0); return True
+    except Exception: return False
+
+def _recover_processes(now):
+    stale = []
+    with _lock:
+        for pid, rec in list(_processes.items()):
+            if (not _pid_alive(pid)) or (PROCESS_HEARTBEAT_TTL and now - rec.get("last_heartbeat", now) > PROCESS_HEARTBEAT_TTL):
+                stale.append((pid, rec))
+                _processes.pop(pid, None)
+    for pid, rec in stale:
+        force_release(rec["owner"])
+        rec["status"] = "orphan_recovered"
+        rec["recovered_at"] = now
+        with _lock: _recovery_events.append(rec)
+
+def process_status():
+    with _lock:
+        return {"available": _process_probe_cache["available"], "processes": [dict(v) for v in _processes.values()],
+                "recovery_events": list(_recovery_events)}
 
 
 def set_gpu_probe(fn):
@@ -518,6 +591,7 @@ def status():
         })
 
     primary = leases_snapshot.get(0) or (next(iter(leases_snapshot.values()), None))
+    ps = process_status()
     return {
         "mode": GPU_MODE,
         "coordinating": GPU_MODE != "parallel",
@@ -533,6 +607,9 @@ def status():
         "memory": mem,
         "gpus": gpus,
         "samples": recent_samples(),
+        "processes": ps["processes"],
+        "process_probe": {"available": ps["available"]},
+        "recovery_events": ps["recovery_events"],
         "ollama_keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "0"),
         "ollama_idle": {
             "unload_seconds": idle_seconds,
@@ -573,6 +650,16 @@ def _sample_once():
          "utilization": g["utilization"]} for g in rows]}
     with _lock:
         _samples.append(point)
+        try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            STATE_FILE.write_text(json.dumps({"samples": list(_samples), "updated_at": time.time()}, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+    try:
+        pp = _default_process_probe()
+        with _lock: _process_probe_cache.update({"t": time.time(), "rows": pp.get("processes", []), "available": pp.get("available", False)})
+    except Exception:
+        pass
 
 
 def _maybe_idle_unload(now):
@@ -614,6 +701,7 @@ def _bg_loop():
                 _drop_expired_locked(now)
                 _pump_locked(now, mem_now)
                 _cv.notify_all()
+        _recover_processes(now)
         try:
             _maybe_idle_unload(now)
         except Exception:
