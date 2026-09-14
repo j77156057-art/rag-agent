@@ -35,7 +35,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   桌面壳默认打开问答页；入口可用 `DOCMIND_HOME` 覆盖（例如 `/workbench`）。
   桌面壳历史包袱：它曾经硬编码打开 `/workbench/`，而浏览器回退路径打开 `/`，两条路进不同页面，用户看懵过。
   工作台的重组件用 `defineAsyncComponent` 异步分块，首屏 JS 体积不受影响（工作台 137KB / gzip 52KB）。
-- **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前第 14 次冻结构建，2026-09-12 18:26；**仍未重新打包**）；随包 MinGit。
+- **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前**第 17 次**冻结构建，2026-09-14 20:56；已重新打包，含本轮 RAG 问答质量收紧）；随包 MinGit。
 - **引擎嵌入（P0-1 已实机闭环，且 UI 可用）**：Godot 4.7.2（`D://Tools//Godot//Godot_v4.7.2-stable_win64.exe`）+ 真 Win32 宿主窗口下实测通过——
   置父/样式摘除、按客户区（或前端指定矩形）对齐、宿主 resize 跟随、**真实合成键鼠（SendInput）送达引擎并回显**、
   解除嵌入后窗口原样还原、停止后无孤儿进程/窗口、父子 DPI 一致（本机 **150% 缩放 = 144 DPI** 实测）。
@@ -98,8 +98,9 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-13 | `c543047` Agent 代码优先路由+健壮动作解析+证据护栏；**`622fdbc` MCP bridge、Web player/导出、GPU lease 队列、native embedding、desktop_bridge focus、场景面板大改、ChatDock**（+4638 行，6 个新测试文件）；Vue Flow 区域画布 spike 验证通过（`b8e869c` 提交，已随 P0-2 转正后移除，见 §6） |
 | 2026-09-14 | **P0-1 Godot HWND 嵌入实机闭环**（Godot 4.7.2 + 真 Win32 宿主）：`desktop_bridge.py` 加固为可逆嵌入 + 客户区/矩形两种尺寸模式 + DPI 感知 + 可靠的跨线程 focus；`engine_*` 增加嵌入状态机与 detach/focus/resize/place/stop_all（停止先解除父子再杀进程树，防孤儿）；`desktop.py` 接 resized/shown/closing 事件并在启动前声明 DPI 感知；新增 `verify_engine_embed.py`（60 项实机断言，含真实合成键鼠回显）。修 3 个真 bug：嵌入后无法二次 embed、`windows_of_pids` 永远返回空、resize 用外框尺寸裁画面 |
 | 2026-09-14 | **`809a3b9` P0-2 场景画布转正 + P1-1 运行时时间线**：`scene_runtime.py` 重写为行块解析/图模型/受控编辑（+1035 行）；新增 `/api/scene/graph`、`/api/scene/op`、`/api/runtime/sessions`、`/api/runtime/clear`，`/api/runtime/events` 支持筛选；前端新增 `SceneCanvas.vue`/`SceneNodeCard.vue`/`SceneFileCard.vue`/`RuntimeTimeline.vue` 与 `sceneApi`；移除 spike 入口与 `src/spike/`；修 gpu 队列抖动用例；补 `/favicon.ico`；构建前清理 `web/assets`。测试 202/202、后端自检 50/50、浏览器冒烟 23/23 |
+| 2026-09-14 | **RAG 问答质量收紧（第 17 次冻结构建，20:56）**：`d4d8820` Agent 提示词五项硬纪律（文档类先查知识库 / 收敛护栏 / 兄弟仓库指路 / 清单逐项 N/A / Thought 只写决策）；`11d7d91` 问答页「深度思考」标注 + 文件路径可点击看源码；`82ac6e4` 修复 ReAct 思考过程泄漏到最终答案。构建验证：单测 223/223、场景画布 54/54 + 浏览器 27/27、引擎嵌入真机 68/68、`npm run build` vendor 哈希不变、冻结态最小 PATH 冷启动冒烟全过、playwright+Edge 真机点链接高亮目标行。产品位于 `D:/Temp/docmind_rel15/DocMind/`，待用户关闭第 16 次运行实例（PID 15520，锁 `dist/DocMind`）后换入 `dist/DocMind` 完成交付 |
 
-> 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（14 次完整记录，继续追加不要新建文件）。
+> 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（17 次完整记录，继续追加不要新建文件）。
 
 ---
 
@@ -128,9 +129,11 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 自动轮询、失败重试、缩略图网格、音频/3D 预览、Prompt/许可证元数据、重复资源分析。
 
-### P3　第 15 次冻结发布
+### P3　冻结发布（标准流程，已执行至第 17 次）
 
-按 `docmind-frozen-release` Skill：py_compile → **223 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(64) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → Godot 实机验证 → 前端 6 文件 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加第十五次记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
+按 `docmind-frozen-release` Skill：py_compile → **223 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(68) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → 前端产物 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
+第 15/16/17 次均已执行（最新 `344007e`=第 16 次、`DocMind_BUILD.md` 第 17 次章节=20:56 构建）。
+**第 17 次交付卡点**：构建产物在 `D:/Temp/docmind_rel15/DocMind/`，因用户正运行的第 16 次桌面实例（PID 15520）锁定 `dist/DocMind` 目录，暂未换入 `dist/DocMind`；用户关闭该实例后，`robocopy /MIR` 换入即完成交付，无需重打包。
 
 ### 其他已记录的改进点
 

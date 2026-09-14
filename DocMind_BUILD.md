@@ -1,6 +1,6 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第十六次重建（模型预加载驻留修复 + 索引库 .chroma 泄漏修复）」；历史构建清单保留在下文。
+> 最新构建见下方「第十七次重建（RAG 问答质量收紧：提示词纪律 + 深度思考标注 + 文件链接看源码 + 思考泄漏修复）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
@@ -8,6 +8,32 @@
 - 整体体积：约 309 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 91 MB/365 文件；**第十六次起不再打包开发者 `.chroma` 索引库，较第十五次 682.5 MB 降约 374 MB**）
 - **当前构建时间：`2026-09-14 18:16:52`（第十六次重建，模型预加载驻留修复 + 索引库 .chroma 泄漏修复，exe 19,670,711 字节）**
 - 上一版：`2026-09-14 17:14:57`（第十五次重建，桌面入口改 RAG 问答页 + 引擎嵌入 + 场景画布 + Agent 路由收敛，exe 19,670,124 字节）
+
+---
+
+## 第十七次重建：RAG 问答质量收紧 — 提示词纪律 + 深度思考标注 + 文件链接看源码 + 思考泄漏修复（2026-09-14 20:56）
+
+### 改动
+- **Agent 提示词五项硬纪律**（d4d8820）：SYSTEM_PROMPT 收紧 ReAct 行为——① 文档/提示词/教程/规范类问题【第一个 Action 必须是 search_knowledge】，严禁先 search_code（避免命中 EXT_blend_minmax 等无关串误判"没有该文档"）；② 收敛硬护栏：同一检索词连续 2 次无新命中即停检、一轮检索步数 ≤4；③ 兄弟仓库指路：文档点名的实现文件名用 search_code/grep 确认（禁 read_file），查不到必须指引 /api/ingest_code 索引对应仓库；④ 用户给编号清单时 Final Answer 逐项答、不可答项标 N/A+原因；⑤ Thought 只写决策、Final Answer 答完即停。
+- **问答页「深度思考」标注 + 文件路径可点击看源码**（11d7d91，纯前端 `web/index.html` 改动，刷新即生效）：推理轨迹头部「推理轨迹（ReAct）」改为「深度思考」，流式时带脉冲指示点（深度思考中）、答完熄灭，默认折叠；答案与轨迹里的 `相对路径:行号` 引用自动变蓝色可点击链接（.fileref），点击经 `GET /api/fs/file?path=` 拉取源码、弹窗带行号并定位高亮目标行；文件不在当前索引库时给友好提示并指引 /api/ingest_code 索引兄弟仓库。
+- **修复 ReAct 思考过程泄漏到最终答案**（82ac6e4）：SYSTEM_PROMPT 加格式硬边界——不调用工具时必须直接以 Final Answer: 开头，禁止以 Thought: 冒充答案；新增 `_clean_fallback_answer()` 兜底残句优先提取 Final Answer、否则剥掉 Thought/Action/Action Input/Observation 标记、仍无实质内容返回友好提示，不再把原始 ReAct 标记抛给用户。
+- 本轮构建还并入此前已提交、但尚未进冻结产物的问答页视觉改造：深色设计语言统一（b28a495）、底部输入区放大重构（a00194f）、滚动条浅色突兀修复（5cf4c1b）、检索去重 + 提示词收紧初版（ec4936f）。
+
+### 验证
+- 单测：全量 `unittest discover` **223/223 通过**（与第十六次持平）。
+- 场景画布：后端 `verify_scene_canvas.py` **54/54**；浏览器冒烟 `verify_scene_canvas_ui.mjs`（serve 8011）**27/27**。
+- 引擎嵌入：真机 `verify_engine_embed.py` **68/68**（本机 150% DPI 下按实际坐标断言；注：HANDOFF §5 旧记 64 项，实际 68）。
+- 前端：`npm run build` 成功；vendor 三分包哈希与第十六次完全一致（业务改动未使 vendor 失效）；`web/assets/workbench-BOV3qPvm.js` 145,833 字节。
+- 冻结态（最小 PATH 仅 System32，DOCMIND_SERVER_ONLY=1，PyInstaller 退出码 0）：
+  - 冷启动 ~1s 服务就绪；`build_time=2026-09-14 20:56:00`（exe mtime，确认本轮，进程 PID 32316）；
+  - `/` 200（响应体 80,310 字节 = RAG 问答页）；`/workbench/` 200；`/assets/workbench-BOV3qPvm.js` 200 且 content-length 145,833 与源一致；favicon 200；
+  - `web/index.html` 含 `think-dot` / 「深度思考」标记、`composer-bar` 输入区；`/api/health` 200；
+  - **前端产物经 HTTP 返回体与 `web/` 源逐字节一致**（`index.html` / `workbench.html` / `web/assets` 下 9 个 JS+CSS 逐个 SHA-256 match）；
+  - 包内**无 `.chroma` / `.docmind_state.json` / `.env`** 泄漏（冒烟 exe 惰性初始化的 `_internal/.chroma` 已移出）；无 `python*.exe`；MinGit 随包；冒烟后已杀进程、端口释放。
+- 真机 E2E（playwright + 系统 Edge）：问答「在 godot_sample 找定义 `_ready()` 的 .gd 文件，用 文件名:行号 格式回答」→ 答案中 `behaviors/player.gd:18` / `behaviors/enemy.gd:16` / `addons/docmind_bridge/docmind_bridge.gd:11` 全部变蓝链；点击 `behaviors/player.gd:18` 弹窗正确拉取源码并高亮第 18 行 `func _ready() -> void:`；最终答案不再以 Thought: 开头（思考泄漏修复生效）。
+- 源码对应提交：`d4d8820 agent: 收紧 ReAct SYSTEM_PROMPT 五项纪律`、`11d7d91 UI: 问答页思考轨迹标注「深度思考」+ 文件路径可点击查看源码`、`82ac6e4 agent: 修复 ReAct 思考过程泄漏到最终答案`。
+
+> **交付说明**：本轮新构建已生成并通过全部验证，产物位于 `D:/Temp/docmind_rel15/DocMind/`（因用户正运行的第十六次桌面实例 PID 15520 锁定 `dist/DocMind` 目录，暂未能换入 `rag-agent/dist/DocMind/`；待用户关闭该实例后，将临时构建 `robocopy /MIR` 换入 `dist/DocMind` 即完成交付，无需重打包）。
 
 ---
 
