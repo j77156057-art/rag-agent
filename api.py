@@ -79,7 +79,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from engine_adapters import skill_for_engine
 import gpu_coordinator as gpu
-from gpu_coordinator import status as gpu_status
+from gpu_coordinator import status as gpu_status, process_environment
 from agent_policy import route_for, permission_check, record_permission, approval_allows, apply_approved_external, routing_status, redact_for_cloud, create_external_approval, list_approvals, decide_approval
 import secrets_store
 _DESKTOP_HOST_HWND = None
@@ -90,7 +90,7 @@ import web_export
 import unity_graph
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
-from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_queue, comfy_history, comfy_cancel, comfy_import, comfy_import_all, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
+from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_templates, comfy_template_workflow, comfy_queue, comfy_history, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
 
 
 @asynccontextmanager
@@ -525,6 +525,40 @@ async def unity_guid_graph_ep():
 async def engine_prepare_ep(req: EngineReq):
     root=_project_root_or_error(); return engine_prepare(root, req.engine, req.executable) if root else {'ok':False,'error':'未配置代码库'}
 
+class UnrealBridgeReq(BaseModel):
+    confirm: bool = False
+    force: bool = False
+
+@app.post('/api/engine/unreal-bridge/install')
+async def unreal_bridge_install_ep(req: UnrealBridgeReq):
+    root = _project_root_or_error()
+    if not root: return {'ok': False, 'error': '未配置代码库'}
+    if not req.confirm: return JSONResponse({'ok': False, 'error': '安装 Unreal 桥接脚本需要明确确认。'}, status_code=400)
+    return install_unreal_bridge(root, req.force)
+
+@app.get('/api/engine/unreal-bridge/status')
+async def unreal_bridge_status_ep(url: str = 'http://127.0.0.1:8765'):
+    try:
+        with urllib.request.urlopen(url.rstrip('/') + '/', timeout=2) as r: data = json.loads(r.read().decode())
+        return {'ok': True, 'available': True, 'bridge': data}
+    except Exception as e:
+        return {'ok': True, 'available': False, 'error': str(e)}
+
+async def _unreal_bridge_get(path: str, url: str):
+    try:
+        with urllib.request.urlopen(url.rstrip('/') + path, timeout=5) as r:
+            return {'ok': True, 'available': True, **json.loads(r.read().decode())}
+    except Exception as e:
+        return {'ok': True, 'available': False, 'error': str(e)}
+
+@app.get('/api/engine/unreal-bridge/assets')
+async def unreal_bridge_assets_ep(url: str = 'http://127.0.0.1:8765'):
+    return await _unreal_bridge_get('/assets', url)
+
+@app.get('/api/engine/unreal-bridge/actors')
+async def unreal_bridge_actors_ep(url: str = 'http://127.0.0.1:8765'):
+    return await _unreal_bridge_get('/actors', url)
+
 # 注意：EngineEmbedReq 只在文件上方定义一次（带 x/y/offset_y 的完整版）。
 # 这里曾经又定义了一次窄版本，把上面的覆盖掉——处理器读 req.x 会 AttributeError，
 # 而因为当时还有一个重复的旧处理器在生效，这个错被完全掩盖了。
@@ -593,6 +627,16 @@ async def runtime_probe_ep():
 @app.post("/api/engine/verify")
 async def engine_verify_ep(req: EngineReq):
     root=_project_root_or_error(); return engine_verify(root, req.executable) if root else {"ok":False,"error":"未配置代码库"}
+
+class EngineDiagnosticsReq(BaseModel):
+    engine: str = "unreal"
+    text: str = ""
+
+@app.post("/api/engine/diagnostics")
+async def engine_diagnostics_ep(req: EngineDiagnosticsReq):
+    if req.engine.lower() != "unreal":
+        return {"ok": False, "error": "当前仅支持 Unreal 诊断解析。"}
+    return {"ok": True, "engine": "unreal", "diagnostics": parse_unreal_diagnostics(req.text)}
 
 # ---------------------------------------------------------------- P0：Godot 单文件校验 + godot-ai 插件
 class GodotCheckReq(BaseModel):
@@ -752,9 +796,17 @@ async def mcp_call_ep(req: McpCallReq):
 @app.get("/api/comfy/status")
 async def comfy_status_ep(url: str = "http://127.0.0.1:8188"):
     return comfy_status(url)
+@app.get("/api/comfy/templates")
+async def comfy_templates_ep(): return comfy_templates()
+@app.get("/api/comfy/templates/{template_id}")
+async def comfy_template_ep(template_id: str): return comfy_template_workflow(template_id)
 @app.get("/api/gpu/status")
 async def gpu_status_ep():
     return {"ok": True, **gpu_status()}
+@app.get("/api/gpu/environment")
+async def gpu_environment_ep(device_index: int = -1):
+    """返回引擎/外部子进程应注入的 GPU 环境变量；device_index<0 表示按当前租约推断。"""
+    return {"ok": True, "environment": process_environment(None if device_index < 0 else device_index)}
 @app.post("/api/gpu/cancel")
 async def gpu_cancel_ep(req: GpuOwnerReq):
     """取消指定 owner 的排队请求（不影响已持有的租约）。"""
@@ -788,6 +840,15 @@ async def comfy_queue_ep(req: ComfyReq):
 @app.get("/api/comfy/history/{prompt_id}")
 async def comfy_history_ep(prompt_id: str, url: str = "http://127.0.0.1:8188"):
     return comfy_history(prompt_id, url)
+@app.get("/api/comfy/wait/{prompt_id}")
+async def comfy_wait_ep(prompt_id: str, url: str = "http://127.0.0.1:8188", timeout: int = 120, interval: float = 1.0):
+    return comfy_wait(prompt_id, url, timeout, interval)
+@app.post("/api/comfy/watch/{prompt_id}")
+async def comfy_watch_ep(prompt_id: str, url: str = "http://127.0.0.1:8188", timeout: int = 900, interval: float = 1.0):
+    return comfy_watch(prompt_id, url, timeout, interval)
+@app.get("/api/comfy/watch/{prompt_id}")
+async def comfy_watch_status_ep(prompt_id: str):
+    return comfy_watch_status(prompt_id)
 @app.post("/api/comfy/cancel")
 async def comfy_cancel_ep(req: ComfyCancelReq):
     """中断 ComfyUI 当前生成（/interrupt）并释放该作业的 GPU 租约。"""
@@ -800,6 +861,14 @@ async def comfy_import_ep(req: ComfyImportReq):
 async def comfy_import_all_ep(req: ComfyImportReq):
     root=_project_root_or_error()
     return comfy_import_all(root, req.prompt_id, req.images, req.url, req.dest_dir) if root else {"ok":False,"error":"未配置代码库"}
+@app.get("/api/comfy/resources/duplicates")
+async def comfy_duplicates_ep(directory: str = "assets/generated"):
+    root = _project_root_or_error()
+    return comfy_resource_duplicates(root, directory) if root else {"ok":False,"error":"未配置代码库"}
+@app.get("/api/comfy/resources/unused")
+async def comfy_unused_ep(directory: str = "assets/generated"):
+    root = _project_root_or_error()
+    return comfy_unused_resources(root, directory) if root else {"ok":False,"error":"未配置代码库"}
 @app.get("/api/fs/scene-tree")
 async def scene_tree_ep(path: str):
     root=_project_root_or_error(); return scene_tree(root,path) if root else {"ok":False,"error":"未配置代码库"}
@@ -1035,6 +1104,8 @@ async def chat(
         grounded = question
 
     def event_stream():
+        # 注意：此处不得再申请 GPU 租约。llm.py 的 _ollama_chat 已以 owner="ollama"
+        # 持租约，SSE 层若以别的 owner 再申请，serial 模式不可重入 → 必然自锁报"GPU 正忙"。
         try:
             yield f"data: {json.dumps({'type':'route','route':routing['route'],'complexity':routing['complexity'],'reason':routing['reason']}, ensure_ascii=False)}\n\n"
             cloud_grounded = redact_for_cloud(grounded) if selected_agent is not agent else grounded
@@ -1228,6 +1299,7 @@ async def selection_ai_ep(req: SelectionAiReq):
     messages = _selection_rewrite_messages(req)
 
     def event_stream():
+        # 同问答 SSE：llm._ollama_chat 内部已持 owner="ollama" 租约，此处禁止二次申请
         try:
             client = LLMClient()
             acc: list[str] = []

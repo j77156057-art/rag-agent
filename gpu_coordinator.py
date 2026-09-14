@@ -28,6 +28,16 @@ import time
 
 GPU_MODE = os.getenv("DOCMIND_GPU_MODE", "serial").lower()  # serial|parallel|multi
 DEFAULT_TTL = float(os.getenv("DOCMIND_GPU_LEASE_TTL", "0") or 0)  # 秒，0=不限
+
+
+def _env_index():
+    """DOCMIND_GPU_INDEX 指定的本机首选卡（无多卡协调时的单卡选择）。"""
+    try:
+        return int(os.getenv("DOCMIND_GPU_INDEX", "0") or 0)
+    except ValueError:
+        return 0
+
+
 POLL_INTERVAL = float(os.getenv("DOCMIND_GPU_POLL_INTERVAL", "5") or 5)  # 显存采样秒
 SAMPLE_MAX = 240  # 240 个采样点 ×5s ≈ 20 分钟迷你曲线
 IDLE_UNLOAD_DEFAULT = float(os.getenv("DOCMIND_OLLAMA_IDLE_UNLOAD", "0") or 0)  # 秒，0=关闭
@@ -513,6 +523,8 @@ def status():
         "coordinating": GPU_MODE != "parallel",
         "active": primary["owner"] if primary else None,
         "purpose": primary["purpose"] if primary else "",
+        # 兼容旧消费方：当前（唯一）租约所在卡；无租约时取 DOCMIND_GPU_INDEX
+        "device_index": next(iter(leases_snapshot), _env_index()),
         "held_for_seconds": round(now - primary["since"], 1) if primary and primary["since"] else None,
         "lease_ttl": (primary.get("ttl") if primary else 0) or 0,
         "holders": [{"gpu": k, **_holder_view(k, v, now)} for k, v in sorted(leases_snapshot.items(), key=lambda x: str(x[0]))],
@@ -529,6 +541,25 @@ def status():
         },
         "hooks": hooks,
     }
+
+
+def process_environment(device_index=None):
+    """返回启动 GPU 子进程时应注入的设备环境字典；不修改当前进程环境。
+
+    - ``device_index`` 显式给定时直接使用——它应来自 ``acquire_lease()`` 返回的 ``gpu``；
+    - 未给定时取当前唯一租约所在卡；没有唯一租约（无持有/多卡多持有）时退到
+      ``DOCMIND_GPU_INDEX``（默认 0）。
+
+    CUDA 只在子进程初始化瞬间读取 ``CUDA_VISIBLE_DEVICES``，必须在 Popen **之前**
+    注入；这是协调器租约到物理设备隔离的唯一接线点。验收口径（含 ``=99`` 负对照）
+    见 HANDOFF.md 第 5 节 P2-1 待验收项 B。
+    """
+    if device_index is None:
+        with _cv:
+            gpu_keys = [k for k in _leases if isinstance(k, int)]
+        device_index = gpu_keys[0] if len(gpu_keys) == 1 else _env_index()
+    idx = int(device_index)
+    return {"CUDA_VISIBLE_DEVICES": str(idx), "DOCMIND_GPU_INDEX": str(idx)}
 
 
 # --------------------------------------------------------------------------- 后台线程

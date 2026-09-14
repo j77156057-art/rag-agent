@@ -140,11 +140,12 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 - 【方案】设置环境变量 `DOCMIND_GPU_MODE=multi` 后启动服务（采样间隔保持默认 `DOCMIND_GPU_POLL_INTERVAL=5`；其余代码不需要改动）。
 - 【验收】①`GET /api/gpu/status` 返回的 `gpus[]` 条数、index/name/显存/利用率/温度与 `nvidia-smi` 一一对应；②两个不带 `gpu` 参数的并发 `acquire_lease` 分别落在两张物理卡（自动挑空余量大者），第三请求按卡忙情况排队或拒绝；③队首指定的卡忙时，释放**另一张**卡不得让队首跨卡获得（严格 FIFO 的真机版，对应用例 `test_fifo_head_blocks_later_waiter`）；④`POST /api/gpu/cancel {owner}` 只取消排队不动持有租约，`POST /api/gpu/force-release {owner}` 只回收指定卡、另一卡 holder 不变；⑤GpuPanel 出现每卡一条的迷你曲线与独立 holder/queue 展示；⑥退化检查：单卡机器把模式误设为 multi 时 `gpus[]` 长度 1，租约功能不报错。
 
-**待验收项 B：CUDA 设备隔离的接线与验收（当前没有消费方，属未来功能）**
+**待验收项 B：CUDA 设备隔离的接线与验收（P1-3 合并后：引擎消费侧已接线，真机单卡/负对照待验，物理多卡仍待）**
 - 【要做什么】协调器的边界是"在 `acquire_lease` 返回值里给出 `gpu` 物理序号"；真正的设备隔离必须由**拉起 GPU 子进程的调用方**在进程启动前把该序号写进子进程环境（NVIDIA 为 `CUDA_VISIBLE_DEVICES=<gpu>`，AMD 对应 `HIP_VISIBLE_DEVICES`）。
-- 【原因】CUDA 只在进程初始化瞬间读这个变量，启动后再改无效；而当前唯一的 GPU 重负载方 ComfyUI（127.0.0.1:8188）与 Ollama（11434）都是**用户自管的外部常驻服务**，DocMind 只发 HTTP、从不 `Popen` 它们——现在代码库内没有任何地方消费租约的 `gpu` 字段，所以 multi 模式在运行时**不产生任何隔离效果**，这不是缺陷而是尚未有此调用方。
+- 【原因】CUDA 只在进程初始化瞬间读这个变量，启动后再改无效；而当前唯一的 GPU 重负载方 ComfyUI（127.0.0.1:8188）与 Ollama（11434）都是**用户自管的外部常驻服务**，DocMind 只发 HTTP、从不 `Popen` 它们——multi 模式对这两个外部服务仍不产生隔离效果。
 - 【方案】未来若由 DocMind 直接 spawn GPU worker（如本地批量出图/内置推理），在唯一的进程启动封装处用租约结果构造子进程环境后再启动（接口级描述：以父进程环境为底，覆写单键 `CUDA_VISIBLE_DEVICES` 为 `lease["gpu"]`，并发 worker 各持各的租约序号）；`game_workbench.comfy_queue` 注释里已标注该接线点。
 - 【验收】①两 worker 分别取得 k0/k1，各自在子进程内枚举可见设备：设备数为 1 且设备 UUID/名称与物理 k0、k1 对应（注意隔离后进程内设备序号会被重映射为 0，只能用 UUID/名称核对物理身份）；②负对照：给子进程一个不存在的序号（如 `CUDA_VISIBLE_DEVICES=99`）时子进程明确报告无可见设备——以此证明变量真正生效，而非"机器本来就只有一卡"；③worker 异常退出后其租约由 TTL 回收，对应卡重新可被分配，无需人工 force-release；④serial 模式（不设该变量）下原有单卡流程行为不变；⑤验收完成后再同步更新本文件与 GpuPanel 文案口径。
+- 【P1-3 合并更新（2026-09-15）】消费方已落地：`engine_start`（owner `engine:<root>`，ttl=0）与 `engine_verify`（owner `verify:<root>`）在 Popen/run 前 `acquire_lease`，并经 `gpu_coordinator.process_environment(lease["gpu"])` 注入 `CUDA_VISIBLE_DEVICES`/`DOCMIND_GPU_INDEX`；启动失败/各异常分支/`engine_stop` 全部释放。协调器新增 `process_environment()` 与 `GET /api/gpu/environment`。**状态**：注入接线有自动化护栏（test_start_injects_env_and_stop_releases）；真机负对照已于 RTX 5070 Ti Laptop 实测：`CUDA_VISIBLE_DEVICES=0` → `torch.cuda.device_count()=1`（设备名正确），`=99` → `0`，证明环境变量真实生效（ComfyUI 便携 Python 3.13 + torch 2.13）；物理多卡 UUID 核对（验收①③）仍需硬件，项 A 口径不变；ComfyUI/Ollama 外部常驻服务仍不享受隔离，未宣称。
 
 ### P2-2　ComfyUI 流水线
 
@@ -385,3 +386,133 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - `query_gpus` 真实探测 0.5s TTL 缓存（注入探测永不缓存）；`_try_grant_locked` 返回真实 reentrant。
 - **真机端到端抓 bug**：双模型（qwen3.6:35b + bge-m3）同驻时空闲卸载首次真机运行，bge-m3 的 `keep_alive=0` 在紧跟大模型卸载后 HTTP 成功但模型仍驻留；`_gpu_ollama_evict_hook` 改为卸载后等 0.8s 用新 `/api/ps` 对幸存者补一轮（最多两轮）。修复后真机复验 PASS（后台空闲触发→两模型全部清空）。
 - 新增 8 例测试（wait 不触发驱逐、mem-deny 才触发、真实探测 TTL 缓存与注入不缓存、reentrant、ComfyUI 低显存拒绝与驱逐后授予、钩子两轮重试/无驻留不调用）；全量 **250 → 258**；§5 P2-1 残留只剩"物理多卡 + CUDA 隔离"两条纯硬件项。
+
+**以下为 codex/p1-3-gpu-comfyui 分支原始变更记录（保留存档；其中部分设计在合并集成时被有意调整，以本文件末尾「P1-3 合并集成」段为准）**
+- 密钥存储新增 1 项回归测试：往返解密、明文不落盘、Provider 列表和撤销均已验证。全量测试 205 项。
+
+- 外部权限现支持 approval_id 绑定：只有对应审批记录为 approved 且路径精确匹配时，/api/agent/permission 才会记录授权；新增回归测试，测试总数 206。
+
+- 目标核对（本轮）：ReAct MCP 工具、云端密钥 DPAPI/Fernet 往返与撤销、外部审批创建/批准/approval_id 精确授权均有接口；全量测试 206 项通过。仍未完成云端请求脱敏与审批 Diff 驱动的实际外部写入执行器。
+
+- 云端 Agent 路由现接入 redact_for_cloud：发送云端前会脱敏 api_key/token/password/secret/private key 等凭据并截断上下文；新增回归测试，测试总数 207。
+
+- 外部审批已接入实际写入端点 /api/agent/external-write：需 approved approval_id + 精确路径，写入前生成 .docmind.bak，失败拒绝。
+
+- 审批请求支持 before/after 自动生成 unified diff，AgentPolicyPanel 审批列表可展示 Diff 并批准/拒绝；前端构建通过。
+
+- 独立分支 codex/p1-3-gpu-comfyui 新增 /api/comfy/wait/{prompt_id} 有界轮询接口，ComfyUI 可等待完成/失败/超时；测试 213 项通过。
+
+- Unreal inspect 现在额外返回 .uproject 插件/目标平台，并解析 Build.cs 依赖。
+
+- ComfyUI history 输出现在包含 preview_url 与 MIME，导入元数据记录 mime，便于前端多媒体预览。
+
+- GPU 队列新增 /api/gpu/cancel/{owner}，可取消尚未获得租约的等待任务；持有中的任务不强制中断。
+
+- Unreal headless verify 现在自动传入扫描到的 .uproject 路径，避免 -ProjectOnly 校验错误项目。
+
+- GPU status 现返回 devices 全量列表，并支持 DOCMIND_GPU_INDEX 选择显存门控目标卡；保持旧 used/free 字段兼容。
+
+- TaskEnginePanel 现按 MIME 预览 ComfyUI 图片/音频/视频输出，并保留导入操作；独立 worktree 未安装 node_modules，需在主仓/frontend 环境构建验证。
+
+### 本轮新增（独立 worktree）
+
+- Unreal 诊断解析：新增 `parse_unreal_diagnostics()`，支持 MSVC/Unreal 常见 `path(line[,column]): error|warning ...` 格式；`engine_verify()` 在 Unreal 模式返回结构化 diagnostics。
+- 新增 `POST /api/engine/diagnostics`，用于前端/Agent 对任意 Unreal 编译日志做结构化解析。
+- 补回并验证 `comfy_wait()` 及 `/api/comfy/wait/{prompt_id}` 有界轮询（超时最多 900 秒），避免无限等待。
+- 新增 Unreal 诊断单元测试；独立 worktree 全量测试 215 项通过。
+
+仍待实现：Unreal Blueprint/Level 深度桥接、GPU 跨进程真实显存隔离与优先级持久队列、ComfyUI 后台自动轮询 UI/取消任务/许可证与重复资源分析。
+- ComfyUI 新增后台 watcher：`POST /api/comfy/watch/{prompt_id}` 启动有界后台轮询，`GET` 查询状态；前端可持续显示完成结果而不阻塞请求。
+- watcher 生命周期已加入单元测试；全量测试基线仍为 215 项通过（另加 watcher 测试通过）。
+仍待实现：GPU 跨进程真实显存隔离、多 GPU 任务绑定/优先级持久队列；Unreal Blueprint/Level Editor 插件桥接；ComfyUI 取消任务、结果网格、许可证/来源与重复资源分析。
+- GPU 协调器新增优先级队列：`acquire(..., priority=N)`，高优先级任务优先获得释放的租约，同优先级保持 FIFO；取消和 TTL 回收会清理优先级元数据。
+- 新增优先级交接测试，GPU 队列相关测试通过。
+仍待实现：跨进程真实显存隔离和任务进程绑定；GPU 优先级尚未持久化到磁盘队列。
+- Unreal `engine_inspect` 现在分类索引 Content 资产：`blueprints`（按 BP_/Blueprint 命名）与 `levels`（.umap），并保留其它 .uasset 为 assets；仅做只读索引，不修改二进制资源。
+- 新增资产分类测试。
+仍待实现：通过 Unreal Editor Python/HTTP 插件读取 Blueprint 节点、Level Actor 属性并执行安全编辑；当前索引不能替代编辑器级解析。
+- ComfyUI 资源管理新增只读重复检测：`comfy_resource_duplicates()` 按 SHA-256 对生成目录分组，并通过 `GET /api/comfy/resources/duplicates` 提供报告；不会自动删除资源。
+- 新增哈希分组测试。
+仍待实现：ComfyUI 任务取消、许可证/来源元数据完善、未使用资源分析；GPU 跨进程显存隔离与持久队列；Unreal Editor 深度读写桥接。
+- ComfyUI 新增未使用资源分析：`GET /api/comfy/resources/unused` 扫描生成目录并与项目文本引用比对，输出疑似未引用文件；仅供审计，不自动删除。
+- 新增对应测试。
+仍待实现：Unreal Editor Python/HTTP Blueprint/Level 深度桥接；GPU 跨进程显存隔离、设备绑定和持久队列；ComfyUI 任务取消与许可证来源管理。
+- GPU 租约现在记录 `device_index`，状态接口暴露当前 owner 的设备绑定；由 `DOCMIND_GPU_INDEX` 选择。该绑定用于后续子进程 CUDA 环境注入，仍不等同于 CUDA 显存隔离。
+- 新增设备绑定测试。
+仍待实现：将设备绑定实际注入 Ollama/ComfyUI/引擎子进程，以及跨进程显存监控和持久任务队列。
+- ComfyUI 新增显式取消：`POST /api/comfy/cancel/{prompt_id}` 调用原生 `/interrupt`，并在 watcher 状态记录 `cancel_requested`；返回值明确表示“已请求中断”，不会伪装成任务完成。
+- 新增取消请求测试。
+仍待实现：按 prompt_id 的精确取消（ComfyUI 原生 interrupt 是全局当前任务）、Unreal Editor 深度读写桥接、GPU 跨进程显存隔离与持久队列。
+- Unreal 新增桥接脚本安装 API：`POST /api/engine/unreal-bridge/install`（需 `confirm=true`，可 `force` 覆盖）。脚本写入 `Content/Python/docmind_bridge.py`，提供 Editor Python 下的 Blueprint 资产枚举和当前 Level Actor 枚举入口；不修改二进制 `.uasset`。
+- 已通过 API 路由与资产索引测试。
+仍待实现：在 Unreal Editor 中启用并运行桥接脚本的进程通信、Blueprint 节点级读写和 Actor 属性安全编辑；GPU 跨进程显存隔离/持久队列。
+- GPU 新增 `GET /api/gpu/environment`，返回启动 Ollama/ComfyUI/引擎子进程时建议注入的 `CUDA_VISIBLE_DEVICES` 与 `DOCMIND_GPU_INDEX`，不修改工作台自身环境。
+- 新增环境生成测试。
+仍待实现：将该环境实际传入各子进程启动器，以及真实跨进程显存监控/隔离。
+- 引擎启动现在会将 GPU 调度器生成的 `CUDA_VISIBLE_DEVICES`/`DOCMIND_GPU_INDEX` 环境注入 Godot、Unity、Unreal 子进程，便于实际设备选择；工作台自身环境不变。
+- API 路由与 GPU 环境测试通过。
+仍待实现：引擎启动前自动申请/停止时释放 GPU 租约（当前仅注入环境）；跨进程显存监控与持久队列。
+- 引擎启动现在先申请 GPU 租约（owner 为 `engine:<project-root>`），启动失败会释放；停止或发现进程已结束也会释放，避免引擎与 Ollama/ComfyUI 抢占。
+- 全量测试运行中已通过前段检查；编译通过。
+仍待实现：跨进程显存真实监控/隔离、持久任务队列，以及 Unreal Editor Blueprint 节点/Actor 属性的实际通信读写。
+- ComfyUI queue 响应新增 `workflow_sha256`，对规范化 workflow 计算稳定哈希，便于任务追踪、缓存和资源来源审计；不保存敏感 workflow 内容。
+- ComfyUI 导入元数据现在保留可选 `license`、`source_url`、`author`、`workflow_sha256` 字段（长度受限），便于资源来源和授权审计。
+- 新增引擎 GPU 租约护栏测试：验证 GPU 忙时引擎启动被阻止，防止未来改动绕过调度器。
+- `engine_verify` 的 Godot/Unity/Unreal headless 校验进程现在同样继承 GPU 设备环境，确保验证阶段与运行阶段使用一致的 CUDA 设备。
+- `engine_verify` 现在也申请独立 GPU 租约，并在成功、找不到可执行文件、超时或异常时释放，避免校验任务与运行任务并发争抢显存。
+- ComfyUI watcher 现在在轮询生命周期内持有 `comfy:<prompt_id>` GPU 租约，并在完成、失败或超时时释放；重复 watcher 不重复占用租约。
+- 这使生成监控阶段与 Ollama/引擎调度互斥，避免轮询期间 GPU 被其它任务抢占。
+- ComfyUI workflow 提交成功后会自动启动后台 watcher（当响应包含 `prompt_id`），`/api/comfy/queue` 返回 `watch` 状态；无需前端额外发起轮询请求。
+
+### 本地 ComfyUI 实机联调（2026-09-14）
+
+- 已确认安装目录：`D:\ComfyUI\ComfyUI`，便携 Python 3.13.14。
+- 已启动实例 PID 46712：`127.0.0.1:8188`，ComfyUI 0.33.1，PyTorch 2.13.0+cu130。
+- 实测 GPU：`cuda:0 NVIDIA GeForce RTX 5070 Ti Laptop GPU`，总显存约 12.82 GB，启动时空闲约 11.58 GB。
+- 已发现 Z-Image：`models/unet/z_image_turbo-Q8_0.gguf`、`models/clip/Qwen3-4B-Q8_0.gguf`、`models/vae/ae.safetensors`。
+- 已发现 MiniMax H3：`diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors`、`diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors`、对应 LoRA、Qwen3VL 文本编码器及音视频 VAE。
+- ComfyUI 日志确认已加载 `TE-Speed-MiniMaxH3-OSS`、`ComfyUI-GGUF`、`comfyui-ollama` 自定义节点。
+
+实机服务已具备，下一步可提交实际 Z-Image/H3 workflow 做端到端生成验证；生成任务会经过工作台 watcher 和 GPU 租约调度。
+
+### Z-Image 实机端到端验证（2026-09-14）
+
+- 使用本地 `UnetLoaderGGUF + CLIPLoaderGGUF + TextEncodeZImageOmni + KSampler + VAEDecode + SaveImage` workflow。
+- ComfyUI 返回 prompt：`2a82927b-0468-478e-857c-26a3c1fab143`。
+- history 状态：`success/completed=true`，耗时约 25 秒。
+- 输出：`docmind_zimage_00001_.png`（ComfyUI output 目录）。
+- 证明 Z-Image 模型、GGUF 节点、VAE、GPU 推理和结果查询链路均可用。
+- MiniMax H3 实机首次 workflow 已提交并被 ComfyUI 接受，但在 `MiniMaxH3ImageToVideo` 文本编码阶段失败：`mat1 and mat2 shapes cannot be multiplied (8x5120 and 2560x8192)`。
+- 诊断表明当前 `CLIPLoaderGGUF(qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors, type=minimax)` 与 H3 节点期望的文本编码维度不匹配；未把失败误报为成功。下一步需读取官方 H3 workflow/正确文本编码器配置后再重试。
+### MiniMax H3 实机成功验证（2026-09-14）
+
+- 使用本地官方 `minimax_h3_t2v.json` 展开脚本 `h3_video_gen.py`，避免手写 workflow 的文本编码器维度错误。
+- 实际参数：首帧 `starblade_kf01.png`、672x384、约 5 秒、8 steps。
+- ComfyUI prompt：`ff95c4f5-e632-4468-9a6c-a0f48dd17df6`，状态 success，耗时约 10 秒。
+- 输出：`D:\ComfyUI\ComfyUI\output\docmind_h3_00001_.mp4`，SaveVideo 返回 animated=true。
+- 证明 H3 模型、正确 Qwen3VL 配置、I2V workflow、GPU 推理和视频输出链路可用。
+- 新增 `/api/comfy/templates` 与前端模板按钮，显示本机 Z-Image Turbo 和 MiniMax H3 参考图视频模型及 workflow 路径，作为工作台模板入口（当前按钮展示元数据，完整 JSON 仍从本地官方 workflow 加载）。
+- ComfyUI 模板现在可直接加载 workflow：`GET /api/comfy/templates/{template_id}`；Z-Image 返回 API prompt 骨架，H3 读取本机官方 UI workflow。前端模板按钮会自动填充 JSON 编辑器。
+- 新增模板加载测试。
+- Ollama 本地聊天与选区 AI 的流式请求现在纳入 GPU 租约：请求开始申请、SSE 完成/异常时释放；GPU 忙时返回清晰提示，避免与 ComfyUI/H3 抢占。
+- 前端 ComfyUI 面板新增最近 10 个 prompt 历史（localStorage），支持点击切换并自动查询；提交后每 4 秒自动刷新当前任务结果，显示生成状态和输出数量。
+- Unreal 桥接脚本升级为本地 HTTP 服务骨架：在 Editor Python 中运行 `run_server(8765)` 后，`/` 探活、`/assets` 枚举 Blueprint 资产、`/actors` 枚举当前关卡 Actor；工作台新增 `GET /api/engine/unreal-bridge/status` 探测端点。
+- 尚需在真实 Unreal Editor 中启用 Python 插件并运行脚本后做通信实测；未宣称节点级编辑已完成。
+- Unreal 桥接新增工作台代理接口：`GET /api/engine/unreal-bridge/assets` 与 `/actors`，转发本地 Editor bridge 的 Blueprint 资产和当前关卡 Actor 数据；不可达时返回 `available=false`，不伪造结果。
+- 前端引擎面板新增 Unreal 桥接状态、Blueprint 资产数量和 Level Actor 数量展示，并通过 `/api/engine/unreal-bridge/*` 查询。
+- ComfyUI history 响应新增 `progress.executed_nodes/total_nodes/percent`，前端自动刷新时显示节点进度百分比。
+- Unreal 面板现在展开显示最多 8 个 Blueprint 资产和 8 个 Level Actor（名称/类名），便于快速确认桥接数据。
+
+**2026-09-15（P1-3 合并集成，分支 `merge/p1-3-integration`，未合回 main）**
+- 合并 `codex/p1-3-gpu-comfyui`（HEAD `226258f`）入 main（基线 `d130646`），不硬合：**保留 main 的新版三模式 GPU 协调器**（serial/parallel/multi、`acquire_lease` 结构化结果、严格 FIFO、显存门槛、`reown/force_release/cancel_wait`、采样环/TTL pump/0.5s 探测缓存/精准驱逐），分支功能在此之上回植。
+- 吸收的 P1-3 功能：Z-Image/H3 模板（`comfy_templates/comfy_template_workflow`，模板路径暂硬编码 `D:\ComfyUI\...`，待配置化）；history 的 `progress`/`preview_url`/`mime`；`comfy_wait` 有界轮询；`comfy_watch/watch_status` 后台轮询（`_COMFY_JOBS`）；queue 返回 `workflow_sha256` 并自动起 watch；import 元数据透传 mime/license/source_url/author/workflow_sha256；`comfy_resource_duplicates/unused_resources`；Unreal inspect 扩展（plugins/targets、Build.cs 依赖、.umap levels、Blueprint 分类）、`install_unreal_bridge`、`parse_unreal_diagnostics` 与 `/api/engine/diagnostics`；Unreal bridge 四个 HTTP 路由；`process_environment()` 回植协调器（含 `status().device_index` 兼容键，`DOCMIND_GPU_INDEX`）；`engine_start/engine_verify` 启动前申请租约并向子进程注入 `CUDA_VISIBLE_DEVICES`/`DOCMIND_GPU_INDEX`，`engine_stop` 所有返回路径释放（owner `engine:<root>` / `verify:<root>`）；`GET /api/gpu/environment`。
+- **相对分支原设计的有意偏离（合并时必须遵守）**：
+  1. **删除两处 SSE 双重租约**：分支在问答/选题两个 event_stream 里以 `ollama:chat`、`ollama:selection` 申请租约；main 的 `llm.py _ollama_chat` 已以 owner `ollama` 持租约，serial 模式不同 owner 不可重入，等 2s 后 100% 自报"GPU 正忙"（自锁）。已删除 SSE 层 acquire/release，租约只在 llm 层持有。
+  2. **ComfyUI watch 不持租约**：整作业周期租约由 `comfy_queue` reown 为 `comfyui:<prompt_id>`（main 命名，非分支的 `comfy:` 前缀），终态由 history/cancel 释放、TTL 兜底；watch 仅轮询，避免重复占卡/泄漏。
+  3. **不回植 priority 优先级队列**（分支 `acquire(priority=)`/`cancel()`，无生产调用方），维持严格 FIFO；`/api/gpu/cancel` 保留 main 的 body 版（`cancel_wait`），丢弃分支路径参 `/cancel/{owner}`。
+  4. ComfyUI 取消以 main 为准：POST /interrupt + `force_release(comfyui:<id>)`，并给 watch job 打 `cancel_requested`；`comfy_wait` 超时键沿用 main 的 `timeout`（分支的 `timed_out` 不采用）。
+- 测试：分支 4 个旧 API 测试改写（priority→FIFO、device_binding 按新语义、engine_lease 改 patch `gw._gpu.acquire_lease`、environment 直接通过），6 个 comfy 测试按 main 响应口径调整；另新增 3 个合并护栏用例（SSE 不自锁行为测试 + 静态 owner 护栏、引擎 start 注入 env 副本且 stop 释放、cancel 给 watch job 打标记）；全量实测 **277** 项通过（main 258 + 分支 13 文件 16 例 + 新增 3 例）；`npm run build` **通过**（vite 5.4.21，2026-09-15）；真机验证见 §5 验收项 B（CUDA =0/=99 负对照已在 RTX 5070 Ti 实测通过；问答/ComfyUI 流式真机冒烟因两服务未运行、且按安全策略不由集成方自行启动，待用户启动服务后补验）。
+
+- 合并后前端生产构建已验证：在 `frontend` 目录执行 `npm run build`，Vite 5.4.21 构建成功；输出 `web/workbench.html` 及全部资源 chunk，只有体积提示，无错误。
+- 集成分支运行时冒烟（2026-09-15）：临时后端 `127.0.0.1:8899` 启动成功；`/api/gpu/status` 返回 RTX 5070 Ti、空闲约 10.9 GB、无残留 holder；`/api/comfy/templates` 正常返回 Z-Image 与 MiniMax H3 模板；本机 Ollama `127.0.0.1:11434/api/tags` 在线并列出 qwen2.5:7b、qwen3:14b 等模型。
+- Unreal bridge 探测按预期返回 `available=false`（Editor bridge 未运行），未将离线状态宣称为通信成功。
