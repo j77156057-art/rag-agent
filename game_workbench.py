@@ -992,8 +992,9 @@ def comfy_cancel(prompt_id, url="http://127.0.0.1:8188"):
     interrupted = False
     err = ""
     try:
+        # ComfyUI 支持带 prompt_id 的定向 interrupt；不再发送全局空载荷。
         req = urllib.request.Request(url.rstrip('/') + '/interrupt',
-                                     data=b"{}", headers={"Content-Type": "application/json"})
+                                     data=json.dumps({'prompt_id': pid}).encode(), headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=5) as r:
             interrupted = 200 <= r.status < 300
     except Exception as e:

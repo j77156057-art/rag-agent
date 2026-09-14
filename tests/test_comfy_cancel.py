@@ -1,4 +1,4 @@
-import unittest
+import unittest, json
 from unittest.mock import patch, MagicMock
 import game_workbench as gw
 
@@ -18,6 +18,8 @@ class CancelTests(unittest.TestCase):
         self.assertIn('lease_released', x)
         self.assertEqual(x['prompt_id'], 'p1')
         u.assert_called_once()
+        body=json.loads(u.call_args.args[0].data.decode())
+        self.assertEqual(body['prompt_id'],'p1')
 
     def test_cancel_marks_watch_job(self):
         resp = MagicMock()
