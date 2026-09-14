@@ -657,6 +657,11 @@ export interface ComfyWatchJob {
   finished_at?: string
   cancel_requested?: boolean
   cancel_requested_at?: string
+  cancel_state?: 'requesting' | 'requested' | 'terminated' | 'failed'
+  status?: 'queued' | 'running' | 'completed' | 'failed' | 'timeout' | 'recovered'
+  recovery_note?: string
+  recovered_at?: string
+  progress?: { executed_nodes: number; total_nodes: number; percent: number }
 }
 
 export const comfyApi = {
