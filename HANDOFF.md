@@ -573,4 +573,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 新增受控 ComfyUI 服务生命周期 API：`POST /api/comfy/start` 按 `DOCMIND_COMFY_ROOT`/D 盘便携目录启动 `python_embeded` + `ComfyUI/main.py`，登记真实 PID；`POST /api/comfy/stop` 终止并注销 PID。默认不自动启动，启动/停止均需用户显式操作；已完成编译与专项回归。
 - ComfyUI 任务面板已接入服务控制按钮（启动/停止/刷新状态），调用上述生命周期 API 并显示 PID；前端构建验证通过，服务仍保持用户显式启动策略。
 - 服务生命周期改动后的全量回归：项目 `.venv` 测试 **298/298 通过**，分支与 `origin/main` 同步，工作区 clean。
+- 新增 ComfyUI 服务生命周期专项测试：缺失便携安装拒绝、启动命令参数/真实 PID 注册、停止注销共 **2/2 通过**；已推送 `origin/main`。
 
