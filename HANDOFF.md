@@ -503,8 +503,8 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI history 响应新增 `progress.executed_nodes/total_nodes/percent`，前端自动刷新时显示节点进度百分比。
 - Unreal 面板现在展开显示最多 8 个 Blueprint 资产和 8 个 Level Actor（名称/类名），便于快速确认桥接数据。
 
-**2026-09-15（P1-3 合并集成，分支 `merge/p1-3-integration`，未合回 main）**
-- 合并 `codex/p1-3-gpu-comfyui`（HEAD `226258f`）入 main（基线 `d130646`），不硬合：**保留 main 的新版三模式 GPU 协调器**（serial/parallel/multi、`acquire_lease` 结构化结果、严格 FIFO、显存门槛、`reown/force_release/cancel_wait`、采样环/TTL pump/0.5s 探测缓存/精准驱逐），分支功能在此之上回植。
+**2026-09-15（P1-3 合并集成，分支 `merge/p1-3-integration`，已合入 main（merge commit 4617dfc））**
+- 合并 `codex/p1-3-gpu-comfyui`（HEAD `226258f`）入 main（基线 `d130646`，merge commit `4617dfc`），不硬合：**保留 main 的新版三模式 GPU 协调器**（serial/parallel/multi、`acquire_lease` 结构化结果、严格 FIFO、显存门槛、`reown/force_release/cancel_wait`、采样环/TTL pump/0.5s 探测缓存/精准驱逐），分支功能在此之上回植。
 - 吸收的 P1-3 功能：Z-Image/H3 模板（`comfy_templates/comfy_template_workflow`，模板路径暂硬编码 `D:\ComfyUI\...`，待配置化）；history 的 `progress`/`preview_url`/`mime`；`comfy_wait` 有界轮询；`comfy_watch/watch_status` 后台轮询（`_COMFY_JOBS`）；queue 返回 `workflow_sha256` 并自动起 watch；import 元数据透传 mime/license/source_url/author/workflow_sha256；`comfy_resource_duplicates/unused_resources`；Unreal inspect 扩展（plugins/targets、Build.cs 依赖、.umap levels、Blueprint 分类）、`install_unreal_bridge`、`parse_unreal_diagnostics` 与 `/api/engine/diagnostics`；Unreal bridge 四个 HTTP 路由；`process_environment()` 回植协调器（含 `status().device_index` 兼容键，`DOCMIND_GPU_INDEX`）；`engine_start/engine_verify` 启动前申请租约并向子进程注入 `CUDA_VISIBLE_DEVICES`/`DOCMIND_GPU_INDEX`，`engine_stop` 所有返回路径释放（owner `engine:<root>` / `verify:<root>`）；`GET /api/gpu/environment`。
 - **相对分支原设计的有意偏离（合并时必须遵守）**：
   1. **删除两处 SSE 双重租约**：分支在问答/选题两个 event_stream 里以 `ollama:chat`、`ollama:selection` 申请租约；main 的 `llm.py _ollama_chat` 已以 owner `ollama` 持租约，serial 模式不同 owner 不可重入，等 2s 后 100% 自报"GPU 正忙"（自锁）。已删除 SSE 层 acquire/release，租约只在 llm 层持有。
@@ -516,3 +516,4 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 合并后前端生产构建已验证：在 `frontend` 目录执行 `npm run build`，Vite 5.4.21 构建成功；输出 `web/workbench.html` 及全部资源 chunk，只有体积提示，无错误。
 - 集成分支运行时冒烟（2026-09-15）：临时后端 `127.0.0.1:8899` 启动成功；`/api/gpu/status` 返回 RTX 5070 Ti、空闲约 10.9 GB、无残留 holder；`/api/comfy/templates` 正常返回 Z-Image 与 MiniMax H3 模板；本机 Ollama `127.0.0.1:11434/api/tags` 在线并列出 qwen2.5:7b、qwen3:14b 等模型。
 - Unreal bridge 探测按预期返回 `available=false`（Editor bridge 未运行），未将离线状态宣称为通信成功。
+
