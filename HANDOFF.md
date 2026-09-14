@@ -513,3 +513,4 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
   4. ComfyUI 取消以 main 为准：POST /interrupt + `force_release(comfyui:<id>)`，并给 watch job 打 `cancel_requested`；`comfy_wait` 超时键沿用 main 的 `timeout`（分支的 `timed_out` 不采用）。
 - 测试：分支 4 个旧 API 测试改写（priority→FIFO、device_binding 按新语义、engine_lease 改 patch `gw._gpu.acquire_lease`、environment 直接通过），6 个 comfy 测试按 main 响应口径调整；另新增 3 个合并护栏用例（SSE 不自锁行为测试 + 静态 owner 护栏、引擎 start 注入 env 副本且 stop 释放、cancel 给 watch job 打标记）；全量实测 **277** 项通过（main 258 + 分支 13 文件 16 例 + 新增 3 例）；`npm run build` **通过**（vite 5.4.21，2026-09-15）；真机验证见 §5 验收项 B（CUDA =0/=99 负对照已在 RTX 5070 Ti 实测通过；问答/ComfyUI 流式真机冒烟因两服务未运行、且按安全策略不由集成方自行启动，待用户启动服务后补验）。
 
+- 合并后前端生产构建已验证：在 `frontend` 目录执行 `npm run build`，Vite 5.4.21 构建成功；输出 `web/workbench.html` 及全部资源 chunk，只有体积提示，无错误。
