@@ -528,4 +528,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - Unreal 工作台代理新增 Blueprint/Actor 查询路由：`/api/engine/unreal-bridge/blueprint/{path}`、`/actor/{name}`。当前本机 Unreal Editor 未运行，真实节点/属性通信仍未验收。
 - 当前已验证：Python 281 项、前端构建、Z-Image/H3 历史实机记录、GPU 单卡采样。未验证：物理多 GPU、Unreal Editor 端到端、引擎实际安装路径上的 Godot/Unity/Unreal 启动、最终远端推送。
 - GPU 运行时状态现在在启动时读取 `.docmind/gpu_state.json`；上次未完成租约不会复用，而是标记为 `recovered` 事件并清除旧状态，避免重启后永久占卡。新增专项测试通过。
+- 2026-09-15 当前机实测：`nvidia-smi --query-gpu` 成功读到单卡 RTX 5070 Ti（12227 MB，总使用约 1717 MB）；`--query-compute-apps` 返回进程但显存均为 `[N/A]`，协调器因此正确报告进程显存 `available=false`，未将其当作真实数值。`CUDA_VISIBLE_DEVICES=0` 正常生成，`=99` 仅作为无效设备负对照生成环境变量，尚未启动 CUDA 子进程验证失败行为。
 
