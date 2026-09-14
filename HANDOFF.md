@@ -514,3 +514,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 测试：分支 4 个旧 API 测试改写（priority→FIFO、device_binding 按新语义、engine_lease 改 patch `gw._gpu.acquire_lease`、environment 直接通过），6 个 comfy 测试按 main 响应口径调整；另新增 3 个合并护栏用例（SSE 不自锁行为测试 + 静态 owner 护栏、引擎 start 注入 env 副本且 stop 释放、cancel 给 watch job 打标记）；全量实测 **277** 项通过（main 258 + 分支 13 文件 16 例 + 新增 3 例）；`npm run build` **通过**（vite 5.4.21，2026-09-15）；真机验证见 §5 验收项 B（CUDA =0/=99 负对照已在 RTX 5070 Ti 实测通过；问答/ComfyUI 流式真机冒烟因两服务未运行、且按安全策略不由集成方自行启动，待用户启动服务后补验）。
 
 - 合并后前端生产构建已验证：在 `frontend` 目录执行 `npm run build`，Vite 5.4.21 构建成功；输出 `web/workbench.html` 及全部资源 chunk，只有体积提示，无错误。
+- 集成分支运行时冒烟（2026-09-15）：临时后端 `127.0.0.1:8899` 启动成功；`/api/gpu/status` 返回 RTX 5070 Ti、空闲约 10.9 GB、无残留 holder；`/api/comfy/templates` 正常返回 Z-Image 与 MiniMax H3 模板；本机 Ollama `127.0.0.1:11434/api/tags` 在线并列出 qwen2.5:7b、qwen3:14b 等模型。
+- Unreal bridge 探测按预期返回 `available=false`（Editor bridge 未运行），未将离线状态宣称为通信成功。
