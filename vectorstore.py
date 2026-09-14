@@ -36,7 +36,19 @@ def get_collection(name=COLLECTION_NAME):
 
 def add_documents(chunks, embeddings, metadatas, ids, collection=COLLECTION_NAME):
     col = get_collection(collection)
-    col.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
+    try:
+        col.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
+    except Exception as exc:  # noqa: BLE001
+        # Chroma fixes a collection's dimension on first insert.  Make a
+        # stale-provider mismatch actionable instead of leaking its opaque
+        # InvalidArgumentError; never delete the existing index implicitly.
+        msg = str(exc)
+        if "dimension" in msg.lower():
+            raise ValueError(
+                f"向量维度与集合不匹配（当前输入 {len(embeddings[0]) if embeddings else 0} 维）。"
+                "请切换到创建该集合时的 embedding 配置，或显式执行 reset_collection() 重建索引。"
+            ) from exc
+        raise
 
 
 def query(text_embedding, k=4, collection=COLLECTION_NAME):
