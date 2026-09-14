@@ -953,6 +953,14 @@ def comfy_ui_to_api_workflow(ui_workflow):
                 src, slot = links[str(link_id)]; inputs[name] = [src, slot]
             elif wi < len(widgets):
                 inputs[name] = widgets[wi]; wi += 1
+        # SaveVideo keeps its widget-only fields outside the serialized input
+        # list in the editor JSON.  The /prompt API still requires them.
+        if typ_name == 'SaveVideo' and widgets:
+            inputs.setdefault('filename_prefix', widgets[0])
+            if len(widgets) > 1:
+                inputs.setdefault('format', widgets[1])
+            if len(widgets) > 2:
+                inputs.setdefault('codec', widgets[2])
         out[nid] = {'class_type': type_aliases.get(str(typ), str(typ)), 'inputs': inputs}
     if not out: return {'ok': False, 'error': 'UI workflow 没有可提交节点'}
     return {'ok': True, 'workflow': out, 'format': 'api'}
