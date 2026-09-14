@@ -558,6 +558,12 @@ async def unreal_bridge_assets_ep(url: str = 'http://127.0.0.1:8765'):
 @app.get('/api/engine/unreal-bridge/actors')
 async def unreal_bridge_actors_ep(url: str = 'http://127.0.0.1:8765'):
     return await _unreal_bridge_get('/actors', url)
+@app.get('/api/engine/unreal-bridge/blueprint/{asset_path:path}')
+async def unreal_bridge_blueprint_ep(asset_path: str, url: str = 'http://127.0.0.1:8765'):
+    return await _unreal_bridge_get('/blueprint/' + urllib.parse.quote(asset_path, safe=''), url)
+@app.get('/api/engine/unreal-bridge/actor/{actor_name:path}')
+async def unreal_bridge_actor_ep(actor_name: str, url: str = 'http://127.0.0.1:8765'):
+    return await _unreal_bridge_get('/actor/' + urllib.parse.quote(actor_name, safe=''), url)
 
 # 注意：EngineEmbedReq 只在文件上方定义一次（带 x/y/offset_y 的完整版）。
 # 这里曾经又定义了一次窄版本，把上面的覆盖掉——处理器读 req.x 会 AttributeError，
