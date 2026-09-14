@@ -73,6 +73,11 @@ _recovery_events = collections.deque(maxlen=200)
 _process_probe_cache = {"t": 0.0, "rows": None, "available": False}
 PROCESS_HEARTBEAT_TTL = float(os.getenv("DOCMIND_GPU_PROCESS_HEARTBEAT_TTL", "30") or 30)
 STATE_FILE = Path(os.getenv("DOCMIND_GPU_STATE_FILE", str(Path(".docmind") / "gpu_state.json")))
+def _persist_runtime_locked():
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps({'leases': {str(k): v for k,v in _leases.items()}, 'updated_at': time.time()}, ensure_ascii=False), encoding='utf-8')
+    except Exception: pass
 
 
 # --------------------------------------------------------------------------- 探测
@@ -286,6 +291,7 @@ def _pump_locked(now, mem):
         _waiters.popleft()
         _leases[chosen] = {"owner": tok["owner"], "purpose": tok["purpose"],
                            "since": now, "ttl": tok["ttl"]}
+        _persist_runtime_locked()
         tok["granted"] = True
         tok["gpu"] = chosen
         tok["event"].set()
@@ -325,6 +331,7 @@ def _try_grant_locked(owner, purpose, ttl, gpu, min_free, now, mem):
     if free_keys:
         key = free_keys[0]
         _leases[key] = {"owner": owner, "purpose": purpose, "since": now, "ttl": ttl}
+        _persist_runtime_locked()
         return ("granted", key, False)
     return ("wait", busy_keys[0] if busy_keys else None, False)
 
@@ -443,6 +450,7 @@ def release(owner):
         if key is None:
             return
         _leases.pop(key, None)
+        _persist_runtime_locked()
         _pump_locked(time.time(), mem_now)
         _cv.notify_all()
 
@@ -480,11 +488,13 @@ def force_release(owner=None):
             if key is None:
                 return None
             prev = _leases.pop(key)["owner"]
+            _persist_runtime_locked()
         else:
             if not _leases:
                 return None
             prev = ",".join(v["owner"] for v in _leases.values())
             _leases.clear()
+            _persist_runtime_locked()
         _pump_locked(time.time(), mem_now)
         _cv.notify_all()
         return prev
