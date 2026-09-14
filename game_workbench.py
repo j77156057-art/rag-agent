@@ -936,7 +936,17 @@ def comfy_ui_to_api_workflow(ui_workflow):
         '4c314f31-ecda-4b08-ae98-faaba1bf613f': 'TESpeedMiniMaxH3',
     }
     out = {}
+    invalid_image_nodes = set()
     for nid, node in nodes.items():
+        if str(node.get('type')) == 'LoadImage':
+            vals = node.get('widgets_values') or []
+            image_name = str(vals[0]) if vals else ''
+            comfy_root = os.getenv('DOCMIND_COMFY_ROOT', r'D:\ComfyUI')
+            if image_name and not os.path.isfile(os.path.join(comfy_root, 'ComfyUI', 'input', image_name)) and not os.path.isfile(os.path.join(comfy_root, 'input', image_name)):
+                invalid_image_nodes.add(nid)
+    for nid, node in nodes.items():
+        if nid in invalid_image_nodes:
+            continue
         typ = node.get('type')
         # Editor-only annotations are not executable ComfyUI nodes.  Official
         # H3 workflows include MarkdownNote blocks; forwarding them to
@@ -968,6 +978,9 @@ def comfy_ui_to_api_workflow(ui_workflow):
             if isinstance(value, str) and ('\\' in value or '/' in value) and key.endswith(('_name', '_name_1', 'clip_name', 'unet_name')):
                 inputs[key] = value.replace('\\', '/').rsplit('/', 1)[-1]
         out[nid] = {'class_type': type_aliases.get(str(typ), str(typ)), 'inputs': inputs}
+    for nid in list(out):
+        if any(isinstance(v, list) and v and str(v[0]) in invalid_image_nodes for v in out[nid].get('inputs', {}).values()):
+            del out[nid]
     # Validate editor links before submitting.  Some distributed H3 UI
     # workflows are documentation-only graphs whose SaveVideo node is wired
     # directly to the model node (MODEL -> VIDEO); ComfyUI rejects this with a
