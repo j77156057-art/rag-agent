@@ -127,7 +127,8 @@ def _default_process_probe():
 def register_process(pid, owner, gpu=None, purpose="", heartbeat=None):
     """注册实际子进程，返回注册记录。"""
     rec = {"pid": int(pid), "owner": str(owner), "gpu": gpu, "purpose": str(purpose),
-           "started_at": time.time(), "status": "running", "last_heartbeat": heartbeat or time.time()}
+           "started_at": time.time(), "status": "running", "heartbeat_required": heartbeat is not None,
+           "last_heartbeat": heartbeat if heartbeat is not None else time.time()}
     with _lock: _processes[int(pid)] = rec
     return dict(rec)
 
@@ -159,7 +160,7 @@ def _recover_processes(now):
     stale = []
     with _lock:
         for pid, rec in list(_processes.items()):
-            if (not _pid_alive(pid)) or (PROCESS_HEARTBEAT_TTL and now - rec.get("last_heartbeat", now) > PROCESS_HEARTBEAT_TTL):
+            if (not _pid_alive(pid)) or (rec.get("heartbeat_required") and PROCESS_HEARTBEAT_TTL and now - rec.get("last_heartbeat", now) > PROCESS_HEARTBEAT_TTL):
                 stale.append((pid, rec))
                 _processes.pop(pid, None)
     for pid, rec in stale:
