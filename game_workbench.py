@@ -127,12 +127,15 @@ def list_assets(asset_class="Blueprint"):
     ar = unreal.AssetRegistryHelpers.get_asset_registry()
     return [str(x.object_path) for x in ar.get_assets_by_class(asset_class)]
 def list_level_actors():
-    return [{"name": a.get_name(), "class": a.get_class().get_name()} for a in unreal.EditorLevelLibrary.get_all_level_actors()]
+    return [{"name": a.get_name(), "class": a.get_class().get_name(), "path": a.get_path_name()} for a in unreal.EditorLevelLibrary.get_all_level_actors()]
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         data = {"ok": True, "service": "docmind-unreal"}
-        if self.path.startswith("/assets"): data["assets"] = list_assets()
+        if self.path.startswith("/health"): data["available"] = True
+        elif self.path.startswith("/assets"): data["assets"] = list_assets()
         elif self.path.startswith("/actors"): data["actors"] = list_level_actors()
+        elif self.path.startswith("/blueprint/"): data.update({"blueprint": self.path.split('/blueprint/',1)[1], "nodes": [], "variables": [], "links": []})
+        elif self.path.startswith("/actor/"): data.update({"actor": self.path.split('/actor/',1)[1], "components": [], "properties": []})
         body=json.dumps(data).encode(); self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
     def log_message(self, *_): pass
 def run_server(port=8765):
