@@ -563,4 +563,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - Godot 原生嵌入复验：`verify_engine_embed.py` 在当前 150% DPI 下通过 59 项（HWND 定位、rect/fill 几何、resize、detach、停止和 HTTP embed 端点）；3 项合成键鼠输入因当前会话拒绝 `SendInput` 而失败，已按工具限制跳过后续输入断言，不影响窗口嵌入契约。
 - 发布审计补充：`verify_api.py` 接口冒烟整体返回 OK，但本机已有 Chroma 集合为 1024 维、当前一次 ingest 使用 256 维而被拒绝；该环境数据维度不一致需在发布前重建/迁移索引，不能将该 ingest 错误宣称为通过。
 - 已修复 Chroma 维度错误可诊断性：`vectorstore.add_documents` 现在将维度冲突转换为明确中文错误，并指导切回原 embedding 配置或显式 `reset_collection()`；不会自动删除现有索引。全量测试 **295/295 通过**。
+- Chroma 维度诊断新增专项回归测试（模拟 1024/256 冲突并断言包含 `reset_collection` 指引）；专项测试通过。
 
