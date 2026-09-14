@@ -17,7 +17,8 @@ async function createBranch() { try { const r=await taskApi.branch({id:taskId.va
 async function verifyTask() { busy.value = true; try { const r = await taskApi.verify({ id: taskId.value, title: title.value, region: region.value, files: files.value.split(/[,\n]/).map(x => x.trim()).filter(Boolean), allowed_paths: region.value ? [region.value] : [] }); result.value = r.ok ? '任务验证通过' : '任务验证失败：请查看检查结果' } catch (e) { result.value = (e as Error).message } finally { busy.value = false } }
 async function toggleEngine() { busy.value = true; try { const r = running.value ? await engineApi.stop() : await engineApi.start(); running.value = 'running' in r ? !!r.running : false; await refresh() } catch (e) { result.value = (e as Error).message } finally { busy.value = false } }
 async function verifyEngine() { busy.value = true; try { const r = await engineApi.verify(); result.value = r.ok ? 'Godot 校验通过' : (r.error || 'Godot 校验失败') } catch (e) { result.value = (e as Error).message } finally { busy.value = false } }
-onMounted(refresh); onMounted(loadTasks); onMounted(async () => { try { comfyTemplates.value = (await comfyApi.templates()).templates } catch {}; try { const h=await comfyApi.jobs(1,20); const ids=(h.items||[]).map(x=>String(x.prompt_id||'' )).filter(Boolean); comfyHistory.value=[...ids,...comfyHistory.value.filter(x=>!ids.includes(x))].slice(0,20) } catch {} })
+async function loadComfyHistory() { try { const h=await comfyApi.jobs(1,20); const ids=(h.items||[]).map(x=>String(x.prompt_id||'' )).filter(Boolean); comfyHistory.value=[...ids,...comfyHistory.value.filter(x=>!ids.includes(x))].slice(0,20) } catch {} }
+onMounted(refresh); onMounted(loadTasks); onMounted(async () => { try { comfyTemplates.value = (await comfyApi.templates()).templates } catch {}; await loadComfyHistory() })
 let timer: number | undefined
 onMounted(() => { timer = window.setInterval(refresh, 3000); window.setInterval(() => { if (promptId.value) pollComfy() }, 4000) })
 import { onBeforeUnmount } from 'vue'
@@ -36,7 +37,7 @@ async function applyComfyParams() { try { const r=await comfyApi.apply(JSON.pars
 <template>
   <div class="te-panel">
     <button class="te-trigger" @click="open = !open">任务 / 引擎</button>
-    <div v-if="open" class="te-pop">
+      <div v-if="open" class="te-pop">
       <div class="te-head"><b>区域任务</b><button @click="open=false">×</button></div>
       <div v-if="tasks.length" class="te-tasks"><span v-for="t in tasks" :key="String(t.id)">{{ t.title }} · {{ t.status }}</span></div>
       <input v-model="title" placeholder="任务目标，例如：修改玩家受击逻辑" />
