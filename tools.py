@@ -162,6 +162,21 @@ def web_search(query):
         lines.append(f"· {t}\n  {s}\n  {link}")
     return "\n".join(lines)
 
+def web_fetch(url):
+    """读取公开网页正文的简化研究工具，返回标题、来源和清理后的文本。"""
+    ok, _ = _url_scheme_ok(url)
+    if not ok: return "网页读取失败：只允许 http/https。"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (DocMind research)"})
+        with urllib.request.urlopen(req, timeout=12) as r: raw = r.read(1_000_000).decode('utf-8','replace')
+        title = re.search(r'<title[^>]*>(.*?)</title>', raw, re.I|re.S)
+        text = re.sub(r'<(script|style|noscript)[^>]*>.*?</\1>', ' ', raw, flags=re.I|re.S)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        clean_title = re.sub(r'<[^>]+>', '', title.group(1)).strip() if title else '未知'
+        return f"来源：{url}\n标题：{clean_title}\n正文：{text[:8000]}"
+    except Exception as e: return f"网页读取失败：{type(e).__name__}: {e}"
+
 
 _ALLOWED_URL_SCHEMES = ("http", "https")
 
@@ -2115,6 +2130,7 @@ def game_playtest(arg):
 
 
 TOOLS = {
+    "web_fetch": {"description": "读取公开网页正文并返回来源、标题和清理后的文本。输入完整 http/https URL。联网研究时先 web_search，再对关键来源调用。", "func": web_fetch},
     "dev_mcp_call": {"description": "调用已启用的 MCP 游戏引擎连接器。输入 key: 服务器key、name: 工具名、arguments: JSON。先用 MCP 工具清单确认可用工具；外部连接器需已启用并遵守审批。", "func": dev_mcp_call},
     "search_knowledge": {
         "description": "在已上传的知识库中检索相关文档片段。输入应为检索关键词或问题。",
