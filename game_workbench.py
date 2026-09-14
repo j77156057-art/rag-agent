@@ -842,7 +842,14 @@ def comfy_templates():
     ]}
 
 def _comfy_workflow_path():
-    candidates = [os.getenv('DOCMIND_COMFY_WORKFLOW_H3',''), r'D:\ComfyUI\ComfyUI\user\default\workflows\minimax_h3_t2v.json', r'C:\ComfyUI\ComfyUI\user\default\workflows\minimax_h3_t2v.json']
+    project = os.getenv('DOCMIND_PROJECT_ROOT', os.getcwd())
+    configured = ''
+    try:
+        with open(os.path.join(project, '.docmind_comfy.json'), encoding='utf-8') as f:
+            configured = str((json.load(f) or {}).get('h3_workflow') or '')
+        if configured and not os.path.isabs(configured): configured = os.path.join(project, configured)
+    except Exception: pass
+    candidates = [configured, os.getenv('DOCMIND_COMFY_WORKFLOW_H3',''), r'D:\ComfyUI\ComfyUI\user\default\workflows\minimax_h3_t2v.json', r'C:\ComfyUI\ComfyUI\user\default\workflows\minimax_h3_t2v.json']
     for p in candidates:
         if p and os.path.isfile(p): return p
     return next((p for p in candidates if p), '')
