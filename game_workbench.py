@@ -817,14 +817,20 @@ def _gpu_busy_error(res):
 # ---------------------------------------------------------------- ComfyUI 模板
 def comfy_templates():
     return {'ok': True, 'templates': [
-        {'id':'z-image-turbo','name':'Z-Image Turbo 图片','model':'z_image_turbo-Q8_0.gguf','kind':'image'},
-        {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','workflow':'D:/ComfyUI/ComfyUI/user/default/workflows/minimax_h3_t2v.json'}
+        {'id':'z-image-turbo','name':'Z-Image Turbo 图片','model':'z_image_turbo-Q8_0.gguf','kind':'image','schema':{'prompt':'string','width':'integer','height':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}},
+        {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','workflow':_comfy_workflow_path(),'schema':{'prompt':'string','width':'integer','height':'integer','frames':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}}
     ]}
+
+def _comfy_workflow_path():
+    candidates = [os.getenv('DOCMIND_COMFY_WORKFLOW_H3',''), r'D:\ComfyUI\ComfyUI\user\default\workflows\minimax_h3_t2v.json', r'C:\ComfyUI\ComfyUI\user\default\workflows\minimax_h3_t2v.json']
+    for p in candidates:
+        if p and os.path.isfile(p): return p
+    return next((p for p in candidates if p), '')
 
 def comfy_template_workflow(template_id):
     # TODO 配置化：硬编码本机路径来自开发机 ComfyUI 安装，后续改为模板注册表/环境变量
     if template_id == 'minimax-h3-i2v':
-        path = r'D:\ComfyUI\ComfyUI\user\default\workflows\minimax_h3_t2v.json'
+        path = _comfy_workflow_path()
         try:
             with open(path, encoding='utf-8') as f: return {'ok': True, 'id': template_id, 'workflow': json.load(f), 'format': 'ui'}
         except Exception as e: return {'ok': False, 'error': f'无法读取 H3 workflow：{e}'}
@@ -994,6 +1000,17 @@ def comfy_watch_status(prompt_id):
     with _COMFY_JOBS_LOCK:
         job = _COMFY_JOBS.get(str(prompt_id))
         return {'ok': bool(job), 'job': dict(job) if job else None}
+
+def comfy_history_list(page=1, page_size=20):
+    """返回本地持久化 ComfyUI 作业历史分页。"""
+    try:
+        page=max(1,int(page)); page_size=max(1,min(int(page_size),100))
+    except Exception: page,page_size=1,20
+    with _COMFY_JOBS_LOCK:
+        rows=[dict(v) for v in _COMFY_JOBS.values()]
+    rows.sort(key=lambda x: x.get('finished_at') or x.get('started_at') or '', reverse=True)
+    start=(page-1)*page_size
+    return {'ok':True,'page':page,'page_size':page_size,'total':len(rows),'items':rows[start:start+page_size]}
 
 def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="assets/generated"):
     """Download one ComfyUI output into a project asset directory with metadata."""
