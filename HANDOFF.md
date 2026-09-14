@@ -571,6 +571,7 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 发布复核（最新）：`git fetch origin` 后 `HEAD` 与 `origin/main` 均为 `437bd9faf42b979c654988b7bdb3ff165251438c`，分支完全同步、工作区 clean。文档前部旧提交数字属于历史记录，以上述最新复核为准。
 - GPU 生命周期专项复验：进程注册/PID 退出与孤儿回收、队列快照恢复、设备环境注入四组测试共 **17/17 通过**；既存 ResourceWarning 仅来自测试夹具未关闭文件，不影响结果。
 - 2026-09-15 ComfyUI 实机闭环：通过 `D:\ComfyUI\run_nvidia_gpu.bat` 启动便携版，ComfyUI 0.33.1 / PyTorch 2.13.0+cu130 / RTX 5070 Ti，真实 PID 35400 被登记。Z-Image 以 256×256、4 steps 实际生成成功，输出 `docmind_zimage_00002_.png`，history/preview/import 均成功并写入 `assets/generated`；任务结束后租约释放。H3 官方 UI workflow 可读取但直接提交 `/prompt` 返回 HTTP 500（UI 格式尚未转换为 API 格式），因此 H3 生成、取消/重试闭环仍未验收；服务已停止释放 GPU。
+- H3 转换器已落地：`comfy_ui_to_api_workflow` 将官方 UI graph 转为 API graph（实测 11 个 UI 节点中生成 6 个可提交节点），并由 `comfy_queue` 自动转换。真实提交现返回 ComfyUI 400 `missing_node_type`：自定义节点 `4c314f31-ecda-4b08-ae98-faaba1bf613f` 未安装；格式转换链路已验证，H3 仍需安装匹配的 TE-Speed-MiniMaxH3-OSS 节点后再做生成/取消/预览验收。服务已停止。
 - 新增受控 ComfyUI 服务生命周期 API：`POST /api/comfy/start` 按 `DOCMIND_COMFY_ROOT`/D 盘便携目录启动 `python_embeded` + `ComfyUI/main.py`，登记真实 PID；`POST /api/comfy/stop` 终止并注销 PID。默认不自动启动，启动/停止均需用户显式操作；已完成编译与专项回归。
 - ComfyUI 任务面板已接入服务控制按钮（启动/停止/刷新状态），调用上述生命周期 API 并显示 PID；前端构建验证通过，服务仍保持用户显式启动策略。
 - 服务生命周期改动后的全量回归：项目 `.venv` 测试 **298/298 通过**，分支与 `origin/main` 同步，工作区 clean。
