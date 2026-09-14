@@ -921,92 +921,294 @@ def comfy_template_workflow(template_id):
             '7': {'class_type':'VAELoader','inputs':{'vae_name':'ae.safetensors'}}, '8': {'class_type':'VAEDecode','inputs':{'samples':['6',0],'vae':['7',0]}}, '9': {'class_type':'SaveImage','inputs':{'images':['8',0],'filename_prefix':'docmind_zimage'}}}}
     return {'ok': False, 'error': '未知模板。'}
 
-def comfy_ui_to_api_workflow(ui_workflow):
-    """Convert ComfyUI editor JSON (nodes/links) to /prompt API JSON."""
+# --------------------------------------------------------------------- ComfyUI UI→API
+# H3（及多数官方）工作流是 **子图（subgraph）UI 格式**：真正的生成链藏在
+# definitions.subgraphs[].nodes 里，顶层 node 只是子图实例（type == 子图 id）。
+# /prompt 既不吃原始 UI 格式（500），也不认把子图实例当普通节点提交（400），
+# 因此这里先把子图 **拍平** 成普通节点，再用 ComfyUI 的 /object_info 按
+# INPUT_TYPES 顺序把 widgets_values 正确映射到 widget 输入（连接型输入不占位）。
+_COMFY_OBJINFO = {}
+_COMFY_WIDGET_TYPES = {'STRING', 'INT', 'FLOAT', 'COMBO', 'BOOLEAN', 'COMFY_DYNAMICCOMBO_V3'}
+_COMFY_CONN_TYPES = {'IMAGE', 'MODEL', 'CLIP', 'VAE', 'LATENT', 'CONDITIONING', 'MASK',
+                     'AUDIO', 'VIDEO', 'SIGMAS', 'SAMPLER', 'GUIDER', 'NOISE', 'CONTROL_NET',
+                     'STYLE_MODEL', 'CLIP_VISION', 'UPLOAD_IMAGE', 'COMFY_AUTOGROW_V3'}
+# 早期 H3 编辑器模板用这个 UUID 当 OSS 加速器（TE-Speed）的节点类型；已安装的
+# 插件暴露稳定名 TESpeedMiniMaxH3。子图 id 同名时不走这里（走子图拍平）。
+_COMFY_TYPE_ALIASES = {'4c314f31-ecda-4b08-ae98-faaba1bf613f': 'TESpeedMiniMaxH3'}
+
+def _comfy_object_info(node_type, url):
+    node_type = str(node_type)
+    if node_type in _COMFY_OBJINFO:
+        return _COMFY_OBJINFO[node_type]
+    info = None
+    for cand in (node_type, _COMFY_TYPE_ALIASES.get(node_type)):
+        if not cand:
+            continue
+        try:
+            u = _safe_comfy_url(url).rstrip('/') + '/object_info/' + cand
+            req = urllib.request.Request(u, headers={'Accept': 'application/json'})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read().decode('utf-8'))
+            info = (data.get(cand) if isinstance(data, dict) else None) or {}
+            if info:
+                break
+        except Exception:
+            info = None
+    _COMFY_OBJINFO[node_type] = info
+    return info
+
+def _comfy_input_type(spec):
+    if isinstance(spec, str):
+        return spec
+    if isinstance(spec, list) and spec:
+        first = spec[0]
+        if isinstance(first, str) and (first in _COMFY_CONN_TYPES or first in _COMFY_WIDGET_TYPES):
+            return first
+        return 'COMBO'  # 选项列表 -> 动态下拉，属 widget
+    return None
+
+def _comfy_is_widget(spec):
+    t = _comfy_input_type(spec)
+    return t in _COMFY_WIDGET_TYPES
+
+def _comfy_norm_widget(key, value):
+    if isinstance(value, str) and ('\\' in value or '/' in value) and key.endswith(('_name', '_name_1', 'clip_name', 'unet_name')):
+        return value.replace('\\', '/').rsplit('/', 1)[-1]
+    return value
+
+def _comfy_links_by_name(node, links_by_id):
+    out = {}
+    for inp in node.get('inputs') or []:
+        if isinstance(inp, dict) and inp.get('name') and inp.get('link') is not None:
+            lid = str(inp['link'])
+            if lid in links_by_id:
+                v = links_by_id[lid]
+                out[inp['name']] = (str(v[0]), int(v[1]))  # (origin_id, slot)
+    return out
+
+def _comfy_skip_node(node):
+    typ = str(node.get('type') or '')
+    if not typ or typ.lower().startswith(('note', 'markdownnote', 'label')) or typ.startswith('TE_image_pro_save_video'):
+        return True
+    if int(node.get('mode', 0) or 0) == 4:
+        return True
+    return False
+
+def _comfy_build_inputs(node, links_by_id, url, resolve_origin, interface_by_slot=None):
+    """Build one node's API `inputs`.
+
+    resolve_origin(origin_id, slot) -> [node_id, slot] | None (connection target).
+    interface_by_slot: optional {slot: ('link', origin, slot) | ('value', literal)}
+    for links whose origin is the subgraph input interface (-10).
+    Widget values are consumed positionally over widget-type INPUT_TYPES inputs;
+    a linked widget input yields to the link, but its widget slot is still consumed.
+    """
+    widgets = list(node.get('widgets_values') or [])
+    wi = 0
+    info = _comfy_object_info(node.get('type'), url)
+    node_links = _comfy_links_by_name(node, links_by_id)
+    inputs = {}
+    if info:
+        req = (info.get('input', {}) or {}).get('required', {}) or {}
+        opt = (info.get('input', {}) or {}).get('optional', {}) or {}
+        ordered = list(req.items()) + list(opt.items())
+    else:
+        # Fallback (ComfyUI 不可达): 退化为旧的"按 inputs 顺序消费 widget"逻辑。
+        # 有 link 的输入视为连接型（omit 或连接），无 link 的输入视为 widget，
+        # 这样未知节点的 widget 值仍能正确映射（见 test_comfy_templates
+        # test_ui_workflow_conversion_maps_links_and_widgets）。
+        ordered = []
+        for inp in (node.get('inputs') or []):
+            if not isinstance(inp, dict) or not inp.get('name'):
+                continue
+            if inp.get('link') is not None:
+                ordered.append((inp['name'], None))
+            else:
+                ordered.append((inp['name'], ['__WIDGET__']))
+    for name, spec in ordered:
+        if name is None:
+            continue
+        t = _comfy_input_type(spec)
+        is_widget = t in _COMFY_WIDGET_TYPES
+        if is_widget:
+            wval = widgets[wi] if wi < len(widgets) else None
+            wi += 1
+            link = node_links.get(name)
+            if link is not None:
+                origin, slot = link
+                if origin in ('-10', '-20'):
+                    iv = (interface_by_slot or {}).get(int(slot))
+                    if iv and iv[0] == 'link':
+                        inputs[name] = [iv[1], int(iv[2])]
+                    elif iv and iv[0] == 'value':
+                        inputs[name] = _comfy_norm_widget(name, iv[1])
+                    elif wval is not None:
+                        inputs[name] = _comfy_norm_widget(name, wval)
+                else:
+                    res = resolve_origin(origin, slot)
+                    if res is not None:
+                        inputs[name] = [res[0], int(res[1])]
+            elif wval is not None:
+                inputs[name] = _comfy_norm_widget(name, wval)
+        elif 'AUTOGROW' in (t or ''):
+            # COMFY_AUTOGROW_V3 在 UI 里拆成 name.a / name.b 子输入；API 端也按
+            # 子名提交（例如 ComfyMathExpression 的 values.a）。逐子输入处理，
+            # 只提交有链接的（未连接的子输入视为可选）。
+            for kn, kv in node_links.items():
+                if not kn.startswith(name + '.'):
+                    continue
+                origin, slot = kv
+                if origin in ('-10', '-20'):
+                    iv = (interface_by_slot or {}).get(int(slot))
+                    if iv and iv[0] == 'link':
+                        inputs[kn] = [iv[1], int(iv[2])]
+                else:
+                    res = resolve_origin(origin, slot)
+                    if res is not None:
+                        inputs[kn] = [res[0], int(res[1])]
+        else:
+            link = node_links.get(name)
+            if link is not None:
+                origin, slot = link
+                if origin in ('-10', '-20'):
+                    iv = (interface_by_slot or {}).get(int(slot))
+                    if iv and iv[0] == 'link':
+                        inputs[name] = [iv[1], int(iv[2])]
+                    # unlinked connection input fed by interface -> omit
+                else:
+                    res = resolve_origin(origin, slot)
+                    if res is not None:
+                        inputs[name] = [res[0], int(res[1])]
+            # unlinked connection input -> omit (optional/default)
+    return inputs
+
+def comfy_ui_to_api_workflow(ui_workflow, url="http://127.0.0.1:8188"):
+    """Convert ComfyUI editor JSON (nodes/links, possibly with subgraphs) to the
+    /prompt API JSON. Subgraphs are flattened; widget values are mapped using each
+    node's INPUT_TYPES so nodes that keep widgets only in `widgets_values` work."""
     if not isinstance(ui_workflow, dict) or not isinstance(ui_workflow.get('nodes'), list):
         return {'ok': True, 'workflow': ui_workflow, 'format': 'api'}
     nodes = {str(n.get('id')): n for n in ui_workflow['nodes'] if isinstance(n, dict) and n.get('id') is not None}
-    links = {}
+    # normalize links (top-level array form or subgraph dict form)
+    links_by_id = {}
     for link in ui_workflow.get('links') or []:
-        if isinstance(link, list) and len(link) >= 4:
-            links[str(link[0])] = (str(link[1]), int(link[2]))
-    # Older H3 editor templates serialized the OSS accelerator by a generated
-    # UUID; the installed plugin exposes the stable mapping name instead.
-    type_aliases = {
-        '4c314f31-ecda-4b08-ae98-faaba1bf613f': 'TESpeedMiniMaxH3',
-    }
-    out = {}
+        if isinstance(link, list) and len(link) >= 5:
+            links_by_id[str(link[0])] = (str(link[1]), int(link[2]))
+        elif isinstance(link, dict) and 'id' in link:
+            links_by_id[str(link['id'])] = (str(link.get('origin_id')), int(link.get('origin_slot') or 0))
+    subgraphs_by_id = {str(s.get('id')): s for s in (ui_workflow.get('definitions', {}).get('subgraphs') or [])
+                       if s.get('id')}
+    comfy_root = os.getenv('DOCMIND_COMFY_ROOT', r'D:\ComfyUI')
     invalid_image_nodes = set()
     for nid, node in nodes.items():
         if str(node.get('type')) == 'LoadImage':
             vals = node.get('widgets_values') or []
             image_name = str(vals[0]) if vals else ''
-            comfy_root = os.getenv('DOCMIND_COMFY_ROOT', r'D:\ComfyUI')
-            if image_name and not os.path.isfile(os.path.join(comfy_root, 'ComfyUI', 'input', image_name)) and not os.path.isfile(os.path.join(comfy_root, 'input', image_name)):
+            if image_name and not os.path.isfile(os.path.join(comfy_root, 'ComfyUI', 'input', image_name)) \
+                    and not os.path.isfile(os.path.join(comfy_root, 'input', image_name)):
                 invalid_image_nodes.add(nid)
+    max_id = max((int(k) for k in nodes), default=0)
+    counter = {'n': max_id + 1}
+    out = {}
+    instance_ids = set()
+    expanded_outputs = {}  # (instance_node_id, slot) -> (new_id, slot)
+
+    def expand(instance_node, links_map):
+        """Flatten one subgraph instance. Returns {slot_index: (new_id, slot)}."""
+        sg_def = subgraphs_by_id.get(str(instance_node.get('type')))
+        if sg_def is None:
+            return {}
+        inst_links_by_name = {}
+        for inp in instance_node.get('inputs') or []:
+            if isinstance(inp, dict) and inp.get('name') and inp.get('link') is not None:
+                lid = str(inp['link'])
+                if lid in links_map:
+                    inst_links_by_name[inp['name']] = links_map[lid]
+        wv = list(instance_node.get('widgets_values') or [])
+        k = 0
+        widget_by_name = {}
+        for inp in sg_def.get('inputs') or []:
+            t = str(inp.get('type') or '').upper()
+            if t in _COMFY_WIDGET_TYPES:
+                if k < len(wv):
+                    widget_by_name[inp.get('name')] = wv[k]
+                k += 1
+        inner_links = {}
+        for lk in sg_def.get('links') or []:
+            if isinstance(lk, dict) and 'id' in lk:
+                inner_links[str(lk['id'])] = (str(lk.get('origin_id')), int(lk.get('origin_slot') or 0),
+                                              str(lk.get('target_id')), int(lk.get('target_slot') or 0))
+        interface_by_slot = {}
+        for i, inp in enumerate(sg_def.get('inputs') or []):
+            name = (inp or {}).get('name')
+            if name in inst_links_by_name:
+                interface_by_slot[i] = ('link',) + inst_links_by_name[name]
+            elif name in widget_by_name:
+                interface_by_slot[i] = ('value', widget_by_name[name])
+        inner_nodes = sg_def.get('nodes') or []
+        remap = {}
+        for nd in inner_nodes:
+            remap[str(nd.get('id'))] = str(counter['n']); counter['n'] += 1
+        nested_ids = set()
+        def resolve_origin(o, s):
+            if o in nested_ids:
+                return expanded_outputs.get((o, int(s)))
+            if o in remap:
+                return [remap[o], int(s)]
+            return [o, int(s)]  # 顶层真实节点（如 ResolutionSelector）保持原 id
+        for nd in inner_nodes:
+            ntyp = str(nd.get('type') or '')
+            if ntyp in subgraphs_by_id:  # 嵌套子图
+                nested_ids.add(str(nd.get('id')))
+                sub = expand(nd, inner_links)
+                for slot_idx, tgt in sub.items():
+                    if isinstance(slot_idx, int):
+                        expanded_outputs[(str(nd.get('id')), slot_idx)] = tgt
+        for nd in inner_nodes:
+            nid = str(nd.get('id'))
+            if nid in nested_ids:
+                continue
+            new_id = remap[nid]
+            eff_type = _COMFY_TYPE_ALIASES.get(str(nd.get('type'))) or str(nd.get('type'))
+            inputs = _comfy_build_inputs(nd, inner_links, url, resolve_origin, interface_by_slot)
+            out[new_id] = {'class_type': eff_type, 'inputs': inputs}
+        out_slots = {}
+        for oi, outp in enumerate(sg_def.get('outputs') or []):
+            for lid in ((outp or {}).get('linkIds') or []):
+                if str(lid) in inner_links:
+                    o, os_, t, ts = inner_links[str(lid)]
+                    if t in ('-20',):
+                        out_slots[oi] = (remap.get(o, o), int(os_))
+        return out_slots
+
+    # 1) expand subgraph instances
+    for nid, node in list(nodes.items()):
+        typ = str(node.get('type') or '')
+        if typ in subgraphs_by_id:
+            if nid in invalid_image_nodes:
+                continue
+            instance_ids.add(nid)
+            for slot_idx, tgt in expand(node, links_by_id).items():
+                expanded_outputs[(nid, slot_idx)] = tgt
+    # 2) convert top-level real nodes (those referenced by instances too)
     for nid, node in nodes.items():
-        if nid in invalid_image_nodes:
+        if nid in instance_ids or nid in invalid_image_nodes or _comfy_skip_node(node):
             continue
-        typ = node.get('type')
-        # Editor-only annotations are not executable ComfyUI nodes.  Official
-        # H3 workflows include MarkdownNote blocks; forwarding them to
-        # /prompt causes a 400 ``missing_node_type`` response.
-        typ_name = str(typ or '')
-        if (not typ_name or typ_name.lower().startswith(('note', 'markdownnote', 'label'))
-                or typ_name.startswith('TE_image_pro_save_video')
-                or int(node.get('mode', 0) or 0) == 4):
-            continue
-        inputs = {}; widgets = list(node.get('widgets_values') or []); wi = 0
-        for inp in node.get('inputs') or []:
-            if not isinstance(inp, dict) or not inp.get('name'): continue
-            name = str(inp['name']); link_id = inp.get('link')
-            if link_id is not None and str(link_id) in links:
-                src, slot = links[str(link_id)]; inputs[name] = [src, slot]
-            elif wi < len(widgets):
-                inputs[name] = widgets[wi]; wi += 1
-        # SaveVideo keeps its widget-only fields outside the serialized input
-        # list in the editor JSON.  The /prompt API still requires them.
-        if typ_name == 'SaveVideo' and widgets:
-            inputs.setdefault('filename_prefix', widgets[0])
-            if len(widgets) > 1:
-                inputs.setdefault('format', widgets[1])
-            if len(widgets) > 2:
-                inputs.setdefault('codec', widgets[2])
-        # UI exports often persist model selections with a directory prefix;
-        # the API combo values are basenames relative to ComfyUI/models.
-        for key, value in list(inputs.items()):
-            if isinstance(value, str) and ('\\' in value or '/' in value) and key.endswith(('_name', '_name_1', 'clip_name', 'unet_name')):
-                inputs[key] = value.replace('\\', '/').rsplit('/', 1)[-1]
-        out[nid] = {'class_type': type_aliases.get(str(typ), str(typ)), 'inputs': inputs}
-    for nid in list(out):
-        if any(isinstance(v, list) and v and str(v[0]) in invalid_image_nodes for v in out[nid].get('inputs', {}).values()):
-            del out[nid]
-    # Remove downstream nodes whose graph inputs now point at a removed node;
-    # this keeps ComfyUI from raising opaque KeyError validation failures.
+        typ = str(node.get('type') or '')
+        eff_type = _COMFY_TYPE_ALIASES.get(typ) or typ
+        inputs = _comfy_build_inputs(node, links_by_id, url,
+                                     resolve_origin=lambda o, s: expanded_outputs.get((o, int(s)))
+                                     if o in instance_ids else [o, int(s)])
+        out[nid] = {'class_type': eff_type, 'inputs': inputs}
+    # Remove dangling references and cascade
     changed = True
     while changed:
         changed = False
         for nid, item in list(out.items()):
-            if any(isinstance(v, list) and v and str(v[0]) not in out for v in item.get('inputs', {}).values()):
-                del out[nid]; changed = True
-    # Validate editor links before submitting.  Some distributed H3 UI
-    # workflows are documentation-only graphs whose SaveVideo node is wired
-    # directly to the model node (MODEL -> VIDEO); ComfyUI rejects this with a
-    # cryptic 400, so surface the actionable graph error here.
-    for nid, node in nodes.items():
-        for inp in node.get('inputs') or []:
-            link_id = inp.get('link') if isinstance(inp, dict) else None
-            if link_id is None or str(link_id) not in links: continue
-            src, slot = links[str(link_id)]
-            src_node = nodes.get(src) or {}
-            src_outputs = src_node.get('outputs') or []
-            dst_type = str(inp.get('type') or '').upper()
-            src_type = str(src_outputs[slot].get('type') if slot < len(src_outputs) and isinstance(src_outputs[slot], dict) else '').upper()
-            compatible = (not src_type or not dst_type or src_type == dst_type
-                          or src_type in {x.strip() for x in dst_type.split(',')})
-            if not compatible:
-                return {'ok': False, 'error': f'工作流连线类型不匹配：{src_type} → {dst_type}（节点 {src} → {nid}）', 'details': {'source': src, 'target': nid}}
-    if not out: return {'ok': False, 'error': 'UI workflow 没有可提交节点'}
+            if any(isinstance(v, list) and v and str(v[0]) not in out for v in (item.get('inputs') or {}).values()):
+                del out[nid]; changed = True; break
+    if not out:
+        return {'ok': False, 'error': 'UI workflow 没有可提交节点'}
     return {'ok': True, 'workflow': out, 'format': 'api'}
 
 def comfy_apply_parameters(workflow, params):
@@ -1039,7 +1241,7 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188"):
     # required by /prompt; fail early with an actionable message instead of
     # forwarding a UI graph and surfacing an opaque HTTP 500.
     if isinstance(workflow, dict) and isinstance(workflow.get('nodes'), list):
-        converted = comfy_ui_to_api_workflow(workflow)
+        converted = comfy_ui_to_api_workflow(workflow, url)
         if not converted.get('ok'): return converted
         workflow = converted['workflow']
     try: url = _safe_comfy_url(url)
