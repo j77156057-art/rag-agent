@@ -804,7 +804,17 @@ def comfy_status(url="http://127.0.0.1:8188"):
     except ValueError as e: return {"ok": False, "available": False, "error": str(e)}
     try:
         with urllib.request.urlopen(url.rstrip('/') + '/system_stats', timeout=3) as r: data = json.loads(r.read().decode())
-        return {"ok": True, "available": True, "url": url, "system": data}
+        pid = None
+        try:
+            port = urllib.parse.urlparse(url).port or 8188
+            out = subprocess.check_output(['netstat','-ano'], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                if f':{port} ' in line and 'LISTENING' in line:
+                    pid = int(line.split()[-1]); break
+        except Exception: pass
+        if pid:
+            _gpu.register_process(pid, 'comfyui:service', None, 'comfyui')
+        return {"ok": True, "available": True, "url": url, "system": data, "pid": pid}
     except Exception as e:
         return {"ok": True, "available": False, "url": url, "error": str(e)}
 
