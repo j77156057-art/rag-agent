@@ -836,6 +836,9 @@ def _gpu_busy_error(res):
 
 # ---------------------------------------------------------------- ComfyUI 模板
 def comfy_templates():
+    # Resolve the portable installation root without baking a developer
+    # machine into the runtime.  Explicit project/env configuration wins;
+    # common Windows locations remain a backwards-compatible fallback.
     return {'ok': True, 'templates': [
         {'id':'z-image-turbo','name':'Z-Image Turbo 图片','model':'z_image_turbo-Q8_0.gguf','kind':'image','author':'Tongyi-MAI','source_url':'https://github.com/Tongyi-MAI/Z-Image','license':'Apache-2.0','schema':{'prompt':'string','negative_prompt':'string','width':'integer','height':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}},
         {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','author':'MiniMax','source_url':'https://github.com/MiniMax-AI','license':'check-model-card','workflow':_comfy_workflow_path(),'schema':{'prompt':'string','width':'integer','height':'integer','frames':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}}
@@ -849,7 +852,10 @@ def _comfy_workflow_path():
             configured = str((json.load(f) or {}).get('h3_workflow') or '')
         if configured and not os.path.isabs(configured): configured = os.path.join(project, configured)
     except Exception: pass
-    candidates = [configured, os.getenv('DOCMIND_COMFY_WORKFLOW_H3',''), r'D:\ComfyUI\ComfyUI\user\default\workflows\minimax_h3_t2v.json', r'C:\ComfyUI\ComfyUI\user\default\workflows\minimax_h3_t2v.json']
+    roots = [str(os.getenv('DOCMIND_COMFY_ROOT','')).strip(), r'D:\ComfyUI', r'C:\ComfyUI']
+    candidates = [configured, os.getenv('DOCMIND_COMFY_WORKFLOW_H3','')]
+    candidates.extend(os.path.join(root, 'ComfyUI', 'user', 'default', 'workflows', 'minimax_h3_t2v.json')
+                      for root in roots if root)
     for p in candidates:
         if p and os.path.isfile(p): return p
     return next((p for p in candidates if p), '')
