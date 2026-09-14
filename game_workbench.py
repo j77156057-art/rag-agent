@@ -921,6 +921,32 @@ def comfy_template_workflow(template_id):
             '7': {'class_type':'VAELoader','inputs':{'vae_name':'ae.safetensors'}}, '8': {'class_type':'VAEDecode','inputs':{'samples':['6',0],'vae':['7',0]}}, '9': {'class_type':'SaveImage','inputs':{'images':['8',0],'filename_prefix':'docmind_zimage'}}}}
     return {'ok': False, 'error': '未知模板。'}
 
+def comfy_ui_to_api_workflow(ui_workflow):
+    """Convert ComfyUI editor JSON (nodes/links) to /prompt API JSON."""
+    if not isinstance(ui_workflow, dict) or not isinstance(ui_workflow.get('nodes'), list):
+        return {'ok': True, 'workflow': ui_workflow, 'format': 'api'}
+    nodes = {str(n.get('id')): n for n in ui_workflow['nodes'] if isinstance(n, dict) and n.get('id') is not None}
+    links = {}
+    for link in ui_workflow.get('links') or []:
+        if isinstance(link, list) and len(link) >= 4:
+            links[str(link[0])] = (str(link[1]), int(link[2]))
+    out = {}
+    for nid, node in nodes.items():
+        typ = node.get('type')
+        if not typ or str(typ).startswith('Note') or int(node.get('mode', 0) or 0) == 4:
+            continue
+        inputs = {}; widgets = list(node.get('widgets_values') or []); wi = 0
+        for inp in node.get('inputs') or []:
+            if not isinstance(inp, dict) or not inp.get('name'): continue
+            name = str(inp['name']); link_id = inp.get('link')
+            if link_id is not None and str(link_id) in links:
+                src, slot = links[str(link_id)]; inputs[name] = [src, slot]
+            elif wi < len(widgets):
+                inputs[name] = widgets[wi]; wi += 1
+        out[nid] = {'class_type': str(typ), 'inputs': inputs}
+    if not out: return {'ok': False, 'error': 'UI workflow 没有可提交节点'}
+    return {'ok': True, 'workflow': out, 'format': 'api'}
+
 def comfy_apply_parameters(workflow, params):
     """按通用参数 schema 修改 API workflow，并严格校验目标节点字段。"""
     wf = json.loads(json.dumps(workflow or {})); p = params or {}
@@ -951,7 +977,9 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188"):
     # required by /prompt; fail early with an actionable message instead of
     # forwarding a UI graph and surfacing an opaque HTTP 500.
     if isinstance(workflow, dict) and isinstance(workflow.get('nodes'), list):
-        return {"ok": False, "error": "该 workflow 是 ComfyUI UI 格式，请先转换为 API prompt 格式后再提交。"}
+        converted = comfy_ui_to_api_workflow(workflow)
+        if not converted.get('ok'): return converted
+        workflow = converted['workflow']
     try: url = _safe_comfy_url(url)
     except ValueError as e: return {"ok": False, "error": str(e)}
     # 租约必须覆盖"提交 → ComfyUI 异步生成 → history 轮询到完成"整个周期，

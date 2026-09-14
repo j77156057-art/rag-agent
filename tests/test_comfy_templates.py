@@ -26,8 +26,12 @@ class T(unittest.TestCase):
   self.assertFalse(gw.comfy_retry('bad')['ok'])
   gw._COMFY_JOBS.pop('old',None); gw._COMFY_JOBS.pop('bad',None)
  def test_queue_rejects_ui_workflow_with_actionable_error(self):
-  r=gw.comfy_queue({'nodes': [], 'links': []})
-  self.assertFalse(r['ok']); self.assertIn('UI 格式', r['error'])
+  r=gw.comfy_ui_to_api_workflow({'nodes': [], 'links': []})
+  self.assertFalse(r['ok']); self.assertIn('可提交节点', r['error'])
+ def test_ui_workflow_conversion_maps_links_and_widgets(self):
+  ui={'nodes':[{'id':1,'type':'Source','inputs':[],'outputs':[{'name':'OUT'}]}, {'id':2,'type':'Sink','inputs':[{'name':'src','link':7},{'name':'value','link':None}],'widgets_values':[42]}], 'links':[[7,1,0,2,0,'X']]}
+  r=gw.comfy_ui_to_api_workflow(ui)
+  self.assertTrue(r['ok']); self.assertEqual(r['workflow']['2']['inputs']['src'],['1',0]); self.assertEqual(r['workflow']['2']['inputs']['value'],42)
  def test_project_workflow_path_precedes_environment(self):
   with tempfile.TemporaryDirectory() as d:
    project=os.path.join(d,'project'); os.makedirs(project)
