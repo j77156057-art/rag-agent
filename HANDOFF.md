@@ -570,4 +570,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 2026-09-15 发布同步：`main` 已成功推送到 `origin/main`（远端从 `d130646` 更新至 `6ac51a9`）；未强推、未改写历史。外部引擎与物理多 GPU 未验收项仍按前述限制保留。
 - 发布复核（最新）：`git fetch origin` 后 `HEAD` 与 `origin/main` 均为 `437bd9faf42b979c654988b7bdb3ff165251438c`，分支完全同步、工作区 clean。文档前部旧提交数字属于历史记录，以上述最新复核为准。
 - GPU 生命周期专项复验：进程注册/PID 退出与孤儿回收、队列快照恢复、设备环境注入四组测试共 **17/17 通过**；既存 ResourceWarning 仅来自测试夹具未关闭文件，不影响结果。
+- 新增受控 ComfyUI 服务生命周期 API：`POST /api/comfy/start` 按 `DOCMIND_COMFY_ROOT`/D 盘便携目录启动 `python_embeded` + `ComfyUI/main.py`，登记真实 PID；`POST /api/comfy/stop` 终止并注销 PID。默认不自动启动，启动/停止均需用户显式操作；已完成编译与专项回归。
 
