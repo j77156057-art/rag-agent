@@ -18,6 +18,12 @@ _ENGINE_LOGS = {}
 # 租约由 comfy_queue 提交后 reown 给 comfyui:{prompt_id}，终态时由 history 释放）
 _COMFY_JOBS = {}
 _COMFY_JOBS_LOCK = threading.Lock()
+_COMFY_HISTORY_FILE = os.getenv('DOCMIND_COMFY_HISTORY_FILE', os.path.join('.docmind','comfy_history.json'))
+def _save_comfy_history():
+    try:
+        os.makedirs(os.path.dirname(_COMFY_HISTORY_FILE) or '.', exist_ok=True)
+        with open(_COMFY_HISTORY_FILE, 'w', encoding='utf-8') as f: json.dump(_COMFY_JOBS, f, ensure_ascii=False)
+    except Exception: pass
 # root_abs -> 嵌入状态 {child_hwnd, host_hwnd, offset_y, title, dpi, size}；
 # 保存它是为了"停止/解除嵌入"时能把引擎窗口原样还原，而不是留下一个失效的子窗口。
 _EMBED_STATE = {}
@@ -872,6 +878,9 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188"):
     if prompt_id:
         # 后台 watch 只负责轮询状态，不再单独持租约（租约已 reown 给本作业 owner）
         result["watch"] = comfy_watch(prompt_id, url)
+        with _COMFY_JOBS_LOCK:
+            _COMFY_JOBS.setdefault(prompt_id, {}).update({'workflow_sha256': result['workflow_sha256'], 'gpu': lease.get('gpu'), 'status': 'queued'})
+            _save_comfy_history()
     return result
 
 def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
