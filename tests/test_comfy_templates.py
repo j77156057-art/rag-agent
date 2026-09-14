@@ -32,6 +32,10 @@ class T(unittest.TestCase):
   ui={'nodes':[{'id':1,'type':'Source','inputs':[],'outputs':[{'name':'OUT'}]}, {'id':2,'type':'Sink','inputs':[{'name':'src','link':7},{'name':'value','link':None}],'widgets_values':[42]}], 'links':[[7,1,0,2,0,'X']]}
   r=gw.comfy_ui_to_api_workflow(ui)
   self.assertTrue(r['ok']); self.assertEqual(r['workflow']['2']['inputs']['src'],['1',0]); self.assertEqual(r['workflow']['2']['inputs']['value'],42)
+ def test_h3_legacy_uuid_maps_to_installed_plugin_name(self):
+  ui={'nodes':[{'id':105,'type':'4c314f31-ecda-4b08-ae98-faaba1bf613f','inputs':[],'widgets_values':[]}], 'links':[]}
+  r=gw.comfy_ui_to_api_workflow(ui)
+  self.assertEqual(r['workflow']['105']['class_type'],'TESpeedMiniMaxH3')
  def test_project_workflow_path_precedes_environment(self):
   with tempfile.TemporaryDirectory() as d:
    project=os.path.join(d,'project'); os.makedirs(project)

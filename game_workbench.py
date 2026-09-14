@@ -930,6 +930,11 @@ def comfy_ui_to_api_workflow(ui_workflow):
     for link in ui_workflow.get('links') or []:
         if isinstance(link, list) and len(link) >= 4:
             links[str(link[0])] = (str(link[1]), int(link[2]))
+    # Older H3 editor templates serialized the OSS accelerator by a generated
+    # UUID; the installed plugin exposes the stable mapping name instead.
+    type_aliases = {
+        '4c314f31-ecda-4b08-ae98-faaba1bf613f': 'TESpeedMiniMaxH3',
+    }
     out = {}
     for nid, node in nodes.items():
         typ = node.get('type')
@@ -943,7 +948,7 @@ def comfy_ui_to_api_workflow(ui_workflow):
                 src, slot = links[str(link_id)]; inputs[name] = [src, slot]
             elif wi < len(widgets):
                 inputs[name] = widgets[wi]; wi += 1
-        out[nid] = {'class_type': str(typ), 'inputs': inputs}
+        out[nid] = {'class_type': type_aliases.get(str(typ), str(typ)), 'inputs': inputs}
     if not out: return {'ok': False, 'error': 'UI workflow 没有可提交节点'}
     return {'ok': True, 'workflow': out, 'format': 'api'}
 
