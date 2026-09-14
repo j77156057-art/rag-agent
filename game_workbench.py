@@ -28,7 +28,19 @@ def _load_comfy_history():
     try:
         with open(_COMFY_HISTORY_FILE, encoding='utf-8') as f:
             data = json.load(f)
-        if isinstance(data, dict): _COMFY_JOBS.update(data)
+        if isinstance(data, dict):
+            # A daemon restart cannot safely resume a remote ComfyUI watcher.
+            # Mark unfinished records explicitly so the UI never presents a
+            # stale running job as live; completed/failed history is retained.
+            for key, value in data.items():
+                if not isinstance(value, dict):
+                    continue
+                row = dict(value)
+                if row.get('running') or row.get('status') in ('queued', 'running'):
+                    row.update({'running': False, 'status': 'recovered',
+                                'recovered_at': datetime.now().isoformat(timespec='seconds'),
+                                'recovery_note': '服务重启后未自动恢复远端任务，请确认 ComfyUI 状态后重新提交'})
+                _COMFY_JOBS[str(key)] = row
     except Exception: pass
 _load_comfy_history()
 # root_abs -> 嵌入状态 {child_hwnd, host_hwnd, offset_y, title, dpi, size}；
