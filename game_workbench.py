@@ -962,6 +962,21 @@ def comfy_ui_to_api_workflow(ui_workflow):
             if len(widgets) > 2:
                 inputs.setdefault('codec', widgets[2])
         out[nid] = {'class_type': type_aliases.get(str(typ), str(typ)), 'inputs': inputs}
+    # Validate editor links before submitting.  Some distributed H3 UI
+    # workflows are documentation-only graphs whose SaveVideo node is wired
+    # directly to the model node (MODEL -> VIDEO); ComfyUI rejects this with a
+    # cryptic 400, so surface the actionable graph error here.
+    for nid, node in nodes.items():
+        for inp in node.get('inputs') or []:
+            link_id = inp.get('link') if isinstance(inp, dict) else None
+            if link_id is None or str(link_id) not in links: continue
+            src, slot = links[str(link_id)]
+            src_node = nodes.get(src) or {}
+            src_outputs = src_node.get('outputs') or []
+            dst_type = str(inp.get('type') or '').upper()
+            src_type = str(src_outputs[slot].get('type') if slot < len(src_outputs) and isinstance(src_outputs[slot], dict) else '').upper()
+            if src_type and dst_type and src_type != dst_type:
+                return {'ok': False, 'error': f'工作流连线类型不匹配：{src_type} → {dst_type}（节点 {src} → {nid}）', 'details': {'source': src, 'target': nid}}
     if not out: return {'ok': False, 'error': 'UI workflow 没有可提交节点'}
     return {'ok': True, 'workflow': out, 'format': 'api'}
 
