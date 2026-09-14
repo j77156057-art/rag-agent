@@ -1020,12 +1020,18 @@ def comfy_cancel(prompt_id, url="http://127.0.0.1:8188"):
             job.update({'cancel_requested': True,
                         'cancel_state': 'requesting',
                         'cancel_requested_at': datetime.now().isoformat(timespec='seconds')})
+            _save_comfy_history()
     # watcher 存在时等待 ComfyUI history 报告终态再释放租约；没有 watcher
     # 的兼容调用才允许立即释放，避免中断请求尚未生效时发生 GPU 抢占。
     with _COMFY_JOBS_LOCK:
         has_watcher = pid in _COMFY_JOBS
     released = (not has_watcher) and (_gpu.force_release(_comfy_job_owner(pid)) is not None)
     # ComfyUI 没在跑时 /interrupt 可能 400/404——租约释放仍算取消成功
+    if interrupted and has_watcher:
+        with _COMFY_JOBS_LOCK:
+            if pid in _COMFY_JOBS:
+                _COMFY_JOBS[pid]['cancel_state'] = 'requested'
+                _save_comfy_history()
     return {"ok": released or interrupted, "prompt_id": pid,
             "interrupted": interrupted, "lease_released": released,
             "cancel_state": 'requested' if interrupted else 'failed',
