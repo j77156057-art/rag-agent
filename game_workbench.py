@@ -952,7 +952,7 @@ def comfy_ui_to_api_workflow(ui_workflow):
             name = str(inp['name']); link_id = inp.get('link')
             if link_id is not None and str(link_id) in links:
                 src, slot = links[str(link_id)]; inputs[name] = [src, slot]
-            elif wi < len(widgets) and isinstance(inp.get('widget'), dict):
+            elif wi < len(widgets):
                 inputs[name] = widgets[wi]; wi += 1
         # SaveVideo keeps its widget-only fields outside the serialized input
         # list in the editor JSON.  The /prompt API still requires them.
