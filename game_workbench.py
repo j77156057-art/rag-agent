@@ -981,6 +981,14 @@ def comfy_ui_to_api_workflow(ui_workflow):
     for nid in list(out):
         if any(isinstance(v, list) and v and str(v[0]) in invalid_image_nodes for v in out[nid].get('inputs', {}).values()):
             del out[nid]
+    # Remove downstream nodes whose graph inputs now point at a removed node;
+    # this keeps ComfyUI from raising opaque KeyError validation failures.
+    changed = True
+    while changed:
+        changed = False
+        for nid, item in list(out.items()):
+            if any(isinstance(v, list) and v and str(v[0]) not in out for v in item.get('inputs', {}).values()):
+                del out[nid]; changed = True
     # Validate editor links before submitting.  Some distributed H3 UI
     # workflows are documentation-only graphs whose SaveVideo node is wired
     # directly to the model node (MODEL -> VIDEO); ComfyUI rejects this with a
