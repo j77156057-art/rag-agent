@@ -1,4 +1,5 @@
-import unittest, tempfile, os
+import unittest, tempfile, os, json
+from unittest.mock import patch
 import game_workbench as gw
 class T(unittest.TestCase):
  def test_z(self): self.assertTrue(gw.comfy_template_workflow('z-image-turbo')['ok'])
@@ -24,4 +25,15 @@ class T(unittest.TestCase):
   gw._COMFY_JOBS['bad']={'status':'failed','workflow':{},'retry_count':2}
   self.assertFalse(gw.comfy_retry('bad')['ok'])
   gw._COMFY_JOBS.pop('old',None); gw._COMFY_JOBS.pop('bad',None)
+ def test_project_workflow_path_precedes_environment(self):
+  with tempfile.TemporaryDirectory() as d:
+   project=os.path.join(d,'project'); os.makedirs(project)
+   selected=os.path.join(project,'project.json'); alternate=os.path.join(d,'env.json')
+   payload={'nodes':[]}
+   for path in (selected, alternate):
+    with open(path,'w',encoding='utf-8') as f: json.dump(payload,f)
+   with open(os.path.join(project,'.docmind_comfy.json'),'w',encoding='utf-8') as f:
+    json.dump({'h3_workflow':'project.json'},f)
+   with patch.dict(os.environ, {'DOCMIND_PROJECT_ROOT':project,'DOCMIND_COMFY_WORKFLOW_H3':alternate}, clear=False):
+    self.assertEqual(os.path.normcase(gw._comfy_workflow_path()), os.path.normcase(selected))
 if __name__=='__main__': unittest.main()
