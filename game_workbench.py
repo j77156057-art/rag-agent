@@ -969,7 +969,10 @@ def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
                         {'filename': name, 'subfolder': sub, 'type': x.get('type') or 'output'})
                     x['mime'] = mimetypes.guess_type(name)[0] or 'application/octet-stream'
                     x['asset_kind'] = '3d' if os.path.splitext(name)[1].lower() in {'.glb','.gltf','.fbx','.obj','.stl','.ply','.usd','.usdz'} else ('media' if x['mime'].split('/')[0] in {'image','audio','video'} else 'unknown')
-                    x['preview_supported'] = x['asset_kind'] != '3d' or x['mime'].startswith(('model/','application/octet-stream'))
+                    # 3D assets are metadata/import-only until an engine-backed
+                    # renderer is available; never imply that a binary MIME
+                    # type is itself preview support.
+                    x['preview_supported'] = x['asset_kind'] != '3d'
                     outputs.append(x)
         status = item.get("status", {}) or {}
         messages = status.get('messages') or []
