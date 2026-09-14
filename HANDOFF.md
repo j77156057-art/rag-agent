@@ -568,4 +568,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 前端 `ComfyWatchJob` 类型已覆盖 `recovered`、取消状态、超时和进度字段；Vite 构建通过，UI 可安全消费重启恢复状态。
 - 最新完整回归：项目 `.venv` 全量测试 **298/298 通过**（含 Chroma 维度诊断、ComfyUI 重启恢复和 3D 输出分类专项）；工作区 clean。
 - 2026-09-15 发布同步：`main` 已成功推送到 `origin/main`（远端从 `d130646` 更新至 `6ac51a9`）；未强推、未改写历史。外部引擎与物理多 GPU 未验收项仍按前述限制保留。
+- 发布复核（最新）：`git fetch origin` 后 `HEAD` 与 `origin/main` 均为 `437bd9faf42b979c654988b7bdb3ff165251438c`，分支完全同步、工作区 clean。文档前部旧提交数字属于历史记录，以上述最新复核为准。
 
