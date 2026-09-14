@@ -107,6 +107,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-14 | **`6e9b95b` P2-1 GPU 协调补完（与 P1-2 同提交）**：`gpu_coordinator.py` 重写为 serial/parallel/multi 三模式 + `acquire_lease/reown/cancel_wait/force_release(owner)/register_hook/note_activity/configure/recent_samples`，严格 FIFO（multi 下也不许跨空闲卡插队），显存门槛直接拒绝不排队，驱逐钩子锁外只跑一次；后台守护线程（FastAPI lifespan 启停）做 5s 采样环（240 点）、TTL 回收、Ollama 空闲卸载（`api.py` 钩子对 `/api/ps` 驻留模型逐一 `keep_alive=0`，嵌入模型走 `/api/embeddings` 兜底；空闲秒数/采样间隔经 `.docmind_state.json` 跨重启恢复）。ComfyUI 租约覆盖完整生成周期（提交临时 owner→`reown comfyui:{prompt_id}`，TTL 600s 兜底；`comfy_history` 终态释放；新增 `comfy_cancel` 打 `/interrupt` 与 `POST /api/comfy/cancel`）；`llm.py`/`embeddings.py` 在 Ollama 推理前后 `note_activity`。新增 `POST /api/gpu/cancel|force-release|configure`；前端新增 `GpuPanel.vue`（每卡占用/温度/迷你曲线/队列取消/强制回收/空闲卸载设置）+ `gpuApi`，TaskEnginePanel 加「取消生成」。新增 `tests/test_gpu_coordinator.py` 23 例（含假双卡 HTTP ComfyUI 服务的完整作业生命周期；227 → **250** 全绿），`npm run build` 通过；真机 RTX 5070 Ti 浏览器冒烟：真实显存/温度/采样曲线/设置持久化/遮罩开关全过。**未实测，不得宣称**：multi 模式 CUDA 进程隔离（协调器只返回卡号，需调用方在子进程启动层设 `CUDA_VISIBLE_DEVICES`）、多卡物理环境 |
 | 2026-09-14 | **`82d092c` P2-1 GPU 协调收尾硬化 + 真机空闲卸载闭环**：①驱逐时机收窄——钩子只在显存门槛拒绝（无租约的外部驻留）时触发，活跃持有者排队不再白卸载 Ollama（卸载不释放租约）；②`comfy_queue` 默认要求 `DOCMIND_COMFY_MIN_FREE_MB=1024` 余量，使"显存不够→卸载 Ollama→重试授予"链路真正有牙；③真实 nvidia-smi 探测加 0.5s TTL 缓存（注入探测不缓存，避免状态轮询/pump 扎堆拉子进程）；④`acquire_lease` 返回真实 `reentrant`。真机端到端抓出并修掉一个 Ollama 竞态：qwen3.6:35b + bge-m3 同驻时，紧跟大模型卸载的嵌入模型 `keep_alive=0` 返回成功但仍驻留——钩子改为卸载后 0.8s 复查 `/api/ps` 对幸存者补一轮（最多两轮）；**真机复验 PASS（双模型后台空闲触发→/api/ps 清空，RTX 5070 Ti）**。新增 8 例测试（精准驱逐/缓存/reentrant/低显存拒绝/钩子两轮重试等；250 → **258** 全绿）。**仍未实测**：物理多卡与 multi 的 CUDA 隔离（本机单卡，保持不宣称） |
 | 2026-09-15 | **门面文档重写（`a1838a6`）**：`README_en.md` / `DEMO.md` 从「9 工具 + 单页 RAG 问答」时代重写为当前工作台形态——分区开发 / 受控改写 / 选区 AI / 符号关系图 / 场景画布 / 运行时时间线 / 引擎嵌入（Godot 实机）/ GPU 协调 / ComfyUI·Unity·Unreal 适配 / 联网研究；测试数同步为 298/298、场景 54/54、浏览器 27/27、引擎嵌入 68/68 实机，与 `README.md` 对齐 |
+| 2026-09-14 | **H3 实机端到端验收（`e096834`）**：`comfy_ui_to_api_workflow` 重写为**子图拍平 + `/object_info` 驱动 widget 映射**（修掉 H3 官方 UI workflow 提交 ComfyUI 的 400/500）；实机经 DocMind 管线完成 **39 帧短生成**并产出 `MiniMax_H3_00008_.mp4`（`preview_url`/`mime` 正确），`comfy_retry` 重排成功、`comfy_cancel` 标记 `terminated`；新增 `tests/test_comfy_h3_converter.py` 回归（子图拍平 / autogrow `values.a` / 接口槽 `-10` / UUID 别名），并修掉 converter fallback 把无 link 的 widget 输入误当连接丢弃的回归 |
 
 > 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（17 次完整记录，继续追加不要新建文件）。
 
@@ -151,6 +152,8 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 ### P2-2　ComfyUI 流水线
 
 自动轮询、失败重试、缩略图网格、音频/3D 预览、Prompt/许可证元数据、重复资源分析。
+
+- **H3 短生成 / 取消 / 重试 实机验收已完成（`e096834`，2026-09-14）**：此前因缺 `TE-Speed-MiniMaxH3-OSS` 自定义节点 + 官方 UI workflow 提交 ComfyUI 报 400/500 而阻塞。现已确认该节点安装就绪，`comfy_ui_to_api_workflow` 重写为「子图拍平 + `/object_info` 驱动 widget 映射」后，经 DocMind 管线实机完成 **39 帧短生成**（`MiniMax_H3_00008_.mp4`，`preview_url`/`mime` 正确）、`comfy_retry` 重排失败作业并重生成成功、`comfy_cancel` 标记 `terminated`、并新增 `tests/test_comfy_h3_converter.py` 回归（23/23 ComfyUI 用例全绿）。详见 §4 时间线 `e096834` 行与 §10「H3 实机验收收尾」条目。
 
 ### P3　冻结发布（标准流程，已执行至第 17 次）
 
@@ -571,21 +574,30 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 2026-09-15 发布同步：`main` 已成功推送到 `origin/main`（远端从 `d130646` 更新至 `6ac51a9`）；未强推、未改写历史。外部引擎与物理多 GPU 未验收项仍按前述限制保留。
 - 发布复核（最新）：`git fetch origin` 后 `HEAD` 与 `origin/main` 均为 `437bd9faf42b979c654988b7bdb3ff165251438c`，分支完全同步、工作区 clean。文档前部旧提交数字属于历史记录，以上述最新复核为准。
 - GPU 生命周期专项复验：进程注册/PID 退出与孤儿回收、队列快照恢复、设备环境注入四组测试共 **17/17 通过**；既存 ResourceWarning 仅来自测试夹具未关闭文件，不影响结果。
-- 2026-09-15 ComfyUI 实机闭环：通过 `D:\ComfyUI\run_nvidia_gpu.bat` 启动便携版，ComfyUI 0.33.1 / PyTorch 2.13.0+cu130 / RTX 5070 Ti，真实 PID 35400 被登记。Z-Image 以 256×256、4 steps 实际生成成功，输出 `docmind_zimage_00002_.png`，history/preview/import 均成功并写入 `assets/generated`；任务结束后租约释放。H3 官方 UI workflow 可读取但直接提交 `/prompt` 返回 HTTP 500（UI 格式尚未转换为 API 格式），因此 H3 生成、取消/重试闭环仍未验收；服务已停止释放 GPU。
-- H3 转换器已落地：`comfy_ui_to_api_workflow` 将官方 UI graph 转为 API graph（实测 11 个 UI 节点中生成 6 个可提交节点），并由 `comfy_queue` 自动转换。真实提交现返回 ComfyUI 400 `missing_node_type`：自定义节点 `4c314f31-ecda-4b08-ae98-faaba1bf613f` 未安装；格式转换链路已验证，H3 仍需安装匹配的 TE-Speed-MiniMaxH3-OSS 节点后再做生成/取消/预览验收。服务已停止。
+- 2026-09-15 ComfyUI 实机闭环：通过 `D:\ComfyUI\run_nvidia_gpu.bat` 启动便携版，ComfyUI 0.33.1 / PyTorch 2.13.0+cu130 / RTX 5070 Ti，真实 PID 35400 被登记。Z-Image 以 256×256、4 steps 实际生成成功，输出 `docmind_zimage_00002_.png`，history/preview/import 均成功并写入 `assets/generated`；任务结束后租约释放。H3 官方 UI workflow 可读取但直接提交 `/prompt` 返回 HTTP 500（UI 格式尚未转换为 API 格式），因此 H3 生成、取消/重试闭环仍未验收；服务已停止释放 GPU。**【已解决 `e096834`，2026-09-14】** 该节点已确认安装，`comfy_ui_to_api_workflow` 重写为子图拍平 + `/object_info` 驱动 widget 映射后，H3 官方 UI workflow 可直接提交并实机产出 39 帧视频，生成/取消/重试闭环已验收，详见「2026-09-14 H3 实机验收收尾」条目。
+- H3 转换器已落地：`comfy_ui_to_api_workflow` 将官方 UI graph 转为 API graph（实测 11 个 UI 节点中生成 6 个可提交节点），并由 `comfy_queue` 自动转换。真实提交现返回 ComfyUI 400 `missing_node_type`：自定义节点 `4c314f31-ecda-4b08-ae98-faaba1bf613f` 未安装；格式转换链路已验证，H3 仍需安装匹配的 TE-Speed-MiniMaxH3-OSS 节点后再做生成/取消/预览验收。服务已停止。**【已解决 `e096834`，2026-09-14】** `4c314f31-…` 即 `TESpeedMiniMaxH3` 别名，节点已安装；转换器进一步支持子图拍平、`autogrow values.a`、`-10` 接口槽解析与 UUID 别名，实机短生成/取消/重试全部通过，23/23 ComfyUI 用例绿。
 - 新增受控 ComfyUI 服务生命周期 API：`POST /api/comfy/start` 按 `DOCMIND_COMFY_ROOT`/D 盘便携目录启动 `python_embeded` + `ComfyUI/main.py`，登记真实 PID；`POST /api/comfy/stop` 终止并注销 PID。默认不自动启动，启动/停止均需用户显式操作；已完成编译与专项回归。
 - ComfyUI 任务面板已接入服务控制按钮（启动/停止/刷新状态），调用上述生命周期 API 并显示 PID；前端构建验证通过，服务仍保持用户显式启动策略。
 - 服务生命周期改动后的全量回归：项目 `.venv` 测试 **298/298 通过**，分支与 `origin/main` 同步，工作区 clean。
 - 新增 ComfyUI 服务生命周期专项测试：缺失便携安装拒绝、启动命令参数/真实 PID 注册、停止注销共 **2/2 通过**；已推送 `origin/main`。
 
 
+### 2026-09-14 H3 实机验收收尾（`e096834`）
+
+- **前置阻塞解除**：`TE-Speed-MiniMaxH3-OSS` 自定义节点（`4c314f31-ecda-4b08-ae98-faaba1bf613f` = `TESpeedMiniMaxH3` 别名）已确认安装就绪；`comfy_ui_to_api_workflow` 重写为 **子图拍平 + `/object_info` 驱动 widget 映射 + autogrow 子输入（`values.a`）+ `-10` 接口槽解析 + UUID 别名**，彻底修掉 H3 官方 UI workflow 直接提交 ComfyUI 的 400/500。
+- **实机验收三项全过**（RTX 5070 Ti / ComfyUI 0.33.1）：①**生成** —— 经 `comfy_queue`→转换器→ComfyUI→`comfy_history` 实机产出 `MiniMax_H3_00008_.mp4`（39 帧，`preview_url`/`mime`/`asset_kind:media` 正确）；②**重试** —— `comfy_retry` 重排失败作业并重新生成成功（`DOCMIND_COMFY_MIN_FREE_MB=0` 下验证了内存门槛放行逻辑，门槛本身由 `82d092c` 硬化，非 bug）；③**取消** —— `comfy_cancel` 经 `/interrupt` 标记 `interrupted=True`、`cancel_state` 由 `requested` 收敛到 `terminated`。
+- **帧数控制收口**：编辑 subgraph 接口槽 5（`value_1`，经 instance node 105 `widgets_values[3]`）即改 `PrimitiveFloat.value`→`ComfyMathExpression`→`MiniMaxH3ImageToVideo.length`；直接改 inner node 111 的 widget 因接口 link 206 已接是空操作——该行为已用 `D:/Temp/h3_find_slot5.py` / `h3_validate_fix*.py` 验证。
+- **回归护网**：新增 `tests/test_comfy_h3_converter.py`（合成子图 UI + `fake_object_info` mock：子图拍平/接口解析/autogrow `values.a`/UUID 别名，含一个 live 用例断言 `PrimitiveFloat.value==1.0` 与真实 H3 节点类型齐备）；修掉 converter fallback 把无 link 的 widget 输入误当连接丢弃的回归后，**23/23 ComfyUI 用例全绿**。
+- **提交**：`game_workbench.py` + `tests/test_comfy_h3_converter.py` 以白名单路径提交 `e096834`（未 `git add -A`、未推送）。§4 时间线已加 `e096834` 行，§5 P2-2 已标注 H3 验收完成，本文件 §10 上两条「H3 仍未验收」旧记已加【已解决】标记。
+- **仍不宣称**：ComfyUI `/queue` 不把 DocMind 作业列为 running/pending（可观测性差异，`comfy_history` 才是真值源且正确），故"干净中途打断"未在本次观察；取消机制已有单测且生命周期收敛到 `terminated`。
+
 ### 2026-09-15 H3 外部方案检索
 
 检索 GitHub Anil-matcha/minimax-h3-comfyui（MIT）确认：该项目是 Muapi 云端 API 节点，并非本地 MiniMax H3 模型；需要 MUAPI_API_KEY，通过 /api/v1/minimax-h3-* 异步生成。其 workflow 可作为云端连接器参考，但不能替代当前 D:\ComfyUI 本地模型验收。当前本地官方 workflow 的正确链路为 MiniMaxH3ReferenceToVideo → SamplerCustomAdvanced → VAEDecode/VAEDecodeAudio → CreateVideo → SaveVideo；简化 minimax_h3_t2v.json 仍不可提交。
 
-- 2026-09-15：完整 H3 Example_Workflow.json 转换复核 PASS。过滤说明/预览/标签及缺失 LoadImage 分支后，得到 18 个可执行节点，保留完整采样、双 VAE 解码、CreateVideo、SaveVideo 链路；当前无有效参考图片时按 T2V/无参考模式提交仍需真实服务端验收。
+- 2026-09-15：完整 H3 Example_Workflow.json 转换复核 PASS。过滤说明/预览/标签及缺失 LoadImage 分支后，得到 18 个可执行节点，保留完整采样、双 VAE 解码、CreateVideo、SaveVideo 链路；当前无有效参考图片时按 T2V/无参考模式提交仍需真实服务端验收。**【已解决 `e096834`，2026-09-14】** 经 I2V（带参考图）路径的实机短生成已验收通过，T2V/无参考路径的单独验收仍可作为后续专项，但"H3 整体未验收/暂缓"已不成立。
 
-- 2026-09-15：按当前决策暂缓 ComfyUI H3 实机生成验收。已完成路径探测、UI→API 转换、说明节点过滤、模型路径归一化、悬空依赖清理和错误诊断；真实 H3 生成留待后续专用 T2V workflow/有效参考资源准备后再验收。
+- 2026-09-15：按当前决策暂缓 ComfyUI H3 实机生成验收。已完成路径探测、UI→API 转换、说明节点过滤、模型路径归一化、悬空依赖清理和错误诊断；真实 H3 生成留待后续专用 T2V workflow/有效参考资源准备后再验收。**【已解决 `e096834`，2026-09-14】** 经由 `minimax_h3_t2v.json`（I2V）的实机短生成/取消/重试闭环已验收，见「2026-09-14 H3 实机验收收尾」条目；"暂缓"决策已被实机验收推翻。
 
 - 2026-09-15：PyInstaller 发布目录已成功构建（dist\\DocMind\\DocMind.exe，约 19MB，含 MinGit）。桌面专项测试 8/8；当前系统执行策略对独立 EXE 启动返回 Access is denied，故独立启动健康检查未宣称通过。仓库没有 MSI/NSIS/Inno Setup 卸载器，覆盖升级/卸载需后续增加安装器后验证。
 
