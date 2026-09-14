@@ -559,4 +559,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI 前端任务历史新增“刷新历史”按钮，显式重新请求后端分页接口；构建已通过，避免仅依赖浏览器 localStorage 的旧任务列表。
 - 3D 输出能力口径已收紧：`.glb/.gltf/.fbx/.obj/.stl/.ply/.usd/.usdz` 仅标记为 `asset_kind=3d` 并提供导入元数据，`preview_supported=false`，直到接入引擎渲染器；前端显示相应的导入提示。
 - ComfyUI 历史分页已接入前端：任务面板支持后端分页的页码、上一页/下一页和刷新，localStorage 仅用于保留近期选择项；`npm run build` 成功。
+- 分页改动后的最终自动化回归：项目 `.venv` 全量测试 **295/295 通过**，前端 Vite 构建成功，工作区 clean。
 
