@@ -852,6 +852,22 @@ def comfy_template_workflow(template_id):
             '7': {'class_type':'VAELoader','inputs':{'vae_name':'ae.safetensors'}}, '8': {'class_type':'VAEDecode','inputs':{'samples':['6',0],'vae':['7',0]}}, '9': {'class_type':'SaveImage','inputs':{'images':['8',0],'filename_prefix':'docmind_zimage'}}}}
     return {'ok': False, 'error': '未知模板。'}
 
+def comfy_apply_parameters(workflow, params):
+    """按通用参数 schema 修改 API workflow，并严格校验目标节点字段。"""
+    wf = json.loads(json.dumps(workflow or {})); p = params or {}
+    targets = {'prompt': [('3','prompt'),('4','prompt')], 'width':[('5','width')], 'height':[('5','height')],
+               'steps':[('6','steps')], 'seed':[('6','seed')], 'filename_prefix':[('9','filename_prefix')],
+               'frames':[('5','batch_size')]}
+    for key, value in p.items():
+        if key not in targets: continue
+        applied=False
+        for node, field in targets[key]:
+            item=wf.get(str(node))
+            if isinstance(item, dict) and isinstance(item.get('inputs'), dict) and field in item['inputs']:
+                item['inputs'][field] = value; applied=True
+        if not applied: return {'ok':False,'error':f'模板缺少参数节点或字段：{key}'}
+    return {'ok':True,'workflow':wf}
+
 
 def comfy_queue(workflow, url="http://127.0.0.1:8188"):
     try: url = _safe_comfy_url(url)
