@@ -888,7 +888,7 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188"):
         # 后台 watch 只负责轮询状态，不再单独持租约（租约已 reown 给本作业 owner）
         result["watch"] = comfy_watch(prompt_id, url)
         with _COMFY_JOBS_LOCK:
-            _COMFY_JOBS.setdefault(prompt_id, {}).update({'workflow_sha256': result['workflow_sha256'], 'gpu': lease.get('gpu'), 'status': 'queued'})
+            _COMFY_JOBS.setdefault(prompt_id, {}).update({'workflow': workflow, 'workflow_sha256': result['workflow_sha256'], 'gpu': lease.get('gpu'), 'status': 'queued', 'retry_count': 0})
             _save_comfy_history()
     return result
 
@@ -1011,6 +1011,23 @@ def comfy_history_list(page=1, page_size=20):
     rows.sort(key=lambda x: x.get('finished_at') or x.get('started_at') or '', reverse=True)
     start=(page-1)*page_size
     return {'ok':True,'page':page,'page_size':page_size,'total':len(rows),'items':rows[start:start+page_size]}
+
+def comfy_retry(prompt_id, url='http://127.0.0.1:8188'):
+    with _COMFY_JOBS_LOCK:
+        job = _COMFY_JOBS.get(str(prompt_id))
+        if not job: return {'ok':False,'error':'找不到作业历史'}
+        if job.get('status') not in ('failed','error'): return {'ok':False,'error':'仅失败作业可重试'}
+        if int(job.get('retry_count',0)) >= 2: return {'ok':False,'error':'已达到最多 2 次重试'}
+        workflow = job.get('workflow'); count = int(job.get('retry_count',0))+1
+    if not workflow: return {'ok':False,'error':'历史中缺少 workflow，无法重试'}
+    result = comfy_queue(workflow, url)
+    if result.get('ok'):
+        with _COMFY_JOBS_LOCK:
+            new_id = str((result.get('response') or {}).get('prompt_id') or '')
+            if new_id in _COMFY_JOBS: _COMFY_JOBS[new_id]['retry_count'] = count
+            _save_comfy_history()
+        result['retry_of'] = str(prompt_id); result['retry_count'] = count
+    return result
 
 def comfy_import(root, prompt_id, image, url="http://127.0.0.1:8188", dest_dir="assets/generated"):
     """Download one ComfyUI output into a project asset directory with metadata."""
