@@ -211,7 +211,14 @@ def _recover_processes(now):
 
 def process_status():
     with _lock:
-        return {"available": _process_probe_cache["available"], "compute_apps": list(_process_probe_cache.get("rows") or []), "processes": [dict(v) for v in _processes.values()],
+        registered = {int(k): v for k,v in _processes.items()}
+        apps=[]
+        for app in (_process_probe_cache.get("rows") or []):
+            item=dict(app); rec=registered.get(int(item.get('pid',-1)))
+            if rec: item.update({'owner':rec.get('owner'), 'gpu':rec.get('gpu'), 'purpose':rec.get('purpose')})
+            else: item.update({'owner':None, 'gpu':None, 'purpose':''})
+            apps.append(item)
+        return {"available": _process_probe_cache["available"], "compute_apps": apps, "processes": [dict(v) for v in _processes.values()],
                 "recovery_events": list(_recovery_events)}
 
 

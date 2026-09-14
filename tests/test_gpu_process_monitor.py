@@ -15,6 +15,11 @@ class GpuProcessMonitorTests(unittest.TestCase):
         first=g.register_process(322,'comfyui:service',0,'comfyui')
         second=g.register_process(322,'comfyui:service',0,'comfyui')
         self.assertEqual(first['started_at'], second['started_at'])
+    def test_compute_apps_are_mapped_to_registered_owner(self):
+        g.register_process(323, 'engine:test', 0, 'godot')
+        g._process_probe_cache.update({'available':True,'rows':[{'pid':323,'process_name':'godot','used_mb':100}]})
+        app=g.process_status()['compute_apps'][0]
+        self.assertEqual(app['owner'],'engine:test'); self.assertEqual(app['purpose'],'godot')
     def test_dead_process_is_recovered_and_lease_released(self):
         g._leases[0]={'owner':'engine:test','purpose':'godot','since':0,'ttl':0}
         g.register_process(999,'engine:test',0,'godot')
