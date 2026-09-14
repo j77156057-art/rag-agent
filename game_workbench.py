@@ -19,6 +19,7 @@ _ENGINE_LOGS = {}
 _COMFY_JOBS = {}
 _COMFY_JOBS_LOCK = threading.Lock()
 _COMFY_HISTORY_FILE = os.getenv('DOCMIND_COMFY_HISTORY_FILE', os.path.join('.docmind','comfy_history.json'))
+_COMFY_SERVICE = None
 def _save_comfy_history():
     try:
         os.makedirs(os.path.dirname(_COMFY_HISTORY_FILE) or '.', exist_ok=True)
@@ -832,6 +833,36 @@ def comfy_status(url="http://127.0.0.1:8188"):
         return {"ok": True, "available": True, "url": url, "system": data, "pid": pid}
     except Exception as e:
         return {"ok": True, "available": False, "url": url, "error": str(e)}
+
+def comfy_start(root=None, port=8188):
+    """Start a local portable ComfyUI instance and register its real PID."""
+    global _COMFY_SERVICE
+    if _COMFY_SERVICE is not None and _COMFY_SERVICE.poll() is None:
+        return {'ok': True, 'running': True, 'pid': _COMFY_SERVICE.pid, 'reused': True}
+    root = root or os.getenv('DOCMIND_COMFY_ROOT', r'D:\ComfyUI')
+    root = os.path.abspath(root)
+    py = os.path.join(root, 'python_embeded', 'python.exe')
+    main = os.path.join(root, 'ComfyUI', 'main.py')
+    if not os.path.isfile(py): return {'ok': False, 'error': f'未找到 ComfyUI Python：{py}'}
+    if not os.path.isfile(main): return {'ok': False, 'error': f'未找到 ComfyUI main.py：{main}'}
+    env = os.environ.copy(); env.update(_gpu_process_environment(None))
+    try:
+        _COMFY_SERVICE = subprocess.Popen([py, main, '--listen', '127.0.0.1', '--port', str(int(port))], cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _gpu.register_process(_COMFY_SERVICE.pid, 'comfyui:service', None, 'comfyui')
+        return {'ok': True, 'running': True, 'pid': _COMFY_SERVICE.pid, 'root': root, 'port': int(port)}
+    except Exception as e: return {'ok': False, 'error': f'启动 ComfyUI 失败：{e}'}
+
+def comfy_stop():
+    global _COMFY_SERVICE
+    p = _COMFY_SERVICE
+    if p is None or p.poll() is not None: return {'ok': True, 'running': False, 'stopped': False}
+    pid = p.pid
+    try: p.terminate(); p.wait(timeout=8)
+    except Exception:
+        try: p.kill()
+        except Exception: pass
+    _gpu.unregister_process(pid, 'stopped'); _COMFY_SERVICE = None
+    return {'ok': True, 'running': False, 'stopped': True, 'pid': pid}
 
 def _comfy_job_owner(prompt_id):
     return f"comfyui:{prompt_id}"
