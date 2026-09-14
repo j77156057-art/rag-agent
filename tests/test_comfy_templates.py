@@ -41,6 +41,9 @@ class T(unittest.TestCase):
                {'id':2,'type':'RealNode','inputs':[],'widgets_values':[]}], 'links':[]}
   r=gw.comfy_ui_to_api_workflow(ui)
   self.assertTrue(r['ok']); self.assertNotIn('1', r['workflow']); self.assertIn('2', r['workflow'])
+ def test_ui_conversion_accepts_union_input_types(self):
+  ui={'nodes':[{'id':1,'type':'Source','inputs':[],'outputs':[{'type':'FLOAT'}]}, {'id':2,'type':'Sink','inputs':[{'name':'value','type':'FLOAT,INT','link':7}],'widgets_values':[]}], 'links':[[7,1,0,2,0,'FLOAT']]}
+  self.assertTrue(gw.comfy_ui_to_api_workflow(ui)['ok'])
  def test_project_workflow_path_precedes_environment(self):
   with tempfile.TemporaryDirectory() as d:
    project=os.path.join(d,'project'); os.makedirs(project)
