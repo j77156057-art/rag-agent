@@ -534,4 +534,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI 取消现在区分“已请求中断”和“已终止”：存在 watcher 时 `/interrupt` 成功只标记 `cancel_state=requested`，等待 history 返回终态后再释放租约；取消专项与 GPU 生命周期测试通过。
 - GPU 状态文件现在同时保存等待队列快照；重启恢复时将旧租约标记为 `recovered`、旧等待项标记为 `recovered_waiting`，只记录审计事件，不自动重启任务，避免重复执行。
 - 发布前回归（2026-09-15）：Python 全量测试 **282/282 通过**；`frontend/npm run build` 使用 Vite 5.4.21 成功；工作区 clean。当前 `main` 比 `origin/main` 超前 86 个提交，尚未推送。
+- 追加实机探测：`D:\Tools\Godot\Godot_v4.7.2-stable_win64_console.exe --version` 返回 `4.7.2.stable.official.ed1daf0bf`；Ollama `127.0.0.1:11434/api/tags` 可用并列出本地模型；本次 ComfyUI `127.0.0.1:8188` 不可用；未发现 Unity Hub 或 UnrealEditor 可执行文件，故 Unity/Unreal 启动和端到端桥接仍未验证。
 
