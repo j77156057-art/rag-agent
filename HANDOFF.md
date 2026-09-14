@@ -577,3 +577,7 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 服务生命周期改动后的全量回归：项目 `.venv` 测试 **298/298 通过**，分支与 `origin/main` 同步，工作区 clean。
 - 新增 ComfyUI 服务生命周期专项测试：缺失便携安装拒绝、启动命令参数/真实 PID 注册、停止注销共 **2/2 通过**；已推送 `origin/main`。
 
+
+### 2026-09-15 H3 外部方案检索
+
+检索 GitHub Anil-matcha/minimax-h3-comfyui（MIT）确认：该项目是 Muapi 云端 API 节点，并非本地 MiniMax H3 模型；需要 MUAPI_API_KEY，通过 /api/v1/minimax-h3-* 异步生成。其 workflow 可作为云端连接器参考，但不能替代当前 D:\ComfyUI 本地模型验收。当前本地官方 workflow 的正确链路为 MiniMaxH3ReferenceToVideo → SamplerCustomAdvanced → VAEDecode/VAEDecodeAudio → CreateVideo → SaveVideo；简化 minimax_h3_t2v.json 仍不可提交。
