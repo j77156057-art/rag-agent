@@ -946,6 +946,12 @@ def comfy_apply_parameters(workflow, params):
 
 
 def comfy_queue(workflow, url="http://127.0.0.1:8188"):
+    # ComfyUI exposes two JSON formats: the editor's UI graph (`nodes`/`links`)
+    # and the API prompt graph (`{id: {class_type, inputs}}`).  The latter is
+    # required by /prompt; fail early with an actionable message instead of
+    # forwarding a UI graph and surfacing an opaque HTTP 500.
+    if isinstance(workflow, dict) and isinstance(workflow.get('nodes'), list):
+        return {"ok": False, "error": "该 workflow 是 ComfyUI UI 格式，请先转换为 API prompt 格式后再提交。"}
     try: url = _safe_comfy_url(url)
     except ValueError as e: return {"ok": False, "error": str(e)}
     # 租约必须覆盖"提交 → ComfyUI 异步生成 → history 轮询到完成"整个周期，

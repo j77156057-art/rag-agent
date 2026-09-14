@@ -25,6 +25,9 @@ class T(unittest.TestCase):
   gw._COMFY_JOBS['bad']={'status':'failed','workflow':{},'retry_count':2}
   self.assertFalse(gw.comfy_retry('bad')['ok'])
   gw._COMFY_JOBS.pop('old',None); gw._COMFY_JOBS.pop('bad',None)
+ def test_queue_rejects_ui_workflow_with_actionable_error(self):
+  r=gw.comfy_queue({'nodes': [], 'links': []})
+  self.assertFalse(r['ok']); self.assertIn('UI 格式', r['error'])
  def test_project_workflow_path_precedes_environment(self):
   with tempfile.TemporaryDirectory() as d:
    project=os.path.join(d,'project'); os.makedirs(project)
