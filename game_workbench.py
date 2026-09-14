@@ -834,7 +834,7 @@ def _gpu_busy_error(res):
 # ---------------------------------------------------------------- ComfyUI 模板
 def comfy_templates():
     return {'ok': True, 'templates': [
-        {'id':'z-image-turbo','name':'Z-Image Turbo 图片','model':'z_image_turbo-Q8_0.gguf','kind':'image','author':'Tongyi-MAI','source_url':'https://github.com/Tongyi-MAI/Z-Image','license':'Apache-2.0','schema':{'prompt':'string','width':'integer','height':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}},
+        {'id':'z-image-turbo','name':'Z-Image Turbo 图片','model':'z_image_turbo-Q8_0.gguf','kind':'image','author':'Tongyi-MAI','source_url':'https://github.com/Tongyi-MAI/Z-Image','license':'Apache-2.0','schema':{'prompt':'string','negative_prompt':'string','width':'integer','height':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}},
         {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','author':'MiniMax','source_url':'https://github.com/MiniMax-AI','license':'check-model-card','workflow':_comfy_workflow_path(),'schema':{'prompt':'string','width':'integer','height':'integer','frames':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}}
     ]}
 
