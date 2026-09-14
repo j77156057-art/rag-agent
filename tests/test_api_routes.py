@@ -58,6 +58,8 @@ class ApiRouteTests(unittest.TestCase):
             ('/api/scene/op', 'POST'),
             ('/api/runtime/events', 'GET'),
             ('/api/runtime/clear', 'POST'),
+            ('/api/comfy/start', 'POST'),
+            ('/api/comfy/stop', 'POST'),
         ]:
             self.assertIn((path, method), routes, '端点缺失：%s %s' % (method, path))
 
