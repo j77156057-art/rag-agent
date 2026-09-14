@@ -45,7 +45,7 @@ class T(unittest.TestCase):
   ui={'nodes':[{'id':1,'type':'Source','inputs':[],'outputs':[{'type':'FLOAT'}]}, {'id':2,'type':'Sink','inputs':[{'name':'value','type':'FLOAT,INT','link':7}],'widgets_values':[]}], 'links':[[7,1,0,2,0,'FLOAT']]}
   self.assertTrue(gw.comfy_ui_to_api_workflow(ui)['ok'])
  def test_ui_conversion_skips_missing_load_images(self):
-  ui={'nodes':[{'id':1,'type':'LoadImage','inputs':[],'widgets_values':['missing.png']}, {'id':2,'type':'Sink','inputs':[{'name':'image','link':7}],'widgets_values':[]}], 'links':[[7,1,0,2,0,'IMAGE']]}
+  ui={'nodes':[{'id':1,'type':'LoadImage','inputs':[],'widgets_values':['missing.png']}, {'id':2,'type':'Sink','inputs':[{'name':'image','link':7}],'widgets_values':[]}, {'id':3,'type':'Keep','inputs':[],'widgets_values':[]}], 'links':[[7,1,0,2,0,'IMAGE']]}
   r=gw.comfy_ui_to_api_workflow(ui)
   self.assertTrue(r['ok']); self.assertNotIn('1',r['workflow']); self.assertNotIn('2',r['workflow'])
  def test_project_workflow_path_precedes_environment(self):
