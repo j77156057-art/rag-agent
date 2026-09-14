@@ -581,3 +581,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 ### 2026-09-15 H3 外部方案检索
 
 检索 GitHub Anil-matcha/minimax-h3-comfyui（MIT）确认：该项目是 Muapi 云端 API 节点，并非本地 MiniMax H3 模型；需要 MUAPI_API_KEY，通过 /api/v1/minimax-h3-* 异步生成。其 workflow 可作为云端连接器参考，但不能替代当前 D:\ComfyUI 本地模型验收。当前本地官方 workflow 的正确链路为 MiniMaxH3ReferenceToVideo → SamplerCustomAdvanced → VAEDecode/VAEDecodeAudio → CreateVideo → SaveVideo；简化 minimax_h3_t2v.json 仍不可提交。
+
+- 2026-09-15：完整 H3 Example_Workflow.json 转换复核 PASS。过滤说明/预览/标签及缺失 LoadImage 分支后，得到 18 个可执行节点，保留完整采样、双 VAE 解码、CreateVideo、SaveVideo 链路；当前无有效参考图片时按 T2V/无参考模式提交仍需真实服务端验收。
