@@ -677,6 +677,7 @@ def process_environment(device_index=None):
 
 def _sample_once():
     rows = query_gpus()
+    rows = rows or []
     point = {"t": round(time.time(), 1), "available": bool(rows), "gpus": [
         {"index": g["index"], "used_mb": g["used_mb"], "total_mb": g["total_mb"],
          "utilization": g["utilization"]} for g in rows]}
