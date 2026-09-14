@@ -538,4 +538,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 最新回归复核：Python 全量 **282/282 通过**；工作区 clean；当前 `main` 比 `origin/main` 超前 88 个提交。由于 ComfyUI/Unity/Unreal 实机条件当前不可用，暂不推送发布分支。
 - 参数修复后的最新回归：Python 全量 **283/283 通过**；前端构建成功。ComfyUI 正/负提示词、尺寸、steps、seed 和输出前缀已分别校验；当前 `main` 比远端超前 91 个提交。
 - 工作台前端已接入 ComfyUI “失败重试”操作，调用 `/api/comfy/retry/{prompt_id}` 并切换到新 prompt；重试上限和服务端 workflow 保留逻辑不变。当前工作区保持 clean，最终推送仍待外部服务/引擎实机验证完成后执行。
+- 最新全量回归：Python **286/286 通过**，前端 `npm run build` 成功；Unreal bridge 安全写入测试已纳入总数。当前 main 比 origin/main 超前 95 个提交。
 
