@@ -554,4 +554,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 2026-09-15 实时环境复核：Ollama `/api/tags` 在线，本机 `qwen2.5:7b` 非流式生成返回 `OK`，随后 `/api/ps` 为空（`keep_alive=0`）；Godot 控制台版返回 `4.7.2.stable.official.ed1daf0bf`。ComfyUI `127.0.0.1:8188` 当前连接被拒绝；未发现 Unity 或 UnrealEditor 可执行文件，因此这三项仍未完成实机验收。
 - 追加回归：ComfyUI 项目配置优先级测试通过；项目 `.venv` 全量测试 **294/294 通过**（忽略既存 ResourceWarning），工作区保持 clean。
 - ComfyUI 资产体验增量：history 输出按扩展名/MIME 标记 `asset_kind`（media/3d/unknown）和 `preview_supported`；前端媒体卡片对 3D 与未知格式显示安全导入/下载提示，并完成 API 类型约束。模板路径优先级与 3D 分类均有自动化测试；前端 Vite 构建通过。
+- 最新验证：在 `frontend` 目录正确执行 `npm run build`（Vite 5.4.21）成功；项目 `.venv` 全量测试 **295/295 通过**；工作区 clean。根目录没有 `package.json`，构建必须从 `frontend` 目录执行。
 
