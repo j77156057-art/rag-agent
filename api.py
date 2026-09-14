@@ -1498,6 +1498,22 @@ def _ollama_needed_models():
     return uniq
 
 
+def _preload_keep_alive():
+    """预加载时应保持的驻留时长。
+
+    预加载按钮只负责"把模型加载进显存、避免首条消息冷启动"，驻留时长必须
+    **跟随服务器默认配置**（OLLAMA_KEEP_ALIVE），不能写死成 30m——否则会把本就
+    驻留更久（如 24h）的模型活活砍短，导致用户体感"刚预加载就自动卸载了"。
+
+    读取失败 / 值为 0 或负（"请求结束即卸载"或"无限"等语义不清的值）时，
+    回落到一个合理的长驻留（24h），避免预加载反而触发立刻卸载。
+    """
+    env = (os.getenv("OLLAMA_KEEP_ALIVE") or "").strip().lower()
+    if not env or env in ("0", "-1", "inf", "infinite", "none"):
+        return "24h"
+    return env
+
+
 class ModelPowerReq(BaseModel):
     action: str = "off"  # off=立即卸载所有驻留模型释放显存；on=预加载当前配置所需模型
 
@@ -1561,7 +1577,7 @@ async def model_power_ep(req: ModelPowerReq):
                 }
             loaded, errors = [], []
             for name in wanted:
-                ok, err = await run_in_threadpool(_ollama_keep_alive, name, "30m")
+                ok, err = await run_in_threadpool(_ollama_keep_alive, name, _preload_keep_alive())
                 (loaded if ok else errors).append(name if ok else f"{name}（{err}）")
             result = {"ok": not errors, "action": "on", "preloaded": loaded}
             if errors:
