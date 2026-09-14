@@ -168,13 +168,19 @@ def web_fetch(url):
     if not ok: return "网页读取失败：只允许 http/https。"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (DocMind research)"})
-        with urllib.request.urlopen(req, timeout=12) as r: raw = r.read(1_000_000).decode('utf-8','replace')
+        with urllib.request.urlopen(req, timeout=12) as r:
+            raw = r.read(1_000_000).decode('utf-8','replace')
+            final_url = r.geturl() or url
+            content_type = r.headers.get('Content-Type', '')
+        if 'html' not in content_type.lower() and '<html' not in raw[:500].lower():
+            return f"来源：{final_url}\n内容类型：{content_type or '未知'}\n网页正文读取器仅支持 HTML 页面。"
         title = re.search(r'<title[^>]*>(.*?)</title>', raw, re.I|re.S)
         text = re.sub(r'<(script|style|noscript)[^>]*>.*?</\1>', ' ', raw, flags=re.I|re.S)
         text = re.sub(r'<[^>]+>', ' ', text)
         text = re.sub(r'\s+', ' ', text).strip()
         clean_title = re.sub(r'<[^>]+>', '', title.group(1)).strip() if title else '未知'
-        return f"来源：{url}\n标题：{clean_title}\n正文：{text[:8000]}"
+        clipped = len(text) > 8000
+        return f"来源：{final_url}\n标题：{clean_title}\n正文：{text[:8000]}" + ("\n[正文已截断]" if clipped else "")
     except Exception as e: return f"网页读取失败：{type(e).__name__}: {e}"
 
 
