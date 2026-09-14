@@ -452,15 +452,21 @@ class ComfyLeaseLifecycleTest(unittest.TestCase):
         h2 = gw.comfy_history("pid-1", self.url)
         self.assertFalse(h2.get("lease_released"))
 
-    def test_cancel_interrupts_and_releases(self):
+    def test_cancel_requests_interrupt_then_releases_on_terminal_history(self):
         r = gw.comfy_queue({}, self.url)
         self.assertTrue(r["ok"])
         owner = r["lease"]["owner"]
         c = gw.comfy_cancel("pid-1", self.url)
         self.assertTrue(c["ok"])
         self.assertTrue(c["interrupted"])
-        self.assertTrue(c["lease_released"])
+        self.assertFalse(c["lease_released"])
+        self.assertEqual(c["cancel_state"], "requested")
         self.assertEqual(self.state.interrupts, 1)
+        self.assertEqual(g.status()["active"], owner)
+        self.state.phase = "finished"
+        h = gw.comfy_history("pid-1", self.url)
+        self.assertTrue(h["finished"])
+        self.assertTrue(h["lease_released"])
         self.assertIsNone(g.status()["active"])
         self.assertEqual(owner, "comfyui:pid-1")
 
