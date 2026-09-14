@@ -865,9 +865,9 @@ def comfy_template_workflow(template_id):
 def comfy_apply_parameters(workflow, params):
     """按通用参数 schema 修改 API workflow，并严格校验目标节点字段。"""
     wf = json.loads(json.dumps(workflow or {})); p = params or {}
-    targets = {'prompt': [('3','prompt'),('4','prompt')], 'width':[('5','width')], 'height':[('5','height')],
+    targets = {'prompt': [('3','prompt')], 'negative_prompt': [('4','prompt')], 'width':[('5','width')], 'height':[('5','height')],
                'steps':[('6','steps')], 'seed':[('6','seed')], 'filename_prefix':[('9','filename_prefix')],
-               'frames':[('5','batch_size')]}
+               'frames':[('5','frames'),('5','frame_count')]}
     for key, value in p.items():
         if key not in targets: continue
         applied=False
@@ -875,7 +875,14 @@ def comfy_apply_parameters(workflow, params):
             item=wf.get(str(node))
             if isinstance(item, dict) and isinstance(item.get('inputs'), dict) and field in item['inputs']:
                 item['inputs'][field] = value; applied=True
-        if not applied: return {'ok':False,'error':f'模板缺少参数节点或字段：{key}'}
+        if not applied:
+            # UI workflow 节点编号不稳定：仅在输入字段名称唯一且明确时回退匹配。
+            matches=[]
+            for item in wf.values() if isinstance(wf, dict) else []:
+                if isinstance(item, dict) and isinstance(item.get('inputs'), dict) and key in item['inputs']:
+                    matches.append(item['inputs'])
+            if len(matches) == 1: matches[0][key] = value
+            else: return {'ok':False,'error':f'模板缺少参数节点或字段：{key}'}
     return {'ok':True,'workflow':wf}
 
 
