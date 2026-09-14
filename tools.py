@@ -183,6 +183,21 @@ def web_fetch(url):
         return f"来源：{final_url}\n标题：{clean_title}\n正文：{text[:8000]}" + ("\n[正文已截断]" if clipped else "")
     except Exception as e: return f"网页读取失败：{type(e).__name__}: {e}"
 
+def web_research(query):
+    """搜索并抓取前 3 个公开来源，供 Agent 直接做联网研究。"""
+    results = web_search(query)
+    urls = re.findall(r'https?://[^\s)]+', results)
+    if not urls:
+        return results
+    out = [f"研究主题：{query}", "搜索摘要：", results, "\n来源正文："]
+    seen = set()
+    for url in urls[:3]:
+        url = url.rstrip('.,')
+        if url in seen: continue
+        seen.add(url)
+        out.append(web_fetch(url))
+    return "\n---\n".join(out)
+
 
 _ALLOWED_URL_SCHEMES = ("http", "https")
 
@@ -2136,6 +2151,7 @@ def game_playtest(arg):
 
 
 TOOLS = {
+    "web_research": {"description": "联网研究：先搜索，再读取最多 3 个公开网页正文，返回来源和证据。适合教程、GitHub、引擎文档和需要最新资料的问题。输入研究主题。", "func": web_research},
     "web_fetch": {"description": "读取公开网页正文并返回来源、标题和清理后的文本。输入完整 http/https URL。联网研究时先 web_search，再对关键来源调用。", "func": web_fetch},
     "dev_mcp_call": {"description": "调用已启用的 MCP 游戏引擎连接器。输入 key: 服务器key、name: 工具名、arguments: JSON。先用 MCP 工具清单确认可用工具；外部连接器需已启用并遵守审批。", "func": dev_mcp_call},
     "search_knowledge": {
