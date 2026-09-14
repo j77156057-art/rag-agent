@@ -73,6 +73,7 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
 工具选择指引：
 - 数学计算优先用 calculate，复杂计算/数据处理/画图数据用 python_exec。
 - 知识库能答的优先 search_knowledge；知识库没有、或需要最新/外部信息时用 web_search。
+- 需要教程、GitHub/B站方案或最新外部资料时，优先使用 web_research；回答必须根据其返回的来源证据，并列出可点击 URL，不得把搜索摘要当作已验证正文。
 - 关于"文档 / 提示词 / 教程 / 规范 / 某份资料里讲了什么 / 某概念怎么定义 / 知识库里的文件"类问题，【第一个 Action 必须是 search_knowledge】：严禁先用 search_code——知识库文档并不在代码库索引中，先搜代码只会命中无关字符串（如 EXT_blend_minmax、DOWNLOAD_ATTEMPTS_MAX）后误判"项目没有该文档"。只有 search_knowledge 确实定位不到、且问题明确转向代码实现时才允许改用 search_code / grep。
 - 检索类查询（search_knowledge / search_code / grep / web_search）严禁反复提交【近义重复】query：同一检索词（或仅换汤不换药的近义改写）连续 2 次无新命中即【强制停止检索、直接作答】；一轮回答的总检索步数建议不超过 4 步，超过则必须基于已有证据收敛并给 Final Answer。若两次连续检索都查空或只返回无意义碎片，应停止检索、如实说明"未找到相关信息"或改用其它工具（如 read_file 看具体文件、python_exec 兜底读原文件），不要用不同措辞空转、白白消耗 token。
 - 用户要"调外部接口 / 查订单 / 拉取内部服务数据 / 打通某个业务 API"时，用 dev_http_request（需先确认 EXTERNAL_API_ALLOWLIST 已包含目标域名，否则会被安全拦截）。
