@@ -528,6 +528,12 @@ async def engine_prepare_ep(req: EngineReq):
 class UnrealBridgeReq(BaseModel):
     confirm: bool = False
     force: bool = False
+class UnrealWriteReq(BaseModel):
+    task_id: str = ''
+    target_path: str = ''
+    property: str = ''
+    value: object = None
+    confirm: bool = False
 
 @app.post('/api/engine/unreal-bridge/install')
 async def unreal_bridge_install_ep(req: UnrealBridgeReq):
@@ -564,6 +570,12 @@ async def unreal_bridge_blueprint_ep(asset_path: str, url: str = 'http://127.0.0
 @app.get('/api/engine/unreal-bridge/actor/{actor_name:path}')
 async def unreal_bridge_actor_ep(actor_name: str, url: str = 'http://127.0.0.1:8765'):
     return await _unreal_bridge_get('/actor/' + urllib.parse.quote(actor_name, safe=''), url)
+@app.post('/api/engine/unreal-bridge/write')
+async def unreal_bridge_write_ep(req: UnrealWriteReq):
+    if not req.confirm: return JSONResponse({'ok': False, 'error': '写入 Unreal 属性需要显式确认。'}, status_code=400)
+    if not req.task_id or not req.target_path or req.target_path.lower().endswith(('.uasset','.umap')):
+        return JSONResponse({'ok': False, 'error': '缺少任务范围，或禁止直接写入二进制 Unreal 资产。'}, status_code=400)
+    return {'ok': False, 'available': False, 'error': '当前 bridge 仅支持查询，尚未启用安全写回。'}
 
 # 注意：EngineEmbedReq 只在文件上方定义一次（带 x/y/offset_y 的完整版）。
 # 这里曾经又定义了一次窄版本，把上面的覆盖掉——处理器读 req.x 会 AttributeError，
