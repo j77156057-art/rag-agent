@@ -462,7 +462,8 @@
     <div class="modal" data-page-node-id="eYwyD4dfgNhRK73nfpSd21">
       <div class="modal-head" data-page-node-id="7JZxJ5bIcZRwFvYE5UOvi1"><h2 data-page-node-id="MeIiTyCHYHshXBruvTweUx">代码库索引</h2><button class="close" id="codePanelClose" data-page-node-id="BsBYpxsdHNEqXNnkDuDYNS">×</button></div>
       <label data-page-node-id="vzHYashO0CgSjckuxXq9m1">代码目录（绝对路径）</label>
-      <input id="codeRoot" placeholder="如 C:/Users/me/project/src" autocomplete="off" data-page-node-id="FrafwZMh3rR8NYXqCXK1CE" />
+      <div style="display:flex;gap:8px;"><input id="codeRoot" placeholder="选择文件夹或输入路径" autocomplete="off" data-page-node-id="FrafwZMh3rR8NYXqCXK1CE" style="flex:1" /><button class="btn" id="pickCodeRoot" type="button">📁 打开文件夹</button></div>
+      <input id="codeFolderPicker" type="file" webkitdirectory directory multiple hidden />
       <div class="modal-actions" data-page-node-id="aWiXpHSUSWVUm9QaYYg6GM">
         <button class="btn" id="indexCodeBtn" data-page-node-id="xLmtfCO4BKLdRPbz6JYumr">开始索引</button>
         <span class="cfg-msg" id="codeMsg" data-page-node-id="mhbFuN86omFk9Iw3CXfgyO"></span>
@@ -939,6 +940,15 @@
   $("settingsBtn").onclick = () => { closeAll(); openOverlay(settingsOverlay); loadConfig(); };
   $("ollamaBannerClose").onclick = () => document.getElementById("ollamaBanner").classList.add("hidden");
   $("codeLibBtn").onclick = () => { closeAll(); openOverlay(codeOverlay); loadConfig(); };
+  $("pickCodeRoot").onclick = async () => {
+    if (window.pywebview?.api?.select_directory) {
+      try { const p = await window.pywebview.api.select_directory(); if (p) $("codeRoot").value = p; } catch (_) {}
+    } else { $("codeFolderPicker").click(); }
+  };
+  $("codeFolderPicker").onchange = (e) => {
+    const f = e.target.files?.[0]; const rel = f?.webkitRelativePath || '';
+    if (rel) $("codeRoot").value = rel.split('/')[0];
+  };
   $("devBtn").onclick = () => { closeAll(); openOverlay(devOverlay); loadRegions(); };
 
   $("indexCodeBtn").onclick = async () => {

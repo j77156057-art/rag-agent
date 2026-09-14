@@ -109,6 +109,10 @@ def build_host_window(api_base: str = "", title: str = "DocMind 开发工作台"
     resized/shown/closing 事件接线），而不是在测试里各写一份——两份实现必然漂移。
     """
     import webview
+    class _DesktopApi:
+        def select_directory(self):
+            result = webview.windows[0].create_file_dialog(webview.FOLDER_DIALOG)
+            return result[0] if result else ''
 
     base = (api_base or API_BASE).rstrip('/')
     page = base + HOME_PATH
@@ -179,7 +183,7 @@ def build_host_window(api_base: str = "", title: str = "DocMind 开发工作台"
             _log("关窗前停止引擎失败：" + str(e))
 
     win = webview.create_window(title, page, width=width, height=height,
-                                min_size=(1024, 680), text_select=True)
+                                min_size=(1024, 680), text_select=True, js_api=_DesktopApi())
     try:
         # pywebview 事件属于具体窗口对象；绑定全局 webview.events 在部分版本不会触发。
         # resized/shown/closed 在不同版本上名字与签名都不一样，逐个 hasattr 探测。
