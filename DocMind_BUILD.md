@@ -1,13 +1,37 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第十四次重建（分区可视化增强：一键创建分区、补齐导出桩、卡片按依赖排序）」；历史构建清单保留在下文。
+> 最新构建见下方「第十五次重建（桌面入口改 RAG 问答页 + 引擎嵌入实机闭环 + 场景画布/运行时时间线 + Agent 路由收敛）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
-- 入口：`DocMind.exe`（约 18.5 MB，控制台模式，启动时自动开浏览器）
-- 整体体积：约 663.4 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB/365 文件）
-- **当前构建时间：`2026-09-12 18:26:30`（第十四次重建，分区可视化增强，exe 19,412,925 字节）**
-- 上一版：`2026-09-12 03:24:52`（第十三次重建，P3 三件套，exe 19,408,724 字节）
+- 入口：`DocMind.exe`（约 19.7 MB，控制台模式，启动时自动开浏览器）
+- 整体体积：约 682.5 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 89.5 MB/365 文件）
+- **当前构建时间：`2026-09-14 17:14:57`（第十五次重建，桌面入口改 RAG 问答页 + 引擎嵌入 + 场景画布 + Agent 路由收敛，exe 19,670,124 字节）**
+- 上一版：`2026-09-12 18:26:30`（第十四次重建，分区可视化增强，exe 19,412,925 字节）
+
+---
+
+## 第十五次重建：桌面入口改 RAG 问答页 + 引擎嵌入实机闭环 + 场景画布/运行时时间线 + Agent 路由收敛（2026-09-14 17:14）
+
+### 改动
+- **桌面壳默认入口改为 RAG 问答页，工作台做第二入口**（d8e21c2，用户拍板）：`desktop.py` 新增 `HOME_PATH = os.getenv("DOCMIND_HOME", "/")`，`build_host_window` 用 `page = base + HOME_PATH` 取代硬编码的 `/workbench/`；可用环境变量覆盖不改代码。问答页顶栏加「开发工作台 →」（`web/index.html` + `.toplink` 样式），工作台顶栏加「问答」回链（`App.vue` + `style.css` 的 `.wb-question-link`）。新增 `tests/test_desktop_entry.py`（5 例）把「默认入口必须是 `/`、可被 `DOCMIND_HOME` 覆盖、宿主窗口不得再硬编码页面路径、问答页必须有 `/workbench` 链接、工作台必须有 `/` 回链」钉住，避免再退化成「两条路进不同页面」（含源码版/打包版状态隔离的说明）。
+- **引擎嵌入实机闭环（Godot HWND）**：e250160（P0-1）/ 622fdbc（MCP bridge、web player、GPU queue、native embedding）/ 511bc12（试玩器接「嵌入工作台」开关）。后端契约 `POST /api/engine/{start,embed,detach,focus,resize}` + `GET /api/engine/inspect`；引擎视窗比例用「宿主客户区宽 / 页面视口宽」（非 `devicePixelRatio`，多屏/DPI 下才准），`detach` 必须可逆（保存原始 parent/style/屏幕矩形），二次嵌入复用保存句柄；本机 150% DPI 下 `verify_engine_embed.py` 按实际坐标断言。
+- **场景画布 + 运行时时间线**（809a3b9，P0-2/P1-1）：试玩器弹窗第 2/3 个 tab——Vue Flow 场景画布（扁平节点 + 四类边 hierarchy/script/instance/reference）、运行时时间线；配套 `verify_scene_canvas.py`（54 项）/ `verify_scene_canvas_ui.mjs`（23 项）。
+- **Agent 路由与审批工作流收敛**（a753614）：新增 `GET /api/agent/routing`、`GET /api/agent/connectors`；新增 `agent_policy.py`、`secrets_store.py` 两模块。
+- **启动修复**（adfb542）：修复被吞掉的换行 + bat 编码导致的启动失败。
+- 次要：c543047 agent 代码优先路由/健壮动作解析、5c5be2b 符号提取补 Java、b8e869c Vue Flow region canvas spike，以及 handoff/技能同步若干文档提交。
+
+### 验证
+- 单测：全量 `unittest discover` **223/223 通过**（较第十四次 88 例 +135，含 `test_desktop_entry` 5 例、场景画布/引擎嵌入回归）。
+- 冻结态（最小 PATH 仅 System32，DOCMIND_SERVER_ONLY=1，PyInstaller 退出码 0）：
+  - 冷启动 **1.6s** 服务就绪；`build_time=2026-09-14 17:14:57` 确认本轮；
+  - 默认 `/` 是问答页且返回体含 `class="toplink" href="/workbench"`（默认入口已改）；`/workbench` 200；
+  - **9 个前端产物经 HTTP 返回体字节与源逐字节一致**；`web/assets/workbench-*.js` 含 `wb-question-link`（问答回链在包内 JS 分包），`web/index.html` 含 `toplink`；
+  - 无代码库时 `/api/fs/tree` 返 **400**（不是 500）；新端点 `/api/agent/routing`、`/api/agent/connectors`、`/api/engine/inspect` 均 **200**；`/api/engine/embed` 单处理器优雅返回 **200**；
+  - 包内无 `python*.exe`/`.env`/`.docmind_state.json`/`.chroma` 泄漏；MinGit 89.5 MB/365 文件；冒烟后已删状态文件、进程结束、端口释放。
+- 阶段 2 哈希一致性：9 个前端产物逐个 SHA-256 与 `web/` 源一致；卫生扫描无状态/索引/密钥泄漏。
+- 引擎嵌入 / 场景画布 / 运行时时间线属需真机（Godot 进程 + 真实 HWND）才能端到端验证的能力，本轮冻结冒烟仅确认其端点可达、相关模块已编入 exe（`agent_policy`/`secrets_store` 在 PYZ 内）；真机闭环由既有 `verify_engine_embed.py`(60)/`verify_scene_canvas.py`(54)/`verify_scene_canvas_ui.mjs`(23) 守护，不在本机打包环境复跑。
+- 源码对应提交：`d8e21c2 feat(desktop): 默认入口改为 RAG 问答页，工作台做第二入口` 为本轮入口改造主提交；a753614 / adfb542 / e250160 / 809a3b9 / 511bc12 / 622fdbc 为同期并入功能。
 
 ---
 
