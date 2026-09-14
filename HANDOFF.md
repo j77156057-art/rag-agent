@@ -564,4 +564,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 发布审计补充：`verify_api.py` 接口冒烟整体返回 OK，但本机已有 Chroma 集合为 1024 维、当前一次 ingest 使用 256 维而被拒绝；该环境数据维度不一致需在发布前重建/迁移索引，不能将该 ingest 错误宣称为通过。
 - 已修复 Chroma 维度错误可诊断性：`vectorstore.add_documents` 现在将维度冲突转换为明确中文错误，并指导切回原 embedding 配置或显式 `reset_collection()`；不会自动删除现有索引。全量测试 **295/295 通过**。
 - Chroma 维度诊断新增专项回归测试（模拟 1024/256 冲突并断言包含 `reset_collection` 指引）；专项测试通过。
+- ComfyUI 重启语义已收紧：加载持久化历史时，`queued/running` 远端任务标记为 `recovered` 并停止显示为 live；保留完成/失败记录，避免服务重启后重复提交或永久占用租约。专项测试通过。
 
