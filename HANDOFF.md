@@ -537,4 +537,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 追加实机探测：`D:\Tools\Godot\Godot_v4.7.2-stable_win64_console.exe --version` 返回 `4.7.2.stable.official.ed1daf0bf`；Ollama `127.0.0.1:11434/api/tags` 可用并列出本地模型；本次 ComfyUI `127.0.0.1:8188` 不可用；未发现 Unity Hub 或 UnrealEditor 可执行文件，故 Unity/Unreal 启动和端到端桥接仍未验证。
 - 最新回归复核：Python 全量 **282/282 通过**；工作区 clean；当前 `main` 比 `origin/main` 超前 88 个提交。由于 ComfyUI/Unity/Unreal 实机条件当前不可用，暂不推送发布分支。
 - 参数修复后的最新回归：Python 全量 **283/283 通过**；前端构建成功。ComfyUI 正/负提示词、尺寸、steps、seed 和输出前缀已分别校验；当前 `main` 比远端超前 91 个提交。
+- 工作台前端已接入 ComfyUI “失败重试”操作，调用 `/api/comfy/retry/{prompt_id}` 并切换到新 prompt；重试上限和服务端 workflow 保留逻辑不变。当前工作区保持 clean，最终推送仍待外部服务/引擎实机验证完成后执行。
 
