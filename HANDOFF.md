@@ -526,6 +526,6 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI 模板支持环境变量 `DOCMIND_COMFY_WORKFLOW_H3` 和 Windows 常见目录探测；模板返回参数 schema。新增 `/api/comfy/templates/apply`，对节点/字段存在性做校验后应用 prompt、尺寸、帧数、steps、seed、输出前缀。
 - ComfyUI 作业历史写入 `.docmind/comfy_history.json`，服务启动恢复；新增 `/api/comfy/jobs` 分页接口和 `/api/comfy/retry/{prompt_id}`，失败作业最多重试 2 次并保留 workflow。
 - Unreal 工作台代理新增 Blueprint/Actor 查询路由：`/api/engine/unreal-bridge/blueprint/{path}`、`/actor/{name}`。当前本机 Unreal Editor 未运行，真实节点/属性通信仍未验收。
-- 当前已验证：Python 280 项、前端构建、Z-Image/H3 历史实机记录、GPU 单卡采样。未验证：物理多 GPU、Unreal Editor 端到端、引擎实际安装路径上的 Godot/Unity/Unreal 启动、最终远端推送。
+- 当前已验证：Python 281 项、前端构建、Z-Image/H3 历史实机记录、GPU 单卡采样。未验证：物理多 GPU、Unreal Editor 端到端、引擎实际安装路径上的 Godot/Unity/Unreal 启动、最终远端推送。
 - GPU 运行时状态现在在启动时读取 `.docmind/gpu_state.json`；上次未完成租约不会复用，而是标记为 `recovered` 事件并清除旧状态，避免重启后永久占卡。新增专项测试通过。
 
