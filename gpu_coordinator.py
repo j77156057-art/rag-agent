@@ -677,16 +677,14 @@ def process_environment(device_index=None):
 
 def _sample_once():
     rows = query_gpus()
-    if not rows:
-        return
-    point = {"t": round(time.time(), 1), "gpus": [
+    point = {"t": round(time.time(), 1), "available": bool(rows), "gpus": [
         {"index": g["index"], "used_mb": g["used_mb"], "total_mb": g["total_mb"],
          "utilization": g["utilization"]} for g in rows]}
     with _lock:
         _samples.append(point)
         try:
             STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            STATE_FILE.write_text(json.dumps({"samples": list(_samples), "updated_at": time.time()}, ensure_ascii=False), encoding="utf-8")
+            STATE_FILE.write_text(json.dumps({"samples": list(_samples), "updated_at": time.time(), "available": bool(rows)}, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
     try:
