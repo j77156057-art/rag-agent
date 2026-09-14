@@ -219,6 +219,12 @@ async function installAddon() {
 function resultOf(s: McpServer) {
   return probeResults.value[s.key]
 }
+function connectorGuide(s: McpServer) {
+  if (s.key.includes('godot')) return '让 AI 读取场景、节点和运行日志；请先打开 Godot 项目。'
+  if (s.key.includes('unity')) return '让 AI 查看 Unity 场景和组件；需先启动 Unity 并运行 MCP 插件。'
+  if (s.key.includes('unreal')) return '让 AI 查询 Unreal 资产、Actor 和蓝图；需先启动 Editor Bridge。'
+  return '让 AI 连接外部工具并调用其能力。'
+}
 </script>
 
 <template>
@@ -252,7 +258,8 @@ function resultOf(s: McpServer) {
     <!-- 点击外部关闭：透明遮罩截获弹层外点击 -->
     <div v-if="enginePopOpen" class="cd-pop-mask" @click="enginePopOpen = false" />
     <div v-if="enginePopOpen" class="cd-pop" @click.stop>
-      <div class="cd-pop-title">引擎 MCP 连接</div>
+      <div class="cd-pop-title">连接游戏引擎</div>
+      <div class="cd-pop-subtitle">连接后，AI 才能读取引擎中的场景、脚本和运行日志。</div>
       <div v-if="addon && addon.is_godot_project" class="cd-addon">
         <div class="cd-addon-row">
           <span class="cd-dot" :class="addon.installed ? 'cd-dot-ok' : 'cd-dot-off'" />
@@ -283,12 +290,13 @@ function resultOf(s: McpServer) {
         <div class="cd-server-row">
           <span class="cd-dot" :class="resultOf(s)?.ok ? 'cd-dot-ok' : (!s.enabled ? 'cd-dot-off' : 'cd-dot-idle')" />
           <span class="cd-server-name">{{ s.label || s.key }}</span>
-          <span class="cd-server-meta">{{ s.transport === 'stdio' ? (s.command + ' ' + (s.args || []).join(' ')).trim() : s.url }}</span>
+          <span class="cd-server-meta">{{ s.transport === 'stdio' ? '本机插件' : '本机服务' }}</span>
           <span class="cd-spacer" />
           <button class="cd-mini" :disabled="probing === s.key || !s.enabled" @click="probe(s.key)">
             {{ probing === s.key ? '连接中…' : (resultOf(s.key) ? '重试' : '连接') }}
           </button>
         </div>
+        <div class="cd-server-guide">{{ connectorGuide(s) }}</div>
         <div v-if="resultOf(s.key)" class="cd-server-result">
           <span v-if="resultOf(s.key)?.ok" class="cd-ok-text">
             已连接 · {{ resultOf(s.key)?.tool_count }} 个工具可用
@@ -419,6 +427,7 @@ function resultOf(s: McpServer) {
   z-index: 60;
 }
 .cd-pop-title { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
+.cd-pop-subtitle { font-size: 11px; color: var(--text-dim); line-height: 1.5; margin-bottom: 8px; }
 .cd-addon {
   border: 1px solid var(--border); border-radius: 7px;
   padding: 8px 10px; margin-bottom: 10px; background: #0c121a;
@@ -446,6 +455,7 @@ function resultOf(s: McpServer) {
 .cd-server-meta { font-family: var(--font-mono); font-size: 10px; color: var(--text-faint); }
 .cd-server-result { margin-top: 4px; font-size: 11px; word-break: break-all; }
 .cd-server-help { margin-top: 3px; font-size: 10.5px; color: var(--text-faint); }
+.cd-server-guide { margin: 4px 0 0 20px; font-size: 10.5px; color: var(--text-dim); line-height: 1.45; }
 .cd-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 7px; }
 .cd-dot-ok { background: var(--green); box-shadow: 0 0 6px rgba(69,201,140,.6); }
 .cd-dot-idle { background: var(--amber); }
