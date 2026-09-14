@@ -530,4 +530,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - GPU 运行时状态现在在启动时读取 `.docmind/gpu_state.json`；上次未完成租约不会复用，而是标记为 `recovered` 事件并清除旧状态，避免重启后永久占卡。新增专项测试通过。
 - 2026-09-15 当前机实测：`nvidia-smi --query-gpu` 成功读到单卡 RTX 5070 Ti（12227 MB，总使用约 1717 MB）；`--query-compute-apps` 返回进程但显存均为 `[N/A]`，协调器因此正确报告进程显存 `available=false`，未将其当作真实数值。`CUDA_VISIBLE_DEVICES=0` 正常生成，`=99` 仅作为无效设备负对照生成环境变量，尚未启动 CUDA 子进程验证失败行为。
 - ComfyUI 状态探测现在尝试通过监听端口解析外部服务 PID，并将其登记为 `comfyui:service`，因此 GPU 面板可显示常驻服务进程；服务不可达时不登记、不伪造可用状态。当前本次探测 `127.0.0.1:8188` 不可达，未做生成实测。
+- Unreal 新增受控写回代理 `POST /api/engine/unreal-bridge/write`：必须提供任务 ID、目标路径和 `confirm=true`，`.uasset/.umap` 直接拒绝；当前 bridge 仍返回 `available=false`，未实现二进制资产写回。
 
