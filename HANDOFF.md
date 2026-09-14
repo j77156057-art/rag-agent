@@ -1,6 +1,6 @@
 # DocMind 项目交接清单（给接手 AI）
 
-> **更新时间**：2026-09-14（含 P0-1 实机闭环）｜ **基线提交**：`809a3b9` + 本次嵌入加固
+> **更新时间**：2026-09-14（含 P0-1 实机闭环 + 接手校准）｜ **基线提交**：`eeb73ab`
 > **全量测试**：**223 项全部通过** ｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
 > **引擎嵌入实机自检**：`verify_engine_embed.py` **68/68**（真 Godot 4.7.2 + 真 Win32 宿主，含真实合成键鼠与 UI 调用路径）｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` **27/27** ｜ **前端构建**：`npm run build` 通过
 > 本文是项目唯一权威交接文档，取代并删除了旧版 `HANDOFF.md`、`AI_BRIEF.md`、`DEV_WORKBENCH_AUDIT.md`、`HANDOFF_ENGINE_EMBEDDING.md`、`HANDOFF_REMAINING_WORK.md`（旧 HANDOFF.md 由本同名文件接管）。
@@ -43,9 +43,10 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   界面照常可用；另有「聚焦 / 解除嵌入 / 停止桌面窗口」。关弹窗或切走 tab 会自动解除嵌入（视窗元素没了，
   继续嵌着只会让引擎画到别处）。浏览器模式下开关自动禁用并提示需要桌面端。
 - **LLM/Embedding**：mock / qwen / deepseek / ollama / llamacpp 多 Provider，页面内免重启切换；本机 Ollama(`11434`, bge-m3) 与 llama.cpp(`8080`, Qwen 35B) 免 Key；622fdbc 新增 native embedding。
-- **验证基线**：后端 `unittest discover` **202/202 通过**（14 个测试文件，MinGit 在 PATH 时 git 用例实际执行）；
-  `verify_scene_canvas.py` 走真实 HTTP 路由 **50/50**（含"每个 op 的 undo 逐字节还原"）；
-  `verify_scene_canvas_ui.mjs` 真浏览器 **23/23**（含"空间布局落点与场景坐标严格成比例"）；前端 build 通过。
+- **验证基线**：后端 `unittest discover` **223/223 通过**；
+  `verify_scene_canvas.py` 走真实 HTTP 路由 **54/54**（含"每个 op 的 undo 逐字节还原"）；
+  `verify_engine_embed.py` 真 Godot + 真 Win32 宿主 **68/68**；
+  `verify_scene_canvas_ui.mjs` 真浏览器 **27/27**（含"空间布局落点与场景坐标严格成比例"）；前端 build 通过。
 
 ---
 
@@ -106,11 +107,12 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 ## 5. 待办清单（规划项，未完成；按优先级）
 
-> 每项含【要做什么】【原因】【方案】【验收】。状态以 `809a3b9` 的代码为准，已核对。
+> 每项含【要做什么】【原因】【方案】【验收】。状态以 `eeb73ab` 的代码为准，2026-09-14 接手时逐项核对。
 
-### Agent 模型路由与权限（基础层已落地）
+### Agent 模型路由与权限（基础层 + UI 已落地，2026-09-14 接手核对）
 
-新增 `agent_policy.py`、`/api/agent/route`、`/api/agent/routing`、`/api/agent/connectors`、`/api/agent/permission` 和 Skill `agent-model-routing`。`/api/chat` 已在 SSE 首事件返回路由建议并注入 Agent 上下文；开启 `AGENT_AUTO_CLOUD=1` 且配置 `AGENT_CLOUD_PROVIDER` 对应密钥后，复杂请求会临时使用云端 Agent，缺少密钥自动回退本地。连接器清单可供 Agent 选择但不会自动启动。外部授权现写入项目内 `.docmind_permissions.jsonl` 审计日志。连接器 UI、云端密钥管理和 ReAct 内部连接器选择仍待完成。外部路径仅在显式授权下允许进入审批流程，Agent 自身项目始终拒绝写入。
+`agent_policy.py`、`/api/agent/route`、`/api/agent/routing`、`/api/agent/connectors`、`/api/agent/permission`、`/api/agent/secrets`(GET/DELETE)、`/api/agent/approvals`(含 decide 与 before/after unified diff)、`/api/agent/external-write` 和 Skill `agent-model-routing` 均已落地；前端 `AgentPolicyPanel.vue` 已在工作台顶栏接线（路由状态/连接器清单/外部路径审批/Diff 批准拒绝）。`/api/chat` SSE 首事件返回路由建议并注入上下文；`AGENT_AUTO_CLOUD=1` + 云端密钥时复杂请求走云端 Agent，缺密钥自动回退本地；云端发送前经 `redact_for_cloud` 脱敏并截断上下文；`dev_mcp_call` 校验连接器启用状态、可选 task_id 绑定与参数路径越权；外部写入需 approved approval_id + 精确路径，写前生成 `.docmind.bak`；密钥 DPAPI/Fernet 往返、撤销、授权均有回归测试。外部授权写项目内 `.docmind_permissions.jsonl` 审计日志，Agent 自身项目始终拒绝写入。
+**仍待做（非阻塞）**：连接器 UI 目前只展示清单与启用状态，启停/配置管理界面未做；ReAct 内部连接器选择依赖工具清单读取，尚无"Agent 自主切换连接器"的策略层。
 
 ### P1-2　Unity 深度适配
 
@@ -133,7 +135,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 按 `docmind-frozen-release` Skill：py_compile → **223 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(68) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → 前端产物 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
 第 15/16/17 次均已执行（最新 `344007e`=第 16 次、`DocMind_BUILD.md` 第 17 次章节=20:56 构建）。
-**第 17 次交付卡点**：构建产物在 `D:/Temp/docmind_rel15/DocMind/`，因用户正运行的第 16 次桌面实例（PID 15520）锁定 `dist/DocMind` 目录，暂未换入 `dist/DocMind`；用户关闭该实例后，`robocopy /MIR` 换入即完成交付，无需重打包。
+**第 17 次交付卡点已解除（2026-09-14 接手核证）**：第 16 次旧实例已关闭、无 DocMind 进程残留；第 17 次产物（`dist/DocMind/DocMind.exe`，mtime 2026-09-14 20:56，19,673,210 字节）已换入 `dist/DocMind`，临时目录 `D:/Temp/docmind_rel15` 已清理。下次发布直接从第 18 次流程开始。
 
 ### 其他已记录的改进点
 
@@ -335,22 +337,13 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - §5：**删除已完成的 P0-1**；把"100%/125% 未实测"与"前端自动嵌入开关未接线"作为残留写进其他改进点（铁律：未做实的不写成已完成）。
 - §7：补 `verify_engine_embed.py` 运行方式。§8：新增第 18 条引擎嵌入坑（6 个子项）。§9：补脚本归属。
 
-- Agent 连接器：ReAct 工具表已加入 dev_mcp_call，可在确认连接器启用并读取工具清单后调用 MCP 工具；调用失败会转为可审计文本，不会静默执行。
+**2026-09-14 追加（Agent 模型路由与权限，多轮累积）**
+- ReAct 工具表加入 `dev_mcp_call`：连接器启用检查 + 可选 task_id 绑定 + 参数路径越权（region/allowed_paths）校验，失败转可审计文本不静默执行。
+- 云端密钥：`/api/agent/secrets`（GET 仅返回 Provider 名称 / DELETE 撤销轮换，明文不落盘），DPAPI/Fernet 往返有回归测试。
+- 外部权限：审批创建/批准、approval_id 精确路径授权、`redact_for_cloud` 上云前脱敏与上下文截断、`/api/agent/external-write` 实际写入执行器（approved + 精确路径 + 写前 `.docmind.bak`）、审批 before/after unified diff 与 `AgentPolicyPanel` 批准/拒绝 UI。
+- 上述过程测试数 205 → 207 递增；与 RAG 收紧轮合计后全量 **223 项**。
 
-- 云端密钥管理新增 /api/agent/secrets（仅返回 Provider 名称）及 DELETE /api/agent/secrets/{provider}，支持撤销/轮换，密钥内容不回传。
-
-- ReAct MCP 调用已增加连接器启用检查与可选 task_id 绑定，未启用连接器或不存在任务会拒绝调用。
-
-- dev_mcp_call 现在会检查 MCP 参数中的 path/file/scene/asset/script 是否落在 task_id 的 region/allowed_paths 内，越权参数直接拒绝。
-
-- 密钥存储新增 1 项回归测试：往返解密、明文不落盘、Provider 列表和撤销均已验证。全量测试 205 项。
-
-- 外部权限现支持 approval_id 绑定：只有对应审批记录为 approved 且路径精确匹配时，/api/agent/permission 才会记录授权；新增回归测试，测试总数 206。
-
-- 目标核对（本轮）：ReAct MCP 工具、云端密钥 DPAPI/Fernet 往返与撤销、外部审批创建/批准/approval_id 精确授权均有接口；全量测试 206 项通过。仍未完成云端请求脱敏与审批 Diff 驱动的实际外部写入执行器。
-
-- 云端 Agent 路由现接入 redact_for_cloud：发送云端前会脱敏 api_key/token/password/secret/private key 等凭据并截断上下文；新增回归测试，测试总数 207。
-
-- 外部审批已接入实际写入端点 /api/agent/external-write：需 approved approval_id + 精确路径，写入前生成 .docmind.bak，失败拒绝。
-
-- 审批请求支持 before/after 自动生成 unified diff，AgentPolicyPanel 审批列表可展示 Diff 并批准/拒绝；前端构建通过。
+**2026-09-14 接手校准**
+- 基线提交更新为 `eeb73ab`；核对全量测试 **223/223**，修正 §2 旧数字（202/50/23 → 223/54/27，补 68 项引擎实机）。
+- Agent 路由与权限段由"待办"改写为"已落地 + 剩余非阻塞项（连接器启停 UI、ReAct 自主切换策略层）"。
+- 核证第 17 次冻结构建交付卡点已解除（exe mtime 20:56 已在 `dist/DocMind`，旧实例与临时目录均已清）。
