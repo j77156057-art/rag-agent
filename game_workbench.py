@@ -942,7 +942,8 @@ def comfy_ui_to_api_workflow(ui_workflow):
         # H3 workflows include MarkdownNote blocks; forwarding them to
         # /prompt causes a 400 ``missing_node_type`` response.
         typ_name = str(typ or '')
-        if (not typ_name or typ_name.lower().startswith(('note', 'markdownnote'))
+        if (not typ_name or typ_name.lower().startswith(('note', 'markdownnote', 'label'))
+                or typ_name.startswith('TE_image_pro_save_video')
                 or int(node.get('mode', 0) or 0) == 4):
             continue
         inputs = {}; widgets = list(node.get('widgets_values') or []); wi = 0
