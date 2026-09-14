@@ -64,12 +64,30 @@ def dev_mcp_call(arg):
     except Exception as e: return f'MCP 调用失败：{e}'
 
 
+def _dedup_docs(docs, metas):
+    """向量检索偶发把同一 chunk 返回多次（同一 source+文本出现 N 遍，曾出现 4 次同片）。
+
+    用 (source, 规范化文本) 作去重键只保留首次出现，避免重复片段浪费 token、
+    并防止 Agent 误以为"信息很多"而空转。返回过滤后的 (docs, metas)。"""
+    seen = set()
+    out_d, out_m = [], []
+    for d, m in zip(docs, metas):
+        key = (m.get("source", "") if m else "", (d or "").strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        out_d.append(d)
+        out_m.append(m)
+    return out_d, out_m
+
+
 def search_knowledge(query):
     """在已上传的知识库中检索与问题相关的文档片段。"""
     emb = _get_emb().embed([query])[0]
     res = vs_query(emb, k=TOP_K)
     docs = (res.get("documents") or [[]])[0]
     metas = (res.get("metadatas") or [[]])[0]
+    docs, metas = _dedup_docs(docs, metas)
     if not docs:
         return "知识库中未找到相关内容。"
     out = []
@@ -677,6 +695,7 @@ def search_code(query):
     res = vs_query(emb, k=TOP_K, collection=CODE_COLLECTION_NAME)
     docs = (res.get("documents") or [[]])[0]
     metas = (res.get("metadatas") or [[]])[0]
+    docs, metas = _dedup_docs(docs, metas)
     if not docs:
         return "代码库未找到相关内容，建议改用 grep 搜索关键词或 read_file 查看具体文件。"
     out = []

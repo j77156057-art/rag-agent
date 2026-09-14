@@ -512,6 +512,12 @@
   const q = document.getElementById("q");
   const $ = (id) => document.getElementById(id);
 
+  // 仅当用户已在底部附近时才自动滚到底；用户上滑阅读某一段时不强行拉回底部
+  function chatNearBottom(threshold) {
+    threshold = threshold == null ? 80 : threshold;
+    return chat.scrollHeight - chat.scrollTop - chat.clientHeight < threshold;
+  }
+
   function addUser(text, imgUrls) {
     const d = document.createElement("div");
     d.className = "msg user";
@@ -536,7 +542,7 @@
       answer.textContent = text;
     }
     chat.appendChild(d);
-    chat.scrollTop = chat.scrollHeight;
+    if (chatNearBottom()) chat.scrollTop = chat.scrollHeight;
   }
 
   function addBotShell() {
@@ -553,7 +559,7 @@
       </div>`;
     d.querySelector(".trace-head").onclick = () => d.querySelector(".trace").classList.toggle("collapsed");
     chat.appendChild(d);
-    chat.scrollTop = chat.scrollHeight;
+    if (chatNearBottom()) chat.scrollTop = chat.scrollHeight;
     return d;
   }
 
@@ -564,9 +570,11 @@
     div.innerHTML = `<span class="tag ${type}">${label}</span><div class="body"></div>`;
     div.querySelector(".body").textContent = text;
     shell.querySelector(".steps").appendChild(div);
-    // 有推理步骤时自动展开轨迹
-    shell.querySelector(".trace").classList.remove("collapsed");
-    chat.scrollTop = chat.scrollHeight;
+    // 仅当用户跟随到底部时才自动展开推理轨迹并滚动；用户上滑阅读时保持原状态
+    if (chatNearBottom()) {
+      shell.querySelector(".trace").classList.remove("collapsed");
+      chat.scrollTop = chat.scrollHeight;
+    }
   }
 
   // ---------- 图片附件（视觉模型输入）----------
@@ -738,7 +746,7 @@
     }
     loadPending();
     loadPowerStatus();  // 对话会让模型加载驻留，刷新显存开关状态
-    chat.scrollTop = chat.scrollHeight;
+    if (chatNearBottom()) chat.scrollTop = chat.scrollHeight;
   }
 
   $("sendBtn").onclick = send;
