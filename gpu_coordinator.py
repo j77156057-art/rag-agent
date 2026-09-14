@@ -79,6 +79,26 @@ def _persist_runtime_locked():
         STATE_FILE.write_text(json.dumps({'leases': {str(k): v for k,v in _leases.items()}, 'updated_at': time.time()}, ensure_ascii=False), encoding='utf-8')
     except Exception: pass
 
+def restore_runtime_state():
+    """恢复上次运行的状态；旧租约不可安全复用，转为 recovered 事件。"""
+    try:
+        data=json.loads(STATE_FILE.read_text(encoding='utf-8'))
+        leases=data.get('leases') or {}
+    except Exception:
+        return 0
+    recovered=0; now=time.time()
+    with _lock:
+        for key, lease in leases.items():
+            item=dict(lease); item['gpu']=int(key) if str(key).isdigit() else key
+            item['status']='recovered'; item['recovered_at']=now
+            _recovery_events.append(item); recovered += 1
+    try:
+        STATE_FILE.unlink()
+    except Exception: pass
+    return recovered
+
+restore_runtime_state()
+
 
 # --------------------------------------------------------------------------- 探测
 

@@ -20,5 +20,17 @@ class GpuProcessMonitorTests(unittest.TestCase):
     def test_probe_failure_is_explicit(self):
         with patch('gpu_coordinator.subprocess.run', side_effect=OSError('missing')):
             self.assertFalse(g._default_process_probe()['available'])
+    def test_restore_marks_stale_leases(self):
+        import tempfile, json, os
+        fd, path = tempfile.mkstemp(); os.close(fd)
+        try:
+            with open(path,'w',encoding='utf-8') as f: json.dump({'leases':{'0':{'owner':'old','purpose':'x'}}},f)
+            old=g.STATE_FILE; g.STATE_FILE=__import__('pathlib').Path(path)
+            self.assertEqual(g.restore_runtime_state(),1)
+            self.assertEqual(g.process_status()['recovery_events'][-1]['status'],'recovered')
+        finally:
+            g.STATE_FILE=old
+            try: os.unlink(path)
+            except OSError: pass
 
 if __name__ == '__main__': unittest.main()
