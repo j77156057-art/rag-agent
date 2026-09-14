@@ -11,4 +11,8 @@ class T(unittest.TestCase):
  def test_template_exposes_provenance(self):
   t=gw.comfy_templates()['templates'][0]
   self.assertTrue(t['author']); self.assertTrue(t['source_url']); self.assertTrue(t['license'])
+ def test_3d_extension_policy_is_documented_in_import_code(self):
+  import inspect
+  src=inspect.getsource(gw.comfy_import)
+  self.assertIn("asset_kind", src); self.assertIn(".glb", src)
 if __name__=='__main__': unittest.main()
