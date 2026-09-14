@@ -550,4 +550,5 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - ComfyUI 取消现向 `/interrupt` 发送目标 `prompt_id`，使用 ComfyUI 的定向中断能力；测试确认请求体带目标 ID，避免恢复为全局中断。
 - 生成 Unreal bridge 脚本已扩展 `/health`、`/assets`、`/actors`、`/blueprint/{path}`、`/actor/{name}` 路由，并通过 `py_compile`；真实 Editor 节点/属性仍需 Unreal Python 插件运行验证。
 - 最新环境复核：Ollama 进程与 API 在线；ComfyUI 端口 8188 当前不可用；未发现 Unity/Unreal 进程。未启动外部服务，避免未经用户操作改变 GPU 负载。
+- 2026-09-15 收尾复核：使用项目 `.venv` 执行 Python 全量测试 **293/293 通过**；`frontend\npm run build` 使用 Vite 5.4.21 成功；工作区 clean。新增提交 `65f5fbf` 修复 ComfyUI watcher/history 终态持久化：状态、进度、输出、完成时间和取消终态会写入 `.docmind/comfy_history.json`。当前 `main` 比 `origin/main` 超前 123 个提交。物理多 GPU、Unity/Unreal 编辑器联机及 ComfyUI 当前端口生成闭环仍缺实机条件，不能宣称已验收。
 
