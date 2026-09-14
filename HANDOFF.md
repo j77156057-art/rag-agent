@@ -517,3 +517,14 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 集成分支运行时冒烟（2026-09-15）：临时后端 `127.0.0.1:8899` 启动成功；`/api/gpu/status` 返回 RTX 5070 Ti、空闲约 10.9 GB、无残留 holder；`/api/comfy/templates` 正常返回 Z-Image 与 MiniMax H3 模板；本机 Ollama `127.0.0.1:11434/api/tags` 在线并列出 qwen2.5:7b、qwen3:14b 等模型。
 - Unreal bridge 探测按预期返回 `available=false`（Editor bridge 未运行），未将离线状态宣称为通信成功。
 
+### 2026-09-15 GPU/ComfyUI/Unreal 产品化增量
+
+- GPU 协调器新增真实 `nvidia-smi --query-compute-apps=pid,process_name,used_memory` 探测；探测失败明确返回 `available=false`，不以估算值替代。
+- 新增进程注册、心跳、注销和 PID 存活回收；异常退出会释放对应租约并记录 `orphan_recovered`。引擎 `Popen` 成功后自动注册真实 PID，停止时注销。
+- `/api/gpu/status` 增加 `processes`、`compute_apps`、`process_probe` 和 `recovery_events`；采样曲线写入有界 `.docmind/gpu_state.json`（运行时文件，已忽略）。GPU 前端显示注册进程和 compute-app 显存。
+- 新增 GPU 进程专项测试；全量 Python 测试从 277 增至 280 项并通过。前端 `npm run build` 通过。
+- ComfyUI 模板支持环境变量 `DOCMIND_COMFY_WORKFLOW_H3` 和 Windows 常见目录探测；模板返回参数 schema。新增 `/api/comfy/templates/apply`，对节点/字段存在性做校验后应用 prompt、尺寸、帧数、steps、seed、输出前缀。
+- ComfyUI 作业历史写入 `.docmind/comfy_history.json`，服务启动恢复；新增 `/api/comfy/jobs` 分页接口和 `/api/comfy/retry/{prompt_id}`，失败作业最多重试 2 次并保留 workflow。
+- Unreal 工作台代理新增 Blueprint/Actor 查询路由：`/api/engine/unreal-bridge/blueprint/{path}`、`/actor/{name}`。当前本机 Unreal Editor 未运行，真实节点/属性通信仍未验收。
+- 当前已验证：Python 280 项、前端构建、Z-Image/H3 历史实机记录、GPU 单卡采样。未验证：物理多 GPU、Unreal Editor 端到端、引擎实际安装路径上的 Godot/Unity/Unreal 启动、最终远端推送。
+
