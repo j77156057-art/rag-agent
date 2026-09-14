@@ -803,6 +803,20 @@ async def comfy_template_ep(template_id: str): return comfy_template_workflow(te
 @app.get("/api/gpu/status")
 async def gpu_status_ep():
     return {"ok": True, **gpu_status()}
+class GpuProcessReq(BaseModel):
+    pid: int
+    owner: str = ""
+    gpu: int | None = None
+    purpose: str = ""
+@app.post("/api/gpu/process/register")
+async def gpu_process_register_ep(req: GpuProcessReq):
+    return {"ok": True, "process": gpu.register_process(req.pid, req.owner, req.gpu, req.purpose)}
+@app.post("/api/gpu/process/heartbeat")
+async def gpu_process_heartbeat_ep(req: GpuProcessReq):
+    return {"ok": gpu.heartbeat_process(req.pid)}
+@app.post("/api/gpu/process/unregister")
+async def gpu_process_unregister_ep(req: GpuProcessReq):
+    return {"ok": bool(gpu.unregister_process(req.pid))}
 @app.get("/api/gpu/environment")
 async def gpu_environment_ep(device_index: int = -1):
     """返回引擎/外部子进程应注入的 GPU 环境变量；device_index<0 表示按当前租约推断。"""
