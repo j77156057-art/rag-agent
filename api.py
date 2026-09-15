@@ -493,7 +493,8 @@ class TestSceneReq(BaseModel): name: str; region: str = "behaviors"
 class ApprovalReq(BaseModel): action: str; user: str; approved: bool = False; target: str = ""; check: bool = False
 
 @app.get("/api/simulate_growth")
-async def simulate_ep(levels: int = 50, base: float = 100, growth: float = 1.08): return {"ok": True, "values": simulate_growth(levels,base,growth)}
+async def simulate_ep(levels: int = 50, base: float = 100, growth: float = 1.08, model: str = "geometric", k: float = 0):
+    return simulate_growth(levels, base, growth, model, (k or None))
 @app.get("/api/asset_dependencies")
 async def asset_deps_ep():
     root=_project_root_or_error(); return {"ok":bool(root),"dependencies":asset_dependencies(root) if root else []}

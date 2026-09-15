@@ -124,6 +124,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-15 | **执行轨迹回传（`2689035`）**：`replanner` 此前只拿到失败任务的错误串与各任务结论，无法判断"为什么没成"。现在 `Agent.run` 把每回合 trace 留在 **`last_turn_record`**，`_run_child` 采集**有界**逐步轨迹（`{action, obs片段}` + thoughts/reflections + 子回合 outcome/llm_calls/tokens/耗时/成本；上限 `DOCMIND_ORCH_TRACE_STEPS`=6 步、每步观察 `DOCMIND_ORCH_TRACE_OBS_CHARS`=240 字，超出只计数），随结果一起进 `results`（`/api/orchestrate` 返回值里也有）；`_replanner` 把失败任务的轨迹逐条渲染进提示（无轨迹时明写"未留下可用执行轨迹"）；`format_report` 给失败/被取消任务补一行轨迹摘要。`test_orchestrator.py` 45 → 54 例，全量 441 → **450** 全绿；端点端到端 **16/16** |
 | 2026-09-15 | **黄金题题库建成（`golden/questions.json` 8 题 + `golden/results_baseline.jsonl` 8/8 通过）**：门不再默认 SKIP——`docmind-frozen-release` 阶段 0 的 `GOLDEN_QUESTIONS` 已指向入仓题库。源码类题（G2/G3/G4/G6/G7）依赖 `code_root` 指向本仓库且 `ingest_code` 已索引；SKILL 已写明**隔离 chroma 的专用评测服务**起法（`CHROMA_DIR` 复制自 `.chroma` + `CODE_ROOT=<repo>` + POST `/api/ingest_code`），避免污染你 `:8000` 的游戏代码索引。断言用 `any_of`+`must_not_include`+`no_error` 鲁棒匹配、不依赖逐字；离线规则打分常驻 `tests/test_agent_eval.py` |
 | 2026-09-15 | **连接器启停 UI 落地**：ChatDock「引擎」弹层新增 **断开**（关闭 stdio 长驻会话，新增 `POST /api/mcp/close` + `mcp_client.close_server` 复用）、**真实连接状态**（新增 `GET /api/mcp/status` + `mcp_client.active_servers()`，弹层打开时回填 connected 态）、**新增/移除连接器**（`POST /api/mcp/servers` / `/remove` 接入 UI 表单）；修正原模板 `resultOf(s.key)` 误传字符串（应为 server 对象）导致「已连接 · N 工具」状态**永不显示**的 bug。新增 `tests/test_mcp_connector.py` 6 例全绿。**未实机**：`active` 仅在真实 stdio 引擎（Godot/uvx）连接后填入，本沙箱无引擎未跑该路径 |
+| 2026-09-15 | **B 档浅实现收口（`simulate_growth` 深化）**：原 2026-09-11 审计六项仅 `simulate_growth` 仍是等比数列玩具，其余五项已于 2026-09-14 做深（impact_analysis 语义检索 / generate_test_scene 真实 AST / performance_sample cProfile / approval TTL 门禁 / verify_contracts 环检测）。本次把 `simulate_growth` 改为 **geometric / linear / logistic S 形 / diminishing 四模型 + 摘要统计**（翻倍数等级 / 峰值增量及其等级 / logistic 拐点等级），`/api/simulate_growth` 与 `game_simulate` 工具加 `model`/`k`，新增 `tests/test_simulate_growth.py` 10 例（含 TestClient 端点形态）全绿；HANDOFF §5 原「仍有效」审计标记已校正，**B 档清单清空** |
 
 > 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（18 次完整记录，继续追加不要新建文件）。
 
@@ -197,7 +198,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 ### 其他已记录的改进点
 
-- **B 档浅实现**（2026-09-11 审计结论，仍有效）：`impact_analysis` 是子串 grep、`generate_test_scene` 写死空壳、`simulate_growth` 等比数列玩具、`performance_sample` 仅计时、`approval` 只追加日志不拦截、默认分区 verify 空转。当演示可以，当真工具需要逐个做深或在 UI 标注能力边界。
+- **B 档浅实现（2026-09-11 审计结论，已于 2026-09-14–09-15 逐项做深，原「仍有效」标记已失效）**：六项中五项在 2026-09-14 已深化——`impact_analysis` 改语义检索优先（bge-m3 向量，子串 grep 仅兜底）、`generate_test_scene` 改真实 AST 符号 + 可运行测试骨架、`performance_sample` 改 cProfile 真实剖析、`approval` 升级为 TTL 门禁（`is_approved`）、默认分区 `verify_contracts` 做环检测/依赖存在/导出文件校验；最后一项 `simulate_growth`（原等比数列玩具）于 **2026-09-15 深化**为 geometric/linear/logistic S 形/diminishing 四模型 + 摘要统计（翻倍数/峰值增量/拐点等级），`/api/simulate_growth` 与 `game_simulate` 工具同步加 `model`/`k`，新增 `tests/test_simulate_growth.py` 10 例全绿。**B 档清单已清空**。
 - **门面文档**：`README.md` 已于 2026-09-14 刷新（反映工作台/分区/引擎/画布现状）；`README_en.md` 与 `DEMO.md` 已于 2026-09-15 按当前形态重写（工作台六件事 / 分区 / 场景画布 / 运行时时间线 / 引擎嵌入 / GPU 协调 / ComfyUI·Unity·Unreal 适配 / 联网研究，测试数同步为 298/298），见 §4 时间线。
 - 新落地的 MCP bridge 与 Web player 的产品级使用文档与边界说明**已补**：`docs/integrations.md`（2026-09-15，覆盖配置模型、API 表面、使用前提、已知边界）。
 - **引擎嵌入的残留**（不影响"已可用"）：本机显示器当前是 **150% 缩放**，100%/125% 未实测——
@@ -437,6 +438,12 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 修一个旧 bug：原模板用 `resultOf(s.key)`（传字符串）而 `resultOf` 接收 server 对象，导致「已连接 · N 工具」**永不显示**；统一改为传 `resultOf(s)`。
 - 新增 `tests/test_mcp_connector.py` 6 例（active 空/有会话+close/未知 key 安全/status 形状/close 形状/save-remove 往返），全绿。**未实机**：`active` 仅在真实引擎（Godot/uvx）建立 stdio 会话后填入，本沙箱无引擎未跑该路径。
 - **未跑 `npm run build`**（铁律：会重建 `web/assets` 打断 `:8000` 实例/对面前端写入者），前端编译待你或下个发布构建核对；改完后端用隔离端口 8078 真打 `status`(`active:[]`) 与 `close`(`ok,closed:false`) 验收。
+
+**2026-09-15 追加（B 档浅实现收口，`simulate_growth` 深化）**
+- `game_workbench.simulate_growth` 由纯等比数列玩具改为四模型数值曲线模拟器：`geometric`（原行为，向后兼容）/ `linear`（绝对步进）/ `logistic`（S 形，承载上限 K=base*20 或 `k` 入参，速率由 growth 映射）/ `diminishing`（边际递减凹函数，p=clamp((growth-1)*2,0.15,0.95)）；未知 model 兜底 geometric。返回 `{ok,model,values:[{level,value}],summary:{count,start,end,total,peak_increment,peak_increment_level,doubling_level?,inflection_level?}}`。
+- `api.py` `/api/simulate_growth` 加 `model`/`k` 查询参数（直接返回函数 dict，不再二次包裹）；`tools.py` `game_simulate` 工具解析 `model`/`k` 并改写描述。无前端消费者，返回结构向后兼容（values 仍为 `{level,value}` 列表）。
+- 新增 `tests/test_simulate_growth.py` 10 例（几何向后兼容/翻倍等级/线性/Logistic 有界单调/递减凹性/未知 model 兜底/levels 截断/base<=0 修正/汇总 total/端点形态），全绿；隔离端口 8078 真打三类模型业务结果正确（logistic 拐点 15.7 给出、几何仍可 100/108/116.64、线性 100/200/300 翻倍在 2 级）。
+- HANDOFF §5 B 档审计「仍有效」标记校正为已逐项做深、B 档清单清空。
 
 **以下为 codex/p1-3-gpu-comfyui 分支原始变更记录（保留存档；其中部分设计在合并集成时被有意调整，以本文件末尾「P1-3 合并集成」段为准）**
 - 密钥存储新增 1 项回归测试：往返解密、明文不落盘、Provider 列表和撤销均已验证。全量测试 205 项。

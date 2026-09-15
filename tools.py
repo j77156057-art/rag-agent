@@ -2185,8 +2185,8 @@ def game_upsert_task(arg):
 
 def game_simulate(arg):
     from game_workbench import simulate_growth
-    f=_parse_keyed(arg or "",["levels","base","growth"])
-    return json.dumps(simulate_growth(int(f.get("levels") or 50),float(f.get("base") or 100),float(f.get("growth") or 1.08)),ensure_ascii=False)
+    f=_parse_keyed(arg or "",["levels","base","growth","model","k"])
+    return json.dumps(simulate_growth(int(f.get("levels") or 50),float(f.get("base") or 100),float(f.get("growth") or 1.08),(f.get("model") or "geometric"),(float(f.get("k")) if f.get("k") not in (None,"") else None)),ensure_ascii=False)
 def game_impact(arg):
     from game_workbench import impact_analysis
     f=_parse_keyed(arg or "",["query"]); return json.dumps(impact_analysis(_get_code_root(),f.get("query") or ""),ensure_ascii=False)
@@ -2274,7 +2274,7 @@ TOOLS = {
     "game_validate_data": {"description": "校验项目 JSON/YAML/TOML 配置格式。", "func": game_validate_data},
     "game_release_check": {"description": "执行发布前检查：配置、翻译和敏感 .env 文件。", "func": game_release_check},
     "game_upsert_task": {"description": "创建或更新游戏开发任务，输入 title/region/priority/status 等字段。", "func": game_upsert_task},
-    "game_simulate": {"description": "模拟等级成长数值，输入 levels/base/growth。", "func": game_simulate},
+    "game_simulate": {"description": "模拟数值成长曲线（等级经验/经济平衡推演），输入 levels/base/growth，可选 model=geometric|linear|logistic|diminishing、k=承载上限。", "func": game_simulate},
     "game_impact": {"description": "按符号或关键词分析代码影响文件，输入 query。", "func": game_impact},
     "game_playtest": {"description": "在项目根目录运行 Playtest 命令，输入 command/timeout。", "func": game_playtest},
     "init_regions": {

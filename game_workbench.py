@@ -1756,9 +1756,89 @@ def project_memory(root, content=None):
         with open(path,"w",encoding="utf-8") as f: f.write(content)
     return open(path,encoding="utf-8").read() if os.path.isfile(path) else ""
 
-def simulate_growth(levels=50, base=100, growth=1.08):
-    levels=max(1,min(int(levels),1000)); base=float(base); growth=float(growth)
-    return [{"level":i,"value":round(base*(growth**(i-1)),4)} for i in range(1,levels+1)]
+def simulate_growth(levels=50, base=100, growth=1.08, model="geometric", k=None):
+    """模拟数值成长曲线，返回逐等级数值 + 摘要统计。
+
+    用于游戏数值/经济平衡（等级经验、货币积累、资源产出等）的离线推演。
+    支持多种成长模型（model）：
+      - geometric   复合成长：v_i = base * growth**(i-1)        （默认，指数型经验曲线）
+      - linear      线性成长：v_i = base + step*(i-1)，step = base*(growth-1)
+      - logistic    S 形（带承载上限 K）：v_i = K / (1 + (K/base-1)·e^{-r·(i-1)})，
+                    K = k 或 base*20；r 由 growth 映射（growth>1 才有意义）
+      - diminishing 边际递减（凹函数，前期陡峭后期平缓的 XP）：v_i = base * i**p，
+                    p = clamp((growth-1)*2, 0.15, 0.95)
+    未知 model 退化为 geometric，保证任何入参都出数。
+
+    返回 {ok, model, values:[{level,value}], summary:{count,start,end,total,
+    peak_increment,peak_increment_level,doubling_level?,inflection_level?}}。
+    """
+    levels = max(1, min(int(levels), 1000))
+    try:
+        base = float(base)
+    except (TypeError, ValueError):
+        base = 100.0
+    if base <= 0:
+        base = 1.0
+    try:
+        growth = float(growth)
+    except (TypeError, ValueError):
+        growth = 1.08
+    model = (model or "geometric").lower()
+    if k in (None, "", 0):
+        kcap = None
+    else:
+        try:
+            kcap = float(k)
+        except (TypeError, ValueError):
+            kcap = None
+
+    values = []
+    if model == "linear":
+        step = base * (growth - 1) if growth > 1 else 0.0
+        for i in range(1, levels + 1):
+            values.append(round(base + step * (i - 1), 4))
+    elif model == "logistic":
+        K = kcap if (kcap and kcap > base) else base * 20.0
+        r = max(0.01, (growth - 1) * 2.0)
+        for i in range(1, levels + 1):
+            v = K / (1.0 + (K / base - 1.0) * math.exp(-r * (i - 1)))
+            values.append(round(v, 4))
+    elif model == "diminishing":
+        p = max(0.15, min(0.95, (growth - 1) * 2.0))
+        for i in range(1, levels + 1):
+            values.append(round(base * (i ** p), 4))
+    else:  # geometric（默认 / 未知 model 兜底）
+        for i in range(1, levels + 1):
+            values.append(round(base * (growth ** (i - 1)), 4))
+
+    series = [{"level": i, "value": values[i - 1]} for i in range(1, levels + 1)]
+
+    increments = [values[i] - values[i - 1] for i in range(1, len(values))]
+    peak_inc = max(increments) if increments else 0.0
+    peak_inc_level = increments.index(peak_inc) + 2 if increments else 1
+    doubling_level = None
+    for i, v in enumerate(values):
+        if v >= base * 2:
+            doubling_level = i + 1
+            break
+    summary = {
+        "count": len(values),
+        "start": values[0],
+        "end": values[-1],
+        "total": round(sum(values), 4),
+        "peak_increment": round(peak_inc, 4),
+        "peak_increment_level": peak_inc_level,
+    }
+    if doubling_level is not None:
+        summary["doubling_level"] = doubling_level
+    if model == "logistic":
+        try:
+            inf = 1 + math.log(K / base - 1.0) / r
+            summary["inflection_level"] = round(max(1.0, inf), 1)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            pass
+
+    return {"ok": True, "model": model, "values": series, "summary": summary}
 
 def asset_dependencies(root):
     refs=[]
