@@ -1289,7 +1289,7 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188"):
             _save_comfy_history()
     return result
 
-def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
+def comfy_history(prompt_id, url="http://127.0.0.1:8188", _release=True):
     try: url = _safe_comfy_url(url)
     except ValueError as e: return {"ok": False, "error": str(e)}
     pid = str(prompt_id or "").strip()
@@ -1342,8 +1342,11 @@ def comfy_history(prompt_id, url="http://127.0.0.1:8188"):
                     if job.get("cancel_requested"):
                         job["cancel_state"] = "terminated"
                 _save_comfy_history()
-        if finished:
-            # 生成结束（成功/失败都算）：释放作业租约，让排队的 Ollama/下一作业上卡
+        if finished and _release:
+            # 生成结束（成功/失败都算）：释放作业租约，让排队的 Ollama/下一作业上卡。
+            # 后台 watch 轮询用 _release=False 只更新状态，避免与用户轮询
+            # （API GET /api/comfy/history，前端 TaskEnginePanel 每 4s 轮询）抢释放，
+            # 导致 lease_released 上报不确定；真正的释放由用户侧 history 轮询负责。
             result["lease_released"] = _gpu.force_release(_comfy_job_owner(pid)) is not None
         return result
     except Exception as e:
@@ -1392,7 +1395,7 @@ def comfy_cancel(prompt_id, url="http://127.0.0.1:8188"):
 def comfy_wait(prompt_id, url="http://127.0.0.1:8188", timeout=120, interval=1.0):
     deadline=time.time()+max(1,min(int(timeout),600))
     while time.time()<deadline:
-        result=comfy_history(prompt_id,url)
+        result=comfy_history(prompt_id,url,_release=False)
         if not result.get("ok"): return result
         status=result.get("status") or {}
         if result.get("finished"):

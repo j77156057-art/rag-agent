@@ -35,7 +35,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   桌面壳默认打开问答页；入口可用 `DOCMIND_HOME` 覆盖（例如 `/workbench`）。
   桌面壳历史包袱：它曾经硬编码打开 `/workbench/`，而浏览器回退路径打开 `/`，两条路进不同页面，用户看懵过。
   工作台的重组件用 `defineAsyncComponent` 异步分块，首屏 JS 体积不受影响（工作台 137KB / gzip 52KB）。
-- **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前**第 17 次**冻结构建，2026-09-14 20:56；已重新打包，含本轮 RAG 问答质量收紧）；随包 MinGit。
+- **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前**第 18 次**冻结构建，2026-09-15 13:09；含 ComfyUI 受管生命周期 + H3 实机验收 + 网页检索工具 + TaskEnginePanel 崩溃回归修复）；随包 MinGit。
 - **引擎嵌入（P0-1 已实机闭环，且 UI 可用）**：Godot 4.7.2（`D://Tools//Godot//Godot_v4.7.2-stable_win64.exe`）+ 真 Win32 宿主窗口下实测通过——
   置父/样式摘除、按客户区（或前端指定矩形）对齐、宿主 resize 跟随、**真实合成键鼠（SendInput）送达引擎并回显**、
   解除嵌入后窗口原样还原、停止后无孤儿进程/窗口、父子 DPI 一致（本机 **150% 缩放 = 144 DPI** 实测）。
@@ -109,7 +109,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-15 | **门面文档重写（`a1838a6`）**：`README_en.md` / `DEMO.md` 从「9 工具 + 单页 RAG 问答」时代重写为当前工作台形态——分区开发 / 受控改写 / 选区 AI / 符号关系图 / 场景画布 / 运行时时间线 / 引擎嵌入（Godot 实机）/ GPU 协调 / ComfyUI·Unity·Unreal 适配 / 联网研究；测试数同步为 298/298、场景 54/54、浏览器 27/27、引擎嵌入 68/68 实机，与 `README.md` 对齐 |
 | 2026-09-14 | **H3 实机端到端验收（`e096834`）**：`comfy_ui_to_api_workflow` 重写为**子图拍平 + `/object_info` 驱动 widget 映射**（修掉 H3 官方 UI workflow 提交 ComfyUI 的 400/500）；实机经 DocMind 管线完成 **39 帧短生成**并产出 `MiniMax_H3_00008_.mp4`（`preview_url`/`mime` 正确），`comfy_retry` 重排成功、`comfy_cancel` 标记 `terminated`；新增 `tests/test_comfy_h3_converter.py` 回归（子图拍平 / autogrow `values.a` / 接口槽 `-10` / UUID 别名），并修掉 converter fallback 把无 link 的 widget 输入误当连接丢弃的回归 |
 
-> 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（17 次完整记录，继续追加不要新建文件）。
+> 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（18 次完整记录，继续追加不要新建文件）。
 
 ---
 
@@ -155,11 +155,11 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 - **H3 短生成 / 取消 / 重试 实机验收已完成（`e096834`，2026-09-14）**：此前因缺 `TE-Speed-MiniMaxH3-OSS` 自定义节点 + 官方 UI workflow 提交 ComfyUI 报 400/500 而阻塞。现已确认该节点安装就绪，`comfy_ui_to_api_workflow` 重写为「子图拍平 + `/object_info` 驱动 widget 映射」后，经 DocMind 管线实机完成 **39 帧短生成**（`MiniMax_H3_00008_.mp4`，`preview_url`/`mime` 正确）、`comfy_retry` 重排失败作业并重生成成功、`comfy_cancel` 标记 `terminated`、并新增 `tests/test_comfy_h3_converter.py` 回归（23/23 ComfyUI 用例全绿）。详见 §4 时间线 `e096834` 行与 §10「H3 实机验收收尾」条目。
 
-### P3　冻结发布（标准流程，已执行至第 17 次）
+### P3　冻结发布（标准流程，已执行至第 18 次）
 
 按 `docmind-frozen-release` Skill：py_compile → **250 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(68) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → 前端产物 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
-第 15/16/17 次均已执行（最新 `344007e`=第 16 次、`DocMind_BUILD.md` 第 17 次章节=20:56 构建）。
-**第 17 次交付卡点已解除（2026-09-14 接手核证）**：第 16 次旧实例已关闭、无 DocMind 进程残留；第 17 次产物（`dist/DocMind/DocMind.exe`，mtime 2026-09-14 20:56，19,673,210 字节）已换入 `dist/DocMind`，临时目录 `D:/Temp/docmind_rel15` 已清理。下次发布直接从第 18 次流程开始。
+第 15/16/17/18 次均已执行（最新 `DocMind_BUILD.md` 第 18 次章节=2026-09-15 13:09 构建；exe SHA-256 `1772415d…`）。
+**第 18 次交付卡点（同第 17 次原态）**：用户正运行的 8000 端口桌面实例锁定 `dist/DocMind/DocMind.exe`，第 18 次产物暂未换入，存于 `D:/Temp/docmind_rel18/DocMind/`。待用户关闭该实例后 `robocopy /MIR` 换入 `dist/DocMind` 即完成交付，无需重打包。
 
 ### 其他已记录的改进点
 

@@ -1,13 +1,40 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第十七次重建（RAG 问答质量收紧：提示词纪律 + 深度思考标注 + 文件链接看源码 + 思考泄漏修复）」；历史构建清单保留在下文。
+> 最新构建见下方「第十八次重建（ComfyUI 受管生命周期 + H3 实机验收 + 网页检索工具落定，并修回 17 次构建引入的 TaskEnginePanel 崩溃回归）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 19.7 MB，控制台模式，启动时自动开浏览器）
 - 整体体积：约 309 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 91 MB/365 文件；**第十六次起不再打包开发者 `.chroma` 索引库，较第十五次 682.5 MB 降约 374 MB**）
-- **当前构建时间：`2026-09-14 18:16:52`（第十六次重建，模型预加载驻留修复 + 索引库 .chroma 泄漏修复，exe 19,670,711 字节）**
+- **当前构建时间：`2026-09-15 13:09:19`（第十八次重建，ComfyUI 受管生命周期 + H3 实机验收 + 网页检索工具 + TaskEnginePanel 崩溃回归修复，exe 19,737,852 字节，SHA-256 1772415d76788920d5b33b57b0253863903cba081804f3894e2cdcda591a17a1）**
 - 上一版：`2026-09-14 17:14:57`（第十五次重建，桌面入口改 RAG 问答页 + 引擎嵌入 + 场景画布 + Agent 路由收敛，exe 19,670,124 字节）
+
+---
+
+## 第十八次重建：ComfyUI 受管生命周期 + H3 实机验收 + 网页检索工具落定，并修回 17 次构建引入的 TaskEnginePanel 崩溃回归（2026-09-15 13:09）
+
+### 改动
+- **ComfyUI 受管生命周期完整落地**（17 次构建后并入的大量提交，09-15 全量）：启停控制（`start`/`stop`/`status`）、历史分页（`/api/comfy/jobs?page&page_size`，前端 `TaskEnginePanel` 每 4s 轮询释放租约）、精确取消（按 prompt_id 调 `/interrupt` 并置 `cancel_requested`/`cancel_state`）、有界重试（`retryComfy`）、来源校验（provenance：`validateProvenance` → 受保护 `import`，需人工审核标记）、模板参数应用（`applyComfyParams` 节点校验）、3D/媒体网格输出分类（`classifyComfyUIOutputs`）、Unreal 桥接（Blueprint/Actor 查询 + 受保护写端点）、GPU 协调增强（显存门槛/探测缓存/空闲卸载竞态/孤儿恢复/遥测）。
+- **H3 子图 UI→API 转换器重写 + 实机短生成/取消/重试验收**（`e096834`，HANDOFF 收尾 `9b97ead`）：`feat: H3 子图 UI->API 转换器重写` 将 ComfyUI UI workflow 转 API prompt（映射 widget 字段、归一化 H3 模型路径、裁剪 editor-only/预览/标注节点、支持 union 输入、跳过缺失引用图、保留 SaveVideo API 字段、校验 link 类型、映射 legacy UUID）；实机跑通 39 帧（≈1.6s）短生成 + 取消 + 重试端到端，HANDOFF §5 P2-2 标【已解决 `e096834`】。
+- **网页可审计抓取 + 答案来源可点击**（09-15 全量）：`feat: add auditable web page fetch tool` + 答案中 `相对路径`/URL 引用变蓝链；research 组合工作流（`web_research`）。
+- **修复两处构建前发现的回归（随本构建同次提交，尚未独立 commit）**：
+  - **`game_workbench.py` `comfy_history` 租约释放竞态**：后台 `comfy_watch` 线程轮询 `comfy_history`（带释放）会与前端每 4s 轮询（API `GET /api/comfy/history`）抢释放，导致 `lease_released` 非确定性（单测 `test_cancel_requests_interrupt_then_releases_on_terminal_history` 偶发失败）。改为 `comfy_watch` 调 `comfy_history(..., _release=False)` 仅更新状态，真实释放只走用户侧轮询；`comfy_history` 加 `_release` 开关。修复后 `tests/test_gpu_coordinator.py` 31/31、全量 313/313。
+  - **`TaskEnginePanel.vue` `comfyPage`/`comfyTotal` 未声明即用**：17 次构建引入的前端回归——`loadComfyHistory`/`comfyPage` pager 使用这两个 `ref` 但第 7 行声明链漏掉，浏览器加载即抛 `ReferenceError: comfyPage is not defined`，面板崩溃。补 `comfyPage = ref(1), comfyTotal = ref(0)` 后浏览器冒烟从 26/27 回升至 27/27（此前唯一失败即此项）。
+
+### 验证
+- 单测：全量 `unittest discover` **313/313 通过**（含 ComfyUI 生命周期 + H3 转换器 + GPU 协调回归；`skipped=1`）。
+- 场景画布：后端 `verify_scene_canvas.py` **54/54**；浏览器冒烟 `verify_scene_canvas_ui.mjs`（serve 8011）**27/27**（修复 comfyPage 崩溃后从 26/27 回升）。
+- 引擎嵌入：真机 `verify_engine_embed.py` **68/68 沿用第十七次**——本轮未改动引擎嵌入代码路径（`game_workbench.py` 仅动了 `comfy_history`/`comfy_watch`，未触碰嵌入逻辑），故直接继承 17 次实机结论，未重复弹窗。
+- 前端：`npm run build` 成功；vendor 三分包（vue/codemirror/misc）哈希与 17 次一致，业务改动未使其失效；`web/assets/workbench-BBWdzMae.js` 182,945 字节、`SceneCanvas-BCwZps71.js` 240,029 字节。
+- 冻结态（最小 PATH 仅 `System32`，`DOCMIND_SERVER_ONLY=1`，PyInstaller 退出码 0，端口 8022 冷冒烟）：
+  - 冷启动 ~1s 服务就绪；build_time（exe mtime）`2026-09-15 13:09:19`；exe 19,737,852 字节；SHA-256 `1772415d76788920d5b33b57b0253863903cba081804f3894e2cdcda591a17a1`；
+  - `/` 200（RAG 问答页，响应体字节与 `web/index.html` SHA-256 一致 `18dda125…`）；`/workbench/` 307→`workbench.html` 且字节与 `web/workbench.html` 一致 `f11e211…`；`/assets/*` 9 个 JS+CSS 逐个 SHA-256 与源一致；favicon 200；
+  - `/api/health` 200（`provider=mock`/`embedding_provider=local`，Ollama 本机 `present_models` 含 `bge-m3:latest` 等）；`/api/config` 200；
+  - **12 个前端产物经 HTTP 返回体与 `web/` 源逐字节一致**（SHA-256 全 match：index.html / workbench.html / favicon.ico / 9 个 JS+CSS）；
+  - 包内**无 `.chroma` / `.env` / `.docmind_state.json`** 泄漏（冒烟 exe 惰性初始化的 `_internal/.chroma` 与 `.docmind` 运行时态已清出）；无 `python*.exe`；MinGit 随包（`cmd/git.exe` 校验通过）；冒烟后已杀进程、端口释放、bundle 清理。
+- 源码对应提交（本轮修复）：`game_workbench.py` comfy_history 竞态修复、`TaskEnginePanel.vue` comfyPage/comfyTotal 补声明（二者随本构建同次提交，见下方「第十八次构建提交」）；H3 与 ComfyUI 生命周期主体见 `e096834` / `9b97ead` 及 09-15 全量提交。
+
+> **交付说明**：同第十七次——用户正运行的 8000 端口桌面实例锁定 `dist/DocMind/DocMind.exe`，暂未换入冻结产物。待用户关闭该实例后，将 `D:/Temp/docmind_rel18/DocMind/` 经 `robocopy /MIR` 换入 `rag-agent/dist/DocMind/` 即完成交付，无需重打包。
 
 ---
 
