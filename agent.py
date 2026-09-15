@@ -42,6 +42,9 @@ PARALLEL_TOOLS = os.getenv("DOCMIND_PARALLEL_TOOLS", "1") != "0"
 PARALLEL_MAX = int(os.getenv("DOCMIND_PARALLEL_MAX", "4"))
 # 编排动态重规划：任务失败后最多追加几次补救（0 = 关闭）
 ORCH_MAX_REPLANS = int(os.getenv("DOCMIND_ORCH_MAX_REPLANS", "2"))
+# 子代理执行轨迹回传：保留多少步、每步观察截断多少字（喂给 replanner 做归因）
+ORCH_TRACE_STEPS = int(os.getenv("DOCMIND_ORCH_TRACE_STEPS", "6"))
+ORCH_TRACE_OBS_CHARS = int(os.getenv("DOCMIND_ORCH_TRACE_OBS_CHARS", "240"))
 # 明确有副作用、**不可并发**的工具：批内只要出现一个就整体退回顺序执行。
 # （delegate 允许并发——子代理各自持独立 LLMClient，见 _delegate）
 _NO_PARALLEL_TOOLS = {"apply_edit", "create_file", "dev_region_edit", "run_command",
@@ -482,6 +485,26 @@ def _parse_role_task(arg):
     return role, task
 
 
+def _child_trace(traj, thoughts, reflections=None, turn_record=None, used=None):
+    """把子代理的执行轨迹压成**有界**结构，挂到任务结果上（供 replanner 归因）。
+
+    这是"把执行轨迹喂给 replanner"的载体：只有逐步做了什么（action + 观察片段）、
+    少量思考/反思，以及结局/用量——不含完整原文，避免提示词爆炸。
+    """
+    rec = turn_record or {}
+    return {
+        "steps": list(traj or []),
+        "n_steps": int(used if used is not None else len(traj or [])),
+        "thoughts": [_clip(str(t), 160) for t in (thoughts or []) if str(t).strip()][:3],
+        "reflections": [_clip(str(r), 160) for r in (reflections or []) if str(r).strip()][:2],
+        "outcome": rec.get("outcome"),
+        "llm_calls": rec.get("llm_calls"),
+        "tokens": {"in": rec.get("prompt_tokens"), "out": rec.get("completion_tokens")},
+        "elapsed_ms": rec.get("elapsed_ms"),
+        "cost_cny": rec.get("cost_cny"),
+    }
+
+
 def _load_json_arg(arg):
     """容错解析工具入参里的 JSON（剥掉 ``` 代码围栏）。返回 (obj, error)。"""
     text = (arg or "").strip()
@@ -559,6 +582,7 @@ class Agent:
         self.tool_allowlist = list(tool_allowlist) if tool_allowlist else None
         self._native_queue = []    # 顺序回退用：逐个消化的 tool_calls
         self._pending_batch = []   # 并行批次用：一轮的多个只读 tool_calls
+        self.last_turn_record = None   # 最近一回合的 trace 记录（父代理据此回传子代理轨迹）
 
     def _native_enabled(self):
         """本轮是否走原生 function-calling。"""
@@ -725,6 +749,7 @@ class Agent:
             except Exception:  # noqa: BLE001
                 turn.cost_cny = 0.0
             rec = turn.to_record()
+            self.last_turn_record = rec      # 供父代理读取（子代理轨迹/成本回传）
             _trace.record(rec)
             if turn.cost_cny:
                 try:
@@ -1323,7 +1348,8 @@ class Agent:
             question += "\n\n【上游子任务结论（供参考，勿重复劳动）】\n" + ctx
         cap = max(1, SUBAGENT_MAX_STEPS)
         final_text, used = "", 0
-        thoughts, last_obs = [], ""
+        thoughts, reflections, last_obs = [], [], ""
+        traj, pending = [], None          # traj: [{action, obs}] —— 有界的逐步轨迹
         try:
             for ev in child.run(question, stream=False):
                 et = ev.get("type")
@@ -1331,15 +1357,25 @@ class Agent:
                     final_text = ev.get("text") or ""
                 elif et == "action":
                     used += 1
+                    if len(traj) < ORCH_TRACE_STEPS:
+                        pending = {"action": ev.get("text") or "", "obs": ""}
+                        traj.append(pending)
+                    else:
+                        pending = None    # 超出上限：只计数，不再累积（防止提示爆炸）
                 elif et == "thought":
                     thoughts.append(ev.get("text") or "")
+                elif et == "reflection":
+                    reflections.append(ev.get("text") or "")
                 elif et == "observation":
                     last_obs = ev.get("text") or ""
+                    if pending is not None and not pending["obs"]:
+                        pending["obs"] = _clip(last_obs, ORCH_TRACE_OBS_CHARS)
                 if used > cap:
                     break
         except Exception as e:  # noqa: BLE001 —— 子代理失败不应炸掉父回合
             return {"status": "failed", "conclusion": "", "steps": used,
-                    "error": f"{type(e).__name__}: {e}"}
+                    "error": f"{type(e).__name__}: {e}", "trace": _child_trace(traj, thoughts)}
+
         if turn is not None:
             turn.add_usage(getattr(child_llm, "last_usage", None))
 
@@ -1353,7 +1389,9 @@ class Agent:
                 degraded = True
                 conclusion = "（子代理未在步数内收尾，以下为过程要点）\n" + _clip(salvage, 900)
         return {"status": "ok", "conclusion": conclusion, "steps": used,
-                "error": "", "degraded": degraded}
+                "error": "", "degraded": degraded,
+                "trace": _child_trace(traj, thoughts, reflections,
+                                      getattr(child, "last_turn_record", None), used)}
 
     def _delegate(self, arg, turn=None):
         """单个子代理委派（delegate 工具）——返回给父代理的一条 Observation 文本。"""
@@ -1421,6 +1459,29 @@ class Agent:
             r = results.get(t["id"]) or {}
             brief.append(f"- 任务 {t['id']}（{t.get('role')}）目标：{t['task']}\n"
                          f"  失败原因：{r.get('error') or '未知'}")
+            # 关键：把子代理的**执行轨迹**给到模型，让它能定位"为什么没成"，
+            # 从而提出有针对性的补救（而不是盲猜一个换汤不换药的做法）
+            tr = r.get("trace") or {}
+            for i, st in enumerate(tr.get("steps") or [], 1):
+                act = _clip(str(st.get("action") or ""), 140)
+                obs = _clip(str(st.get("obs") or ""), 200)
+                brief.append(f"  轨迹{i}. {act} → {obs or '（无观察）'}")
+            meta = []
+            if tr.get("outcome"):
+                meta.append(f"结局={tr['outcome']}")
+            if tr.get("n_steps") is not None:
+                meta.append(f"步数={tr['n_steps']}")
+            tok = tr.get("tokens") or {}
+            if tok.get("in") or tok.get("out"):
+                meta.append(f"tokens={tok.get('in')}/{tok.get('out')}")
+            if tr.get("elapsed_ms"):
+                meta.append(f"耗时={tr['elapsed_ms']}ms")
+            if meta:
+                brief.append("  " + "，".join(meta))
+            for th in (tr.get("thoughts") or [])[:2]:
+                brief.append(f"  模型当时在想：{th}")
+            if not (tr.get("steps") or tr.get("thoughts")):
+                brief.append("  （该任务未留下可用执行轨迹）")
         ok_lines = [f"- {tid}：{(r.get('conclusion') or '')[:200]}"
                     for tid, r in results.items()
                     if r.get("status") == "ok" and r.get("conclusion")]

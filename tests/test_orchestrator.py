@@ -539,6 +539,121 @@ class AgentOrchestrateTests(unittest.TestCase):
         self.assertTrue(out.get("degraded"), "应标记为降级（过程要点）")
 
 
+class _ScriptLLM:
+    """按序回放脚本（逐字符流式），用于造出子代理的执行轨迹。"""
+    provider = "fake"
+    model = "script"
+
+    def __init__(self, scripts):
+        self.scripts = scripts
+        self.i = 0
+        self.last_usage = {}
+        self.last_tool_calls = []
+
+    def clone(self):
+        return _ScriptLLM(self.scripts)
+
+    def chat(self, messages, stream=True, **kw):
+        s = self.scripts[min(self.i, len(self.scripts) - 1)]
+        self.i += 1
+        self.last_usage = {"prompt_tokens": 5, "completion_tokens": 2}
+        self.last_tool_calls = []
+        if stream:
+            def g():
+                for ch in s:
+                    yield ch
+            return g()
+        return s
+
+    def count_tokens(self, text):
+        return 1
+
+
+class TraceFeedbackTests(unittest.TestCase):
+    """子代理执行轨迹回传：被抓取、有界、并进入 replanner 提示。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="dm_tf_")
+        self._t = agent_trace.TRACE_FILE
+        self._s = sessions.SESSIONS_DIR
+        agent_trace.TRACE_FILE = os.path.join(self.tmp, "t.jsonl")
+        sessions.SESSIONS_DIR = os.path.join(self.tmp, "s")
+
+    def tearDown(self):
+        agent_trace.TRACE_FILE = self._t
+        sessions.SESSIONS_DIR = self._s
+
+    def test_child_trace_captured(self):
+        llm = _ScriptLLM([
+            "Thought: 先搜代码\nAction: search_code\nAction Input: query: foo",
+            "Thought: 再读文件\nAction: read_file\nAction Input: path: bar.gd",
+            "Final Answer: 完成",
+        ])
+        a = agent_mod.Agent(llm=llm)
+        out = a._run_child("researcher", "查 foo")
+        tr = out["trace"]
+        self.assertEqual(tr["n_steps"], 2)
+        self.assertEqual([s["action"].split("(")[0] for s in tr["steps"]],
+                         ["search_code", "read_file"])
+        self.assertTrue(tr["steps"][0]["obs"], "每一步应带观察片段")
+        self.assertEqual(tr["outcome"], "completed")
+        self.assertGreater(tr["tokens"]["in"], 0)
+
+    def test_child_trace_is_bounded(self):
+        # 放开子代理步数上限、收紧轨迹上限，验证"真实步数 > 保留轨迹长度"
+        old_cap, old_steps = agent_mod.SUBAGENT_MAX_STEPS, agent_mod.ORCH_TRACE_STEPS
+        agent_mod.SUBAGENT_MAX_STEPS = 10
+        agent_mod.ORCH_TRACE_STEPS = 3
+        try:
+            scripts = [f"Action: search_code\nAction Input: query: t{i}" for i in range(9)]
+            scripts.append("Final Answer: 完成")
+            a = agent_mod.Agent(llm=_ScriptLLM(scripts))
+            tr = a._run_child("researcher", "查")["trace"]
+            self.assertEqual(len(tr["steps"]), 3, "轨迹步数应被上限截断")
+            self.assertGreater(tr["n_steps"], len(tr["steps"]),
+                               "真实步数应大于保留的轨迹长度")
+        finally:
+            agent_mod.SUBAGENT_MAX_STEPS, agent_mod.ORCH_TRACE_STEPS = old_cap, old_steps
+
+    def test_observation_is_truncated(self):
+        long_obs = "x" * 5000
+        a = agent_mod.Agent(llm=_ScriptLLM(["Final Answer: 完成"]))
+        out = a._run_child("researcher", "查")
+        self.assertIsInstance(out["trace"], dict)
+        # 直接验证截断逻辑（用超长观察构造）
+        tr = agent_mod._child_trace([{"action": "search_code(x)", "obs": long_obs[:agent_mod.ORCH_TRACE_OBS_CHARS]}],
+                                    [], [], None, 1)
+        self.assertLessEqual(len(tr["steps"][0]["obs"]), agent_mod.ORCH_TRACE_OBS_CHARS)
+
+    def test_last_turn_record_exposed_after_run(self):
+        a = agent_mod.Agent(llm=_ScriptLLM(["Final Answer: 你好"]))
+        list(a.run("hi", stream=True))
+        self.assertIsInstance(a.last_turn_record, dict)
+        self.assertEqual(a.last_turn_record.get("outcome"), "completed")
+
+    def test_report_shows_trace_for_failed_task(self):
+        report = {
+            "n_tasks": 1, "waves": [["a"]], "order": ["a"], "replans": 0, "revisions": [],
+            "blocked": [], "merged": "", "elapsed_ms": 5, "n_ok": 0, "n_failed": 1,
+            "results": {"a": {"status": "failed", "error": "挂了", "elapsed_ms": 3,
+                              "trace": {"steps": [{"action": "search_code(q)", "obs": "无"},
+                                                  {"action": "grep(x)", "obs": "无"}]}}},
+        }
+        text = orch.format_report(report)
+        self.assertIn("轨迹（2 步）", text)
+        self.assertIn("search_code(q)", text)
+
+    def test_report_without_trace_is_fine(self):
+        report = {
+            "n_tasks": 1, "waves": [["a"]], "order": ["a"], "replans": 0, "revisions": [],
+            "blocked": [], "merged": "", "elapsed_ms": 5, "n_ok": 0, "n_failed": 1,
+            "results": {"a": {"status": "failed", "error": "挂了", "elapsed_ms": 3}},
+        }
+        text = orch.format_report(report)
+        self.assertIn("[FAIL] a", text)
+        self.assertNotIn("轨迹（", text)
+
+
 class _ReplanLLM:
     """按提示内容分流：重规划请求回 JSON 补救任务，其余回 Final Answer。"""
     provider = "deepseek"
@@ -547,6 +662,7 @@ class _ReplanLLM:
     def __init__(self, remediation):
         self.remediation = remediation
         self.calls = []
+        self.prompts = []
         self.last_usage = {}
         self.last_tool_calls = []
 
@@ -556,6 +672,7 @@ class _ReplanLLM:
     def chat(self, messages, stream=True, **kw):
         prompt = (messages[-1].get("content") or "") if messages else ""
         self.calls.append(prompt[:60])
+        self.prompts.append(prompt)
         self.last_usage = {"prompt_tokens": 3, "completion_tokens": 1}
         self.last_tool_calls = []
         if "重规划" in prompt:
@@ -632,6 +749,39 @@ class AgentReplanTests(unittest.TestCase):
         a = agent_mod.Agent(llm=llm)
         out = a._replanner([{"id": "a", "task": "甲"}], {"a": {"status": "failed"}}, 1)
         self.assertEqual(out, {"drop": ["b"]})
+
+    def test_replanner_prompt_contains_execution_trace(self):
+        llm = _ReplanLLM([])
+        a = agent_mod.Agent(llm=llm)
+        failed = [{"id": "b", "role": "reviewer", "task": "评审这段实现"}]
+        results = {"b": {"status": "failed", "error": "工具一直没命中",
+                         "trace": {"steps": [{"action": "search_code(query: x)",
+                                              "obs": "未找到相关内容"}],
+                                   "n_steps": 3, "outcome": "evidence_fallback",
+                                   "tokens": {"in": 120, "out": 30}, "elapsed_ms": 800,
+                                   "thoughts": ["我应该换个关键词"]}}}
+        self.assertEqual(a._replanner(failed, results, 1), [])
+        prompt = llm.prompts[-1]
+        for needle in ("轨迹1.", "search_code(query: x)", "未找到相关内容",
+                       "evidence_fallback", "我应该换个关键词", "步数=3"):
+            self.assertIn(needle, prompt, f"提示词里缺少 {needle!r}")
+
+    def test_replanner_notes_missing_trace(self):
+        llm = _ReplanLLM([])
+        a = agent_mod.Agent(llm=llm)
+        a._replanner([{"id": "b", "role": "reviewer", "task": "评审"}],
+                     {"b": {"status": "failed", "error": "挂了"}}, 1)
+        self.assertIn("未留下可用执行轨迹", llm.prompts[-1])
+
+    def test_orchestrate_end_to_end_trace_reaches_replanner(self):
+        # 真链路：坏角色任务失败 → 子代理无轨迹 → 提示词里出现"未留下可用执行轨迹"
+        llm = _ReplanLLM([])
+        a = agent_mod.Agent(llm=llm)
+        rep = a.orchestrate({"tasks": [{"id": "a", "role": "wizard", "task": "坏角色"}]},
+                            synth=False, replan=True)
+        self.assertEqual(rep["replans"], 0)
+        self.assertIn("未留下可用执行轨迹", llm.prompts[-1])
+        self.assertEqual(rep["results"]["a"]["status"], "failed")
 
     def test_orchestrate_backtracking_replace_rescues_task(self):
         # a 是坏角色 → 必然失败；b 依赖 a 本会被阻断，replanner 用 replace 把 b 的依赖摘掉

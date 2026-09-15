@@ -345,6 +345,11 @@ def format_report(report, max_conclusion=400):
         if len(body) > max_conclusion:
             body = body[:max_conclusion] + "…（截断）"
         lines.append(f"- [{mark}] {tid}（{r.get('elapsed_ms', 0)}ms）：{body or '（无内容）'}")
+        # 失败/被取消的任务补一行轨迹摘要：让下游/用户看得见"它到底试了什么"
+        steps = (r.get("trace") or {}).get("steps") or []
+        if status in ("failed", "dropped") and steps:
+            chain = " → ".join(str(s.get("action") or "?")[:40] for s in steps)
+            lines.append(f"    轨迹（{len(steps)} 步）：{chain}")
     for rev in report.get("revisions") or []:
         bits = []
         if rev.get("added"):
