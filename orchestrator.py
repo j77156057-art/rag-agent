@@ -14,8 +14,12 @@
 """
 from __future__ import annotations
 
+import inspect
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+
+import pricing
 
 MAX_TASKS = int(__import__("os").environ.get("DOCMIND_ORCH_MAX_TASKS", "12"))
 
@@ -96,6 +100,66 @@ def topological_waves(tasks):
         for deps in remaining.values():
             deps.difference_update(ready)
     return waves
+
+
+_WS = re.compile(r"\s+")
+
+
+def _norm_task(text):
+    return _WS.sub(" ", str(text or "").strip()).lower()
+
+
+def dedup_tasks(tasks):
+    """批次内去重 + 依赖重路由。
+
+    按 ``(role, 归一化 task)`` 判定重复；保留拓扑波序中最靠前的副本，
+    后续副本标记 dropped，并把其下游 ``depends_on`` 重路由（transitive）到保留副本。
+    返回 ``(kept_tasks, dropped_ids, remap)``。无重复时 dropped/remap 为空。
+    """
+    tasks = parse_plan(list(tasks))           # 复用校验（id 重复/依赖/循环）
+    waves = topological_waves(tasks)
+    order_idx = {}
+    for wi, w in enumerate(waves):
+        for i, tid in enumerate(w):
+            order_idx[tid] = (wi, i)
+
+    seen, kept, dropped, remap = {}, [], [], {}
+    for t in tasks:
+        key = (t["role"], _norm_task(t["task"]))
+        if key in seen:
+            dropped.append(t["id"])
+            remap[t["id"]] = seen[key]
+        else:
+            seen[key] = t["id"]
+            kept.append(t)
+    if not dropped:
+        return kept, dropped, remap
+
+    # 重路由：被删副本的 id 在其它任务 depends_on 中替换为其保留副本（递归收敛，无环）
+    def _resolve(did):
+        guard = set()
+        while did in remap and did not in guard:
+            guard.add(did)
+            did = remap[did]
+        return did
+
+    for t in kept:
+        if t["depends_on"]:
+            t["depends_on"] = [d for d in (_resolve(d) for d in t["depends_on"])
+                               if d != t["id"]]
+    return kept, dropped, remap
+
+
+def _replanner_accepts_ctx(fn):
+    """探测 replanner 是否接受第 4 个 ctx 参数（支持 4 位置参或 **kwargs）。"""
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError):
+        return False
+    params = list(sig.parameters.values())
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+        return True
+    return len(params) >= 4
 
 
 def _is_optional(tid, by_id, results):
@@ -205,7 +269,8 @@ def apply_proposal(proposal, by_id, tasks, results, max_tasks):
 
 
 def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
-             replanner=None, max_replans=0, max_tasks=None):
+             replanner=None, max_replans=0, max_tasks=None,
+             budget_session="", vram_provider=None, cost_aware=False):
     """迭代调度任务图（支持**动态重规划**）。
 
     runner(task, context) -> {"status": "ok"|"failed", "conclusion": str,
@@ -223,7 +288,6 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
     t0 = time.monotonic()
     # 接受"原始任务"或"已 parse_plan 过的任务"两种入参（幂等规范化，避免调用方踩坑）
     tasks = parse_plan(list(tasks))
-    by_id = {t["id"]: t for t in tasks}
     topological_waves(tasks)          # 静态校验：先炸出循环依赖
     limit_tasks = int(max_tasks or MAX_TASKS)
     results = {}
@@ -238,6 +302,16 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
                 on_event(kind, payload)
             except Exception:  # noqa: BLE001 —— 埋点/通知失败不影响调度
                 pass
+
+    # 批次内去重：合并完全相同的 (role, 任务) 副本，依赖重路由到保留副本
+    tasks, _dropped, _remap = dedup_tasks(tasks)
+    by_id = {t["id"]: t for t in tasks}
+    if _dropped:
+        for _did in _dropped:
+            results[_did] = {"status": "deduped", "conclusion": "", "steps": 0,
+                             "error": "", "elapsed_ms": 0, "kept": _remap.get(_did),
+                             "optional": True}
+        _emit("dedup", {"dropped": _dropped, "remap": _remap})
 
     while True:
         runnable = []
@@ -255,6 +329,23 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
             else:
                 runnable.append(t)
         if not runnable:
+            break
+
+        # 成本/显存感知：预算已用尽则停止本轮调度（不空跑烧钱）
+        _ctx_budget = pricing.check(budget_session) if cost_aware else {"ok": True}
+        _vram_free = None
+        if vram_provider is not None:
+            try:
+                _vram_free = vram_provider()
+            except Exception:  # noqa: BLE001 —— 探测失败按无信息处理
+                _vram_free = None
+        if cost_aware and not _ctx_budget.get("ok"):
+            for _t in runnable:
+                results[_t["id"]] = {"status": "blocked", "conclusion": "", "steps": 0,
+                                     "error": "预算已用尽，停止调度", "elapsed_ms": 0}
+                blocked[_t["id"]] = "预算已用尽（%s）" % _ctx_budget.get("reason", "")
+            _emit("budget", {"reason": _ctx_budget.get("reason", ""),
+                             "blocked": [_t["id"] for _t in runnable]})
             break
 
         _emit("wave", {"wave": len(rounds), "tasks": [t["id"] for t in runnable]})
@@ -284,8 +375,13 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
 
         failed = [t for t in runnable if (results.get(t["id"]) or {}).get("status") == "failed"]
         if failed and replanner is not None and replans < int(max_replans):
+            _ctx = {"budget": _ctx_budget, "vram_free": _vram_free,
+                    "attempt": replans + 1, "cost_aware": cost_aware}
             try:
-                proposal = replanner(failed, dict(results), replans + 1)
+                if _replanner_accepts_ctx(replanner):
+                    proposal = replanner(failed, dict(results), replans + 1, _ctx)
+                else:
+                    proposal = replanner(failed, dict(results), replans + 1)
             except Exception:  # noqa: BLE001 —— 重规划失败按"不再重规划"处理
                 proposal = None
             delta = apply_proposal(proposal, by_id, tasks, results, limit_tasks)
@@ -316,6 +412,7 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
         "merged": merged,
         "replans": replans,
         "revisions": revisions,
+        "deduped": {"dropped": _dropped, "remap": _remap},
         "dropped": [tid for r in revisions for tid in r.get("dropped", [])],
         "n_tasks": len(tasks),
         "n_ok": sum(1 for r in results.values() if r.get("status") == "ok"),
@@ -336,7 +433,7 @@ def format_report(report, max_conclusion=400):
         r = report["results"].get(tid, {})
         status = r.get("status")
         mark = {"ok": "ok", "failed": "FAIL", "blocked": "BLOCKED",
-                "dropped": "DROPPED"}.get(status, status)
+                "dropped": "DROPPED", "deduped": "DEDUP"}.get(status, status)
         if status == "ok" and r.get("degraded"):
             mark = "ok(部分)"   # 子代理未在步数内收尾，结论是过程要点兜底
         body = (r.get("conclusion") or "").strip()

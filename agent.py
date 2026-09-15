@@ -25,6 +25,10 @@ import sessions as _sessions
 import hooks as _hooks
 import skills as _skills
 import pricing as _pricing
+try:
+    import gpu_coordinator as _gpu
+except Exception:  # noqa: BLE001 —— 无 GPU/探测失败不得影响导入
+    _gpu = None
 import orchestrator as _orchestrator
 
 # 单轮总截止时间（秒）：0 或负数表示不限时。防止一次问答无限拖长。
@@ -699,6 +703,18 @@ class Agent:
             yield {"type": "final",
                    "text": f"（预算熔断）{_bud.get('reason', '预算已用尽')}。"
                            f"可在 /api/budget 调整额度或清零后重试。"}
+            return
+
+        # ①-b 每分钟限流：超出则拒绝本轮（调用次数上限在此预检并计数）
+        try:
+            _rate = _pricing.rate_check(self.session_id or "", projected_cost=0.0)
+        except Exception:  # noqa: BLE001
+            _rate = {"ok": True}
+        if not _rate.get("ok"):
+            turn.finish("rate_limited")
+            _trace.record(turn.to_record())
+            yield {"type": "final",
+                   "text": f"（每分钟限流）{_rate.get('reason', '调用过于频繁')}。请稍后重试。"}
             return
 
         # ② pre_turn 钩子：可改写问题，或整轮拦截
@@ -1540,7 +1556,7 @@ class Agent:
         synth_runner = (lambda ts, rs: self._synth(ts, rs, turn=turn)) if synth else None
         rp = None
         if replan:
-            rp = lambda fs, rs, att: self._replanner(fs, rs, att, turn=turn)  # noqa: E731
+            rp = lambda fs, rs, att, ctx=None: self._replanner(fs, rs, att, turn=turn)  # noqa: E731
         return _orchestrator.run_plan(
             tasks,
             lambda t, ctx: self._task_runner(t, ctx, turn=turn),
@@ -1548,6 +1564,9 @@ class Agent:
             max_parallel=mp,
             replanner=rp,
             max_replans=(ORCH_MAX_REPLANS if max_replans is None else int(max_replans)),
+            budget_session=self.session_id or "",
+            vram_provider=(lambda: (_gpu.memory_info() or {}).get("free_mb") if _gpu else None),
+            cost_aware=True,
         )
 
     def _orchestrate_tool(self, arg, turn=None):

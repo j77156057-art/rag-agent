@@ -190,11 +190,10 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 - **执行轨迹是"有界摘要"**：喂给 `replanner` 的轨迹只保留最近 `DOCMIND_ORCH_TRACE_STEPS`（默认 6）步、每步观察截断到 `DOCMIND_ORCH_TRACE_OBS_CHARS`（默认 240 字），且不含子代理的完整原文/原始工具输出——超长轨迹与原文只能去 `.docmind_traces.jsonl` 里按 `turn_id` 查。
 - **replanner 看不到父代理自己的回合轨迹**：它拿到的是各子任务的轨迹摘要，不含主代理这一轮的选择过程。
 - **结论可信度校验**：`synth` 只做**合成与冲突标注**，不会独立复核某个子任务的结论是否属实（没有 fact-check 环节）。
-- **成本感知调度**：`max_parallel` 是静态的；重规划也不会参考剩余预算/显存决定补不补。
-- **批次内去重与依赖排序**：并行工具批次的重复调用不去重、也互不感知依赖（各跑各的）。
+- **批次内去重与依赖排序 / 成本感知调度 / 每分钟限流 / 跨重启日配额强一致** 已于 2026-09-15 落地（见 §4 `1709486` 之后的 harness 增强提交）：`run_plan` 新增 `dedup_tasks`（按 role+归一化任务去重并依赖重路由）、每波前 `pricing.check` + `vram_provider` 预算/显存感知停波、`replanner` 第四参 ctx 透传 `{budget,vram_free,attempt}`；`pricing` 改跨进程文件锁强一致 + 每分钟调用/费用限额。下列边界仍成立：
 - **hooks 无沙箱**：钩子是以 `importlib` 在服务进程内直接加载的 `.py`，权限等同本服务本身（只适合可信本地代码）。
 - **技能仅是提示词注入**：`SKILL.md` 只提供指引文本，不携带可执行脚本或权限声明，也不参与工具白名单。
-- **成本熔断粒度**：按 provider/model 单价 + 会话/全局累计；**未**做每分钟限流、按工具计费、跨重启的日配额强一致。
+- **成本熔断粒度（仍缺）**：已按 provider/model 单价 + 会话/全局累计 + 每分钟限流 + 跨重启日配额强一致；**仍**未做「按工具计费」（无法区分同一次 LLM 调用里不同子任务的花费分摊）——这是有意简化，不得宣称可按工具出账。
 - **golden 门依赖本地模型**：无本地模型时优雅 SKIP；CI 上常驻的只有离线规则打分（`tests/test_agent_eval.py`）。
 
 ### 其他已记录的改进点
@@ -452,6 +451,13 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - `agent.py` `SYSTEM_PROMPT` 改写连接器指引，接入「发现→路由→列工具→调用→切换」闭环（原仅一句 `dev_mcp_call` 提示且让 Agent 自行读工具清单，无运行时发现/路由手段）。
 - `api.py` 新增 `GET /api/agent/connector-route`（包装 `select_connector`，供前端复用与真机核对）；`/api/agent/connectors` 返回追加 `capabilities`/`best_for`（additive，向后兼容）。
 - 新增 `tests/test_connector_routing.py` 13 例（能力推导/目录启用态/排序/引擎专指过滤/unity 启用场景/`dev_*` 工具/端点形态），全绿；隔离端口 8079 真打 `connector-route`（`Godot 场景`→godot score 9、`Unity 构建`→[]）与 `connectors` 富化字段。**未实机**：真实 stdio 引擎（godot/uvx）的连接/工具调用路径本沙箱无引擎未跑，路由策略纯配置读取已离线覆盖。
+
+**2026-09-15 追加（harness 成本/并行增强）**
+- `orchestrator.run_plan` 新增三项能力：① **批次内去重** `dedup_tasks(tasks)` —— 按 `(role, 归一化任务)` 判定重复，保留拓扑波中最靠前的副本、后续副本标记 `deduped` 并把其下游 `depends_on` **传递重路由**到保留副本（发出 `dedup` 事件）；② **成本/显存感知调度** —— 每波前 `pricing.check(budget_session)`（仅 `cost_aware=True` 时）预算用尽则停该波并标记 `budget_blocked`、发 `budget` 事件，`vram_provider()` 探测显存自由量随波透传；③ **replanner 第四参 ctx** —— `inspect` 探测 4 参签名后透传 `{budget, vram_free, attempt, cost_aware}`。`run_plan` 新参数 `budget_session/vram_provider/cost_aware` **默认保持向后兼容**（cost_aware 默认 False，不改动既有调用方行为）。
+- `pricing` 强一致 + 每分钟限流：进程内 `threading.Lock` 换成**跨进程文件锁**（`O_EXCL` 原子锁文件 + `os.replace` 临时写，硬上限 5s 防卡死、3s 孤儿锁清理），`charge/set_limit/reset/check/status` 跨进程 RMW 不丢更新；新增 `per_minute` 调用/费用限额（分钟桶 `_minute_key`，跨分钟自动重置）+ `rate_check()` 预检、`set_rate_limit()` 配置、`charge()` 超限拒绝并标记 `rate_limited`；`status()` 暴露 `per_minute_calls_limit/cost_limit/calls_this_minute/rate_limited`。
+- `agent.py` `orchestrate` 调用处显式 `cost_aware=True` + `budget_session=self.session_id` + `vram_provider=(lambda: _gpu.memory_info().free_mb)`（防御式 `import gpu_coordinator`）；每回合预算熔断门（既有的 per-turn `pricing.check`）保留，编排层为额外的安全网。
+- `api.py` `/api/budget` 增 `per_minute_calls`/`per_minute_cost`（与 `limit_cny`/`reset` 可组合），返回 `rate` 块；`BudgetReq` schema 扩展。新增 `tests/test_harness_cost_parallel.py` 12 例（去重重路由/成本感知停波/replanner ctx/定价强一致并发不丢/每分钟限流）全绿；**全量 491 项 OK**。
+- **未实机**：①`/api/budget` 每分钟字段的真机 HTTP 验收因启动服务会触发沙箱对 `.docmind/gpu_state.json` 的批量删除保护（你已拒绝），改用 FastAPI `TestClient` + 临时预算文件的单测覆盖，端点包裹层以路由注册测试 + 代码核查为准；②成本感知停波仅在 `cost_aware=True` 且预算真用尽时触发，本机默认无预算不触发，逻辑由单测覆盖。
 
 **以下为 codex/p1-3-gpu-comfyui 分支原始变更记录（保留存档；其中部分设计在合并集成时被有意调整，以本文件末尾「P1-3 合并集成」段为准）**
 - 密钥存储新增 1 项回归测试：往返解密、明文不落盘、Provider 列表和撤销均已验证。全量测试 205 项。

@@ -1282,16 +1282,24 @@ class BudgetReq(BaseModel):
     limit_cny: Optional[float] = None
     session_id: str = ""
     reset: bool = False
+    per_minute_calls: Optional[float] = None
+    per_minute_cost: Optional[float] = None
 
 
 @app.post("/api/budget")
 async def budget_set_ep(req: BudgetReq):
-    """设置预算上限（0 = 不限）或清零。`limit_cny` 与 `reset` 可单独使用。"""
+    """设置预算上限（0 = 不限）/清零/每分钟限流。`limit_cny`、`reset`、`per_minute_*` 可单独或组合使用。"""
     if req.reset:
         return {"ok": True, "check": pricing_mod.reset(req.session_id)}
-    if req.limit_cny is None:
-        return {"ok": False, "error": "需要 limit_cny 或 reset=true"}
-    return {"ok": True, "check": pricing_mod.set_limit(req.limit_cny, req.session_id)}
+    out = {}
+    if req.limit_cny is not None:
+        out["check"] = pricing_mod.set_limit(req.limit_cny, req.session_id)
+    if req.per_minute_calls is not None or req.per_minute_cost is not None:
+        out["rate"] = pricing_mod.set_rate_limit(req.per_minute_calls or 0.0,
+                                                  req.per_minute_cost or 0.0)
+    if not out:
+        return {"ok": False, "error": "需要 limit_cny / reset=true / per_minute_* 之一"}
+    return {"ok": True, **out}
 
 
 @app.get("/api/hooks")
