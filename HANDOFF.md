@@ -364,6 +364,7 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 | `分区开发设计.md` | 分区 2.0 架构设计，`regions.py` 注释引用 |
 | `game_project_template.md` | 给用户游戏工程（code_root）使用的目录骨架与 DOCMIND_RULES 模板 |
 | `README.md` / `README_en.md` / `DEMO.md` | 对外门面/演示（内容偏旧，待按 §5 重写，勿当现状依据） |
+| `docs/integrations.md` | MCP 引擎桥接与 Web 试玩导出的产品级使用文档与边界说明（2026-09-14 新增，README/README_en 已引用） |
 | `.trae/skills/*/SKILL.md` | 发布、引擎装配/适配、HWND 嵌入的操作规范 |
 | `verify_scene_canvas.py` | 场景画布后端自检（50 项，走真实 HTTP 路由）；`--serve` 模式可开一个指向临时 Godot 工程的演示服务 |
 | `verify_scene_canvas_ui.mjs` | 场景画布浏览器冒烟（23 项，Playwright + 系统 Edge/Chrome）；截图产物在 `docs/screenshots/` |
@@ -423,6 +424,11 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - `query_gpus` 真实探测 0.5s TTL 缓存（注入探测永不缓存）；`_try_grant_locked` 返回真实 reentrant。
 - **真机端到端抓 bug**：双模型（qwen3.6:35b + bge-m3）同驻时空闲卸载首次真机运行，bge-m3 的 `keep_alive=0` 在紧跟大模型卸载后 HTTP 成功但模型仍驻留；`_gpu_ollama_evict_hook` 改为卸载后等 0.8s 用新 `/api/ps` 对幸存者补一轮（最多两轮）。修复后真机复验 PASS（后台空闲触发→两模型全部清空）。
 - 新增 8 例测试（wait 不触发驱逐、mem-deny 才触发、真实探测 TTL 缓存与注入不缓存、reentrant、ComfyUI 低显存拒绝与驱逐后授予、钩子两轮重试/无驻留不调用）；全量 **250 → 258**；§5 P2-1 残留只剩"物理多卡 + CUDA 隔离"两条纯硬件项。
+
+**2026-09-14 追加（文档引用，`60afe5b` → 本次引用补完）**
+- 新建 `docs/integrations.md`（MCP 引擎桥接 + Web 试玩导出的产品级使用文档与边界说明，提交 `60afe5b`）。
+- 本次在 `README.md` / `README_en.md`（配套能力段 + 目录树 `mcp_client.py`/`web_export.py` 注释）与 `HANDOFF.md` §9 文档地图补 `docs/integrations.md` 引用，使其从"docs/ 下第一份孤立 .md"变为被三处引用。
+- 提交：本引用补完（独立提交，仅文档引用变动）。
 
 **以下为 codex/p1-3-gpu-comfyui 分支原始变更记录（保留存档；其中部分设计在合并集成时被有意调整，以本文件末尾「P1-3 合并集成」段为准）**
 - 密钥存储新增 1 项回归测试：往返解密、明文不落盘、Provider 列表和撤销均已验证。全量测试 205 项。

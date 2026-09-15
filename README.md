@@ -25,6 +25,8 @@ DocMind 的应对分两层：
 
 配套：**引擎嵌入**（Godot / Unity / Unreal 启停 + Win32 HWND 嵌进工作台）、**Web 试玩**（导出 WASM 在画布里边玩边改）、**MCP 桥接**、**GPU 租约队列**、**桌面打包**（PyInstaller onedir，双击即用），以及一套 **Agent 运行时（Harness）**——trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔，见下文「Harness 能力」。
 
+> **MCP 引擎桥接** 与 **Web 试玩导出** 的产品级使用文档与边界说明（配置模型 / API 表 / 调用前置 / 能力边界）见 [`docs/integrations.md`](docs/integrations.md)。
+
 ## 🧱 技术栈
 
 - 后端：Python · FastAPI（HTTP + SSE）· Chroma 双集合（文档 / 代码）· OpenAI 兼容多 Provider（qwen / deepseek / ollama / llamacpp / mock）· PyInstaller + pywebview
@@ -50,8 +52,8 @@ rag-agent/
 ├── desktop_bridge.py      # Win32：查找宿主窗口 / SetParent 嵌入 / resize / focus
 ├── desktop.py             # 桌面启动器（单实例保护 + pywebview 窗口）
 ├── gpu_coordinator.py     # GPU 租约队列（TTL 过期 / 移交 + 显存阈值）
-├── mcp_client.py          # MCP（Model Context Protocol）桥接
-├── web_export.py          # Godot Web 导出与本地试玩
+├── mcp_client.py          # MCP（Model Context Protocol）桥接（用法与边界见 docs/integrations.md）
+├── web_export.py          # Godot Web 导出与本地试玩（用法与边界见 docs/integrations.md）
 ├── llm.py / embeddings.py / vectorstore.py / ingest.py / config.py
 ├── agent_trace.py         # 逐轮 trace + token 账本（JSONL，只记元数据；/trace 查看页）
 ├── sessions.py            # 会话隔离 + 持久化 + 滚动摘要

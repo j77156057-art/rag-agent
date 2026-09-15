@@ -25,6 +25,8 @@ DocMind answers with two layers:
 
 Supporting pieces: **engine embedding** (Godot / Unity / Unreal launch + Win32 HWND embed into the workbench), **Web playtest** (export WASM and play inside the canvas), **MCP bridge**, **GPU lease queue**, and **desktop packaging** (PyInstaller onedir, double-click to run).
 
+> Product-level usage docs and boundary notes for the **MCP bridge** and **Web playtest export** (config model / API table / call prerequisites / capability boundaries) are in [`docs/integrations.md`](docs/integrations.md).
+
 ## 🧱 Tech Stack
 
 - Backend: Python · FastAPI (HTTP + SSE) · Chroma dual collections (docs / code) · OpenAI-compatible multi-provider (qwen / deepseek / ollama / llamacpp / mock, plus native embedding) · PyInstaller + pywebview
