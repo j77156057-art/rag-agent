@@ -28,12 +28,20 @@ $env:PATH = "C:\Users\h'h'h\.local\bin\MinGit\cmd;" + $env:PATH   # 用户名含
 3. GetDiagnostics 零问题；`git status` 明确本轮白名单（web/assets、dist 均 gitignore，不入库）。
 4. **Agent 黄金题回归门**（打包含 agent/工具/提示词改动时必跑；纯前端或文档改动可跳）：
    ```powershell
-   $env:GOLDEN_QUESTIONS = "D:\eval\questions.json"      # 题库（含 expect 字段）
-   $env:GOLDEN_BASELINE  = "D:\eval\results_baseline.jsonl"
+   # 题库已入仓（golden/questions.json，8 题，expect 已用真实模型校准）；baseline 同目录
+   $env:GOLDEN_QUESTIONS = "D:\WorkBuddy\rag-agent\golden\questions.json"   # 含 expect 字段
+   $env:GOLDEN_BASELINE  = "D:\WorkBuddy\rag-agent\golden\results_baseline.jsonl"
    .\.venv\Scripts\python.exe ".trae\skills\agent-golden-eval\assets\gate.py"
    ```
    - 退出码 **0 = 通过或跳过**（无题库 / 服务不可达 / 无本地模型时自动 SKIP）；**1 = 检出回归**（pass→fail 或通过率下滑）→ **本版不得发布**，先修再重跑；2 = 执行失败。
-   - 需要本地模型与已索引题仓：先起 dev 服务（`:8000`）并按 `agent-golden-eval` Skill 准备题库/baseline。
+   - 需要本地模型 + 已索引的「本仓库」代码：源码类题（G2/G3/G4/G6/G7）依赖 `search_code` 检索 DocMind 自身源码，必须在 `code_root` 指向本仓库且已 `ingest_code` 的 dev 服务上跑，否则退化读文件、判不过。推荐起一个**隔离 chroma** 的专用评测服务（不污染你 `:8000` 的游戏代码索引）：
+     ```powershell
+     $env:CHROMA_DIR = 'D:\Temp\docmind_chroma_eval'   # 复制自 .chroma 以保留知识库集合
+     $env:CODE_ROOT  = 'D:\WorkBuddy\rag-agent'
+     $env:DOCMIND_SERVER_ONLY = '1'; $env:DOCMIND_PORT = '8078'
+     .\.venv\Scripts\python.exe desktop.py            # 起服务后 POST /api/ingest_code root=D:\WorkBuddy\rag-agent
+     ```
+     再设 `GOLDEN_BASE=http://127.0.0.1:8078` 跑门。**切勿对 :8000 直接 ingest**（会清空你的游戏代码索引）。`golden/results_baseline.jsonl` 即按此配置产出（8/8 通过）。
    - gate 会打印一行 `摘要（贴 BUILD.md）`，**原样记入 `DocMind_BUILD.md` 本轮「验证」小节**；若为 SKIP，也必须把跳过原因写进构建档案（不得留空、不得假装跑过）。
    - 规则打分逻辑本身由 `tests/test_agent_eval.py` 常驻单测守着——**即使本轮 SKIP，离线部分也已被全量测试覆盖**。
 

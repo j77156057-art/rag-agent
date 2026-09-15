@@ -1,0 +1,74 @@
+[
+  {
+    "id": "G1",
+    "question": "DocMind 的 /api/chat 接口是怎么把问题发给 Agent、又怎么把回答返回给前端的？",
+    "expect": {
+      "any_of": ["SSE", "流式", "session_id", "stream", "event-stream", "逐段"],
+      "must_not_include": ["没有相关代码", "无法回答", "I cannot", "未配置代码库"],
+      "no_error": true
+    }
+  },
+  {
+    "id": "G2",
+    "question": "agent.py 里限制主代理 ReAct 循环最大步数的常量叫什么？子代理默认最多跑几步？",
+    "expect": {
+      "any_of": ["MAX_AGENT_STEPS", "SUBAGENT_MAX_STEPS", "4"],
+      "must_not_include": ["没有相关代码", "无法回答", "I cannot", "未配置代码库"],
+      "no_error": true
+    }
+  },
+  {
+    "id": "G3",
+    "question": "tools.py 里负责「代码检索」的工具函数叫什么名字？它返回的内容按什么维度组织（文件/符号/行号）？",
+    "expect": {
+      "any_of": ["search_code", "代码检索", "代码库检索"],
+      "must_not_include": ["没有相关代码", "无法回答", "I cannot", "未配置代码库"],
+      "no_error": true
+    }
+  },
+  {
+    "id": "G4",
+    "question": "tools.py 里负责「知识库（RAG）检索」的工具函数叫什么名字？",
+    "expect": {
+      "any_of": ["search_knowledge", "知识库检索", "知识检索", "RAG 检索"],
+      "must_not_include": ["没有相关代码", "无法回答", "I cannot", "未配置代码库"],
+      "no_error": true
+    }
+  },
+  {
+    "id": "G5",
+    "question": "如果想让 Agent 直接调用一个外部 HTTP 接口，应该用 tools.py 里的哪个工具？",
+    "expect": {
+      "any_of": ["dev_http_request", "外部 HTTP", "外部接口", "外部 API"],
+      "must_not_include": ["没有相关代码", "无法回答", "I cannot", "未配置代码库"],
+      "no_error": true
+    }
+  },
+  {
+    "id": "G6",
+    "question": "DocMind 前端工作台基于什么框架？场景画布用的节点图编辑库是哪个？",
+    "expect": {
+      "any_of": ["Vue", "vue-flow", "@vue-flow", "Vue Flow"],
+      "must_not_include": ["没有相关代码", "无法回答", "I cannot", "未配置代码库"],
+      "no_error": true
+    }
+  },
+  {
+    "id": "G7",
+    "question": "DocMind 的 harness 里，负责记录每一轮 token 用量、工具延迟和结局的模块文件叫什么？",
+    "expect": {
+      "any_of": ["agent_trace", "轨迹模块", "trace 模块", "token 用量"],
+      "must_not_include": ["没有相关代码", "无法回答", "I cannot", "未配置代码库"],
+      "no_error": true
+    }
+  },
+  {
+    "id": "G8",
+    "question": "要让两次 /api/chat 调用各自拥有独立的历史、互不串台，应该传哪个字段？",
+    "expect": {
+      "any_of": ["session_id"],
+      "must_not_include": ["没有相关代码", "无法回答", "I cannot", "未配置代码库"],
+      "no_error": true
+    }
+  }
+]
