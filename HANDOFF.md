@@ -34,7 +34,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   **两页必须能互跳**：问答页顶栏有「开发工作台 →」，工作台顶栏有「问答」回链（`tests/test_desktop_entry.py` 钉住）。
   桌面壳默认打开问答页；入口可用 `DOCMIND_HOME` 覆盖（例如 `/workbench`）。
   桌面壳历史包袱：它曾经硬编码打开 `/workbench/`，而浏览器回退路径打开 `/`，两条路进不同页面，用户看懵过。
-  工作台的重组件用 `defineAsyncComponent` 异步分块，首屏 JS 体积不受影响（工作台 137KB / gzip 52KB）。
+  工作台的重组件用 `defineAsyncComponent` 异步分块，首屏 JS 体积不受影响（工作台 172KB / gzip 63KB，第 19 次构建实测）。
 - **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前**第 19 次**冻结构建，2026-09-15 15:47；含本轮全部 harness 能力——trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔；exe 19,814,751 字节，SHA-256 `7c816242…`）；随包 MinGit。
 - **引擎嵌入（P0-1 已实机闭环，且 UI 可用）**：Godot 4.7.2（`D://Tools//Godot//Godot_v4.7.2-stable_win64.exe`）+ 真 Win32 宿主窗口下实测通过——
   置父/样式摘除、按客户区（或前端指定矩形）对齐、宿主 resize 跟随、**真实合成键鼠（SendInput）送达引擎并回显**、

@@ -50,6 +50,16 @@ Start-Sleep -Seconds 2   # 确认端口已释放再继续
 - 构建：`.\.venv\Scripts\python.exe -m PyInstaller docmind.spec --noconfirm --log-level WARN`
 - 用 `$LASTEXITCODE` 判定（约 50–60s），必须为 0。
 
+> **⚠️ 例外：:8000 是「用户自己正在用的实例」时，绝不要杀它。**
+> 本机常态是用户挂着一个 DocMind 桌面实例在 :8000（它同时锁着 `dist/DocMind/DocMind.exe`）。
+> 正确做法（第 17–19 次构建实际采用）：**不碰 :8000**，把产物打到临时目录再延后换入——
+> ```powershell
+> .\.venv\Scripts\python.exe -m PyInstaller docmind.spec --noconfirm --distpath D:\Temp\docmind_relNN
+> ```
+> 冒烟改用别的端口（`$env:DOCMIND_PORT = '8044'`），交付说明里写明
+> 「用户关闭该实例后 `robocopy /MIR D:\Temp\docmind_relNN\DocMind dist\DocMind` 即完成，无需重打包」。
+> 这样既不打断用户，也避免在锁定目录上做半截替换。**换入前务必确认目标 exe 未被占用。**
+
 ## 阶段 2：产物核对
 
 - `dist\DocMind\DocMind.exe`：大小（约 18.5–19.4 MB）与 mtime=本轮构建时间；整包约 663 MB。
@@ -76,8 +86,12 @@ $p = Start-Process -FilePath '.\dist\DocMind\DocMind.exe' -PassThru `
   - **索引必须用 multipart 表单**（`curl.exe -F "root=D:\WorkBuddy\godot_sample" .../api/ingest_code`），**字段是 form 的 `root`，不是 JSON**；样例基线 18 切片；
   - 功能端点回归（如 symbol-map=7 文件/18 符号、relation-graph=7 节点/3 继承边——数值随功能演进而变，以当轮设计为准）。
 - **收尾三件事，缺一不可**：
-  1. `Stop-Process` 杀冻结进程，确认 :8000 释放；
-  2. 删除 `dist\DocMind\_internal\.docmind_state.json`（冒烟写入的本机选择，绝不能随包分发）并复核不存在；
+  1. `Stop-Process` 杀冻结进程，确认端口释放；
+  2. 删除**冒烟写出的全部运行时态**（都不能随包分发，逐个复核为 0）：
+     `_internal\.docmind_state.json`（本机 code_root 选择）、
+     `_internal\.docmind_traces.jsonl`（+`.1`）、`_internal\.docmind_sessions\`、
+     `_internal\.docmind_budget.json`、`_internal\.docmind\`（含 `gpu_state.json`）、
+     `_internal\.chroma\`（走一遍问答就会自建空库）、以及 exe 同级可能出现的 `docmind_desktop.log`；
   3. 清理临时日志/环境变量。
 
 ## 阶段 4：更新构建文档
@@ -113,7 +127,11 @@ git commit -F $tmp; Remove-Item -Force $tmp
 
 ## 历史教训速查
 
-- SQLite 锁：不停 :8000 打包必失败（第八版）。
+- **`/tmp` 在 Git Bash 里不可写**（第十九版）：`curl -o /tmp/x.bin` 直接 `exit 23` 且文件不存在，后续 `sha256sum` 报 "No such file"。**一律用 Windows 绝对路径**（`D:/Temp/...`）落盘——`$TEMP`（= `/tmp`）与 Python 的 `os.environ['TEMP']`（= `D:\Temp`）本来就不一致。
+- **`curl -o /dev/null -w "%{size_download}"` 对这些 chunked 响应会报 0**（第十九版）：不能拿它判断字节数和"有没有内容"。要看字节就 `-o <file>` 后 `stat -c%s`，要比对就 SHA-256。
+- **冻结冒烟后要清的运行时态清单会随功能增长**（第十九版起）：除 `.docmind_state.json` 外还有 `.docmind_traces.jsonl` / `.docmind_sessions/` / `.docmind_budget.json` / `.docmind/` / `.chroma/`；**新增功能若在 `BASE_DIR` 下落新文件，记得同步更新本清单**。
+- **:8000 是用户实例时不要杀**（第十七版起）：打 `--distpath D:\Temp\docmind_relNN`、冒烟换端口、延后 `robocopy` 换入（详见阶段 1 的例外块）。
+- SQLite 锁：不停 :8000 打包必失败（第八版；前提是那个 :8000 是**你**起的 dev 实例）。
 - commit BOM：禁用 `Set-Content -Encoding UTF8` 写信息文件（第九版 e825b26）。
 - 状态泄漏：冻结冒烟后忘删 `_internal/.docmind_state.json` 会把本机 code_root 分发给用户（第八版起纳入清单）。
 - 前端旧 hash：`emptyOutDir:false` → 每次手动清 `web/assets/workbench-*`（第八版起）。
