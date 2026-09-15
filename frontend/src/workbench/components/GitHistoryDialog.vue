@@ -121,7 +121,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 .gh-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(5, 8, 12, 0.62);
+  background: rgba(38, 52, 77, 0.38);
   backdrop-filter: blur(2px);
   z-index: 92;
   display: flex;
@@ -135,7 +135,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   background: var(--bg-raised);
   border: 1px solid var(--border-strong);
   border-radius: 10px;
-  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 24px 70px rgba(35, 52, 84, 0.16);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -192,7 +192,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   cursor: pointer;
 }
 .gh-commit:hover { background: var(--bg-hover); }
-.gh-commit.active { background: #58a6ff14; border-color: #58a6ff44; }
+.gh-commit.active { background: #2f6fed14; border-color: #2f6fed44; }
 .gh-commit-msg {
   font-size: 12.5px;
   color: var(--text);
@@ -208,8 +208,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 .gh-commit-meta code {
   font-family: 'Cascadia Code', Consolas, monospace;
   font-size: 10.5px;
-  color: #58a6ff;
-  background: #58a6ff12;
+  color: #2f6fed;
+  background: #2f6fed12;
   border-radius: 3px;
   padding: 0 5px;
 }
@@ -242,8 +242,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 .gh-preview-hash {
   font-family: 'Cascadia Code', Consolas, monospace;
   font-size: 11px;
-  color: #45c98c;
-  background: #45c98c12;
+  color: #1c9e66;
+  background: #1c9e6612;
   border-radius: 3px;
   padding: 1px 6px;
   flex: 0 0 auto;
@@ -267,15 +267,15 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  border: 1px solid #d98a3d55;
-  background: #d98a3d14;
-  color: #e0a05c;
+  border: 1px solid #dfb067;
+  background: #fdf3df;
+  color: #8a5a16;
   font-size: 12px;
   padding: 4px 12px;
   border-radius: 6px;
   cursor: pointer;
 }
-.gh-restore-btn:hover:not(:disabled) { background: #d98a3d26; border-color: #d98a3d88; }
+.gh-restore-btn:hover:not(:disabled) { background: #c8811c26; border-color: #dfb067; }
 .gh-restore-btn:disabled { opacity: 0.5; cursor: default; }
 
 .gh-preview {
@@ -286,7 +286,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   font-family: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
   font-size: 12.5px;
   line-height: 1.6;
-  color: #c9d4e3;
+  color: #243044;
   white-space: pre;
   tab-size: 4;
 }
@@ -304,5 +304,5 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 .gh-preview-state { min-height: 120px; }
 .gh-state p { margin: 0; font-size: 12.5px; }
 .gh-faint { color: var(--text-faint); }
-.gh-error { color: #ff7b72; }
+.gh-error { color: #c23a40; }
 </style>

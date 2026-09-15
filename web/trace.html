@@ -3,73 +3,111 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>DocMind · Trace 账本</title>
+<title>DocMind · AI 操作记录</title>
 <style>
   :root{
-    --bg:#0e1116; --bg-raised:#161b22; --border:#2a313c; --border-strong:#3a4350;
-    --text:#e6edf3; --muted:#8b949e; --dim:#6b7280;
-    --green:#3fb950; --amber:#d29922; --red:#f85149; --blue:#58a6ff; --purple:#bc8cff;
+    --bg:#eef1f7; --bg-raised:#ffffff; --border:#dde3ee; --border-strong:#c4cedd;
+    --text:#222b38; --muted:#5a6778; --dim:#98a3b4;
+    --green:#1c9e66; --amber:#c8811c; --red:#e0484f; --blue:#2f6fed; --purple:#7a5af8;
     --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--text);
     font:13px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
-  header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:12px;
-    padding:12px 18px;background:var(--bg-raised);border-bottom:1px solid var(--border)}
+  header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+    padding:12px 18px;background:rgba(255,255,255,.92);backdrop-filter:blur(6px);border-bottom:1px solid var(--border)}
   header h1{font-size:15px;font-weight:600;margin:0;letter-spacing:.3px}
+  header .sub{color:var(--dim);font-size:11.5px}
   header .sp{flex:1}
-  button{background:#1b2430;border:1px solid var(--border-strong);color:#c9d6e4;
-    border-radius:6px;padding:5px 11px;cursor:pointer;font:inherit}
-  button:hover{border-color:var(--blue);color:#eaf2fb}
-  button.warn:hover{border-color:var(--red);color:#ffd7d5}
+  button{background:#fff;border:1px solid var(--border-strong);color:#334055;
+    border-radius:7px;padding:5px 12px;cursor:pointer;font:inherit;font-weight:600}
+  button:hover{border-color:var(--blue);color:var(--blue)}
+  button.warn:hover{border-color:var(--red);color:var(--red)}
   label.chk{color:var(--muted);display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none}
-  input[type=text]{background:var(--bg);border:1px solid var(--border);color:var(--text);
-    border-radius:6px;padding:5px 9px;font:inherit}
+  input[type=text]{background:#f6f8fb;border:1px solid var(--border-strong);color:var(--text);
+    border-radius:7px;padding:5px 9px;font:inherit}
   main{padding:16px 18px 40px}
+  .demo-note{display:none;background:#eef3fc;border:1px solid #c8dcfa;color:#2b5797;
+    border-radius:10px;padding:9px 13px;font-size:12px;line-height:1.6;margin-bottom:14px}
+  .demo-note.show{display:block}
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:16px}
-  .card{background:var(--bg-raised);border:1px solid var(--border);border-radius:10px;padding:11px 13px}
+  .card{background:var(--bg-raised);border:1px solid var(--border);border-radius:12px;padding:11px 13px;
+    box-shadow:0 1px 2px rgba(35,52,84,.04)}
   .card .k{color:var(--muted);font-size:11px;letter-spacing:.4px}
-  .card .v{font-size:21px;font-weight:600;margin-top:3px;font-variant-numeric:tabular-nums}
+  .card .v{font-size:21px;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums;color:var(--text)}
   .card.acc .v{color:var(--blue)} .card.tok .v{color:var(--purple)}
   .card.warn .v{color:var(--amber)} .card.bad .v{color:var(--red)}
-  table{width:100%;border-collapse:collapse;font-size:12px}
-  th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--border);vertical-align:top}
-  th{color:var(--muted);font-weight:500;position:sticky;top:49px;background:var(--bg);z-index:2}
-  tbody tr:hover{background:#12171f}
+  table{width:100%;border-collapse:collapse;font-size:12px;background:var(--bg-raised);
+    border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{color:var(--muted);font-weight:600;position:sticky;top:56px;background:#f6f8fb;z-index:2}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:#f3f6fb}
   td.mono,.mono{font-family:var(--mono);font-size:11px}
-  .pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;border:1px solid}
-  .pill.ok{color:var(--green);border-color:#1f6f34;background:#10281a}
-  .pill.warn{color:var(--amber);border-color:#7a5a12;background:#2a2310}
-  .pill.bad{color:var(--red);border-color:#8e2f2b;background:#2c1413}
-  .chips{display:flex;flex-wrap:wrap;gap:3px}
-  .chip{font-family:var(--mono);font-size:10px;color:#9fb3c8;border:1px solid var(--border);
-    border-radius:4px;padding:0 5px;background:#131a24}
-  .foot{color:var(--dim);margin-top:14px;font-size:11px}
-  .empty{color:var(--muted);padding:26px;text-align:center;border:1px dashed var(--border);border-radius:10px}
-  a{color:var(--blue)}
+  .pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:11px;font-weight:700;border:1px solid}
+  .pill.ok{color:#128053;border-color:#8fd8bd;background:#e6f7ee}
+  .pill.warn{color:#8a5a16;border-color:#ecd3a0;background:#fdf2e0}
+  .pill.bad{color:#b32d33;border-color:#efc4c6;background:#fdecec}
+  .chips{display:flex;flex-wrap:wrap;gap:4px}
+  .chip{font-family:var(--mono);font-size:10px;color:#2f6fed;border:1px solid #c8dcfa;
+    border-radius:5px;padding:1px 6px;background:#f3f8ff}
+  .foot{color:var(--dim);margin-top:14px;font-size:11px;line-height:1.7}
+  .empty{color:var(--muted);padding:26px;text-align:center;border:1px dashed var(--border-strong);border-radius:12px;background:#fff}
+  a{color:var(--blue);text-decoration:none}
+  a:hover{text-decoration:underline}
 </style>
 </head>
 <body>
 <header>
-  <h1>Trace 账本</h1>
+  <h1>AI 操作记录</h1>
+  <span class="sub">AI 每轮回答：用了哪个模型、调了哪些工具、花了多少 token 和时间</span>
   <span class="sp"></span>
-  <input type="text" id="token" placeholder="x-docmind-token（如已启用鉴权）" style="width:230px" />
+  <input type="text" id="token" placeholder="访问令牌（启用鉴权时填写）" style="width:200px" />
   <label class="chk"><input type="checkbox" id="auto" /> 自动刷新</label>
   <button id="refresh">刷新</button>
-  <button id="clear" class="warn">清空</button>
-  <a href="/" style="margin-left:6px">← 问答页</a>
+  <button id="clear" class="warn">清空记录</button>
+  <a href="/" style="margin-left:6px">← AI 问答</a>
+  <a href="/workbench.html">代码工作台</a>
 </header>
 <main>
+  <div class="demo-note" id="demoNote"></div>
   <div class="cards" id="cards"></div>
   <div id="tablewrap"></div>
-  <p class="foot">只记元数据：不落 prompt / 回答正文，只有长度、哈希、工具名与延迟。</p>
+  <p class="foot">隐私说明：这里只记操作元数据（问题/回答的长度、用了什么工具、耗时与 token 数），不保存你的提问内容和回答正文。</p>
 </main>
 <script>
 const S = {
-  turns:{k:'回合数'}, total_tokens:{k:'总 token', cls:'tok'},
-  avg_elapsed_ms:{k:'平均耗时', fmt:v=>v+'ms'},
-  aborted:{k:'断连中止', cls:'warn'}, errors:{k:'错误', cls:'bad'},
+  turns:{k:'回答轮数'}, total_tokens:{k:'累计 token 用量', cls:'tok'},
+  avg_elapsed_ms:{k:'平均每轮耗时', fmt:v=>v+' 毫秒'},
+  aborted:{k:'中途取消', cls:'warn'}, errors:{k:'出错次数', cls:'bad'},
 };
+
+const OUTCOME_CN = {
+  completed:'正常完成', verbatim:'直接答复', error:'出错了',
+  deadline_exceeded:'超时', max_steps:'步数到上限', truncated:'内容被截断', empty:'没有回答',
+};
+const TOOL_CN = {
+  search_docs:'查资料', search_code:'搜代码', read_file:'读文件',
+  write_file:'写文件', edit_file:'改文件', list_dir:'看目录',
+  grep:'全文搜索', run_cmd:'跑命令', web_search:'联网搜索',
+};
+
+// 探测不到本地服务时展示的示例数据（静态演示用）
+const DEMO = {
+  summary:{turns:3,total_tokens:18640,avg_elapsed_ms:4820,aborted:0,errors:0},
+  items:[
+    {ts:'2025-05-19 10:32:11',session_id:'s_demo_8a21',turn_id:'t_003',provider:'ollama',model:'qwen2.5:7b',
+     steps:[{action:'search_code',latency_ms:180,obs_chars:2140,ok:true},{action:'read_file',latency_ms:42,obs_chars:3080,ok:true},{action:'grep',latency_ms:95,obs_chars:960,ok:true}],
+     prompt_tokens:3420,completion_tokens:860,total_tokens:4280,elapsed_ms:6210,llm_ms:4860,llm_calls:2,outcome:'completed'},
+    {ts:'2025-05-19 10:30:02',session_id:'s_demo_8a21',turn_id:'t_002',provider:'ollama',model:'qwen2.5:7b',
+     steps:[{action:'search_docs',latency_ms:210,obs_chars:1780,ok:true},{action:'read_file',latency_ms:38,obs_chars:2400,ok:true}],
+     prompt_tokens:2100,completion_tokens:540,total_tokens:2640,elapsed_ms:3980,llm_ms:3300,llm_calls:1,outcome:'completed'},
+    {ts:'2025-05-19 10:28:44',session_id:'s_demo_8a21',turn_id:'t_001',provider:'ollama',model:'qwen2.5:7b',
+     steps:[{action:'grep',latency_ms:120,obs_chars:1220,ok:true},{action:'read_file',latency_ms:40,obs_chars:2860,ok:true},{action:'read_file',latency_ms:35,obs_chars:1980,ok:true}],
+     prompt_tokens:5100,completion_tokens:1080,total_tokens:6180,elapsed_ms:7120,llm_ms:5400,llm_calls:2,outcome:'verbatim'},
+  ],
+};
+
 let timer = null;
 
 function tok(){ return (document.getElementById('token').value || localStorage.getItem('docmind.token') || '').trim(); }
@@ -81,24 +119,17 @@ function outcomePill(o){
   const ok = ['completed','verbatim'].includes(o);
   const bad = ['error','deadline_exceeded','max_steps','truncated','empty'].includes(o);
   const cls = ok ? 'ok' : (bad ? 'bad' : 'warn');
-  return `<span class="pill ${cls}">${esc(o||'—')}</span>`;
+  return `<span class="pill ${cls}">${esc(OUTCOME_CN[o] || o || '—')}</span>`;
 }
 
-async function load(){
-  let data;
-  try{
-    const r = await fetch('/api/trace?limit=200', {headers: hdr()});
-    data = await r.json();
-  }catch(e){
-    document.getElementById('tablewrap').innerHTML =
-      `<div class="empty">无法读取 /api/trace：${esc(e.message)}</div>`;
-    return;
-  }
-  if (!data || data.ok === false){
-    document.getElementById('tablewrap').innerHTML =
-      `<div class="empty">读取失败：${esc(data && data.error || '未知错误')}${tok()?'':'（若已启用 DOCMIND_API_TOKEN，请在右上填入令牌）'}</div>`;
-    return;
-  }
+function toolName(a){ return TOOL_CN[a] || a || '—'; }
+
+function renderTrace(data, isDemo){
+  const note = document.getElementById('demoNote');
+  note.classList.toggle('show', !!isDemo);
+  note.innerHTML = isDemo
+    ? '🧪 <b>示例演示数据</b>：当前页面没有连接到本机 DocMind 服务（比如正在看静态预览）。在本机启动服务后，这里会显示真实的 AI 操作记录。'
+    : '';
   const s = data.summary || {};
   document.getElementById('cards').innerHTML = Object.keys(S).map(key=>{
     const meta = S[key];
@@ -109,31 +140,50 @@ async function load(){
   const rows = (data.items || []).slice().reverse();
   if (!rows.length){
     document.getElementById('tablewrap').innerHTML =
-      `<div class="empty">还没有记录。去<a href="/">问答页</a>问一次，这里就会出现逐轮账本。</div>`;
+      `<div class="empty">还没有记录。去<a href="/">AI 问答</a>问一次，AI 每次「翻代码、查资料」的过程都会自动记在这里。</div>`;
     return;
   }
   const body = rows.map(r=>{
     const steps = (r.steps||[]).map(st=>
-      `<span class="chip" title="${esc(st.action)} · ${st.latency_ms}ms · obs ${st.obs_chars}字${st.ok?'':' · 失败'}">${esc(st.action)} ${st.latency_ms}ms</span>`
+      `<span class="chip" title="${esc(st.action)}（${st.latency_ms}毫秒${st.ok?'':' · 这一步失败了'}）">${esc(toolName(st.action))} ${st.latency_ms}ms</span>`
     ).join('');
     return `<tr>
       <td class="mono">${esc((r.ts||'').replace('T',' '))}</td>
       <td class="mono">${esc(r.session_id)}<div style="color:var(--dim)">${esc(r.turn_id)}</div></td>
       <td class="mono">${esc(r.provider)}<div style="color:var(--dim)">${esc(r.model)}</div></td>
       <td><div class="chips">${steps || '<span style="color:var(--dim)">—</span>'}</div></td>
-      <td class="mono">${r.prompt_tokens} / ${r.completion_tokens}<div style="color:var(--dim)">Σ ${r.total_tokens}</div></td>
-      <td class="mono">${r.elapsed_ms}ms<div style="color:var(--dim)">llm ${r.llm_ms}ms · ${r.llm_calls}次</div></td>
+      <td class="mono">${r.prompt_tokens} / ${r.completion_tokens}<div style="color:var(--dim)">合计 ${r.total_tokens}</div></td>
+      <td class="mono">${r.elapsed_ms}ms<div style="color:var(--dim)">模型思考 ${r.llm_ms}ms · 调用 ${r.llm_calls} 次</div></td>
       <td>${outcomePill(r.outcome)}${r.error?'<div class="mono" style="color:var(--red)">'+esc(r.error).slice(0,90)+'</div>':''}</td>
     </tr>`;
   }).join('');
   document.getElementById('tablewrap').innerHTML = `<table>
-    <thead><tr><th>时间</th><th>会话 / 回合</th><th>模型</th><th>工具序列</th><th>tokens in/out</th><th>耗时</th><th>结局</th></tr></thead>
+    <thead><tr><th>时间</th><th>会话 / 轮次编号</th><th>模型</th><th>AI 做了哪些动作（耗时）</th><th>token：提问 / 回答</th><th>总耗时</th><th>结果</th></tr></thead>
     <tbody>${body}</tbody></table>`;
+}
+
+async function load(){
+  let data;
+  try{
+    const r = await fetch('/api/trace?limit=200', {headers: hdr()});
+    data = await r.json();
+  }catch(e){
+    // 连不上本地服务（静态托管/服务没启动）→ 展示示例数据
+    renderTrace(DEMO, true);
+    return;
+  }
+  if (!data || data.ok === false){
+    document.getElementById('demoNote').classList.remove('show');
+    document.getElementById('tablewrap').innerHTML =
+      `<div class="empty">读取失败：${esc(data && data.error || '未知错误')}${tok()?'':'（如果服务设置了访问令牌，请在右上角填写）'}</div>`;
+    return;
+  }
+  renderTrace(data, false);
 }
 
 document.getElementById('refresh').onclick = load;
 document.getElementById('clear').onclick = async ()=>{
-  if (!confirm('清空整个 trace 账本？此操作不可撤销。')) return;
+  if (!confirm('确定清空全部操作记录吗？此操作不能撤销。')) return;
   await fetch('/api/trace/clear', {method:'POST', headers: hdr()});
   load();
 };

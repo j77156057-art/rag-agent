@@ -17,9 +17,9 @@ const CHART_H = 56
 const LINE_COLORS = ['#5b8def', '#e0a33e', '#7ac47c', '#c47adf', '#45b8c6']
 
 const modeLabel: Record<string, string> = {
-  serial: '串行（全机一把锁）',
-  multi: '多卡（每卡独立租约）',
-  parallel: '不协调（并行）',
+  serial: '排队模式（一次只跑一个任务，最稳妥）',
+  multi: '多卡模式（每张显卡各跑各的）',
+  parallel: '自由模式（不干预，可能互相抢显存）',
 }
 
 const summary = computed(() => {
@@ -137,7 +137,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="gp">
-    <button class="gp-trigger" :class="{ 'gp-busy': busyDot }" title="GPU 协调：显存占用 / 排队 / 空闲回收" @click="open = !open">
+    <button class="gp-trigger" :class="{ 'gp-busy': busyDot }" title="显卡（GPU）：看显存用了多少、谁在占用、任务排队和空闲自动释放" @click="open = !open">
       <svg width="12" height="12" viewBox="0 0 12 12">
         <rect x="1" y="2.2" width="10" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="0.9" />
         <rect x="2.2" y="3.4" width="2" height="2" rx="0.3" fill="currentColor" opacity="0.5" />
@@ -152,7 +152,7 @@ onBeforeUnmount(() => {
       <div class="gp-backdrop" @click="open = false" />
       <div class="gp-pop">
         <div class="gp-head">
-          <b>GPU 协调</b>
+          <b>显卡使用情况</b>
           <span class="gp-mode">{{ st ? modeLabel[st.mode] || st.mode : '—' }}</span>
           <span class="gp-spacer" />
           <button class="gp-link" :disabled="busy" @click="refresh">刷新</button>
@@ -253,26 +253,26 @@ onBeforeUnmount(() => {
   padding: 5px 9px; cursor: pointer; font-size: 11px; white-space: nowrap;
 }
 .gp-trigger:hover { color: var(--text); }
-.gp-busy { border-color: #b07a2e; color: #d99a3d; }
+.gp-busy { border-color: #dfb067; color: #8a5a16; }
 .gp-backdrop { position: fixed; inset: 0; z-index: 40; }
 .gp-pop {
   position: absolute; right: 0; top: 34px; width: 420px; max-height: 80vh; overflow-y: auto;
   padding: 12px; background: var(--bg-raised);
   border: 1px solid var(--border-strong); border-radius: 8px;
   z-index: 41; font-size: 12px; line-height: 1.6;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 12px 32px rgba(35, 52, 84, 0.16);
 }
 .gp-head { display: flex; align-items: center; gap: 8px; }
 .gp-head b { color: var(--text); font-size: 13px; }
 .gp-mode { color: var(--text-muted); font-size: 11px; }
 .gp-spacer { flex: 1; }
-.gp-link { background: none; border: none; color: #6d9bef; cursor: pointer; font-size: 11px; padding: 0; }
-.gp-warn { margin: 8px 0 0; padding: 6px 8px; border-radius: 5px; background: rgba(207, 163, 62, 0.12); color: #d99a3d; font-size: 11px; }
-.gp-err { margin: 8px 0 0; color: #e06c6c; font-size: 11px; }
+.gp-link { background: none; border: none; color: #2f6fed; cursor: pointer; font-size: 11px; padding: 0; }
+.gp-warn { margin: 8px 0 0; padding: 6px 8px; border-radius: 5px; background: rgba(200, 129, 28, 0.12); color: #8a5a16; font-size: 11px; }
+.gp-err { margin: 8px 0 0; color: #c23a40; font-size: 11px; }
 .gp-faint { color: var(--text-muted); font-size: 11px; }
 
 .gp-chart-wrap { margin: 10px 0 4px; }
-.gp-chart { width: 100%; height: 56px; display: block; background: rgba(255, 255, 255, 0.02); border-radius: 4px; }
+.gp-chart { width: 100%; height: 56px; display: block; background: #f6f8fb; border-radius: 4px; }
 .gp-grid { stroke: var(--border-strong); stroke-width: 0.5; stroke-dasharray: 2 3; }
 .gp-legend { display: flex; gap: 10px; margin-top: 3px; font-size: 10px; color: var(--text-muted); }
 .gp-legend i { display: inline-flex; align-items: center; gap: 4px; font-style: normal; }
@@ -282,20 +282,20 @@ onBeforeUnmount(() => {
 .gp-card-head { display: flex; align-items: baseline; gap: 8px; }
 .gp-card-head b { font-size: 12px; color: var(--text); font-weight: 600; }
 .gp-card-head em { font-style: normal; font-weight: 400; color: var(--text-muted); font-size: 11px; }
-.gp-bar { height: 6px; border-radius: 3px; background: rgba(255, 255, 255, 0.07); margin-top: 6px; overflow: hidden; }
-.gp-bar i { display: block; height: 100%; border-radius: 3px; background: linear-gradient(90deg, #4f7fd6, #7aa7f0); }
+.gp-bar { height: 6px; border-radius: 3px; background: rgba(35, 52, 84, 0.08); margin-top: 6px; overflow: hidden; }
+.gp-bar i { display: block; height: 100%; border-radius: 3px; background: linear-gradient(90deg, #2f6fed, #6f9cf5); }
 .gp-bar-row { display: flex; justify-content: space-between; margin-top: 3px; font-size: 11px; color: var(--text-muted); }
 
 .gp-holder { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 11px; }
 .gp-wait .gp-owner { color: var(--text-muted); }
 .gp-tag { padding: 0 6px; border-radius: 8px; font-size: 10px; line-height: 16px; }
-.gp-tag-on { background: rgba(217, 108, 108, 0.16); color: #e08585; }
-.gp-tag-wait { background: rgba(109, 155, 239, 0.16); color: #6d9bef; }
+.gp-tag-on { background: rgba(224, 72, 79, 0.12); color: #c23a40; }
+.gp-tag-wait { background: rgba(47, 111, 237, 0.12); color: #2f6fed; }
 .gp-owner { color: var(--text); }
 .gp-mini { background: transparent; border: 1px solid var(--border-strong); color: var(--text-muted); border-radius: 4px; font-size: 10px; padding: 1px 7px; cursor: pointer; }
-.gp-mini:hover:not(:disabled) { color: var(--text); border-color: #6d9bef; }
-.gp-mini-danger { background: transparent; border: 1px solid rgba(224, 108, 108, 0.5); color: #e08585; border-radius: 4px; font-size: 10px; padding: 1px 7px; cursor: pointer; }
-.gp-mini-danger:hover:not(:disabled) { background: rgba(224, 108, 108, 0.12); }
+.gp-mini:hover:not(:disabled) { color: var(--text); border-color: #2f6fed; }
+.gp-mini-danger { background: transparent; border: 1px solid rgba(224, 72, 79, 0.5); color: #c23a40; border-radius: 4px; font-size: 10px; padding: 1px 7px; cursor: pointer; }
+.gp-mini-danger:hover:not(:disabled) { background: rgba(224, 72, 79, 0.1); }
 button:disabled { opacity: 0.5; cursor: default; }
 
 .gp-idle { margin-top: 12px; padding: 8px 9px; border: 1px solid var(--border-strong); border-radius: 6px; }
@@ -305,6 +305,6 @@ button:disabled { opacity: 0.5; cursor: default; }
 .gp-idle-meta { margin-top: 4px; }
 
 .gp-foot { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
-.gp-danger { background: transparent; border: 1px solid rgba(224, 108, 108, 0.5); color: #e08585; border-radius: 5px; font-size: 11px; padding: 4px 10px; cursor: pointer; }
-.gp-danger:hover:not(:disabled) { background: rgba(224, 108, 108, 0.12); }
+.gp-danger { background: transparent; border: 1px solid rgba(224, 72, 79, 0.5); color: #c23a40; border-radius: 5px; font-size: 11px; padding: 4px 10px; cursor: pointer; }
+.gp-danger:hover:not(:disabled) { background: rgba(224, 72, 79, 0.1); }
 </style>

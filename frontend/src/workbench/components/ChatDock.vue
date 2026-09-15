@@ -3,13 +3,14 @@
 // - 答案中的文件引用渲染为可点击卡片：跳转代码行 + 文件树展开闪烁 + 分区高亮；
 // - 头部「引擎」弹层：MCP 服务器连接状态（godot-ai stdio / unity / unreal HTTP）
 //   与 godot-ai 插件安装引导（安装前必须用户确认）。
-import { nextTick, ref, watch, onBeforeUnmount } from 'vue'
+import { nextTick, ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
 import { aiApi, mcpApi } from '../api'
 import type { McpServer } from '../api'
 import type { SseEvent } from '../api'
 import { mdToHtml, extractFileRefs } from '../markdown'
 import type { FileRef } from '../markdown'
+import { demoMode } from '../composables/demo'
 
 const {
   nodeExists, revealPath, jumpToLine,
@@ -58,6 +59,13 @@ async function send(text?: string) {
   const turn: ChatMsg = { id: msgSeq++, role: 'assistant', text: '', status: 'streaming', trace: [] }
   messages.value.push(turn)
   sending.value = true
+  if (demoMode.value) {
+    await nextTick(scrollToBottom)
+    await demoAnswer(turn.id, q)
+    sending.value = false
+    await nextTick(scrollToBottom)
+    return
+  }
   const ac = new AbortController()
   abortCtl = ac
   await nextTick(scrollToBottom)
@@ -112,6 +120,63 @@ function clearMessages() {
   if (sending.value) stop()
   messages.value = []
 }
+
+// ---------------------------------------------------------------- 离线演示问答
+function demoAnswer(turnId: number, q: string): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(() => {
+      const t = messages.value.find((m) => m.id === turnId)
+      if (!t) return resolve()
+      t.trace = [
+        { type: 'thought', text: '先理解问题涉及的关键词，再到代码库里检索相关文件。' },
+        { type: 'action', text: 'search_code：玩家受伤 / take_damage / health' },
+        { type: 'observation', text: '命中 4 个文件，逐个阅读最相关的 2 个。' },
+      ]
+      t.text = demoReply(q)
+      t.status = 'done'
+      resolve()
+    }, 900)
+  })
+}
+function demoReply(q: string): string {
+  if (q.includes('数值') || q.includes('受伤') || q.includes('血') || q.includes('伤害')) {
+    return [
+      '**（这是演示回答）** 连接你的真实项目后，AI 会先在代码库里检索，再给出文件+行号。',
+      '',
+      '以一个典型 Godot 项目为例，玩家受伤数值通常在这几处：',
+      '',
+      '1. **生命值定义**：`player_stats.gd` 里的 `max_health / health`（角色初始数值）',
+      '2. **受伤计算**：`damage_calc.gd` 的 `take_damage(amount)`，先扣护甲、再扣血',
+      '3. **数值配置**：策划常把数值放在 `resources/player_values.tres`，改数字不用改代码',
+      '',
+      '真实使用时，下面会出现可点击的文件卡片，点一下直接跳到对应行。',
+    ].join('\n')
+  }
+  if (q.includes('结构') || q.includes('梳理')) {
+    return [
+      '**（演示回答）** 连接真实项目后，AI 会按目录和入口梳理出：',
+      '',
+      '- **入口**：主场景与初始化脚本',
+      '- **核心系统**：角色、背包、战斗、存档各自的目录',
+      '- **数据配置**：数值表 / 资源文件放在哪',
+      '- 还可以点顶部「代码地图」看函数调用关系图',
+    ].join('\n')
+  }
+  return [
+    '**（演示回答）** 在本地版中，AI 会带着这个问题去搜你的代码库：读文件、追调用链，',
+    '然后用大白话解释，并附上可点击的文件与行号。',
+    '',
+    '你可以换个更具体的问题试试，比如「玩家受伤扣多少血在哪算的？」。',
+  ].join('\n')
+}
+
+// 欢迎页「去问问」按钮聚焦：展开对话台并定位输入框
+function onFocusChat() {
+  collapsed.value = false
+  nextTick(() => inputEl.value?.focus())
+}
+onMounted(() => window.addEventListener('docmind:focus-chat', onFocusChat))
+onBeforeUnmount(() => window.removeEventListener('docmind:focus-chat', onFocusChat))
 
 function scrollToBottom() {
   const el = scroller.value
@@ -299,13 +364,13 @@ function connectorGuide(s: McpServer) {
         <svg width="9" height="9" viewBox="0 0 9 9"><path d="M2 1.5 L5.5 4.5 L2 7.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </span>
       <span class="cd-title">AI 助手</span>
-      <span class="cd-hint">问代码 · 找文件 · 定位角色数值与行为逻辑</span>
-      <span v-if="sending" class="cd-live">检索中<span class="cd-dots">…</span></span>
+      <span class="cd-hint">用大白话问代码：数值在哪 · 逻辑怎么走 · 报错怎么改</span>
+      <span v-if="sending" class="cd-live">AI 正在查代码<span class="cd-dots">…</span></span>
       <span class="cd-spacer" />
       <button
         class="cd-btn"
         :class="{ 'cd-btn-on': enginePopOpen }"
-        title="引擎 / MCP 连接（godot-ai / Unity / Unreal）"
+        title="连接游戏引擎（Godot / Unity / Unreal）：连上后 AI 能读场景和运行日志"
         @click.stop="enginePopOpen = !enginePopOpen"
       >
         <svg width="14" height="14" viewBox="0 0 14 14">
@@ -405,7 +470,7 @@ function connectorGuide(s: McpServer) {
     <template v-if="!collapsed">
       <div ref="scroller" class="cd-body">
         <div v-if="messages.length === 0" class="cd-empty">
-          <p class="cd-empty-title">直接问整个代码库，AI 会定位到具体文件和行号</p>
+          <p class="cd-empty-title">用大白话提问，AI 自己搜代码，并把答案定位到具体文件和行号 👇</p>
           <div class="cd-quicks">
             <button v-for="q in QUICK_PROMPTS" :key="q" class="cd-quick" @click="send(q)">{{ q }}</button>
           </div>
@@ -416,7 +481,7 @@ function connectorGuide(s: McpServer) {
           <template v-else>
             <div v-if="m.text" class="ai-md cd-answer" v-html="answerHtml(m)" />
             <div v-else-if="m.status === 'streaming'" class="cd-thinking">
-              正在检索代码库并组织回答<span class="cd-dots">…</span>
+              AI 正在翻代码、组织回答<span class="cd-dots">…</span>
             </div>
             <div v-if="m.status === 'error'" class="cd-error">⚠ {{ m.error }}</div>
             <div v-if="m.trace.length" class="cd-trace">
@@ -515,7 +580,7 @@ function connectorGuide(s: McpServer) {
   background: var(--bg-raised);
   border: 1px solid var(--border-strong);
   border-radius: 8px;
-  box-shadow: 0 12px 32px rgba(0,0,0,.5);
+  box-shadow: 0 14px 38px rgba(35,52,84,.2);
   padding: 10px 12px;
   z-index: 60;
 }
@@ -523,7 +588,7 @@ function connectorGuide(s: McpServer) {
 .cd-pop-subtitle { font-size: 11px; color: var(--text-dim); line-height: 1.5; margin-bottom: 8px; }
 .cd-addon {
   border: 1px solid var(--border); border-radius: 7px;
-  padding: 8px 10px; margin-bottom: 10px; background: #0c121a;
+  padding: 8px 10px; margin-bottom: 10px; background: var(--bg-hover);
 }
 .cd-addon-row, .cd-server-row { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text); }
 .cd-addon-ver { color: var(--text-muted); font-size: 11px; }
@@ -611,8 +676,8 @@ function connectorGuide(s: McpServer) {
 .cd-ref {
   display: inline-flex; align-items: center; gap: 4px;
   height: 22px; padding: 0 8px;
-  border: 1px solid var(--border-strong); border-radius: 5px;
-  background: #0d151f; color: var(--accent);
+  border: 1px solid #c8dcfa; border-radius: 5px;
+  background: #f3f8ff; color: var(--accent);
   font-family: var(--font-mono); font-size: 11px; cursor: pointer;
 }
 .cd-ref:hover { background: var(--bg-selected); border-color: var(--accent); }
@@ -630,8 +695,8 @@ function connectorGuide(s: McpServer) {
 .cd-input:focus { border-color: var(--accent); }
 .cd-send {
   height: 30px; padding: 0 16px; border-radius: 7px;
-  border: 1px solid var(--accent); background: var(--accent);
-  color: #08121f; font-size: 12px; font-weight: 600; cursor: pointer;
+  border: 1px solid #2560d4; background: linear-gradient(180deg,#3b7ef2,#2f6fed);
+  color: #fff; font-size: 12px; font-weight: 600; cursor: pointer;
 }
 .cd-send:disabled { opacity: .4; cursor: default; }
 .cd-stop { background: transparent; color: var(--danger); border-color: var(--danger); }

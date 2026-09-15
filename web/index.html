@@ -4,10 +4,10 @@
 <meta charset="UTF-8" data-page-node-id="ajJ5ubuNpFhKTET2zXxKrW" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="nZSMT2qQScccaXyyxC7tMh" />
 <link rel="icon" type="image/x-icon" href="/favicon.ico" />
-<title>DocMind · 本地 RAG 代码问答</title>
+<title>DocMind · AI 代码问答（本地运行）</title>
 <style>
   :root {
-    color-scheme: dark;
+    color-scheme: light;
     --bg: #0b0f15;
     --bg-grad: radial-gradient(1200px 600px at 80% -10%, #111824 0%, #0b0f15 55%);
     --panel: #0f141c;
@@ -324,6 +324,100 @@
   #devGraph svg .node-box { fill:#16203a;stroke:#2a3a5c;stroke-width:1; }
   #devGraph svg .node-label { fill:#cdd9ee;font-size:11px;font-family:"Segoe UI",sans-serif; }
   #devGraph svg .node-key { fill:#8aa0c4;font-size:9px;font-family:Consolas,monospace; }
+
+  /* ================= 浅色亲和主题覆盖层（同优先级靠后生效） ================= */
+  :root {
+    color-scheme: light;
+    --bg: #eef1f7;
+    --bg-grad: radial-gradient(1200px 600px at 80% -10%, #e8f0ff 0%, #eef1f7 55%);
+    --panel: #ffffff;
+    --panel-2: #f6f8fb;
+    --line: #dde3ee;
+    --line-strong: #c4cedd;
+    --txt: #222b38;
+    --txt-dim: #5a6778;
+    --txt-faint: #98a3b4;
+    --accent: #2f6fed;
+    --accent-2: #7a5af8;
+    --user-grad: linear-gradient(135deg, #3b7ef2, #7a5af8);
+    --bot: #ffffff;
+    --ok: #1c9e66;
+    --warn: #c8811c;
+    --err: #e0484f;
+    --shadow: 0 14px 40px rgba(35,52,84,.14);
+  }
+  .sidebar { background: linear-gradient(180deg, #f8faff, #ffffff); }
+  .brand .logo { box-shadow: 0 4px 14px rgba(47,111,237,.25); }
+  .card { box-shadow: 0 1px 2px rgba(35,52,84,.04); }
+  .src .ic { background: #eef3fc; }
+  .btn { background: linear-gradient(135deg, #3b7ef2, #7a5af8); }
+  .btn.ghost { background: #f3f6fb; }
+  .badge { background: rgba(47,111,237,.12); color: #2f6fed; border-color: rgba(47,111,237,.3); }
+  .badge.emb { background: rgba(122,90,248,.12); color: #6a48e0; border-color: rgba(122,90,248,.3); }
+  .btn.power-off { background: rgba(224,72,79,.08); color: #c0393f; border-color: rgba(224,72,79,.35); }
+  .btn.power-off:hover { color: #a52e34; border-color: var(--err); }
+  .btn.power-on { background: rgba(28,158,102,.08); color: #158053; border-color: rgba(28,158,102,.35); }
+  .btn.power-on:hover { color: #0f6844; border-color: var(--ok); }
+
+  .topbar { background: rgba(255,255,255,.82); }
+  .topbar::after { background: linear-gradient(90deg, transparent, rgba(47,111,237,.18) 20%, rgba(122,90,248,.14) 55%, transparent 80%); }
+  .topbar .toplink:hover { background: rgba(47,111,235,.07); color: var(--accent); }
+
+  .ollama-banner { background: #fdf6e9; border-color: #ecd9ab; color: #8a5a16; }
+  .ob-text { color: #7a4c10; }
+  .ob-close { color: #b07a1e; }
+
+  .msg.bot .av { background: #eef3fc; border-color: #c8dcfa; }
+  .bubble code, .bubble .answer code { background: rgba(47,111,237,.09); color: #2f6fed; }
+  .tag.thought { background: #fbe4a3; }
+  .tag.action { background: #bdebd5; }
+  .tag.observation { background: #b9d4f9; }
+  .tag.reflection { background: #f7c9d0; }
+  .tag.final { background: #f3c6e2; }
+  .step .tag { color: #4a3b14; }
+  .tag.action { color: #0f6a47; }
+  .tag.observation { color: #1b4e8f; }
+  .tag.reflection { color: #96323f; }
+  .tag.final { color: #8a2f5f; }
+  .step .body { color: #334055; background: #f6f8fb; border-color: var(--line); }
+
+  footer { background: rgba(255,255,255,.92); }
+  footer #q:focus { box-shadow: 0 0 0 3px rgba(47,111,237,.15); }
+  footer.drag #q { background: rgba(47,111,237,.06); }
+  .chat-imgs img { border-color: rgba(35,52,84,.15); }
+
+  .overlay { background: rgba(30,40,60,.32); }
+  .modal { box-shadow: var(--shadow); }
+  .fileref { border-bottom-color: rgba(47,111,237,.5); }
+  .fileref:hover { color: #1d5fd4; background: rgba(47,111,237,.1); }
+
+  .file-modal .codeview { background: #fcfdff; }
+  .file-modal .codeview .ln .src { color: #334055; }
+  .file-modal .codeview .ln.hl { background: rgba(47,111,237,.12); box-shadow: inset 3px 0 0 var(--accent); }
+
+  ::-webkit-scrollbar-thumb { background: #cdd5e1; border-color: var(--bg); }
+  ::-webkit-scrollbar-thumb:hover { background: #b6c1d0; }
+  #chat, .sidebar, .modal, #devRegions, #devChangesets, #devBugs { scrollbar-color: #cdd5e1 transparent; }
+
+  .badge.dirty { background: rgba(200,129,28,.12); color: #9a6410; border-color: rgba(200,129,28,.35); }
+  .badge.ok { background: rgba(28,158,102,.1); color: #158053; border-color: rgba(28,158,102,.32); }
+  .badge.warn { background: rgba(224,72,79,.09); color: #c0393f; border-color: rgba(224,72,79,.32); }
+  #devGraph svg .edge { stroke: #b9c6dc; }
+  #devGraph svg .earrow { fill: #b9c6dc; }
+  #devGraph svg .node-box { fill: #eef3fc; stroke: #c8dcfa; }
+  #devGraph svg .node-label { fill: #334055; }
+  #devGraph svg .node-key { fill: #74839a; }
+
+  /* 离线演示横幅 */
+  .demo-banner {
+    display: flex; gap: 10px; align-items: flex-start;
+    margin: 0 0 4px; padding: 10px 14px; border-radius: 12px;
+    background: #eef3fc; border: 1px solid #c8dcfa; color: #2b5797;
+    font-size: 12.5px; line-height: 1.6;
+  }
+  .demo-banner.hidden { display: none; }
+  .demo-banner b { color: #1d5fd4; }
+  .demo-banner .ob-close { color: #4a78b8; }
 </style>
 </head>
 <body data-page-node-id="X2MohhkbYRgVfpyl5v1CIg">
@@ -333,48 +427,48 @@
       <div class="logo" data-page-node-id="qq1NPPAWG1Z644UQ4ZRKFV">D</div>
       <div data-page-node-id="44AiR2cyBBMC6culxGwni6">
         <h1 data-page-node-id="bkP3uT71gTNYDV78fSbeu2">DocMind</h1>
-        <p data-page-node-id="OqAMbVIAk29aUEvef6jYop">本地 RAG · 工具调用 Agent</p>
+        <p data-page-node-id="OqAMbVIAk29aUEvef6jYop">AI 读代码 · 全程本地运行</p>
       </div>
     </div>
 
     <!-- 知识库（文档分区） -->
     <div class="card" data-page-node-id="X4LB8YQTVwpz1i4i6LN1KL">
-      <h3 data-page-node-id="m8K2lATxR2xd49KD9sNPfz"><span class="dot" data-page-node-id="QdioDgMsHevcjrEEJNTI6g"></span>知识库 · 文档分区 <span class="count" id="kbCount" data-page-node-id="4aRoGYdQTVCD20DLYLM6Av">0</span></h3>
+      <h3 data-page-node-id="m8K2lATxR2xd49KD9sNPfz"><span class="dot" data-page-node-id="QdioDgMsHevcjrEEJNTI6g"></span>资料文档（先给 AI 读） <span class="count" id="kbCount" data-page-node-id="4aRoGYdQTVCD20DLYLM6Av">0</span></h3>
       <div class="upload-row" data-page-node-id="8uEl3qpWLjY2rJrJoNgeUo">
-        <label class="file-label" for="fileInput" data-page-node-id="QZgsQE0UkIwagkxDWYOkPs">选择 PDF / MD / TXT</label>
+        <label class="file-label" for="fileInput" data-page-node-id="QZgsQE0UkIwagkxDWYOkPs">选择 PDF / Markdown / TXT</label>
         <input type="file" id="fileInput" accept=".pdf,.md,.txt" data-page-node-id="OciEcuAt43ph1rk4WDEIKo" />
-        <button class="btn sm" id="uploadBtn" data-page-node-id="msA57Vx5bT3fbMN2wZ5nhI">上传</button>
+        <button class="btn sm" id="uploadBtn" data-page-node-id="msA57Vx5bT3fbMN2wZ5nhI">喂给 AI</button>
       </div>
       <div class="src-list" id="kbList" style="margin-top:10px;" data-page-node-id="VTl3qL9zdswYoKXA5kTrG3">
-        <div class="empty" id="kbEmpty" data-page-node-id="fMWVDFrQ0rK9aLrt5lcFL5">尚未上传文档。<br data-page-node-id="2FO0sXkDhkTDpSZSsAJdHO">上传后，Agent 会先检索再作答。</div>
+        <div class="empty" id="kbEmpty" data-page-node-id="fMWVDFrQ0rK9aLrt5lcFL5">还没有资料。<br data-page-node-id="2FO0sXkDhkTDpSZSsAJdHO">上传策划案/接口文档后，AI 回答前会先翻这些资料。</div>
       </div>
     </div>
 
     <!-- 代码库（代码分区） -->
     <div class="card" data-page-node-id="zAxo2EsTS7B4vSUpaWD6st">
-      <h3 data-page-node-id="HZloOzDJ5jiS5RfDGeSHgD"><span class="dot" style="background:var(--accent);box-shadow:0 0 8px var(--accent)" data-page-node-id="cihZ5OG0Kp9gP1M6Tpw97V"></span>代码库 · 代码分区 <span class="count" id="codeCount" data-page-node-id="5owzmIGDL4xKf5v7vQnN1F">0</span></h3>
+      <h3 data-page-node-id="HZloOzDJ5jiS5RfDGeSHgD"><span class="dot" style="background:var(--accent);box-shadow:0 0 8px var(--accent)" data-page-node-id="cihZ5OG0Kp9gP1M6Tpw97V"></span>项目代码（先建索引） <span class="count" id="codeCount" data-page-node-id="5owzmIGDL4xKf5v7vQnN1F">0</span></h3>
       <div class="code-status" id="codeStatus" data-page-node-id="LoYUrGiJOtPzE5p79rdVbs">
-        <span class="empty" data-page-node-id="jyr67RVACmjf9gBbiEmD4p">未索引代码库。<br data-page-node-id="S9qlqTjWzo2bRgt4b5I4tv">索引后可问「某函数在哪实现」「伤害计算逻辑在哪」。</span>
+        <span class="empty" data-page-node-id="jyr67RVACmjf9gBbiEmD4p">还没让 AI 读过你的项目。<br data-page-node-id="S9qlqTjWzo2bRgt4b5I4tv">选一次项目文件夹建索引，之后就能直接问：「受伤扣血在哪算的？」「这个函数在哪实现？」</span>
       </div>
-      <button class="btn ghost block sm" id="codeLibBtn" style="margin-top:10px;" data-page-node-id="KBFtHwvAqEERm962wTuO1x">📁 索引代码目录</button>
+      <button class="btn ghost block sm" id="codeLibBtn" style="margin-top:10px;" data-page-node-id="KBFtHwvAqEERm962wTuO1x">📁 选项目文件夹，一键建索引</button>
     </div>
 
     <!-- 分区开发（开发模式） -->
     <div class="card" data-page-node-id="devCard">
       <h3 data-page-node-id="devH"><span class="dot" style="background:#BA7517;box-shadow:0 0 8px #BA7517" data-page-node-id="devDot"></span>分区开发 <span class="count" id="regionCount" data-page-node-id="devCnt">0</span></h3>
       <div class="code-status" id="devStatus" data-page-node-id="devSt">
-        <span class="empty" data-page-node-id="devEmpty">未初始化分区。<br data-page-node-id="devE2">初始化后按 素材区/数值区/bug区/角色行为区 隔离改动，各分区独立 git 回滚。</span>
+        <span class="empty" data-page-node-id="devEmpty">未开启（高级功能）。<br data-page-node-id="devE2">开启后把 素材 / 数值 / Bug / 角色行为 等改动分区隔离，每块都能单独撤销，互不误伤。</span>
       </div>
-      <button class="btn ghost block sm" id="devBtn" style="margin-top:10px;" data-page-node-id="devBtn">🛠 开发模式</button>
+      <button class="btn ghost block sm" id="devBtn" style="margin-top:10px;" data-page-node-id="devBtn">🛠 分区开发（高级）</button>
     </div>
 
     <!-- 模型状态 -->
     <div class="card model-box" data-page-node-id="JddNg5gGbu1ihxzY8XG246">
       <h3 data-page-node-id="sj3LsFfbnDmUVLVEa2apUT"><span class="dot" style="background:var(--ok);box-shadow:0 0 8px var(--ok)" data-page-node-id="7UZHhMbFSm848OsgkwokrT"></span>模型状态</h3>
-      <div class="model-line" data-page-node-id="uuPGlUCSFJODP58k7iKWD7">Provider <span class="badge" id="mProv" data-page-node-id="cAcQmxe1L3BJjAgCEvztZF">mock</span></div>
-      <div class="model-line" style="margin-top:7px;" data-page-node-id="jBzxtEPnv1jBRH4wCgGQZ0">检索向量 <span class="badge emb" id="mEmb" data-page-node-id="T54RhZgyWVqmJlovPquFwZ">local</span></div>
+      <div class="model-line" data-page-node-id="uuPGlUCSFJODP58k7iKWD7">回答用的模型 <span class="badge" id="mProv" data-page-node-id="cAcQmxe1L3BJjAgCEvztZF">mock</span></div>
+      <div class="model-line" style="margin-top:7px;" data-page-node-id="jBzxtEPnv1jBRH4wCgGQZ0">文字理解引擎 <span class="badge emb" id="mEmb" data-page-node-id="T54RhZgyWVqmJlovPquFwZ">local</span></div>
       <div class="actions" data-page-node-id="r9l2ZLK17ez2Ux0KFyJEWX">
-        <button class="btn ghost sm" id="settingsBtn" style="flex:1;" data-page-node-id="1FiW8m1mNrAL9jJVUQTEyF">⚙ 模型设置</button>
+        <button class="btn ghost sm" id="settingsBtn" style="flex:1;" data-page-node-id="1FiW8m1mNrAL9jJVUQTEyF">⚙ 切换模型</button>
       </div>
       <div class="model-line" id="mModel" style="margin-top:9px;color:var(--txt-faint);" data-page-node-id="R0W2b40FtJZwI9AF0BAaWb"></div>
       <div class="power-box" id="powerBox">
@@ -387,16 +481,24 @@
   <!-- ===== 主区 ===== -->
   <div class="main" data-page-node-id="dap8vBV3Cylxp163UuUIRS">
     <div class="topbar" data-page-node-id="j4sirg3FpmYx2FBbOSEtU9">
-      <div class="title" data-page-node-id="jDjdHpAfLvjKfv9y3y1tS2">本地 RAG 问答 <small data-page-node-id="GggkEUjAMdPnuYLYPQ1r7x">ReAct 推理 · 检索增强 · 工具调用</small></div>
+      <div class="title" data-page-node-id="jDjdHpAfLvjKfv9y3y1tS2">AI 代码问答 <small data-page-node-id="GggkEUjAMdPnuYLYPQ1r7x">用大白话提问，AI 自己搜代码、给答案、标文件位置</small></div>
       <div class="spacer" data-page-node-id="mUp4elVMi0fMV7L75znmvy"></div>
-      <a class="toplink" href="/workbench" title="打开开发工作台：分区治理 · 引擎/试玩 · 场景画布 · 运行时时间线">开发工作台 →</a>
-      <div class="status-pill" id="status" data-page-node-id="0uTeAZIXXoo6g4X1y6Obij">就绪。默认 mock 模式无需 Key，可直接提问示例知识库。</div>
+      <a class="toplink" href="/workbench.html" title="打开代码工作台：编辑文件、看代码地图、运行游戏">代码工作台 →</a>
+      <div class="status-pill" id="status" data-page-node-id="0uTeAZIXXoo6g4X1y6Obij">就绪。直接在下面输入问题即可开始。</div>
+    </div>
+
+    <div id="demoBanner" class="demo-banner hidden" role="status">
+      <div class="ob-icon">🧪</div>
+      <div class="ob-body">
+        <b>示例演示模式：</b>当前没有连接本地 DocMind 服务，下面的资料、代码库与问答均为示例。在本机启动 DocMind 并选择你的项目文件夹后，这里会显示真实内容与真实回答。
+      </div>
+      <button class="ob-close" id="demoBannerClose" title="知道了">×</button>
     </div>
 
     <div id="ollamaBanner" class="ollama-banner hidden" role="alert">
       <div class="ob-icon">⚠️</div>
       <div class="ob-body">
-        <div class="ob-title">本机 Ollama 未运行 / 不可达</div>
+        <div class="ob-title">本机没检测到 Ollama（跑本地大模型的程序）</div>
         <pre class="ob-text" id="ollamaGuidance"></pre>
       </div>
       <button class="ob-close" id="ollamaBannerClose" title="忽略">×</button>
@@ -406,7 +508,7 @@
 
     <footer data-page-node-id="SWPJ3nNNQK5WQ1HjvQIgmq">
       <div id="imgPreview" class="img-preview hidden"></div>
-      <textarea id="q" placeholder="例如：这张截图里的报错是什么意思？UI 这张设计稿帮我还原成代码…  (可直接粘贴/拖入图片，Enter 发送 / Shift+Enter 换行)"></textarea>
+      <textarea id="q" placeholder="用大白话问，例如：玩家受伤扣多少血、在哪段代码算的？这个按钮点了没反应是为什么？（可粘贴报错截图，Enter 发送 / Shift+Enter 换行）"></textarea>
       <div class="composer-bar">
         <div class="composer-left">
           <button class="btn ghost sm" id="imgBtn" title="附加图片（也可直接 Ctrl+V 粘贴截图或拖入，最多 4 张）">🖼 图片</button>
@@ -423,9 +525,9 @@
     <div class="modal" data-page-node-id="wRIEzLDk8KtQhXia3KyW9m">
       <div class="modal-head" data-page-node-id="Bp8uDplSmkTsdnAWlhhpP7"><h2 data-page-node-id="WnsvoMRx9fu5x5aknDWXrq">模型设置</h2><button class="close" id="panelClose" data-page-node-id="dXfDic2JKs7mpb10HwE21H">×</button></div>
 
-      <label data-page-node-id="zyRngVabBEivMDfVM4OnU9">模型 Provider</label>
+      <label data-page-node-id="zyRngVabBEivMDfVM4OnU9">回答用的模型（从哪里来）</label>
       <select id="cfgProvider" data-page-node-id="H5Yv9z9cmCNPfyDJJZDbxx">
-        <option value="mock" data-page-node-id="m0gLxmXC4B6zYksNQBFlGF">mock（离线演示，无需 Key）</option>
+        <option value="mock" data-page-node-id="m0gLxmXC4B6zYksNQBFlGF">离线演示（不用配置，直接能聊）</option>
         <option value="qwen" data-page-node-id="KD1OXIwESMc9gVhtHoeUOl">通义千问 qwen</option>
         <option value="deepseek" data-page-node-id="mOplKFrdshPXAtGlpmCvYk">DeepSeek</option>
         <option value="ollama" data-page-node-id="YsmDnBjSy4oiABBFMO1JBo">Ollama（本地）</option>
@@ -437,46 +539,46 @@
       <label data-page-node-id="1nTP12uisE8lCxqUcLedqA">模型名 <span class="sub" data-page-node-id="IrfNrKjlnFGesek59ZH028">（留空用默认，如 qwen-plus）</span></label>
       <input id="cfgModel" placeholder="qwen-plus / qwen-max / deepseek-chat ..." autocomplete="off" data-page-node-id="PVQpPDRyAUStM4OJuGQh7P" />
 
-      <label data-page-node-id="d29KhCHHURfR1cWYkKwKHf">检索向量 Embedding</label>
+      <label data-page-node-id="d29KhCHHURfR1cWYkKwKHf">文字理解引擎（让 AI「读懂」代码和文档用的）</label>
       <select id="cfgEmbed" data-page-node-id="1SFULGmUf0SIJMRcWf4J1v">
-        <option value="local" data-page-node-id="sFwg3OPiniJLLCZClmetYI">local（本地兜底，离线可用）</option>
-        <option value="ollama" data-page-node-id="a7kQmZp3VxR9wT1nYcLbH">ollama（本地 bge-m3，多语言，零 Key）</option>
-        <option value="qwen" data-page-node-id="VfYE0eiOQe61YmG81zCzM6">qwen（语义更准，需 Key）</option>
+        <option value="local" data-page-node-id="sFwg3OPiniJLLCZClmetYI">本地简易版（离线就能用，理解力一般）</option>
+        <option value="ollama" data-page-node-id="a7kQmZp3VxR9wT1nYcLbH">本地增强版（Ollama bge-m3，推荐，免费）</option>
+        <option value="qwen" data-page-node-id="VfYE0eiOQe61YmG81zCzM6">云端版（理解力更强，需要 Key）</option>
       </select>
 
       <label style="margin-top:14px;display:flex;align-items:center;gap:8px;color:var(--txt-dim);">
         <input type="checkbox" id="cfgEditConfirm" style="width:auto;">
-        <span>写操作需人工确认（改前出 diff，确认后才写入）</span>
+        <span>AI 改文件前先给我看改动内容，我点头后才真正写入（推荐）</span>
       </label>
 
       <div class="modal-actions" data-page-node-id="cuUVEirIG7BMvicFlM8JEC">
         <button class="btn" id="saveCfg" data-page-node-id="UZCTJG9vMQFUB8iBj09TDA">保存并切换</button>
         <span class="cfg-msg" id="cfgMsg" data-page-node-id="oIAJcawbCiudvbgQ0a53zt"></span>
       </div>
-      <div class="modal-note" data-page-node-id="5JezB22Qj0XUdrFOIuIzat">切换即时生效，无需重启。Key 仅存内存，重启服务后恢复 .env 默认值。切换 Embedding 会清空已上传文档向量，需重新上传。</div>
+      <div class="modal-note" data-page-node-id="5JezB22Qj0XUdrFOIuIzat">切换后立即生效，不用重启。API Key 只保存在本次运行的内存里，重启服务后恢复默认配置。注意：更换「文字理解引擎」后，之前上传的资料需要重新喂给 AI 一次。</div>
     </div>
   </div>
 
   <!-- ===== 代码库索引弹窗 ===== -->
   <div class="overlay hidden" id="codeOverlay" data-page-node-id="33NKHdeWHex2GXHMIHZjtZ">
     <div class="modal" data-page-node-id="eYwyD4dfgNhRK73nfpSd21">
-      <div class="modal-head" data-page-node-id="7JZxJ5bIcZRwFvYE5UOvi1"><h2 data-page-node-id="MeIiTyCHYHshXBruvTweUx">代码库索引</h2><button class="close" id="codePanelClose" data-page-node-id="BsBYpxsdHNEqXNnkDuDYNS">×</button></div>
-      <label data-page-node-id="vzHYashO0CgSjckuxXq9m1">代码目录（绝对路径）</label>
-      <div style="display:flex;gap:8px;"><input id="codeRoot" placeholder="选择文件夹或输入路径" autocomplete="off" data-page-node-id="FrafwZMh3rR8NYXqCXK1CE" style="flex:1" /><button class="btn" id="pickCodeRoot" type="button">📁 打开文件夹</button></div>
+      <div class="modal-head" data-page-node-id="7JZxJ5bIcZRwFvYE5UOvi1"><h2 data-page-node-id="MeIiTyCHYHshXBruvTweUx">给项目代码建索引</h2><button class="close" id="codePanelClose" data-page-node-id="BsBYpxsdHNEqXNnkDuDYNS">×</button></div>
+      <label data-page-node-id="vzHYashO0CgSjckuxXq9m1">你的项目文件夹（完整路径）</label>
+      <div style="display:flex;gap:8px;"><input id="codeRoot" placeholder="点右侧按钮选文件夹，或手动输入完整路径" autocomplete="off" data-page-node-id="FrafwZMh3rR8NYXqCXK1CE" style="flex:1" /><button class="btn" id="pickCodeRoot" type="button">📁 选择文件夹</button></div>
       <input id="codeFolderPicker" type="file" webkitdirectory directory multiple hidden />
       <div class="modal-actions" data-page-node-id="aWiXpHSUSWVUm9QaYYg6GM">
-        <button class="btn" id="indexCodeBtn" data-page-node-id="xLmtfCO4BKLdRPbz6JYumr">开始索引</button>
+        <button class="btn" id="indexCodeBtn" data-page-node-id="xLmtfCO4BKLdRPbz6JYumr">开始建索引</button>
         <span class="cfg-msg" id="codeMsg" data-page-node-id="mhbFuN86omFk9Iw3CXfgyO"></span>
       </div>
-      <div class="modal-note" data-page-node-id="gLZA8IdCmFBcyVL7uzBzJk">遍历目录内源码（.py/.js/.cs/.java/.ts/.go/.rs 等），按函数/类切分到独立代码集合，并记录语言标签与 import 依赖边。索引即"分区"——让 Agent 精准定位、按需修改，避免 AI 改代码时的堆叠与幻觉。</div>
+      <div class="modal-note" data-page-node-id="gLZA8IdCmFBcyVL7uzBzJk">这一步会让 AI 把项目里的代码（支持常见编程语言）通读一遍：每个函数、每个类分别记在小卡片上，并记住它们之间谁调用谁。建好之后，你用大白话提问，它就能直接翻到对应文件和行号，回答有据可查，不会瞎编。</div>
     </div>
   </div>
 
   <!-- ===== 分区开发工作台弹窗 ===== -->
   <div class="overlay hidden" id="devOverlay" data-page-node-id="devOverlay">
     <div class="modal" id="devModalBox" data-page-node-id="devModal" style="width:620px;max-width:94vw;">
-      <div class="modal-head" data-page-node-id="devMH"><h2 data-page-node-id="devMH2">分区开发工作台</h2><button class="close" id="devPanelClose" data-page-node-id="devPC">×</button></div>
-      <p style="color:var(--txt-dim);margin:0 0 12px;line-height:1.6;" data-page-node-id="devDesc">代码库按分工切成多个独立分区（子目录），每个分区独立 git 仓库，可单独提交 / 回滚；依赖方向单向，契约校验防循环耦合。初始化后 Agent 写操作被约束在对应分区内。</p>
+      <div class="modal-head" data-page-node-id="devMH"><h2 data-page-node-id="devMH2">分区开发（高级安全功能）</h2><button class="close" id="devPanelClose" data-page-node-id="devPC">×</button></div>
+      <p style="color:var(--txt-dim);margin:0 0 12px;line-height:1.6;" data-page-node-id="devDesc">把项目按分工切成几块独立区域（子目录），每块单独存档（git），可以只改一块、只撤销一块，互不误伤。AI 的修改会被限制在对应区域内，不会动到不该动的文件。</p>
       <div class="modal-actions" data-page-node-id="devAct">
         <button class="btn sm" id="devInitBtn" data-page-node-id="devInit">初始化分区</button>
         <button class="btn ghost sm" id="devRefreshBtn" data-page-node-id="devRef">刷新状态</button>
@@ -541,6 +643,94 @@
   const q = document.getElementById("q");
   const $ = (id) => document.getElementById(id);
 
+  // ---------- 离线演示模式：静态预览（无 FastAPI）时用示例数据，让首次打开的人也能看懂 ----------
+  let demoMode = false;
+  async function probeBackend() {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2200);
+    try {
+      const r = await fetch("/api/health", { signal: ctrl.signal });
+      demoMode = !r.ok;
+    } catch (e) { demoMode = true; }
+    clearTimeout(timer);
+    if (demoMode) startDemo();
+  }
+  function demoGuardMsg() {
+    status.textContent = "示例演示模式：这个操作需要在本机启动 DocMind 后使用。";
+  }
+  function startDemo() {
+    $("demoBanner").classList.remove("hidden");
+    $("demoBannerClose").onclick = () => $("demoBanner").classList.add("hidden");
+    // 侧栏示例数据
+    $("kbCount").textContent = "3";
+    $("kbList").innerHTML = [
+      ["策划案_战斗系统.md", "MD"], ["数值表说明.pdf", "PDF"], ["接口文档.txt", "TXT"],
+    ].map(([n, ext]) => `<div class="src"><div class="ic">${ext}</div><div class="nm">${n}</div></div>`).join("");
+    $("codeCount").textContent = "1,280";
+    $("codeStatus").innerHTML = `<b>已索引</b> 1,280 条切片<div class="code-path">D:\\GameProjects\\MyFirstGame</div>`;
+    $("regionCount").textContent = "4";
+    $("devStatus").innerHTML = `<span>示例项目已按 素材 / 数值 / 行为 / Bug 四个区隔离。</span>`;
+    $("mProv").textContent = "ollama";
+    $("mEmb").textContent = "ollama";
+    $("mModel").textContent = "模型：qwen2.5:7b（本地显卡运行，不花钱）";
+    $("vrText").textContent = "示例：本地模型跑在你自己的显卡上，数据不出本机。";
+    status.textContent = "示例演示模式 · 直接在下面提问试试，回答为模拟内容";
+  }
+  function demoAnswer(question) {
+    const t = question || "";
+    if (t.includes("血") || t.includes("伤") || t.includes("伤害") || t.includes("数值") || t.includes("damage")) {
+      return [
+        "找到了。玩家受伤扣血主要在这三处：",
+        "",
+        "1. 生命值定义：player/player_stats.gd:12 —— max_health = 100",
+        "2. 受伤计算：scripts/damage_calc.gd:42 —— take_damage(amount) 先扣护甲 armor，再从 health 里扣；血量到 0 触发 game_over",
+        "3. 数值配置：resources/player_values.tres —— 策划数值在这改，不用动代码",
+        "",
+        "（以上是示例回答）连接你的真实项目后，点蓝色文件链接可以直接看到对应源码行。",
+      ].join("\n");
+    }
+    if (t.includes("结构") || t.includes("梳理") || t.includes("入口")) {
+      return [
+        "按示例项目的结构，代码大致是这样分工的：",
+        "",
+        "· 入口：main/main.gd:1（游戏启动与主循环）",
+        "· 玩家：player/player_stats.gd、player/player_controller.gd",
+        "· 战斗：scripts/damage_calc.gd:42",
+        "· 数值配置：resources/player_values.tres",
+        "",
+        "（示例回答）真实使用时，还可以点右上角「代码工作台 →」看可视化的代码地图。",
+      ].join("\n");
+    }
+    return [
+      "（示例回答）在你的真实项目里，AI 会先搜索代码索引、再打开相关文件确认，",
+      "然后用大白话解释，并把答案定位到具体文件和行号，例如 scripts/damage_calc.gd:42。",
+      "",
+      "试试问：「玩家受伤扣多少血，在哪段代码里算的？」",
+    ].join("\n");
+  }
+  function demoChat(shell, ans) {
+    const td = shell.querySelector(".think-dot");
+    if (td) td.classList.add("active");
+    const seq = [
+      ["thought", "先拆关键词：受伤 / 扣血 / damage / health"],
+      ["action", "search_code：搜索 take_damage、health、扣血"],
+      ["observation", "命中 4 个文件，最相关的是 scripts/damage_calc.gd"],
+      ["action", "read_file：scripts/damage_calc.gd（第 30–70 行）"],
+      ["observation", "找到 take_damage(amount)：先扣护甲，再扣生命值"],
+    ];
+    let chain = Promise.resolve();
+    seq.forEach(([type, text]) => {
+      chain = chain.then(() => new Promise((r) => setTimeout(r, 520)))
+        .then(() => appendStep(shell, type, text));
+    });
+    chain.then(() => new Promise((r) => setTimeout(r, 450))).then(() => {
+      ans.textContent = demoAnswer(q.dataset.lastQuestion || "");
+      if (td) td.classList.remove("active");
+      linkifyShell(shell);
+      if (chatNearBottom()) chat.scrollTop = chat.scrollHeight;
+    });
+  }
+
   // 仅当用户已在底部附近时才自动滚到底；用户上滑阅读某一段时不强行拉回底部
   function chatNearBottom(threshold) {
     threshold = threshold == null ? 80 : threshold;
@@ -582,7 +772,7 @@
       <div class="bubble">
         <div class="answer"></div>
         <div class="trace collapsed">
-          <div class="trace-head"><span class="think-dot"></span><span class="chev">▾</span><span class="lbl">深度思考</span></div>
+          <div class="trace-head"><span class="think-dot"></span><span class="chev">▾</span><span class="lbl">AI 是怎么找到答案的（点开看过程）</span></div>
           <div class="steps"></div>
         </div>
       </div>`;
@@ -593,7 +783,7 @@
   }
 
   function appendStep(shell, type, text) {
-    const label = { thought: "思考", action: "行动", observation: "观察", reflection: "反思", final: "回答" }[type] || type;
+    const label = { thought: "想了想", action: "动手操作", observation: "查到结果", reflection: "回头检查", final: "回答" }[type] || type;
     const div = document.createElement("div");
     div.className = "step";
     div.innerHTML = `<span class="tag ${type}">${label}</span><div class="body"></div>`;
@@ -821,7 +1011,13 @@
     const shell = addBotShell();
     const ans = shell.querySelector(".answer");
     const _td = shell.querySelector(".think-dot"); if (_td) _td.classList.add("active");
-    ans.innerHTML = `<div class="typing">深度思考中 <span class="d"></span><span class="d"></span><span class="d"></span></div>`;
+    ans.innerHTML = `<div class="typing">AI 正在翻代码 <span class="d"></span><span class="d"></span><span class="d"></span></div>`;
+
+    if (demoMode) {
+      q.dataset.lastQuestion = question;
+      demoChat(shell, ans);
+      return;
+    }
 
     const fd = new FormData();
     fd.append("question", question);
@@ -888,6 +1084,7 @@
   $("enhanceBtn").onclick = async () => {
     const draft = q.value.trim();
     if (!draft) { status.textContent = "请先在输入框写下要增强的提示词草稿。"; return; }
+    if (demoMode) { demoGuardMsg(); return; }
     const btn = $("enhanceBtn");
     const oldLabel = btn.textContent;
     btn.disabled = true; btn.textContent = "增强中…";
@@ -915,6 +1112,7 @@
   $("uploadBtn").onclick = async () => {
     const f = $("fileInput").files[0];
     if (!f) { status.textContent = "请先选择一个 PDF/MD/TXT 文件"; return; }
+    if (demoMode) { demoGuardMsg(); return; }
     status.textContent = "正在摄取：" + f.name + " ...";
     const fd = new FormData();
     fd.append("file", f);
@@ -955,6 +1153,7 @@
     const root = $("codeRoot").value.trim();
     const codeMsg = $("codeMsg");
     if (!root) { codeMsg.className = "cfg-msg error"; codeMsg.textContent = "请先填写代码目录绝对路径"; return; }
+    if (demoMode) { codeMsg.className = "cfg-msg warn"; codeMsg.textContent = "示例演示模式：请在本机启动 DocMind 后再建索引。"; return; }
     codeMsg.className = "cfg-msg"; codeMsg.textContent = "索引中…";
     status.textContent = "正在索引代码目录：" + root + " ...";
     try {
@@ -1116,6 +1315,13 @@
     const card = $("devRegions");
     const cnt = $("regionCount");
     if (!card) return;
+    if (demoMode) {
+      card.innerHTML = `<div class="empty">示例演示模式：在本机连接项目并初始化后，这里显示真实分区、提交与回滚记录。</div>`;
+      $("devChangesets").innerHTML = `<div class="empty">示例模式暂无变更集。</div>`;
+      $("devBugs").innerHTML = `<div class="empty">示例模式暂无异常记录。</div>`;
+      $("devGraph").innerHTML = "";
+      return;
+    }
     try {
       const r = await fetch("/api/regions");
       const j = await r.json();
@@ -1419,6 +1625,7 @@
   }
 
   async function loadConfig() {
+    if (demoMode) return;  // 演示数据已在 startDemo() 填好
     try {
       const r = await fetch("/api/config");
       const c = await r.json();
@@ -1483,6 +1690,7 @@
   }
 
   $("saveCfg").onclick = async () => {
+    if (demoMode) { $("cfgMsg").className = "cfg-msg warn"; $("cfgMsg").textContent = "示例演示模式：模型切换需要在本机启动 DocMind。"; return; }
     const body = {
       provider: $("cfgProvider").value,
       api_key: $("cfgKey").value,
@@ -1526,6 +1734,7 @@
   }
 
   async function loadPowerStatus() {
+    if (demoMode) return;  // 演示模式无真实显存状态
     const btn = $("powerBtn"), vrText = $("vrText"), vrDot = $("vrDot");
     if (!btn) return;
     let s;
@@ -1605,8 +1814,8 @@
   setInterval(loadPowerStatus, 20000);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) loadPowerStatus(); });
 
-  loadConfig();
-  loadPowerStatus();
+  // 启动先探测本地服务：探测不到（如静态预览）自动进入示例演示模式
+  probeBackend().then(() => { if (!demoMode) { loadConfig(); loadPowerStatus(); } });
 </script>
 </body>
 </html>

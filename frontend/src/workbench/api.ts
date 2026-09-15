@@ -1008,3 +1008,120 @@ export const mcpApi = {
     return postJson('/api/engine/addon/install', { confirm: true, force })
   },
 }
+
+// ---------------------------------------------------------------- harness 运维层
+// 对应后端 agent_trace / sessions / pricing / hooks / skills（纯只读查看 + 预算/热重载操作）。
+
+export interface BudgetStatus {
+  global_limit: number
+  global_spent: number
+  day: string
+  day_spent: number
+  per_minute_calls_limit: number
+  per_minute_cost_limit: number
+  minute_calls: number
+  minute_cost: number
+  sessions: Record<string, { spent: number; limit: number }>
+  pricing_file: string
+}
+export interface BudgetCheck {
+  ok: boolean
+  reason: string
+  global_limit: number
+  global_spent: number
+  session_limit: number
+  session_spent: number
+  day_spent: number
+  minute_calls: number
+  minute_cost: number
+  per_minute_calls_limit: number
+  per_minute_cost_limit: number
+}
+export interface TraceStep {
+  i: number
+  action: string
+  arg_chars?: number
+  latency_ms?: number
+  obs_chars?: number
+  ok?: boolean
+}
+export interface TraceItem {
+  turn_id: string
+  ts: string
+  session_id: string
+  provider: string
+  model: string
+  route: string | null
+  question_chars: number
+  messages_count: number
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  cost_cny: number
+  llm_calls: number
+  llm_ms: number
+  elapsed_ms: number
+  outcome: string
+  finish_reason?: string | null
+  aborted: boolean
+  error: string
+  steps: TraceStep[]
+}
+export interface TraceSummary {
+  turns: number
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  avg_elapsed_ms: number
+  aborted: number
+  errors: number
+  by_provider: Record<string, { turns: number; tokens: number } | number>
+}
+export interface SessionInfo {
+  session_id: string
+  turns: number
+  has_summary: boolean
+  updated_at: string
+}
+export interface SkillInfo {
+  name: string
+  description: string
+  when_to_use: string
+  path: string
+}
+
+export const harnessApi = {
+  budget(): Promise<{ ok: boolean; status: BudgetStatus; check: BudgetCheck }> {
+    return request('/api/budget')
+  },
+  setBudgetLimit(limitCny: number): Promise<{ ok: boolean; check?: BudgetCheck; error?: string }> {
+    return postJson('/api/budget', { limit_cny: limitCny })
+  },
+  resetBudget(): Promise<{ ok: boolean; check?: BudgetCheck }> {
+    return postJson('/api/budget', { reset: true })
+  },
+  sessions(): Promise<{ ok: boolean; items: SessionInfo[] }> {
+    return request('/api/sessions')
+  },
+  deleteSession(id: string): Promise<{ ok: boolean }> {
+    return fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }).then((r) => r.json())
+  },
+  trace(limit = 30): Promise<{ ok: boolean; items: TraceItem[]; summary: TraceSummary }> {
+    return request(`/api/trace?limit=${limit}`)
+  },
+  clearTrace(): Promise<{ ok: boolean }> {
+    return postJson('/api/trace/clear', {})
+  },
+  skills(): Promise<{ ok: boolean; skills_dir: string; exists: boolean; count: number; errors: string[]; items: SkillInfo[] }> {
+    return request('/api/skills')
+  },
+  reloadSkills(): Promise<{ ok: boolean; count?: number; errors?: string[] }> {
+    return postJson('/api/skills/reload', {})
+  },
+  hooks(): Promise<{ ok: boolean; hooks_dir: string; exists: boolean; counts: Record<string, number>; sources: Record<string, unknown>; errors: string[] }> {
+    return request('/api/hooks')
+  },
+  reloadHooks(): Promise<{ ok: boolean; errors?: string[] }> {
+    return postJson('/api/hooks/reload', {})
+  },
+}

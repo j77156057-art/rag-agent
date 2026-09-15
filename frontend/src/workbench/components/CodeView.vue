@@ -12,15 +12,34 @@ import { json } from '@codemirror/lang-json'
 import { html } from '@codemirror/lang-html'
 import { css } from '@codemirror/lang-css'
 import { markdown } from '@codemirror/lang-markdown'
-import { oneDark } from '@codemirror/theme-one-dark'
 import type { EditorTab } from '../composables/workbench'
 import { useWorkbench } from '../composables/workbench'
 import { regionColor, formatMtime, gitState } from '../theme'
+import { demoMode } from '../composables/demo'
 
 const props = defineProps<{ tab: EditorTab | null }>()
 
-const { saveActive, closeTab, tabs, registerContentGetter, registerDocReplacer, setSelection } =
-  useWorkbench()
+const {
+  saveActive, closeTab, tabs, registerContentGetter, registerDocReplacer, setSelection,
+  openSymbolMap,
+} = useWorkbench()
+
+// 浅色编辑器主题（壳是浅色，代码区也用白底；语法色走 CM 默认高亮，浅底可读）。
+const MONO_FONT = "'Cascadia Code','JetBrains Mono',Consolas,monospace"
+const lightEditorTheme = EditorView.theme({
+  '&': { height: '100%', fontSize: '12.5px', backgroundColor: '#ffffff', color: '#222b38' },
+  '.cm-scroller': { fontFamily: MONO_FONT },
+  '.cm-content': { caretColor: '#2f6fed' },
+  '&.cm-focused .cm-cursor': { borderLeftColor: '#2f6fed' },
+  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection':
+    { backgroundColor: 'rgba(47,111,237,.16)' },
+  '.cm-gutters': { backgroundColor: '#f6f8fb', color: '#9aa5b6', borderRight: '1px solid #e4e9f2' },
+  '.cm-activeLine': { backgroundColor: 'rgba(47,111,237,.05)' },
+  '.cm-activeLineGutter': { backgroundColor: '#eef3fc', color: '#2f6fed' },
+  '.cm-foldPlaceholder': {
+    backgroundColor: '#eef1f7', border: '1px solid #dde3ee', color: '#5a6778',
+  },
+})
 
 const host = ref<HTMLElement | null>(null)
 let view: EditorView | null = null
@@ -99,7 +118,7 @@ function buildState(tab: EditorTab): EditorState {
     extensions: [
       basicSetup,
       langExtension(tab.lang),
-      oneDark,
+      lightEditorTheme,
       readOnlyComp.of(EditorState.readOnly.of(!tab.writable)),
       keymap.of([{
         key: 'Mod-s',
@@ -118,11 +137,6 @@ function buildState(tab: EditorTab): EditorState {
         if (!u.docChanged) return
         const t = tabs.value.find((x) => x.id === tab.id)
         if (t) t.dirty = isDocDirty(u.state.doc.toString(), t.savedContent)
-      }),
-      EditorView.theme({
-        '&': { height: '100%', fontSize: '12.5px' },
-        '.cm-scroller': { fontFamily: "'Cascadia Code','JetBrains Mono',Consolas,monospace" },
-        '.cm-gutters': { background: '#0b0f15', borderRight: '1px solid #1b2330' },
       }),
     ],
   })
@@ -174,7 +188,7 @@ function syncView() {
 }
 
 onMounted(() => {
-  view = new EditorView({ parent: host.value!, extensions: [oneDark] })
+  view = new EditorView({ parent: host.value!, extensions: [lightEditorTheme] })
   syncView()
   // 编辑器桥：DevTools / 后续选区 AI（P2）经此读取当前 EditorView。
   // view 单例不变，切标签只替换其 state。
@@ -227,6 +241,16 @@ function savedLabel(tab: EditorTab): string {
   if (tab.savedAt) return `已保存 ${new Date(tab.savedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
   return ''
 }
+
+// ---- 新手欢迎页：让第一次打开的人 30 秒知道这里能干什么 ----
+function focusChat() {
+  window.dispatchEvent(new CustomEvent('docmind:focus-chat'))
+}
+function showSymbolMap() {
+  // 演示模式没有项目数据，地图打开也是空的，不触发
+  if (demoMode.value) return
+  openSymbolMap()
+}
 </script>
 
 <template>
@@ -275,14 +299,54 @@ function savedLabel(tab: EditorTab): string {
       <button class="cv-close-btn" @click="closeTab(tab.id)">关闭标签</button>
     </div>
 
-    <!-- 空态 -->
-    <div v-else-if="!tab" class="cv-state cv-empty">
-      <svg width="46" height="46" viewBox="0 0 46 46" fill="none">
-        <rect x="8" y="6" width="30" height="34" rx="3" stroke="#2b3543" stroke-width="1.5" />
-        <path d="M14 16 H32 M14 22 H32 M14 28 H25" stroke="#2b3543" stroke-width="1.5" stroke-linecap="round" />
-      </svg>
-      <p class="cv-empty-title">从左侧文件树选择文件</p>
-      <p class="cv-empty-hint">点击打开，Ctrl+S 保存；右键文件或文件夹可新建 / 重命名 / 删除</p>
+    <!-- 新手欢迎页（未打开任何文件时） -->
+    <div v-else-if="!tab" class="welcome">
+      <div class="welcome-inner">
+        <span class="welcome-badge">👋 第一次使用，花 30 秒看一下</span>
+        <h2>用大白话指挥 AI 读懂你的项目</h2>
+        <p class="welcome-sub">
+          这里是 DocMind 代码工作台：不用自己翻代码，直接用中文问 AI——
+          「玩家受伤扣多少血在哪算的？」「这个按钮点了为什么没反应？」它会自己搜代码、给答案、标出位置。
+          按下面四步开始：
+        </p>
+
+        <div class="welcome-grid">
+          <a class="welcome-card" href="/">
+            <span class="welcome-num">1</span>
+            <span>
+              <h4>先让 AI「读完」你的项目</h4>
+              <p>到 AI 问答首页选择项目文件夹并建立索引。没建索引，AI 就像没读过课本就上考场。</p>
+            </span>
+          </a>
+          <button class="welcome-card" type="button" @click="focusChat">
+            <span class="welcome-num">2</span>
+            <span>
+              <h4>用大白话直接提问</h4>
+              <p>点这里，光标会跳到右下角「AI 助手」。试试问：玩家受伤的数值在哪段代码里算的？</p>
+            </span>
+          </button>
+          <button class="welcome-card" type="button" :disabled="demoMode" @click="showSymbolMap">
+            <span class="welcome-num">3</span>
+            <span>
+              <h4>看图秒懂项目结构</h4>
+              <p>顶部「代码地图」画出全项目函数在哪定义、谁调用谁；Unity 项目还能查资源引用、标红断链。<template v-if="demoMode">（演示版无真实数据）</template></p>
+            </span>
+          </button>
+          <div class="welcome-card welcome-static">
+            <span class="welcome-num">4</span>
+            <span>
+              <h4>改坏了也能「读档」</h4>
+              <p>每次 git 提交都是一个存档点。文件上的「历史版本」可以一键回到任意旧版本，放心改。</p>
+            </span>
+          </div>
+        </div>
+
+        <div class="welcome-foot">
+          <span>💡 左侧是项目文件，点击即可查看</span>
+          <span>Ctrl+S 保存</span>
+          <span>右键文件可新建 / 重命名 / 删除</span>
+        </div>
+      </div>
     </div>
 
     <div v-show="tab && !tab.loading && !tab.error" ref="host" class="cv-host" />

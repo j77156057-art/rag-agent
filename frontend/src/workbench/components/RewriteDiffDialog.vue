@@ -102,7 +102,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 .rd-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(5, 8, 12, 0.62);
+  background: rgba(38, 52, 77, 0.38);
   backdrop-filter: blur(2px);
   z-index: 93;
   display: flex;
@@ -116,7 +116,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   background: var(--bg-raised);
   border: 1px solid var(--border-strong);
   border-radius: 10px;
-  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 24px 70px rgba(35, 52, 84, 0.16);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -154,13 +154,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 .rd-instr {
   flex: 0 0 auto;
   display: flex; gap: 7px; align-items: flex-start;
-  font-size: 12px; color: #b9c4d3; background: var(--bg);
+  font-size: 12px; color: var(--text-muted); background: var(--bg);
   border-bottom: 1px solid var(--border);
   padding: 8px 16px;
 }
 .rd-instr-tag {
-  flex: 0 0 auto; font-size: 10px; color: #8fc1ff;
-  border: 1px solid #2c4a6b; border-radius: 5px; padding: 0 5px; line-height: 16px; margin-top: 1px;
+  flex: 0 0 auto; font-size: 10px; color: #2f6fed;
+  border: 1px solid #b9d0f5; border-radius: 5px; padding: 0 5px; line-height: 16px; margin-top: 1px;
 }
 
 .rd-statbar {
@@ -171,18 +171,18 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   padding: 7px 16px;
   font-size: 11.5px;
   border-bottom: 1px solid var(--border);
-  background: #0b0f15;
+  background: #f6f8fb;
 }
 .rd-stat-same { color: var(--text-faint); }
-.rd-stat-add { color: #7fd49a; font-weight: 600; font-family: 'Cascadia Code', Consolas, monospace; }
-.rd-stat-del { color: #ff8e8e; font-weight: 600; font-family: 'Cascadia Code', Consolas, monospace; }
-.rd-stat-equal { color: #e3a857; }
+.rd-stat-add { color: #146c48; font-weight: 600; font-family: 'Cascadia Code', Consolas, monospace; }
+.rd-stat-del { color: #b32d33; font-weight: 600; font-family: 'Cascadia Code', Consolas, monospace; }
+.rd-stat-equal { color: #b5791f; }
 .rd-stat-hint { margin-left: auto; color: var(--text-faint); font-size: 10.5px; }
 
 .rd-body {
   flex: 1 1 auto;
   overflow: auto;
-  background: #0a0e14;
+  background: #f6f8fb;
   font-family: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
   font-size: 12.5px;
   line-height: 1.65;
@@ -197,7 +197,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   flex: 0 0 46px;
   text-align: right;
   padding: 0 8px 0 0;
-  color: #4d586b;
+  color: #98a3b4;
   user-select: none;
   font-size: 11px;
 }
@@ -209,16 +209,16 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 .rd-code {
   flex: 1 1 auto;
   padding-right: 16px;
-  color: #c9d4e3;
+  color: #243044;
 }
-.rd-del { background: rgba(255, 99, 99, 0.12); }
-.rd-del .rd-sign { color: #ff8e8e; }
-.rd-del .rd-code { color: #ffc4c4; }
-.rd-del .rd-gno { background: rgba(255, 99, 99, 0.08); }
-.rd-add { background: rgba(63, 195, 120, 0.12); }
-.rd-add .rd-sign { color: #7fd49a; }
-.rd-add .rd-code { color: #bff0cf; }
-.rd-add .rd-gno { background: rgba(63, 195, 120, 0.08); }
+.rd-del { background: #fdecec; }
+.rd-del .rd-sign { color: #b32d33; }
+.rd-del .rd-code { color: #b32d33; }
+.rd-del .rd-gno { background: #fbdfdf; }
+.rd-add { background: #e6f7ee; }
+.rd-add .rd-sign { color: #146c48; }
+.rd-add .rd-code { color: #146c48; }
+.rd-add .rd-gno { background: #d9f2e4; }
 
 .rd-foot {
   flex: 0 0 auto;
@@ -231,14 +231,14 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 }
 .rd-cancel {
   padding: 6px 18px; font-size: 12.5px; border-radius: 7px; cursor: pointer;
-  border: 1px solid #2b3543; background: transparent; color: #aeb9c8;
+  border: 1px solid var(--border-strong); background: transparent; color: var(--text-muted);
 }
-.rd-cancel:hover { background: #1a2230; color: #d6deea; }
+.rd-cancel:hover { background: var(--bg-hover); color: var(--text); }
 .rd-accept {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 6px 18px; font-size: 12.5px; border-radius: 7px; cursor: pointer;
-  border: 1px solid #2f7a4d; background: #16402a; color: #bff0cf;
+  border: 1px solid #15804f; background: linear-gradient(180deg,#2bb57a,#1c9e66); color: #fff;
 }
-.rd-accept:hover:not(:disabled) { background: #1d5236; }
+.rd-accept:hover:not(:disabled) { background: #1c9e66; }
 .rd-accept:disabled { opacity: 0.45; cursor: default; }
 </style>

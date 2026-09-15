@@ -125,7 +125,7 @@ function go(s: SymbolInfo) {
   gap: 6px;
   padding: 0 8px;
   border-bottom: 1px solid var(--border);
-  background: #0d1219;
+  background: #ffffff;
 }
 .so-title {
   font-size: 11.5px;
@@ -136,7 +136,7 @@ function go(s: SymbolInfo) {
 .so-count {
   font-size: 10.5px;
   color: var(--text-faint);
-  background: #16202e;
+  background: var(--bg-hover);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 0 6px;
@@ -165,9 +165,9 @@ function go(s: SymbolInfo) {
   margin: 4px 8px 8px;
   padding: 7px 9px;
   border: 1px solid var(--border);
-  border-left: 2px solid #58a6ff77;
+  border-left: 2px solid #2f6fed77;
   border-radius: 5px;
-  background: #10182466;
+  background: rgba(47,111,237,.06);
 }
 .so-class-name {
   display: flex;
@@ -176,7 +176,7 @@ function go(s: SymbolInfo) {
   font-family: var(--font-mono);
   font-size: 12px;
   font-weight: 600;
-  color: #cfe4ff;
+  color: #1b3c73;
 }
 .so-extends {
   margin-top: 3px;
@@ -184,7 +184,7 @@ function go(s: SymbolInfo) {
   color: var(--text-muted);
   font-family: var(--font-mono);
 }
-.so-extends code { color: #9ecbff; }
+.so-extends code { color: #2f6fed; }
 .so-doc {
   margin-top: 4px;
   font-size: 11px;

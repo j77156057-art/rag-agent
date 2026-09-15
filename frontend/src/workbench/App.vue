@@ -20,7 +20,9 @@ import SceneRuntimePanel from './components/SceneRuntimePanel.vue'
 import ChatDock from './components/ChatDock.vue'
 import AgentPolicyPanel from './components/AgentPolicyPanel.vue'
 import GpuPanel from './components/GpuPanel.vue'
+import HarnessPanel from './components/HarnessPanel.vue'
 import { useWorkbench } from './composables/workbench'
+import { probeBackend, demoMode } from './composables/demo'
 import { regionColor } from './theme'
 
 const {
@@ -49,7 +51,10 @@ function beforeUnload(e: BeforeUnloadEvent) {
 }
 
 onMounted(() => {
-  void loadTree()
+  // 先探测同源后端：静态预览（无 FastAPI）进演示模式，不发会失败的树请求。
+  void probeBackend().then((online) => {
+    if (online) void loadTree()
+  })
   window.addEventListener('beforeunload', beforeUnload)
 })
 onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
@@ -61,11 +66,11 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
       <div class="wb-brand">
         <span class="wb-mark" aria-hidden="true">
           <svg width="15" height="15" viewBox="0 0 15 15">
-            <rect x="1.5" y="2.5" width="9" height="10" rx="1.5" fill="none" stroke="#58a6ff" stroke-width="1.3" />
-            <path d="M11 5.5 H12.5 L14 7 V12.5 H11 Z" fill="#58a6ff22" stroke="#58a6ff" stroke-width="1.3" stroke-linejoin="round" />
+            <rect x="1.5" y="2.5" width="9" height="10" rx="1.5" fill="none" stroke="#2f6fed" stroke-width="1.3" />
+            <path d="M11 5.5 H12.5 L14 7 V12.5 H11 Z" fill="rgba(47,111,237,.13)" stroke="#2f6fed" stroke-width="1.3" stroke-linejoin="round" />
           </svg>
         </span>
-        <span class="wb-brand-name">DocMind <em>开发工作台</em></span>
+        <span class="wb-brand-name">DocMind <em>代码工作台</em></span>
       </div>
       <div v-if="tree" class="wb-topbar-meta">
         <span class="wb-rootpath" :title="tree.code_root">
@@ -83,15 +88,16 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
         </button>
       </div>
       <div class="wb-topbar-right">
-        <a class="wb-question-link" href="/" title="回到 RAG 问答页（检索问答 / 索引代码目录）">问答</a>
+        <a class="wb-question-link" href="/" title="回到 AI 问答首页：用大白话提问，让 AI 在代码库里找答案">AI 问答</a>
         <TaskEnginePanel />
         <GpuPanel />
+        <HarnessPanel />
         <AgentPolicyPanel />
         <SceneRuntimePanel />
         <button
           v-if="tree"
           class="wb-map-btn"
-          title="查看全项目符号语义地图"
+          title="代码地图：全项目的函数/变量都在哪定义、被谁调用，一图看清"
           @click="openSymbolMap"
         >
           <svg width="13" height="13" viewBox="0 0 13 13">
@@ -100,12 +106,12 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
             <circle cx="8.2" cy="10" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
             <path d="M4.6 4.2 L8.4 3.6 M4.3 4.6 L7.3 9 M9 4.4 L8.5 8.6" stroke="currentColor" stroke-width="0.8" />
           </svg>
-          符号地图
+          代码地图
         </button>
         <button
           v-if="tree"
           class="wb-map-btn"
-          title="查看类继承与场景挂载关系图"
+          title="类的继承关系，以及场景里挂了哪些脚本组件"
           @click="openRelationGraph"
         >
           <svg width="13" height="13" viewBox="0 0 13 13">
@@ -119,7 +125,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
         <button
           v-if="tree"
           class="wb-map-btn"
-          title="Unity 工程：.meta GUID 引用图（场景/预制体/脚本/贴图依赖，断裂引用检测）"
+          title="Unity 引用图：场景/预制体/脚本/贴图之间谁引用谁，自动标红断掉的引用"
           @click="openUnityGraph"
         >
           <svg width="13" height="13" viewBox="0 0 13 13">
@@ -133,7 +139,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
         <button
           v-if="activeTab && canHistoryActive"
           class="wb-save-btn wb-history-btn"
-          title="查看该文件的提交历史，可恢复为任意历史版本"
+          title="历史版本：查看这个文件每次提交的记录，可一键恢复到任意旧版本"
           @click="openHistory(activeTab.path, activeTab.name)"
         >
           <svg width="12" height="12" viewBox="0 0 12 12">
@@ -147,7 +153,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
         <button
           v-if="activeTab && canRevertActive"
           class="wb-save-btn wb-revert-btn"
-          title="放弃该文件全部未提交修改（含未保存与已暂存），恢复到上次提交"
+          title="撤销改动：丢弃本次所有未提交修改，恢复到上次提交的版本（不可恢复）"
           @click="revertPath(activeTab.path, activeTab.name)"
         >
           <svg width="12" height="12" viewBox="0 0 12 12">
@@ -169,6 +175,11 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
         </button>
       </div>
     </header>
+
+    <div v-if="demoMode" class="wb-demo-banner">
+      <b>示例演示</b>
+      <span>你正在浏览的是离线演示版，所有数据均为示例。在本地启动 DocMind 并连接你的项目后，这里会显示真实文件和真实问答。</span>
+    </div>
 
     <div class="wb-body">
       <aside v-if="treeError" class="wb-tree-error">
@@ -196,7 +207,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
           <footer class="wb-statusbar">
             <span v-if="selectedPath" class="wb-status-path">{{ selectedPath }}</span>
             <span v-else class="wb-status-faint">未选择文件</span>
-            <span v-if="dirtyCount" class="wb-status-dirty">● {{ dirtyCount }} 个文件未保存</span>
+            <span v-if="dirtyCount" class="wb-status-dirty">● {{ dirtyCount}} 个文件未保存</span>
             <span class="wb-status-spacer" />
             <span v-if="tree.regions_enabled" class="wb-status-legend">
               <i v-for="r in tree.regions" :key="r.key">
@@ -207,9 +218,39 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
         </main>
       </template>
 
+      <template v-else-if="demoMode">
+        <aside class="wb-sidebar wb-demo-side">
+          <div class="wb-demo-side-note">项目文件（示例）</div>
+          <ul>
+            <li class="wb-demo-dir">📁 assets</li>
+            <li class="wb-demo-dir">📁 scripts
+              <ul>
+                <li>player_controller.gd</li>
+                <li>inventory_system.gd</li>
+                <li>damage_calc.gd</li>
+              </ul>
+            </li>
+            <li class="wb-demo-dir">📁 scenes</li>
+            <li>project.godot</li>
+          </ul>
+          <p>本地版会在这里列出你项目的真实文件，点击文件名即可查看和编辑。</p>
+        </aside>
+
+        <main class="wb-main">
+          <EditorTabs />
+          <div class="wb-editor-row">
+            <CodeView :tab="null" />
+          </div>
+          <ChatDock />
+          <footer class="wb-statusbar">
+            <span class="wb-status-faint">示例演示模式 · 未连接本地项目</span>
+          </footer>
+        </main>
+      </template>
+
       <div v-else class="wb-booting">
         <div class="cv-spinner" />
-        <p>正在加载工作台…</p>
+        <p>正在连接本地 DocMind 服务…</p>
       </div>
     </div>
 

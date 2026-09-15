@@ -88,10 +88,10 @@ function press(_e: MouseEvent) {}
   z-index: 1200;
   min-width: 196px;
   padding: 6px 6px 7px;
-  background: rgba(18, 24, 33, 0.97);
-  border: 1px solid #263142;
+  background: rgba(255, 255, 255, 0.97);
+  border: 1px solid var(--border-strong);
   border-radius: 9px;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 10px 30px rgba(35, 52, 84, 0.18), 0 0 0 1px rgba(35, 52, 84, 0.08);
   backdrop-filter: blur(6px);
   user-select: none;
   animation: sel-ai-pop 0.12s ease-out;
@@ -102,7 +102,7 @@ function press(_e: MouseEvent) {}
 }
 .sel-ai-meta {
   font-size: 10.5px;
-  color: #7d8aa0;
+  color: var(--text-muted);
   padding: 0 4px 5px;
   white-space: nowrap;
   letter-spacing: 0.02em;
@@ -117,7 +117,7 @@ function press(_e: MouseEvent) {}
   gap: 4px;
   padding: 4px 8px;
   font-size: 12px;
-  color: #c6d0dd;
+  color: var(--text);
   background: transparent;
   border: 1px solid transparent;
   border-radius: 6px;
@@ -125,21 +125,21 @@ function press(_e: MouseEvent) {}
   white-space: nowrap;
 }
 .sel-ai-btn:hover {
-  background: #202a38;
-  color: #e8eef6;
+  background: var(--bg-hover);
+  color: var(--text);
 }
 .sel-ai-btn-accent {
-  color: #7fd49a;
+  color: #1c9e66;
 }
 .sel-ai-btn-accent:hover {
-  background: rgba(79, 158, 106, 0.16);
-  color: #9fe6b8;
+  background: rgba(28, 158, 102, 0.14);
+  color: #15734c;
 }
 .sel-ai-btn-ask {
-  color: #8fc1ff;
+  color: #2f6fed;
 }
 .sel-ai-btn-ask:hover {
-  background: rgba(88, 166, 255, 0.15);
-  color: #b7d7ff;
+  background: rgba(47, 111, 237, 0.12);
+  color: #2560d4;
 }
 </style>

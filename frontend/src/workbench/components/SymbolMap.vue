@@ -215,7 +215,7 @@ function kindOf(kind: string) {
 .sm-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(5, 8, 12, 0.62);
+  background: rgba(38, 52, 77, 0.38);
   backdrop-filter: blur(2px);
   z-index: 90;
   display: flex;
@@ -229,7 +229,7 @@ function kindOf(kind: string) {
   background: var(--bg-raised);
   border: 1px solid var(--border-strong);
   border-radius: 10px;
-  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 24px 70px rgba(35, 52, 84, 0.16);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -274,7 +274,7 @@ function kindOf(kind: string) {
   height: 32px;
   color: var(--text-faint);
 }
-.sm-search:focus-within { border-color: #58a6ff66; box-shadow: 0 0 0 2px #58a6ff18; }
+.sm-search:focus-within { border-color: #2f6fed66; box-shadow: 0 0 0 2px #2f6fed18; }
 .sm-search input {
   flex: 1;
   border: none;
@@ -309,8 +309,8 @@ function kindOf(kind: string) {
 }
 .sm-chip i { font-style: normal; font-size: 10.5px; color: var(--text-faint); }
 .sm-chip:hover { border-color: var(--border-strong); color: var(--text); }
-.sm-chip.active { background: #1b3350; border-color: #3b6ea5; color: #cfe4ff; }
-.sm-chip.active i { color: #9ecbff; }
+.sm-chip.active { background: #e4edfc; border-color: #2560d4; color: #1b3c73; }
+.sm-chip.active i { color: #2560d4; }
 .sm-content { flex: 1; overflow-y: auto; padding: 8px 10px 20px; }
 .sm-state { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 70px 0; color: var(--text-faint); font-size: 12.5px; }
 .sm-retry { border: 1px solid var(--border-strong); background: transparent; color: var(--text); border-radius: 5px; padding: 5px 14px; cursor: pointer; }
@@ -357,8 +357,8 @@ function kindOf(kind: string) {
   line-height: 15px;
   flex: 0 0 auto;
 }
-.sm-file-name { font-family: var(--font-mono); font-size: 12px; color: #c6d2e0; flex: 0 0 auto; }
-.sm-file-class { font-family: var(--font-mono); font-size: 11px; color: #9ecbff; flex: 0 0 auto; }
+.sm-file-name { font-family: var(--font-mono); font-size: 12px; color: var(--text); flex: 0 0 auto; }
+.sm-file-class { font-family: var(--font-mono); font-size: 11px; color: #2f6fed; flex: 0 0 auto; }
 .sm-file-doc {
   font-size: 11px;
   color: var(--text-faint);
@@ -394,7 +394,7 @@ function kindOf(kind: string) {
   align-self: center;
   text-align: center;
 }
-.sm-sym-name { font-family: var(--font-mono); color: #d7e2ee; flex: 0 0 auto; align-self: center; }
+.sm-sym-name { font-family: var(--font-mono); color: var(--text); flex: 0 0 auto; align-self: center; }
 .sm-sym-detail {
   font-family: var(--font-mono);
   font-size: 10.5px;

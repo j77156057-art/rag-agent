@@ -801,7 +801,7 @@ const externalIds = computed<Set<string>>(
 .ug-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(5, 8, 12, 0.66);
+  background: rgba(38, 52, 77, 0.38);
   backdrop-filter: blur(2px);
   z-index: 90;
   display: flex;
@@ -815,7 +815,7 @@ const externalIds = computed<Set<string>>(
   background: var(--bg-raised);
   border: 1px solid var(--border-strong);
   border-radius: 10px;
-  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 24px 70px rgba(35, 52, 84, 0.16);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -831,8 +831,8 @@ const externalIds = computed<Set<string>>(
 .ug-title { display: flex; align-items: center; gap: 9px; flex: 1; }
 .ug-title h2 { margin: 0; font-size: 14px; font-weight: 600; }
 .ug-stats { font-size: 11.5px; color: var(--text-faint); }
-.ug-warn { color: #e0a458; font-style: normal; }
-.ug-bad { color: #ff7b72; font-style: normal; font-weight: 600; }
+.ug-warn { color: #b5791f; font-style: normal; }
+.ug-bad { color: #c23a40; font-style: normal; font-weight: 600; }
 .ug-iconbtn {
   border: 1px solid transparent;
   background: transparent;
@@ -865,7 +865,7 @@ const externalIds = computed<Set<string>>(
   color: var(--text-faint);
   max-width: 420px;
 }
-.ug-search:focus-within { border-color: #58a6ff66; box-shadow: 0 0 0 2px #58a6ff18; }
+.ug-search:focus-within { border-color: #2f6fed66; box-shadow: 0 0 0 2px #2f6fed18; }
 .ug-search input {
   flex: 1;
   border: none;
@@ -898,7 +898,7 @@ const externalIds = computed<Set<string>>(
 }
 .ug-chip:hover { filter: brightness(1.25); }
 .ug-chip.off { opacity: 0.3; }
-.ug-chip-missing { color: #ff7b72 !important; border-color: #ff7b7266 !important; }
+.ug-chip-missing { color: #c23a40 !important; border-color: #c23a4066 !important; }
 .ug-zoom { display: flex; gap: 4px; }
 .ug-zoom button {
   min-width: 26px; height: 24px;
@@ -927,10 +927,10 @@ const externalIds = computed<Set<string>>(
 
 .ug-line {
   fill: none;
-  stroke: #55637a;
+  stroke: #93a0b2;
   stroke-width: 1.15;
 }
-.ug-line.miss { stroke: #d05c5c; stroke-dasharray: 5 4; }
+.ug-line.miss { stroke: #e0484f; stroke-dasharray: 5 4; }
 .ug-line.dim { opacity: 0.08; }
 
 .ug-node { cursor: pointer; }
@@ -955,7 +955,7 @@ const externalIds = computed<Set<string>>(
   text-align: center;
   padding: 0 40px;
 }
-.ug-error { color: #ff8585; }
+.ug-error { color: #c23a40; }
 .ug-hint { font-size: 11.5px; }
 .ug-retry { border: 1px solid var(--border-strong); background: transparent; color: var(--text); border-radius: 5px; padding: 5px 14px; cursor: pointer; }
 
@@ -966,7 +966,7 @@ const externalIds = computed<Set<string>>(
   display: flex;
   align-items: center;
   gap: 14px;
-  background: rgba(15, 20, 28, 0.82);
+  background: rgba(255, 255, 255, 0.92);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 6px 12px;
@@ -974,7 +974,7 @@ const externalIds = computed<Set<string>>(
   color: var(--text-muted);
   pointer-events: none;
 }
-.ug-legend-warn { color: #e0a458; }
+.ug-legend-warn { color: #b5791f; }
 
 /* ------------------------------------------------------------ 详情侧栏 */
 .ug-detail {
@@ -1056,7 +1056,7 @@ const externalIds = computed<Set<string>>(
   cursor: pointer;
 }
 .ug-d-section li:hover { background: var(--bg-hover); }
-.ug-d-section li.miss .ug-d-li-label { color: #ff8f8f; }
+.ug-d-section li.miss .ug-d-li-label { color: #c23a40; }
 .ug-d-dot { width: 8px; height: 8px; border-radius: 2px; flex: 0 0 auto; }
 .ug-d-li-label {
   flex: 1;
