@@ -198,7 +198,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 - **B 档浅实现**（2026-09-11 审计结论，仍有效）：`impact_analysis` 是子串 grep、`generate_test_scene` 写死空壳、`simulate_growth` 等比数列玩具、`performance_sample` 仅计时、`approval` 只追加日志不拦截、默认分区 verify 空转。当演示可以，当真工具需要逐个做深或在 UI 标注能力边界。
 - **门面文档**：`README.md` 已于 2026-09-14 刷新（反映工作台/分区/引擎/画布现状）；`README_en.md` 与 `DEMO.md` 已于 2026-09-15 按当前形态重写（工作台六件事 / 分区 / 场景画布 / 运行时时间线 / 引擎嵌入 / GPU 协调 / ComfyUI·Unity·Unreal 适配 / 联网研究，测试数同步为 298/298），见 §4 时间线。
-- 新落地的 MCP bridge 与 Web player 目前缺产品级使用文档与边界说明。
+- 新落地的 MCP bridge 与 Web player 的产品级使用文档与边界说明**已补**：`docs/integrations.md`（2026-09-15，覆盖配置模型、API 表面、使用前提、已知边界）。
 - **引擎嵌入的残留**（不影响"已可用"）：本机显示器当前是 **150% 缩放**，100%/125% 未实测——
   `verify_engine_embed.py` 会打印当前 DPI 并按实际坐标断言，改了缩放直接重跑即可补档。
 - **桌面壳内的 UI 自动化没做成**（不是没做，是做不了）：pywebview 的 `evaluate_js` 在 WebView2 上不稳定
