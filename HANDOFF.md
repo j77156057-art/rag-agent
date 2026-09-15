@@ -1,7 +1,7 @@
 # DocMind 项目交接清单（给接手 AI）
 
-> **更新时间**：2026-09-15（编排动态重规划：失败自动补图并继续，见 §4）｜ **基线提交**：`eb8516a`（第 18 次冻结构建）
-> **全量测试**：**430 项全部通过**（417 + 13 新增重规划用例）｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
+> **更新时间**：2026-09-15（回溯式重规划：可增/可删/可改未执行任务，见 §4）｜ **基线提交**：`eb8516a`（第 18 次冻结构建）
+> **全量测试**：**441 项全部通过**（430 + 11 新增回溯用例）｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
 > **引擎嵌入实机自检**：`verify_engine_embed.py` **68/68**（真 Godot 4.7.2 + 真 Win32 宿主，含真实合成键鼠与 UI 调用路径）｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` **27/27** ｜ **前端构建**：`npm run build` 通过
 > 本文是项目唯一权威交接文档，取代并删除了旧版 `HANDOFF.md`、`AI_BRIEF.md`、`DEV_WORKBENCH_AUDIT.md`、`HANDOFF_ENGINE_EMBEDDING.md`、`HANDOFF_REMAINING_WORK.md`（旧 HANDOFF.md 由本同名文件接管）。
 > **铁律：规划项一律写在第 5 节，不得描述为已完成；做完一项就把它移到第 4 节时间线并注明提交号。**
@@ -43,7 +43,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   界面照常可用；另有「聚焦 / 解除嵌入 / 停止桌面窗口」。关弹窗或切走 tab 会自动解除嵌入（视窗元素没了，
   继续嵌着只会让引擎画到别处）。浏览器模式下开关自动禁用并提示需要桌面端。
 - **LLM/Embedding**：mock / qwen / deepseek / ollama / llamacpp 多 Provider，页面内免重启切换；本机 Ollama(`11434`, bge-m3) 与 llama.cpp(`8080`, Qwen 35B) 免 Key；622fdbc 新增 native embedding。
-- **验证基线**：后端 `unittest discover` **430/430 通过**（含 `test_gpu_coordinator.py` 31 例、`test_agent_trace.py` 14 例、`test_llm_resilience.py` 8 例、`test_agent_eval.py` 11 例、`test_native_tools.py` 11 例、`test_subagent_plan.py` 9 例、`test_hooks_skills.py` 13 例、`test_pricing.py` 8 例、`test_parallel.py` 9 例、`test_orchestrator.py` 34 例）；
+- **验证基线**：后端 `unittest discover` **441/441 通过**（含 `test_gpu_coordinator.py` 31 例、`test_agent_trace.py` 14 例、`test_llm_resilience.py` 8 例、`test_agent_eval.py` 11 例、`test_native_tools.py` 11 例、`test_subagent_plan.py` 9 例、`test_hooks_skills.py` 13 例、`test_pricing.py` 8 例、`test_parallel.py` 9 例、`test_orchestrator.py` 45 例）；
   `verify_scene_canvas.py` 走真实 HTTP 路由 **54/54**（含"每个 op 的 undo 逐字节还原"）；
   `verify_engine_embed.py` 真 Godot + 真 Win32 宿主 **68/68**；
   `verify_scene_canvas_ui.mjs` 真浏览器 **27/27**（含"空间布局落点与场景坐标严格成比例"）；前端 build 通过。
@@ -64,7 +64,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | `pricing.py`（新） | **按 provider 计价 + 预算熔断**：单价表（`<BASE_DIR>/.docmind_pricing.json` 可覆盖，本地 provider 恒 0）+ 全局/会话累计花费落 `.docmind_budget.json`；回合前 `check()` 拒绝超限、回合后 `charge()`；`GET/POST /api/budget` |
 | `hooks.py`（新） | **工具/回合钩子热插拔**：`.docmind/hooks/*.py` 的 `pre_tool` / `post_tool` / `pre_turn` / `post_turn`；异常隔离、坏钩子不影响主流程；`GET /api/hooks`、`POST /api/hooks/reload` |
 | `skills.py`（新） | **技能热插拔**：扫 `.docmind/skills/**/*.md`（frontmatter），只把目录注入系统提示、正文由 `dev_use_skill` 按需取；`GET /api/skills`、`POST /api/skills/reload` |
-| `orchestrator.py`（新） | **多代理编排器**（纯调度，不依赖 Agent）：任务图校验（id 重复/依赖缺失/循环依赖/超量）、迭代调度（每轮挑依赖已落定者并行）、**下游注入上游结论**、**动态重规划**（`replanner(failed, results, attempt)` 追加补救任务，受 `max_replans`/总量约束；返回空或抛异常即停）、上游失败阻断下游（`optional` 除外）、可选 `synth_runner` 合成并标注冲突；调用方通过 `runner(task, context)` 回调提供"怎么跑子任务"，故可完全离线单测 |
+| `orchestrator.py`（新） | **多代理编排器**（纯调度，不依赖 Agent）：任务图校验（id 重复/依赖缺失/循环依赖/超量）、迭代调度（每轮挑依赖已落定者并行）、**下游注入上游结论**、**回溯式重规划**（`replanner(failed, results, attempt)` 可返回 `{add, drop, replace}`：追加补救任务、取消未执行任务、原地改写未执行任务；**只能动尚未执行的任务**，已执行者不可删改——本系统不回滚已产生的副作用；非法项逐条忽略；受 `max_replans`/总量约束；每轮改动记入 `revisions` 审计）、上游失败/被取消阻断下游（`optional` 除外）、可选 `synth_runner` 合成并标注冲突；调用方通过 `runner(task, context)` 回调提供"怎么跑子任务"，故可完全离线单测 |
 | `tools.py`（105KB） | 工具注册表 `TOOLS`：9 基础 + 受控写（apply_edit/create_file/run_command）+ 11 个 dev_* 分区工具 + 研判分区工具 |
 | `regions.py`（47KB） | 分区 2.0：DEFAULT_REGIONS 8 区、regions.json 覆盖、契约校验（DAG 无环/导出存在）、init/scaffold/fill_exports、变更集与回滚 |
 | `game_workbench.py`（60KB） | Godot/Unity/Unreal catalog、引擎启停与自动嵌入、运行时事件、任务/资产/bug 工作流；**P2-1 ComfyUI 租约覆盖完整生成周期**：`comfy_queue` 用一次性提交 owner 拿租约（带 Ollama 驱逐钩子）→ 成功后 `reown` 为 `comfyui:{prompt_id}`（TTL 600s `DOCMIND_COMFY_JOB_TTL` 兜底），`comfy_history` 见终态（outputs/completed/error/failed）幂等释放，`comfy_cancel` 调 ComfyUI `/interrupt` 后释放。提交默认要求 `DOCMIND_COMFY_MIN_FREE_MB=1024` 显存余量：余量不足先触发 Ollama 卸载钩子，腾不出则直接拒绝不排队 |
@@ -120,6 +120,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-15 | **harness 并行化（`89264ce`）**：① **并行工具批次**——原生通道一轮返回多条 tool_call 且**全部只读安全**时用 `ThreadPoolExecutor` 并发（上限 `DOCMIND_PARALLEL_MAX`，默认 4），结果**保序**聚合后一次回填多条 observation；批内含写/副作用工具（`_NO_PARALLEL_TOOLS`：apply_edit/run_command/python_exec/dev_commit…）则整批**退回顺序**，绝不并发写；单条异常只标记该条。② **子代理并行扇出**——`LLMClient.clone()` + 子代理改用**独立** client，消除共享实例 `last_usage`/`last_tool_calls` 的并发竞态；一轮多 `delegate` 并行执行、token 分别计入父回合；`Turn` 累加操作加锁。新增 `test_parallel.py` 9 例（真并发墙钟、3 线程、保序、失败隔离、写工具回退、clone 独立性、并行扇出），全量 387 → **396** 全绿 |
 | 2026-09-15 | **多代理编排器（`c31467a`）**：新增 `orchestrator.py`（**纯调度、不依赖 Agent、可离线单测**）——任务图校验（id 重复/依赖缺失/自依赖/超量）、`topological_waves()` 拓扑分波、同波并行、**下游任务注入上游结论**（补齐"子代理不共享父上下文"）、上游失败**阻断**下游（`optional` 豁免）、可选 `synth_runner` 合成并标注冲突。agent 侧抽出 `_run_child`（delegate 与 orchestrate 共用）、新增 `Agent.orchestrate()` 与 `orchestrate` 工具（JSON 入参）、子代理步数耗尽时**过程要点兜底**（标 `degraded`，不再给下游空结论）；`api.py` 加 `POST /api/orchestrate`。新增 `test_orchestrator.py` 21 例，全量 396 → **417** 全绿；端点端到端 8/8 |
 | 2026-09-15 | **编排动态重规划（`f6b2179`）**：`run_plan` 改为**迭代调度器**——每轮挑「依赖已落定且未被阻断」的任务并行跑；某轮出现失败且预算未耗尽时调用 `replanner(failed, results, attempt)` 追加**补救任务**并继续（`_accept_new_tasks` 走 `parse_plan(known_ids=…)` 校验，故补救任务可依赖**已完成的旧任务**；坏项/重复 id/悬空依赖逐条丢弃；受 `max_replans` 与总量槽位限制）；不重规划或预算耗尽才按原语义阻断下游。agent 侧新增 `_replanner`（一次 LLM 调用产 JSON 补救任务，提示要求"换做法而非原样重试"）与 `orchestrate(replan=, max_replans=)`；工具 JSON 与 `POST /api/orchestrate` 同步支持；新增 `DOCMIND_ORCH_MAX_REPLANS`（默认 2）。顺带把 `run_plan` 入口改成幂等 `parse_plan`（原始 dict 与规范化任务都能吃）。`test_orchestrator.py` 21 → 34 例，全量 417 → **430** 全绿；端点端到端 **11/11** |
+| 2026-09-15 | **回溯式重规划（`78d1504`）**：`replanner` 提案升级为 `{add, drop, replace}`（裸任务数组仍等价于 `{add}`，向后兼容）——**add** 追加补救任务、**drop** 取消尚未执行的任务（记为 `dropped` 并阻断其下游）、**replace** 原地改写未执行任务的 role/task/deps（常用来把被阻断的下游**救回来**）。**安全边界**：只能动**尚未执行**的任务，已执行者不可删改（记入 `ignored`），本编排器**不回滚已产生的副作用**。非法项逐条忽略不抛异常；每次改动记入 `report.revisions` 审计。修了两个要点：被 drop 的任务移出 `by_id` 后，`ok` 与依赖判定改用 `.get` 兜底且把 `optional` 留在结果条目里（可选任务被 drop 后下游仍豁免）；`drop` 不就地修改调用方传入的 plan。agent 侧 `_replanner` 提示升级并放行 dict 形态提案。`test_orchestrator.py` 34 → 45 例，全量 430 → **441** 全绿；端点端到端 **13/13** |
 
 > 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（18 次完整记录，继续追加不要新建文件）。
 
@@ -178,7 +179,8 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 已补齐十项：逐轮 trace/token 账本、会话隔离+持久化+摘要、LLM 重试/退避/deadline/断连中止、黄金题自动打分+回归门、原生 function-calling、子代理+plan、hooks/技能热插拔、按 provider 计价+预算熔断、golden 门入冻结流水线、**并行工具批次 + 子代理并行扇出**（只读工具并发、结果保序、写/副作用工具自动退回顺序、子代理各持独立 `LLMClient`）。
 
 **仍缺（未实现，不得宣称）**：
-- **重规划是"追加式"的**：失败后只能**追加**补救任务（受 `max_replans` 与总量上限约束），**不能**删除/改写已提交的任务，也没有跨波的回溯（无法撤销已执行的任务）。
+- **不能回滚已执行的任务**：回溯只能改**尚未执行**的计划（add / drop / replace）；已经跑过、已产生副作用（比如改过文件）的任务**不会**被撤销或重跑——这是有意的安全边界，不是能力缺失，但也不得对外宣称"可回滚"。
+- **重规划依据有限**：`replanner` 只拿到失败任务 + 各任务结论 + 错误串，拿不到完整执行轨迹（每步子代理的中间过程），因此补救方案的针对性受限于这点信息。
 - **结论可信度校验**：`synth` 只做**合成与冲突标注**，不会独立复核某个子任务的结论是否属实（没有 fact-check 环节）。
 - **成本感知调度**：`max_parallel` 是静态的；重规划也不会参考剩余预算/显存决定补不补。
 - **批次内去重与依赖排序**：并行工具批次的重复调用不去重、也互不感知依赖（各跑各的）。
