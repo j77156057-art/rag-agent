@@ -40,7 +40,7 @@ def dev_mcp_call(arg):
     if not key or not name: return 'MCP 调用失败：需要 key 和 name。'
     try:
         cfg=mcp_client.get_server_config(root,key)
-        if not cfg.get('enabled'): return 'MCP 调用失败：连接器未启用，请先在工作台启用并审批。'
+        if not cfg.get('enabled'): return 'MCP 调用失败：连接器未启用，请先在工作台启用并审批。可调用 dev_route_connector 查看其它已启用连接器。'
         if task_id:
             from game_workbench import list_tasks
             task=next((t for t in list_tasks(root) if str(t.get('id'))==str(task_id)),None)
@@ -61,7 +61,55 @@ def dev_mcp_call(arg):
         args=data.get('arguments','{}')
         if isinstance(args,str): args=json.loads(args) if args else {}
         return json.dumps(mcp_client.call_tool(root,key,name,args), ensure_ascii=False)[:6000]
-    except Exception as e: return f'MCP 调用失败：{e}'
+    except Exception as e: return f'MCP 调用失败：{e}（若怀疑是连接器选择有误，可先调用 dev_route_connector 重新挑选已启用连接器）'
+
+
+def dev_list_connectors(arg):
+    """列出已配置 MCP 连接器（key/label/engine/transport/启用状态/能力标签/适用说明），供 Agent 自主挑选。输入留空。"""
+    root = get_runtime('code_root') or CODE_ROOT
+    if not root: return '连接器列表失败：未配置代码库。'
+    try:
+        rows = mcp_client.connector_directory(root)
+        return json.dumps({"ok": True, "connectors": rows}, ensure_ascii=False)
+    except Exception as e:
+        return f'连接器列表失败：{e}'
+
+
+def dev_route_connector(arg):
+    """按任务语义挑选最合适的【已启用】MCP 连接器。输入 hint（任务描述，如 'Godot 里打开 Main 场景并运行'）。
+
+    返回排序候选与匹配理由；Agent 应取 top.key 作为 dev_mcp_call 的 key。无已启用连接器匹配时，
+    提示改用具内工具（search_code/apply_edit/python_exec）或先在工作台启用对应引擎连接器。
+    """
+    root = get_runtime('code_root') or CODE_ROOT
+    if not root: return '连接器路由失败：未配置代码库。'
+    hint = str(arg or '').strip().splitlines()[0] if str(arg or '').strip() else ''
+    try:
+        ranked = mcp_client.select_connector(root, hint)
+        if not ranked:
+            return json.dumps({"ok": True, "hint": hint, "matches": [],
+                               "message": "没有已启用的连接器匹配该任务；可改用内置工具（search_code/apply_edit/python_exec 等），或先在工作台启用对应引擎连接器。"}, ensure_ascii=False)
+        return json.dumps({"ok": True, "hint": hint, "top": ranked[0]["key"], "matches": ranked}, ensure_ascii=False)
+    except Exception as e:
+        return f'连接器路由失败：{e}'
+
+
+def dev_list_connector_tools(arg):
+    """列出某连接器暴露的工具（name/description/input_schema），确定 dev_mcp_call 的 name 与参数。
+
+    输入 key: <连接器key>。仅对打算调用的连接器使用（godot 等 stdio 需先建立会话，引擎未开会失败）。
+    """
+    root = get_runtime('code_root') or CODE_ROOT
+    if not root: return '工具清单失败：未配置代码库。'
+    key = str(arg or '').strip()
+    if key.startswith('key:'):
+        key = key[len('key:'):].strip()
+    if not key: return '工具清单失败：需要 key（key: <连接器key>）。'
+    try:
+        r = mcp_client.list_tools(root, key)
+        return json.dumps(r, ensure_ascii=False)[:6000]
+    except Exception as e:
+        return f'工具清单失败：{e}（连接器可能未启用或引擎未运行，可先用 dev_route_connector 换一个）'
 
 
 def _dedup_docs(docs, metas):
@@ -2198,7 +2246,10 @@ def game_playtest(arg):
 TOOLS = {
     "web_research": {"description": "联网研究：先搜索，再读取最多 3 个公开网页正文，返回来源和证据。适合教程、GitHub、引擎文档和需要最新资料的问题。输入研究主题。", "func": web_research},
     "web_fetch": {"description": "读取公开网页正文并返回来源、标题和清理后的文本。输入完整 http/https URL。联网研究时先 web_search，再对关键来源调用。", "func": web_fetch},
-    "dev_mcp_call": {"description": "调用已启用的 MCP 游戏引擎连接器。输入 key: 服务器key、name: 工具名、arguments: JSON。先用 MCP 工具清单确认可用工具；外部连接器需已启用并遵守审批。", "func": dev_mcp_call},
+    "dev_mcp_call": {"description": "调用已启用的 MCP 游戏引擎连接器。输入 key: 服务器key、name: 工具名、arguments: JSON。先用 dev_list_connectors 看清可用连接器、用 dev_route_connector 按任务语义挑 top 作为 key、用 dev_list_connector_tools 确认 name 与参数；外部连接器需已启用并遵守审批。", "func": dev_mcp_call},
+    "dev_list_connectors": {"description": "列出已配置 MCP 连接器（key/label/engine/transport/启用状态/能力标签/适用说明），供 Agent 自主挑选最合适的引擎连接器。输入留空。", "func": dev_list_connectors},
+    "dev_route_connector": {"description": "按任务语义挑选最合适的【已启用】连接器：输入 hint（任务描述，如 'Godot 里打开 Main 场景并运行'），返回排序候选与匹配理由（top.key 即 dev_mcp_call 的 key）。某连接器不可用或调用失败时，用它重新挑选其它已启用连接器。", "func": dev_route_connector},
+    "dev_list_connector_tools": {"description": "列出某连接器暴露的工具（name/description/input_schema），确定 dev_mcp_call 的 name 与参数。输入 key: <连接器key>；仅对打算调用的连接器使用（godot 等 stdio 需先建立会话）。", "func": dev_list_connector_tools},
     "search_knowledge": {
         "description": "在已上传的知识库中检索相关文档片段。输入应为检索关键词或问题。",
         "func": search_knowledge,

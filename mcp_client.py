@@ -188,6 +188,137 @@ def get_server_config(root, key):
     raise MCPError(f"未找到 MCP 服务器：{key}")
 
 
+# ---------------------------------------------------------------- 连接器能力模型 / 路由策略
+# Agent 自主切换连接器的策略层：把"连接器能干什么"结构化出来，并按任务语义打分排序，
+# 让 ReAct 不必靠硬编码的引擎名、也不必先开会话就能挑/切连接器。全部纯配置读取，可离线单测。
+
+# 预设引擎默认携带的通用能力（用户配置里的 capabilities 字段可追加/覆盖语义）
+_ENGINE_CAPS = {
+    "godot": ["scene", "editor", "run", "build", "asset", "script", "export", "debug"],
+    "unity": ["scene", "editor", "run", "build", "asset", "script", "export", "debug"],
+    "unreal": ["scene", "editor", "run", "build", "asset", "script", "export", "debug"],
+}
+
+# 各引擎的"适用说明"，注入 Agent 目录便于按自然语言挑连接器
+_BEST_FOR = {
+    "godot": "Godot 编辑器内的场景/脚本/资源/运行/构建操作（godot-ai 插件）",
+    "unity": "Unity 编辑器内的场景/资源/Console/PlayMode 操作（unity-mcp 插件）",
+    "unreal": "Unreal 编辑器内的 Actor/Blueprint/构建操作（UnrealMCP 插件）",
+}
+
+# 任务描述里的关键词 → 能力同义词，提升召回（只映射到具体能力串，避免误命中）
+_KEYWORD_CAPS = {
+    "场景": "scene", "scene": "scene", "关卡": "scene", "level": "scene", "地图": "scene",
+    "运行": "run", "play": "run", "启动": "run", "run": "run", "试玩": "run",
+    "编辑器": "editor", "editor": "editor", "编辑": "editor",
+    "构建": "build", "build": "build", "编译": "build", "打包": "build", "出包": "build",
+    "资源": "asset", "asset": "asset", "素材": "asset", "导入": "asset",
+    "脚本": "script", "script": "script", "代码": "script",
+    "导出": "export", "export": "export",
+    "调试": "debug", "debug": "debug", "断点": "debug",
+    "蓝图": "blueprint", "blueprint": "blueprint",
+    "godot": "engine:godot", "unity": "engine:unity", "unreal": "engine:unreal",
+    "游戏引擎": "game_engine", "引擎": "game_engine",
+}
+
+
+def capabilities_of(cfg):
+    """从配置推导连接器的能力标签集合（排序返回）。"""
+    caps = set()
+    engine = (cfg.get("engine") or "").lower()
+    if engine:
+        caps.add("game_engine")
+        caps.add(f"engine:{engine}")
+        for c in _ENGINE_CAPS.get(engine, []):
+            caps.add(c)
+    for c in (cfg.get("capabilities") or []):
+        if isinstance(c, str) and c.strip():
+            caps.add(c.strip().lower())
+    return sorted(caps)
+
+
+def best_for_of(cfg):
+    explicit = cfg.get("best_for")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    engine = (cfg.get("engine") or "").lower()
+    return _BEST_FOR.get(engine, "")
+
+
+def connector_directory(root):
+    """Agent 面向的连接器目录：启用的连接器 + 能力标签 + 适用说明（不打开会话）。
+
+    与前端 `/api/agent/connectors` 同源，但额外带 capabilities / best_for，供 Agent 自主挑选。
+    """
+    rows = []
+    for item in server_configs(root):
+        rows.append({
+            "key": item.get("key"),
+            "label": item.get("label"),
+            "engine": item.get("engine"),
+            "transport": item.get("transport"),
+            "enabled": bool(item.get("enabled")),
+            "capabilities": capabilities_of(item),
+            "best_for": best_for_of(item),
+            "help": item.get("help") or "",
+            "config_error": item.get("config_error"),
+        })
+    return rows
+
+
+def select_connector(root, task_hint, only_enabled=True):
+    """按任务语义给连接器打分排序，返回 [{key, score, reason}]（高分在前）。
+
+    打分：能力同义词命中 +2、引擎名直接出现 +3、label/help/best_for 含任务词 +1。
+    仅对已启用且无配置错误的连接器排序（only_enabled）；无匹配返回空列表。
+
+    两个语义约束（避免误路由）：
+      - 关键词用「子串扫描」匹配，兼容中文无空格分词（"生成游戏场景"能拆出"场景"）。
+      - 若任务描述点名某引擎（godot/unity/unreal），只在该引擎的连接器里选，
+        绝不把 Unity 任务路由到 Godot 等其它引擎。
+    """
+    hint = (task_hint or "").lower()
+    # 子串扫描：hint 含某关键词即视为命中其能力同义词（中文无需分词）
+    caps_in_hint = {cap for kw, cap in _KEYWORD_CAPS.items() if kw and kw in hint}
+    # 引擎专指：点名某引擎则只在它之内选
+    preferred = next((e for e in ("godot", "unity", "unreal") if e in hint), None)
+    results = []
+    for item in connector_directory(root):
+        if only_enabled and not item["enabled"]:
+            continue
+        if item.get("config_error"):
+            continue
+        engine = (item.get("engine") or "").lower()
+        if preferred and engine != preferred:
+            continue
+        score = 0
+        matched = []
+        for cap in item["capabilities"]:
+            for h in caps_in_hint:
+                if cap == h or (h and (h in cap or cap in h)):
+                    score += 2
+                    matched.append(cap)
+                    break
+        if engine and engine in hint:
+            score += 3
+            matched.append(f"engine:{engine}")
+        blob = f"{item.get('label','')} {item.get('help','')} {item.get('best_for','')}".lower()
+        for kw in _KEYWORD_CAPS:
+            if len(kw) >= 2 and kw in hint and kw in blob:
+                score += 1
+                matched.append(kw)
+        if score > 0:
+            reasons = []
+            if engine and engine in hint:
+                reasons.append(f"引擎名命中 {engine}")
+            if matched:
+                reasons.append("能力匹配：" + ", ".join(sorted(set(matched))))
+            results.append({"key": item["key"], "score": score,
+                             "reason": "；".join(reasons) if reasons else "能力相关"})
+    results.sort(key=lambda x: (-x["score"], x["key"]))
+    return results
+
+
 def save_server(root, key, cfg):
     """新增/更新一个服务器（白名单字段，拒绝畸形 key）。"""
     if not key or not all(ch.isalnum() or ch in "_-" for ch in key) or len(key) > 40:

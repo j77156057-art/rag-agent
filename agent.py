@@ -63,7 +63,10 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
 - web_fetch(url): 读取搜索结果中的公开网页正文，保留来源 URL 和标题后再总结。
 - web_research(query): 一步完成搜索与最多 3 个来源正文读取，适合教程、GitHub、引擎文档和最新资料。
 - dev_http_request(url, method?, headers?, body?, timeout?): 调用你自己的外部业务 API（REST/JSON）。受 EXTERNAL_API_ALLOWLIST 域名白名单约束（防 SSRF），未配置白名单则拒绝。当用户要求"调用外部接口 / 查订单 / 调内部服务 / 打通某个 API"时使用。输入（多行 key: value）：第一行 `url: <完整URL>`，可选 `method: <GET/POST/...>`、`headers: <单行JSON对象>`、`body: <请求体，可多行>`、`timeout: <秒>`。
-- dev_mcp_call(key, name, arguments?): 调用已启用的 MCP 游戏引擎连接器工具。先确认连接器已启用并读取工具清单；外部连接器调用需保留审计信息。
+- dev_list_connectors(): 列出已配置连接器（key/label/engine/能力标签/适用说明/启用状态）。调用游戏引擎类工具前先用它看清有哪些连接器可用、各自能干什么。
+- dev_route_connector(hint): 按任务语义（如 "Godot 里打开 Main 场景并运行"）挑选最合适的【已启用】连接器，返回排序候选与匹配理由。优先用它的 top.key 作为 dev_mcp_call 的 key；若某连接器不可用或调用失败，重新用它挑选其它已启用连接器。
+- dev_list_connector_tools(key): 列出某连接器暴露的工具（name/description），确定要调用的 name 与参数。仅对打算调用的连接器使用（godot 等 stdio 需先建立会话）。
+- dev_mcp_call(key, name, arguments?): 调用选中的连接器工具。若调用失败（连接器未启用/引擎未开/工具名不对），用 dev_route_connector 重新挑选其它已启用连接器，或改用内置工具（search_code/apply_edit/python_exec）。外部连接器调用需保留审计信息。
 - python_exec(code): 在受限子进程中执行 Python 代码并返回输出。用于数值计算、数据处理、文本变换等需要"真正动手"的任务。
 - gen_video_prompt(spec): 按 MiniMax H3 的三段结构，把一段创意描述生成为结构化视频提示词（可直接粘贴进 ComfyUI）。
 - search_code(query): 在已索引的源代码/配置中检索相关函数、类、配置片段。回答"某功能在哪实现/某函数做什么/某配置怎么写"等关于代码库的问题。

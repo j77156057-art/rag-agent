@@ -196,19 +196,27 @@ async def agent_secret_delete_ep(provider: str):
 
 @app.get('/api/agent/connectors')
 async def agent_connectors_ep():
-    """返回可供 Agent 选择的连接器及其启用状态；不自动启动外部进程。"""
+    """返回可供 Agent 选择的连接器及其启用状态与能力；不自动启动外部进程。"""
     root = _project_root_or_error()
     if not root: return {'ok': False, 'error': '未配置代码库', 'connectors': []}
     try:
-        rows = mcp_client.server_configs(root)
+        rows = mcp_client.connector_directory(root)
         return {'ok': True, 'connectors': [
-            {'key': x.get('key'), 'label': x.get('label'), 'transport': x.get('transport'),
-             'enabled': bool(x.get('enabled')), 'requires_approval': True,
-             'config_error': x.get('config_error')}
-            for x in rows
+            {**x, 'requires_approval': True} for x in rows
         ]}
     except Exception as e:
         return {'ok': False, 'error': str(e), 'connectors': []}
+
+
+@app.get('/api/agent/connector-route')
+async def agent_connector_route_ep(hint: str = ''):
+    """按任务语义给已启用连接器打分排序（Agent 自主切换连接器的策略层入口）。"""
+    root = _project_root_or_error()
+    if not root: return {'ok': False, 'error': '未配置代码库', 'matches': []}
+    try:
+        return {'ok': True, 'hint': hint, 'matches': mcp_client.select_connector(root, hint)}
+    except Exception as e:
+        return {'ok': False, 'error': str(e), 'matches': []}
 
 class DesktopHostReq(BaseModel):
     hwnd: int

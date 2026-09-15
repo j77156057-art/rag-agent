@@ -125,6 +125,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-15 | **黄金题题库建成（`golden/questions.json` 8 题 + `golden/results_baseline.jsonl` 8/8 通过）**：门不再默认 SKIP——`docmind-frozen-release` 阶段 0 的 `GOLDEN_QUESTIONS` 已指向入仓题库。源码类题（G2/G3/G4/G6/G7）依赖 `code_root` 指向本仓库且 `ingest_code` 已索引；SKILL 已写明**隔离 chroma 的专用评测服务**起法（`CHROMA_DIR` 复制自 `.chroma` + `CODE_ROOT=<repo>` + POST `/api/ingest_code`），避免污染你 `:8000` 的游戏代码索引。断言用 `any_of`+`must_not_include`+`no_error` 鲁棒匹配、不依赖逐字；离线规则打分常驻 `tests/test_agent_eval.py` |
 | 2026-09-15 | **连接器启停 UI 落地**：ChatDock「引擎」弹层新增 **断开**（关闭 stdio 长驻会话，新增 `POST /api/mcp/close` + `mcp_client.close_server` 复用）、**真实连接状态**（新增 `GET /api/mcp/status` + `mcp_client.active_servers()`，弹层打开时回填 connected 态）、**新增/移除连接器**（`POST /api/mcp/servers` / `/remove` 接入 UI 表单）；修正原模板 `resultOf(s.key)` 误传字符串（应为 server 对象）导致「已连接 · N 工具」状态**永不显示**的 bug。新增 `tests/test_mcp_connector.py` 6 例全绿。**未实机**：`active` 仅在真实 stdio 引擎（Godot/uvx）连接后填入，本沙箱无引擎未跑该路径 |
 | 2026-09-15 | **B 档浅实现收口（`simulate_growth` 深化）**：原 2026-09-11 审计六项仅 `simulate_growth` 仍是等比数列玩具，其余五项已于 2026-09-14 做深（impact_analysis 语义检索 / generate_test_scene 真实 AST / performance_sample cProfile / approval TTL 门禁 / verify_contracts 环检测）。本次把 `simulate_growth` 改为 **geometric / linear / logistic S 形 / diminishing 四模型 + 摘要统计**（翻倍数等级 / 峰值增量及其等级 / logistic 拐点等级），`/api/simulate_growth` 与 `game_simulate` 工具加 `model`/`k`，新增 `tests/test_simulate_growth.py` 10 例（含 TestClient 端点形态）全绿；HANDOFF §5 原「仍有效」审计标记已校正，**B 档清单清空** |
+| 2026-09-15 | **连接器自主切换策略层落地**：`mcp_client` 新增 `capabilities_of`（engine + 显式 capabilities 推导能力标签）/ `connector_directory`（Agent 目录，含能力/适用说明/启用态，不打开会话）/ `select_connector`（按任务语义打分排序；点名引擎只在该引擎内选，避免误路由）；Agent 新增 `dev_list_connectors`/`dev_route_connector`/`dev_list_connector_tools` 三工具，`dev_mcp_call` 失败时提示回退，`SYSTEM_PROMPT` 接入「发现→路由→列工具→调用→切换」闭环；`/api/agent/connector-route` 暴露策略入口、`/api/agent/connectors` 追加 `capabilities`/`best_for`。新增 `tests/test_connector_routing.py` 13 例全绿（中文子串扫描 + 引擎专指过滤）；隔离端口 8079 真打 `connector-route`（`Godot 场景`→godot score 9、`Unity 构建`→[] 不误路由）与 `connectors` 富化字段。HANDOFF §5 Agent 路由「仍待做」项已落地 |
 
 > 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（18 次完整记录，继续追加不要新建文件）。
 
@@ -137,7 +138,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 ### Agent 模型路由与权限（基础层 + UI 已落地，2026-09-14 接手核对）
 
 `agent_policy.py`、`/api/agent/route`、`/api/agent/routing`、`/api/agent/connectors`、`/api/agent/permission`、`/api/agent/secrets`(GET/DELETE)、`/api/agent/approvals`(含 decide 与 before/after unified diff)、`/api/agent/external-write` 和 Skill `agent-model-routing` 均已落地；前端 `AgentPolicyPanel.vue` 已在工作台顶栏接线（路由状态/连接器清单/外部路径审批/Diff 批准拒绝）。`/api/chat` SSE 首事件返回路由建议并注入上下文；`AGENT_AUTO_CLOUD=1` + 云端密钥时复杂请求走云端 Agent，缺密钥自动回退本地；云端发送前经 `redact_for_cloud` 脱敏并截断上下文；`dev_mcp_call` 校验连接器启用状态、可选 task_id 绑定与参数路径越权；外部写入需 approved approval_id + 精确路径，写前生成 `.docmind.bak`；密钥 DPAPI/Fernet 往返、撤销、授权均有回归测试。外部授权写项目内 `.docmind_permissions.jsonl` 审计日志，Agent 自身项目始终拒绝写入。
-**仍待做（非阻塞）**：ReAct 内部连接器选择依赖工具清单读取，尚无"Agent 自主切换连接器"的策略层（连接器**启停/配置管理 UI 已于 2026-09-15 落地**：ChatDock「引擎」弹层，后端新增 `POST /api/mcp/close` 与 `GET /api/mcp/status`，见 §4 时间线）。
+**连接器策略层已落地（2026-09-15）**：ReAct 现可自主挑/切连接器——`mcp_client` 新增 `capabilities_of`/`connector_directory`/`select_connector`（按任务语义给已启用连接器打分排序；点名某引擎只在该引擎内选，绝不把 Unity 任务误路由到 Godot）；Agent 新增 `dev_list_connectors`/`dev_route_connector`/`dev_list_connector_tools` 三工具，`dev_mcp_call` 失败时提示回退，`SYSTEM_PROMPT` 接入「发现→路由→列工具→调用→切换」闭环；`/api/agent/connector-route` 暴露策略入口，`/api/agent/connectors` 追加 `capabilities`/`best_for`。新增 `tests/test_connector_routing.py` 13 例全绿。连接器**启停/配置管理 UI** 见上条（2026-09-15 `mcp_client`+`api.py`+`ChatDock.vue`+`api.ts`）。
 
 ### P1-2　Unity 深度适配（GUID 引用图已落地，编辑器联机未做）
 
@@ -444,6 +445,13 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - `api.py` `/api/simulate_growth` 加 `model`/`k` 查询参数（直接返回函数 dict，不再二次包裹）；`tools.py` `game_simulate` 工具解析 `model`/`k` 并改写描述。无前端消费者，返回结构向后兼容（values 仍为 `{level,value}` 列表）。
 - 新增 `tests/test_simulate_growth.py` 10 例（几何向后兼容/翻倍等级/线性/Logistic 有界单调/递减凹性/未知 model 兜底/levels 截断/base<=0 修正/汇总 total/端点形态），全绿；隔离端口 8078 真打三类模型业务结果正确（logistic 拐点 15.7 给出、几何仍可 100/108/116.64、线性 100/200/300 翻倍在 2 级）。
 - HANDOFF §5 B 档审计「仍有效」标记校正为已逐项做深、B 档清单清空。
+
+**2026-09-15 追加（连接器自主切换策略层）**
+- `mcp_client` 新增连接器能力模型与路由策略：`capabilities_of`（由 `engine` + 显式 `capabilities` 推导能力标签，预设 godot/unity/unreal 注入 scene/editor/run/build/asset/script/export/debug）、`best_for_of`（各引擎适用说明）、`connector_directory(root)`（Agent 面向目录，含能力/适用说明/启用态，**不打开会话**）、`select_connector(root, hint)`（按任务语义打分排序：能力同义词 +2、引擎名 +3、label/help 命中 +1）。两个语义约束：①关键词用**子串扫描**匹配以兼容中文无空格分词；②任务点名某引擎（godot/unity/unreal）时**只在该引擎内选**，绝不把 Unity 任务误路由到 Godot。
+- `tools.py` 新增三个只读 Agent 工具：`dev_list_connectors`（目录）、`dev_route_connector`（按 hint 选 top，返回排序候选+理由）、`dev_list_connector_tools`（某连接器工具清单，确定 name/参数）；`dev_mcp_call` 在连接器未启用/异常时追加「可调用 dev_route_connector 重新挑选」回退提示。三者均为只读，不进 `_NO_PARALLEL_TOOLS`。
+- `agent.py` `SYSTEM_PROMPT` 改写连接器指引，接入「发现→路由→列工具→调用→切换」闭环（原仅一句 `dev_mcp_call` 提示且让 Agent 自行读工具清单，无运行时发现/路由手段）。
+- `api.py` 新增 `GET /api/agent/connector-route`（包装 `select_connector`，供前端复用与真机核对）；`/api/agent/connectors` 返回追加 `capabilities`/`best_for`（additive，向后兼容）。
+- 新增 `tests/test_connector_routing.py` 13 例（能力推导/目录启用态/排序/引擎专指过滤/unity 启用场景/`dev_*` 工具/端点形态），全绿；隔离端口 8079 真打 `connector-route`（`Godot 场景`→godot score 9、`Unity 构建`→[]）与 `connectors` 富化字段。**未实机**：真实 stdio 引擎（godot/uvx）的连接/工具调用路径本沙箱无引擎未跑，路由策略纯配置读取已离线覆盖。
 
 **以下为 codex/p1-3-gpu-comfyui 分支原始变更记录（保留存档；其中部分设计在合并集成时被有意调整，以本文件末尾「P1-3 合并集成」段为准）**
 - 密钥存储新增 1 项回归测试：往返解密、明文不落盘、Provider 列表和撤销均已验证。全量测试 205 项。
