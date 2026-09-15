@@ -98,6 +98,14 @@ def topological_waves(tasks):
     return waves
 
 
+def _is_optional(tid, by_id, results):
+    """任务是否可选：优先读结果里的标记（被 drop 的任务已从 by_id 移出）。"""
+    r = results.get(tid) or {}
+    if "optional" in r:
+        return bool(r["optional"])
+    return bool((by_id.get(tid) or {}).get("optional"))
+
+
 def _deps_state(tid, by_id, results):
     """返回 (是否可判定, 阻断原因)。
 
@@ -107,35 +115,93 @@ def _deps_state(tid, by_id, results):
         r = results.get(d)
         if r is None:
             return False, None                     # 依赖还没跑完
-        if r.get("status") != "ok" and not by_id[d].get("optional"):
+        if r.get("status") != "ok" and not _is_optional(d, by_id, results):
             return True, f"上游 {d} {r.get('status')}"
     return True, None
 
 
-def _accept_new_tasks(raw, by_id, tasks, max_tasks):
-    """校验并接收 replanner 产出的补救任务（幂等过滤：坏项跳过，不抛异常）。"""
-    if not raw:
-        return []
-    items = raw.get("tasks") if isinstance(raw, dict) else raw
-    if not isinstance(items, list) or not items:
-        return []
-    try:
-        norm = parse_plan(items, known_ids=set(by_id))
-    except PlanError:
-        return []
+def apply_proposal(proposal, by_id, tasks, results, max_tasks):
+    """应用 replanner 的提案——支持**回溯式**修改尚未执行的计划。
+
+    提案可以是（向后兼容的）任务数组，也可以是对象：
+      {"add": [task...], "drop": ["id"...], "replace": [task...]}   // revise/cancel 为别名
+
+    **安全边界**：只能改**尚未执行**的任务。已执行的任务不可删改（尝试会被记入
+    `ignored` 而不生效）——本编排器不会回滚已经产生的副作用（比如已改的文件）。
+
+    非法项（id 冲突、依赖未知、已执行）**逐条忽略**，绝不抛异常。
+    返回 {"added","dropped","replaced","ignored","changed"}。
+    """
+    delta = {"added": [], "dropped": [], "replaced": [], "ignored": [], "changed": False}
+    if not proposal:
+        return delta
+    if isinstance(proposal, list):
+        proposal = {"add": proposal}
+    if not isinstance(proposal, dict):
+        return delta
+
+    def _unexecuted(tid):
+        return tid in by_id and tid not in results
+
+    # ① replace：原地改写未执行任务的 role/task/deps（先做，便于后续按新定义判断）
+    raw = proposal.get("replace") or proposal.get("revise") or []
+    if isinstance(raw, list) and raw:
+        try:
+            norm = parse_plan(raw, known_ids=set(by_id))
+        except PlanError:
+            norm = []
+        for t in norm:
+            tid = t["id"]
+            if not _unexecuted(tid):
+                delta["ignored"].append(f"replace:{tid}(已执行或不存在)")
+                continue
+            by_id[tid].update({"role": t["role"], "task": t["task"],
+                               "depends_on": t["depends_on"], "optional": t["optional"]})
+            delta["replaced"].append(tid)
+
+    # ② drop：取消未执行任务；其下游会在调度时被判为 blocked
+    raw = proposal.get("drop") or proposal.get("cancel") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if isinstance(raw, list):
+        for tid in raw:
+            tid = str(tid).strip()
+            if not _unexecuted(tid):
+                delta["ignored"].append(f"drop:{tid}(已执行或不存在)")
+                continue
+            was_optional = bool(by_id[tid].get("optional"))
+            by_id.pop(tid, None)
+            tasks[:] = [x for x in tasks if x["id"] != tid]
+            # 保留 optional 标记：任务被移出 by_id 后，下游/整体成败判定仍要能读到它
+            results[tid] = {"status": "dropped", "conclusion": "", "steps": 0,
+                            "error": "被重规划取消（其下游将被阻断）", "elapsed_ms": 0,
+                            "optional": was_optional}
+            delta["dropped"].append(tid)
+
+    # ③ add：追加补救任务（可依赖已完成的任务）
+    raw = proposal.get("add") or proposal.get("tasks") or []
     room = max(0, max_tasks - len(tasks))
-    added = []
-    for t in norm:
-        if t["id"] in by_id:
-            continue                                # id 冲突：丢弃
-        if any(d not in by_id for d in t["depends_on"]):
-            continue                                # 依赖指向同批里被丢弃的项：丢弃
-        by_id[t["id"]] = t
-        tasks.append(t)
-        added.append(t)
-        if len(added) >= room:
-            break
-    return added
+    if isinstance(raw, list) and raw and room:
+        try:
+            norm = parse_plan(raw, known_ids=set(by_id))
+        except PlanError:
+            norm = []
+        for t in norm:
+            tid = t["id"]
+            if tid in by_id or tid in results:
+                delta["ignored"].append(f"add:{tid}(id 冲突)")
+                continue
+            if any(d not in by_id and d not in results for d in t["depends_on"]):
+                delta["ignored"].append(f"add:{tid}(依赖未知)")
+                continue
+            by_id[tid] = t
+            tasks.append(t)
+            delta["added"].append(tid)
+            if len(delta["added"]) >= room:
+                break
+
+    delta["changed"] = bool(delta["added"] or delta["dropped"] or delta["replaced"])
+    return delta
 
 
 def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
@@ -164,6 +230,7 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
     blocked = {}
     rounds = []                       # 每轮实际执行的 id 列表（≈ 拓扑波）
     replans = 0
+    revisions = []                    # 每次重规划做了什么（审计）
 
     def _emit(kind, payload):
         if on_event:
@@ -216,15 +283,18 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
         rounds.append([t["id"] for t in runnable])
 
         failed = [t for t in runnable if (results.get(t["id"]) or {}).get("status") == "failed"]
-        if failed and replanner is not None and replans < int(max_replans) and len(tasks) < limit_tasks:
+        if failed and replanner is not None and replans < int(max_replans):
             try:
                 proposal = replanner(failed, dict(results), replans + 1)
             except Exception:  # noqa: BLE001 —— 重规划失败按"不再重规划"处理
                 proposal = None
-            added = _accept_new_tasks(proposal, by_id, tasks, limit_tasks)
-            if added:
+            delta = apply_proposal(proposal, by_id, tasks, results, limit_tasks)
+            if delta["changed"]:
                 replans += 1
-                _emit("replan", {"attempt": replans, "added": [t["id"] for t in added]})
+                revisions.append({"attempt": replans, **{k: delta[k] for k in
+                                                         ("added", "dropped", "replaced", "ignored")}})
+                _emit("replan", {"attempt": replans, "added": delta["added"],
+                                 "dropped": delta["dropped"], "replaced": delta["replaced"]})
                 continue
         # 不再重规划：失败者的下游由下一轮 _deps_state 标记为 blocked
 
@@ -236,7 +306,8 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
             merged = f"（结果合成失败：{type(e).__name__}: {e}）"
 
     return {
-        "ok": all((r.get("status") == "ok") or by_id[tid].get("optional")
+        # 注意：被 drop 的任务已从 by_id 移除，这里必须用 .get / 结果标记兜底
+        "ok": all((r.get("status") == "ok") or _is_optional(tid, by_id, results)
                   for tid, r in results.items()),
         "waves": rounds,
         "order": list(results.keys()),
@@ -244,6 +315,8 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
         "blocked": sorted(blocked),
         "merged": merged,
         "replans": replans,
+        "revisions": revisions,
+        "dropped": [tid for r in revisions for tid in r.get("dropped", [])],
         "n_tasks": len(tasks),
         "n_ok": sum(1 for r in results.values() if r.get("status") == "ok"),
         "n_failed": sum(1 for r in results.values() if r.get("status") == "failed"),
@@ -262,7 +335,8 @@ def format_report(report, max_conclusion=400):
     for tid in report["order"]:
         r = report["results"].get(tid, {})
         status = r.get("status")
-        mark = {"ok": "ok", "failed": "FAIL", "blocked": "BLOCKED"}.get(status, status)
+        mark = {"ok": "ok", "failed": "FAIL", "blocked": "BLOCKED",
+                "dropped": "DROPPED"}.get(status, status)
         if status == "ok" and r.get("degraded"):
             mark = "ok(部分)"   # 子代理未在步数内收尾，结论是过程要点兜底
         body = (r.get("conclusion") or "").strip()
@@ -271,6 +345,16 @@ def format_report(report, max_conclusion=400):
         if len(body) > max_conclusion:
             body = body[:max_conclusion] + "…（截断）"
         lines.append(f"- [{mark}] {tid}（{r.get('elapsed_ms', 0)}ms）：{body or '（无内容）'}")
+    for rev in report.get("revisions") or []:
+        bits = []
+        if rev.get("added"):
+            bits.append("追加 " + "、".join(rev["added"]))
+        if rev.get("dropped"):
+            bits.append("取消 " + "、".join(rev["dropped"]))
+        if rev.get("replaced"):
+            bits.append("改写 " + "、".join(rev["replaced"]))
+        if bits:
+            lines.append(f"· 第 {rev.get('attempt')} 次重规划：" + "；".join(bits))
     if report.get("merged"):
         lines.append("\n【合成结论】\n" + report["merged"])
     return "\n".join(lines)

@@ -1427,11 +1427,18 @@ class Agent:
         prompt = (
             f"第 {attempt} 次重规划。以下子任务失败了：\n" + "\n".join(brief) +
             ("\n\n已成功的子任务结论：\n" + "\n".join(ok_lines) if ok_lines else "") +
-            "\n\n请给出**补救任务**（最多 3 个），用 JSON 数组输出，每项形如 "
-            '{"id":"r1","role":"researcher|coder|reviewer|tester","task":"...",'
-            '"depends_on":["可引用已存在的任务id"],"optional":false}。'
-            "补救必须**换一种做法**（换角色、换检索策略、缩小范围、先补前置信息），"
-            "不要把失败的任务原样重试。若确实无法补救，直接输出 []。只输出 JSON，不要解释。"
+            "\n\n请给出**回溯式修订方案**，用 JSON 对象输出："
+            '{"add":[任务...],"drop":["要取消的任务id"],"replace":[改写后的任务...]}。'
+            "任务字段：`id` / `role`(researcher|coder|reviewer|tester) / `task` / "
+            "`depends_on`(可引用已存在的任务id) / `optional`。\n"
+            "用法说明：\n"
+            "· add —— 追加补救任务（最多 3 个），可依赖已完成的任务；\n"
+            "· drop —— 取消**尚未执行**的任务（例如它依赖的东西已经失败、没必要再跑）；\n"
+            "· replace —— **原地改写**尚未执行的任务（换角色 / 换做法 / 重接依赖），"
+            "常用来把被阻断的下游任务救回来（把它对失败任务的依赖去掉）。\n"
+            "**只能改动尚未执行的任务**——已经跑过的任务不能删改，本系统不会回滚已产生的副作用。\n"
+            "修订要**换一种做法**（换角色、换检索策略、缩小范围、先补前置信息），"
+            "不要把失败的任务原样重试。若确实无法补救，输出 {}。只输出 JSON，不要解释。"
         )
         llm = self._child_llm()
         try:
@@ -1444,9 +1451,12 @@ class Agent:
         obj, err = _load_json_arg(out or "")
         if err:
             return []
-        if isinstance(obj, dict):
-            obj = obj.get("tasks")
-        return obj if isinstance(obj, list) else []
+        if isinstance(obj, list):
+            return obj            # 向后兼容：裸任务数组等价于 {"add": [...]}
+        if isinstance(obj, dict) and any(
+                k in obj for k in ("add", "drop", "replace", "revise", "cancel", "tasks")):
+            return obj
+        return []
 
     def orchestrate(self, plan, synth=True, max_parallel=None, turn=None,
                     replan=True, max_replans=None):

@@ -291,6 +291,132 @@ class ReplanTests(unittest.TestCase):
         self.assertLessEqual(rep["n_tasks"], 3)
 
 
+class BacktrackingTests(unittest.TestCase):
+    """回溯式重规划：replanner 可 add / drop / replace，但只能动**尚未执行**的任务。"""
+
+    def test_drop_unexecuted_task(self):
+        def runner(task, ctx):
+            if task["id"] == "a":
+                return {"status": "failed", "error": "boom"}
+            raise AssertionError("被 drop 的任务不应执行")
+
+        plan = [{"id": "a", "task": "甲"}, {"id": "b", "task": "乙", "depends_on": ["a"]}]
+        rep = orch.run_plan(plan, runner,
+                            replanner=lambda f, r, a: {"drop": ["b"]}, max_replans=1)
+        self.assertEqual(rep["dropped"], ["b"])
+        self.assertEqual(rep["results"]["b"]["status"], "dropped")
+        # drop 只作用于 run_plan 内部的任务列表，**不就地修改调用方传入的 plan**
+        self.assertIn("b", [t["id"] for t in orch.parse_plan(plan)])
+        self.assertEqual(rep["n_tasks"], 1)                              # b 已移出内部任务列表
+        self.assertIn("取消 b", orch.format_report(rep))
+
+    def test_replace_rescues_blocked_downstream(self):
+        def runner(task, ctx):
+            if task["id"] == "a":
+                return {"status": "failed", "error": "boom"}
+            return {"status": "ok", "conclusion": "救回来了"}
+
+        plan = [{"id": "a", "task": "甲"}, {"id": "b", "task": "乙", "depends_on": ["a"]}]
+
+        def replanner(failed, results, attempt):
+            return {"replace": [{"id": "b", "role": "researcher", "task": "换个做法",
+                                 "depends_on": []}]}
+
+        rep = orch.run_plan(plan, runner, replanner=replanner, max_replans=1)
+        self.assertEqual(rep["revisions"][0]["replaced"], ["b"])
+        self.assertEqual(rep["results"]["b"]["status"], "ok")
+        self.assertEqual(rep["blocked"], [], "重接依赖后不应再被阻断")
+        self.assertIn("改写 b", orch.format_report(rep))
+
+    def test_executed_task_is_immutable(self):
+        def runner(task, ctx):
+            return {"status": "ok" if task["id"] == "a" else "failed",
+                    "conclusion": "a 好了", "error": "b 挂了"}
+
+        plan = [{"id": "a", "task": "甲"}, {"id": "b", "task": "乙", "depends_on": ["a"]}]
+        proposal = {"drop": ["a"],
+                    "replace": [{"id": "a", "task": "偷偷改", "depends_on": []}],
+                    "add": [{"id": "r1", "role": "researcher", "task": "补救"}]}
+        rep = orch.run_plan(plan, runner, replanner=lambda f, r, a: proposal, max_replans=1)
+        self.assertNotIn("a", rep["dropped"])
+        self.assertEqual(rep["results"]["a"]["status"], "ok", "已执行任务不可被改写")
+        ignored = rep["revisions"][0]["ignored"]
+        self.assertTrue(any(x.startswith("drop:a") for x in ignored), ignored)
+        self.assertTrue(any(x.startswith("replace:a") for x in ignored), ignored)
+        self.assertEqual(rep["revisions"][0]["added"], ["r1"])
+
+    def test_invalid_replace_is_ignored(self):
+        plan = [{"id": "a", "task": "甲"}, {"id": "b", "task": "乙", "depends_on": ["a"]}]
+        rep = orch.run_plan(
+            plan,
+            lambda t, c: {"status": "failed", "error": "boom"},
+            replanner=lambda f, r, a: {"replace": [{"id": "b", "task": "x", "depends_on": ["不存在"]}]},
+            max_replans=1)
+        self.assertEqual(rep["replans"], 0)
+        self.assertEqual(rep["revisions"], [])
+
+    def test_empty_proposal_object_changes_nothing(self):
+        rep = orch.run_plan([{"id": "a", "task": "甲"}],
+                            lambda t, c: {"status": "failed", "error": "boom"},
+                            replanner=lambda f, r, a: {}, max_replans=2)
+        self.assertEqual(rep["replans"], 0)
+
+    def test_apply_proposal_is_pure_wrt_input_shapes(self):
+        tasks = orch.parse_plan([{"id": "a", "task": "甲"}])
+        by_id = {t["id"]: t for t in tasks}
+        results = {}
+        # 裸数组（向后兼容）等价于 {"add": [...]}
+        d1 = orch.apply_proposal([{"id": "r1", "role": "researcher", "task": "补"}],
+                                 by_id, tasks, results, 10)
+        self.assertEqual(d1["added"], ["r1"])
+        # 非 dict/非 list 的垃圾提案不炸
+        self.assertFalse(orch.apply_proposal("nope", by_id, tasks, results, 10)["changed"])
+        self.assertFalse(orch.apply_proposal(None, by_id, tasks, results, 10)["changed"])
+
+    def test_drop_unknown_id_is_ignored(self):
+        rep = orch.run_plan([{"id": "a", "task": "甲"}],
+                            lambda t, c: {"status": "failed", "error": "boom"},
+                            replanner=lambda f, r, a: {"drop": ["不存在"]}, max_replans=1)
+        self.assertEqual(rep["replans"], 0)
+        self.assertEqual(rep["dropped"], [])
+
+    def test_dropped_task_blocks_its_dependent(self):
+        plan = [{"id": "a", "task": "甲"},
+                {"id": "b", "task": "乙", "depends_on": ["a"]},
+                {"id": "c", "task": "丙", "depends_on": ["b"]},
+                {"id": "d", "task": "丁", "depends_on": ["b"]}]
+
+        def runner(task, ctx):
+            return {"status": "ok" if task["id"] == "a" else "failed",
+                    "conclusion": "ok", "error": "boom"}
+
+        rep = orch.run_plan(plan, runner,
+                            replanner=lambda f, r, a: {"drop": ["c"]}, max_replans=1)
+        self.assertEqual(rep["dropped"], ["c"])
+        self.assertEqual(rep["results"]["c"]["status"], "dropped")
+        self.assertEqual(rep["results"]["d"]["status"], "blocked")
+        self.assertEqual(rep["n_tasks"], 3)          # c 已移出任务列表
+        self.assertFalse(rep["ok"])                  # b 真失败（非 optional）
+
+    def test_dropped_optional_task_keeps_exemption(self):
+        # f 先失败（第 1 波），此时 a 还没跑 → 可被 drop；a 是 optional，
+        # 因此依赖它的 b 不应被阻断（optional 豁免在任务被移出 by_id 后依然生效）。
+        plan = [{"id": "f", "task": "必挂"},
+                {"id": "a", "task": "甲", "depends_on": ["f"], "optional": True},
+                {"id": "b", "task": "乙", "depends_on": ["a"]}]
+
+        def runner(task, ctx):
+            if task["id"] == "f":
+                return {"status": "failed", "error": "boom"}
+            return {"status": "ok", "conclusion": "ok"}
+
+        rep = orch.run_plan(plan, runner,
+                            replanner=lambda f, r, a: {"drop": ["a"]}, max_replans=1)
+        self.assertEqual(rep["results"]["a"]["status"], "dropped")
+        self.assertEqual(rep["results"]["b"]["status"], "ok", "optional 上游被 drop 不应阻断下游")
+        self.assertNotIn("b", rep["blocked"])
+
+
 class _CloningLLM:
     """父实例按脚本回放；clone 出的子实例固定回一句 Final Answer。"""
     provider = "deepseek"
@@ -500,6 +626,27 @@ class AgentReplanTests(unittest.TestCase):
                             synth=False, replan=False)
         self.assertEqual(rep["replans"], 0)
         self.assertEqual(rep["n_tasks"], 1)
+
+    def test_replanner_returns_dict_proposal(self):
+        llm = _ReplanLLM({"drop": ["b"]})
+        a = agent_mod.Agent(llm=llm)
+        out = a._replanner([{"id": "a", "task": "甲"}], {"a": {"status": "failed"}}, 1)
+        self.assertEqual(out, {"drop": ["b"]})
+
+    def test_orchestrate_backtracking_replace_rescues_task(self):
+        # a 是坏角色 → 必然失败；b 依赖 a 本会被阻断，replanner 用 replace 把 b 的依赖摘掉
+        llm = _ReplanLLM({"replace": [{"id": "b", "role": "researcher",
+                                       "task": "换一种做法", "depends_on": []}]})
+        a = agent_mod.Agent(llm=llm)
+        rep = a.orchestrate({"tasks": [
+            {"id": "a", "role": "wizard", "task": "坏角色"},
+            {"id": "b", "role": "researcher", "task": "原任务", "depends_on": ["a"]},
+        ]}, synth=False, replan=True)
+        self.assertEqual(rep["replans"], 1)
+        self.assertEqual(rep["results"]["a"]["status"], "failed")
+        self.assertEqual(rep["results"]["b"]["status"], "ok", "回溯改写后应被救回")
+        self.assertEqual(rep["revisions"][0]["replaced"], ["b"])
+        self.assertEqual(rep["blocked"], [])
 
     def test_orchestrate_tool_passes_replan_flags(self):
         llm = _ReplanLLM([{"id": "r1", "role": "researcher", "task": "补救"}])
