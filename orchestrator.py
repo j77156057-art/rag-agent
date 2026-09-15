@@ -34,8 +34,12 @@ def _as_deps(value):
     raise PlanError(f"depends_on 类型不支持：{type(value).__name__}")
 
 
-def parse_plan(raw):
-    """校验并规范化任务列表。返回 [{id, role, task, depends_on, optional}]。"""
+def parse_plan(raw, known_ids=None):
+    """校验并规范化任务列表。返回 [{id, role, task, depends_on, optional}]。
+
+    `known_ids` 用于**动态重规划**：补救任务的 `depends_on` 允许指向本轮之前
+    已存在的任务（那些 id 不在新任务列表里）。
+    """
     if isinstance(raw, dict):
         tasks = raw.get("tasks")
     elif isinstance(raw, list):
@@ -68,7 +72,7 @@ def parse_plan(raw):
             "optional": bool(t.get("optional")),
         })
 
-    ids = {t["id"] for t in out}
+    ids = {t["id"] for t in out} | {str(k) for k in (known_ids or ())}
     for t in out:
         for d in t["depends_on"]:
             if d == t["id"]:
@@ -94,22 +98,72 @@ def topological_waves(tasks):
     return waves
 
 
-def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None):
-    """按波执行任务图。
+def _deps_state(tid, by_id, results):
+    """返回 (是否可判定, 阻断原因)。
+
+    可判定 = 所有依赖都已执行完；此时若某个非可选依赖不是 ok，就给出阻断原因。
+    """
+    for d in by_id[tid]["depends_on"]:
+        r = results.get(d)
+        if r is None:
+            return False, None                     # 依赖还没跑完
+        if r.get("status") != "ok" and not by_id[d].get("optional"):
+            return True, f"上游 {d} {r.get('status')}"
+    return True, None
+
+
+def _accept_new_tasks(raw, by_id, tasks, max_tasks):
+    """校验并接收 replanner 产出的补救任务（幂等过滤：坏项跳过，不抛异常）。"""
+    if not raw:
+        return []
+    items = raw.get("tasks") if isinstance(raw, dict) else raw
+    if not isinstance(items, list) or not items:
+        return []
+    try:
+        norm = parse_plan(items, known_ids=set(by_id))
+    except PlanError:
+        return []
+    room = max(0, max_tasks - len(tasks))
+    added = []
+    for t in norm:
+        if t["id"] in by_id:
+            continue                                # id 冲突：丢弃
+        if any(d not in by_id for d in t["depends_on"]):
+            continue                                # 依赖指向同批里被丢弃的项：丢弃
+        by_id[t["id"]] = t
+        tasks.append(t)
+        added.append(t)
+        if len(added) >= room:
+            break
+    return added
+
+
+def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
+             replanner=None, max_replans=0, max_tasks=None):
+    """迭代调度任务图（支持**动态重规划**）。
 
     runner(task, context) -> {"status": "ok"|"failed", "conclusion": str,
                               "steps": int, "error": str}
       context = {上游任务id: 上游结论}（仅含非空结论）
-    synth_runner(tasks, results) -> str（可选，做结果合成/冲突标注）
+    synth_runner(tasks, results) -> str（可选，结果合成/冲突标注）
+    replanner(failed_tasks, results, attempt) -> list[task] | None（可选）
+      某轮有任务失败时调用，返回**补救任务**（可依赖已完成的任务）。
+      返回空/非法/抛异常都视为"不再重规划"。最多调用 max_replans 次。
 
-    返回结构化结果；单个任务异常只影响它自己。
+    调度语义：每轮挑出「依赖已全部落定且未被阻断」的任务并行执行；
+    上游失败且不再重规划时，其下游标记 blocked 而不空跑（optional 上游除外）。
+    单个任务异常只影响它自己。
     """
     t0 = time.monotonic()
-    tasks = list(tasks)
+    # 接受"原始任务"或"已 parse_plan 过的任务"两种入参（幂等规范化，避免调用方踩坑）
+    tasks = parse_plan(list(tasks))
     by_id = {t["id"]: t for t in tasks}
-    waves = topological_waves(tasks)
+    topological_waves(tasks)          # 静态校验：先炸出循环依赖
+    limit_tasks = int(max_tasks or MAX_TASKS)
     results = {}
     blocked = {}
+    rounds = []                       # 每轮实际执行的 id 列表（≈ 拓扑波）
+    replans = 0
 
     def _emit(kind, payload):
         if on_event:
@@ -118,31 +172,27 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None):
             except Exception:  # noqa: BLE001 —— 埋点/通知失败不影响调度
                 pass
 
-    def _blocked_reason(tid):
-        for d in by_id[tid]["depends_on"]:
-            if d in blocked:
-                return f"上游 {d} 被阻断"
-            r = results.get(d)
-            if r and r.get("status") not in ("ok",) and not by_id[d].get("optional"):
-                return f"上游 {d} {r.get('status')}"
-        return None
-
-    for wi, wave in enumerate(waves):
+    while True:
         runnable = []
-        for tid in wave:
-            reason = _blocked_reason(tid)
+        for t in tasks:
+            tid = t["id"]
+            if tid in results:
+                continue
+            settled, reason = _deps_state(tid, by_id, results)
+            if not settled:
+                continue
             if reason:
                 blocked[tid] = reason
                 results[tid] = {"status": "blocked", "conclusion": "", "steps": 0,
                                 "error": reason, "elapsed_ms": 0}
             else:
-                runnable.append(tid)
+                runnable.append(t)
         if not runnable:
-            continue
-        _emit("wave", {"wave": wi, "tasks": list(runnable)})
+            break
 
-        def _run_one(tid):
-            t = by_id[tid]
+        _emit("wave", {"wave": len(rounds), "tasks": [t["id"] for t in runnable]})
+
+        def _run_one(t):
             ctx = {d: (results.get(d) or {}).get("conclusion", "") for d in t["depends_on"]}
             ctx = {k: v for k, v in ctx.items() if v}
             start = time.monotonic()
@@ -155,14 +205,28 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None):
             out.setdefault("conclusion", "")
             out.setdefault("steps", 0)
             out["elapsed_ms"] = int((time.monotonic() - start) * 1000)
-            return tid, out
+            return t["id"], out
 
         with ThreadPoolExecutor(max_workers=min(max_parallel, max(1, len(runnable)))) as ex:
-            futures = [ex.submit(_run_one, tid) for tid in runnable]
+            futures = [ex.submit(_run_one, t) for t in runnable]
             for f in futures:
                 tid, out = f.result()
                 results[tid] = out
                 _emit("task", {"id": tid, "status": out.get("status")})
+        rounds.append([t["id"] for t in runnable])
+
+        failed = [t for t in runnable if (results.get(t["id"]) or {}).get("status") == "failed"]
+        if failed and replanner is not None and replans < int(max_replans) and len(tasks) < limit_tasks:
+            try:
+                proposal = replanner(failed, dict(results), replans + 1)
+            except Exception:  # noqa: BLE001 —— 重规划失败按"不再重规划"处理
+                proposal = None
+            added = _accept_new_tasks(proposal, by_id, tasks, limit_tasks)
+            if added:
+                replans += 1
+                _emit("replan", {"attempt": replans, "added": [t["id"] for t in added]})
+                continue
+        # 不再重规划：失败者的下游由下一轮 _deps_state 标记为 blocked
 
     merged = ""
     if synth_runner and any(r.get("status") == "ok" for r in results.values()):
@@ -171,15 +235,15 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None):
         except Exception as e:  # noqa: BLE001 —— 合成失败退回只给各任务结论
             merged = f"（结果合成失败：{type(e).__name__}: {e}）"
 
-    order = [tid for w in waves for tid in w]
     return {
         "ok": all((r.get("status") == "ok") or by_id[tid].get("optional")
                   for tid, r in results.items()),
-        "waves": waves,
-        "order": order,
+        "waves": rounds,
+        "order": list(results.keys()),
         "results": results,
         "blocked": sorted(blocked),
         "merged": merged,
+        "replans": replans,
         "n_tasks": len(tasks),
         "n_ok": sum(1 for r in results.values() if r.get("status") == "ok"),
         "n_failed": sum(1 for r in results.values() if r.get("status") == "failed"),
@@ -192,7 +256,8 @@ def format_report(report, max_conclusion=400):
     lines = [
         f"编排完成：{report['n_tasks']} 个任务 / {len(report['waves'])} 波，"
         f"成功 {report['n_ok']}、失败 {report['n_failed']}、阻断 {len(report['blocked'])}，"
-        f"耗时 {report['elapsed_ms']}ms。"
+        + (f"重规划 {report.get('replans', 0)} 次，" if report.get("replans") else "")
+        + f"耗时 {report['elapsed_ms']}ms。"
     ]
     for tid in report["order"]:
         r = report["results"].get(tid, {})

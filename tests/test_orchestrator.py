@@ -184,6 +184,113 @@ class RunPlanTests(unittest.TestCase):
         self.assertIn("MERGED", text)
 
 
+class ReplanTests(unittest.TestCase):
+    """动态重规划：失败 → 追加补救任务 → 继续执行（受 max_replans 约束）。"""
+
+    def _plan(self):
+        return orch.parse_plan([{"id": "a", "task": "甲"},
+                                {"id": "b", "task": "乙", "depends_on": ["a"]}])
+
+    def test_parse_plan_known_ids_allows_dep_on_existing(self):
+        # 补救任务依赖"已存在但不是本批"的任务 id —— 静态校验会拒，known_ids 放行
+        with self.assertRaises(orch.PlanError):
+            orch.parse_plan([{"id": "r1", "task": "x", "depends_on": ["a"]}])
+        ok = orch.parse_plan([{"id": "r1", "task": "x", "depends_on": ["a"]}], known_ids={"a"})
+        self.assertEqual(ok[0]["depends_on"], ["a"])
+
+    def test_remediation_task_is_added_and_runs(self):
+        state = {"n": 0}
+
+        def runner(task, ctx):
+            if task["id"] == "a":
+                return {"status": "failed", "error": "第一次失败"}
+            return {"status": "ok", "conclusion": f"补救成功-{task['id']}"}
+
+        def replanner(failed, results, attempt):
+            state["n"] += 1
+            return [{"id": "r1", "role": "researcher", "task": "换一种查法"}]
+
+        rep = orch.run_plan(self._plan(), runner, replanner=replanner, max_replans=2)
+        self.assertEqual(rep["replans"], 1)
+        self.assertEqual(state["n"], 1)
+        self.assertIn("r1", rep["results"])
+        self.assertEqual(rep["results"]["r1"]["status"], "ok")
+        self.assertEqual(rep["n_tasks"], 3)          # a + b + 补救 r1
+        self.assertIn("重规划 1 次", orch.format_report(rep))
+
+    def test_remediation_receives_upstream_context(self):
+        seen = {}
+
+        def runner(task, ctx):
+            seen[task["id"]] = dict(ctx)
+            if task["id"] == "a":
+                return {"status": "failed", "error": "boom"}
+            return {"status": "ok", "conclusion": "done"}
+
+        def replanner(failed, results, attempt):
+            return [{"id": "r1", "role": "researcher", "task": "补救", "depends_on": ["a"]}]
+
+        orch.run_plan([{"id": "a", "task": "甲", "optional": True}], runner,
+                      replanner=replanner, max_replans=1)
+        self.assertEqual(seen["r1"].get("a", ""), "")   # a 失败无结论 → 无上下文
+        self.assertIn("r1", seen)
+
+    def test_empty_proposal_stops_replanning_and_blocks_downstream(self):
+        def runner(task, ctx):
+            if task["id"] == "a":
+                return {"status": "failed", "error": "boom"}
+            return {"status": "ok", "conclusion": "never"}
+
+        rep = orch.run_plan(self._plan(), runner,
+                            replanner=lambda f, r, a: [], max_replans=3)
+        self.assertEqual(rep["replans"], 0)
+        self.assertEqual(rep["results"]["b"]["status"], "blocked")
+
+    def test_max_replans_is_enforced(self):
+        seq = {"n": 0}
+
+        def runner(task, ctx):
+            return {"status": "failed", "error": "always fails"}
+
+        def replanner(failed, results, attempt):
+            seq["n"] += 1
+            return [{"id": f"r{attempt}", "role": "researcher", "task": "再补一刀"}]
+
+        rep = orch.run_plan([{"id": "a", "task": "甲"}], runner,
+                            replanner=replanner, max_replans=2)
+        self.assertEqual(rep["replans"], 2)
+        self.assertEqual(seq["n"], 2, "不应超过 max_replans 次调用")
+
+    def test_garbage_proposals_are_ignored(self):
+        for bad in ("nope", {"no": "tasks"}, [{"id": "a", "task": "id 冲突"}],
+                    [{"task": ""}], [{"id": "x", "task": "y", "depends_on": ["不存在"]}]):
+            rep = orch.run_plan([{"id": "a", "task": "甲"}],
+                                lambda t, c: {"status": "failed", "error": "boom"},
+                                replanner=lambda f, r, a, b=bad: b, max_replans=2)
+            self.assertEqual(rep["replans"], 0, f"坏提案应被忽略：{bad!r}")
+            self.assertEqual(rep["n_tasks"], 1)
+
+    def test_replanner_exception_is_contained(self):
+        def boom(failed, results, attempt):
+            raise RuntimeError("replanner boom")
+
+        rep = orch.run_plan([{"id": "a", "task": "甲"}],
+                            lambda t, c: {"status": "failed", "error": "boom"},
+                            replanner=boom, max_replans=2)
+        self.assertEqual(rep["replans"], 0)
+        self.assertFalse(rep["ok"])
+
+    def test_max_tasks_cap_limits_appended(self):
+        def replanner(failed, results, attempt):
+            return [{"id": f"r{attempt}_{i}", "role": "researcher", "task": "补"}
+                    for i in range(5)]
+
+        rep = orch.run_plan([{"id": "a", "task": "甲"}],
+                            lambda t, c: {"status": "failed", "error": "boom"},
+                            replanner=replanner, max_replans=3, max_tasks=3)
+        self.assertLessEqual(rep["n_tasks"], 3)
+
+
 class _CloningLLM:
     """父实例按脚本回放；clone 出的子实例固定回一句 Final Answer。"""
     provider = "deepseek"
@@ -304,6 +411,105 @@ class AgentOrchestrateTests(unittest.TestCase):
         self.assertEqual(out["status"], "ok")
         self.assertTrue(out["conclusion"].strip(), "空结论会让下游失去上下文")
         self.assertTrue(out.get("degraded"), "应标记为降级（过程要点）")
+
+
+class _ReplanLLM:
+    """按提示内容分流：重规划请求回 JSON 补救任务，其余回 Final Answer。"""
+    provider = "deepseek"
+    model = "replan"
+
+    def __init__(self, remediation):
+        self.remediation = remediation
+        self.calls = []
+        self.last_usage = {}
+        self.last_tool_calls = []
+
+    def clone(self):
+        return self
+
+    def chat(self, messages, stream=True, **kw):
+        prompt = (messages[-1].get("content") or "") if messages else ""
+        self.calls.append(prompt[:60])
+        self.last_usage = {"prompt_tokens": 3, "completion_tokens": 1}
+        self.last_tool_calls = []
+        if "重规划" in prompt:
+            content = json.dumps(self.remediation, ensure_ascii=False)
+        else:
+            content = "Final Answer: 子代理结论 OK"
+        if stream:
+            def g():
+                for ch in content:
+                    yield ch
+            return g()
+        return content
+
+    def count_tokens(self, text):
+        return 1
+
+
+class AgentReplanTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="dm_rp_")
+        self._t = agent_trace.TRACE_FILE
+        self._s = sessions.SESSIONS_DIR
+        agent_trace.TRACE_FILE = os.path.join(self.tmp, "t.jsonl")
+        sessions.SESSIONS_DIR = os.path.join(self.tmp, "s")
+
+    def tearDown(self):
+        agent_trace.TRACE_FILE = self._t
+        sessions.SESSIONS_DIR = self._s
+
+    def test_replanner_parses_llm_json(self):
+        llm = _ReplanLLM([{"id": "r1", "role": "researcher", "task": "换查法"}])
+        a = agent_mod.Agent(llm=llm)
+        out = a._replanner([{"id": "a", "role": "researcher", "task": "甲"}],
+                           {"a": {"status": "failed", "error": "boom"}}, 1)
+        self.assertEqual(out, [{"id": "r1", "role": "researcher", "task": "换查法"}])
+
+    def test_replanner_returns_empty_on_non_json(self):
+        class _NotJson(_ReplanLLM):
+            def chat(self, messages, stream=True, **kw):
+                self.last_usage = {}
+                self.last_tool_calls = []
+                s = "我觉得没法补救，你看着办吧"
+                if stream:
+                    def g():
+                        for ch in s:
+                            yield ch
+                    return g()
+                return s
+
+        a = agent_mod.Agent(llm=_NotJson([]))
+        self.assertEqual(a._replanner([{"id": "a", "task": "甲"}], {}, 1), [])
+
+    def test_orchestrate_replans_failed_task_end_to_end(self):
+        # role "wizard" 不存在 → 任务 a 必然 failed → 触发重规划 → r1 成功
+        llm = _ReplanLLM([{"id": "r1", "role": "researcher", "task": "换一种查法"}])
+        a = agent_mod.Agent(llm=llm)
+        rep = a.orchestrate({"tasks": [{"id": "a", "role": "wizard", "task": "坏角色"}]},
+                            synth=False, replan=True)
+        self.assertEqual(rep["replans"], 1, rep.get("results"))
+        self.assertEqual(rep["results"]["a"]["status"], "failed")
+        self.assertEqual(rep["results"]["r1"]["status"], "ok")
+        self.assertEqual(rep["n_tasks"], 2)
+
+    def test_orchestrate_replan_disabled(self):
+        llm = _ReplanLLM([{"id": "r1", "role": "researcher", "task": "补救"}])
+        a = agent_mod.Agent(llm=llm)
+        rep = a.orchestrate({"tasks": [{"id": "a", "role": "wizard", "task": "坏角色"}]},
+                            synth=False, replan=False)
+        self.assertEqual(rep["replans"], 0)
+        self.assertEqual(rep["n_tasks"], 1)
+
+    def test_orchestrate_tool_passes_replan_flags(self):
+        llm = _ReplanLLM([{"id": "r1", "role": "researcher", "task": "补救"}])
+        a = agent_mod.Agent(llm=llm)
+        payload = {"tasks": [{"id": "a", "role": "wizard", "task": "坏角色"}],
+                   "synth": False, "replan": True, "max_replans": 1}
+        out = a._orchestrate_tool(json.dumps(payload))
+        self.assertIn("编排完成", out)
+        self.assertIn("重规划 1 次", out)
+        self.assertIn("r1", out)
 
 
 if __name__ == "__main__":

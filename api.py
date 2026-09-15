@@ -1294,17 +1294,24 @@ async def skills_reload_ep():
 class OrchestrateReq(BaseModel):
     tasks: list = []
     synth: bool = True
+    replan: bool = True
+    max_replans: int = -1
     max_parallel: int = 0
     session_id: str = "default"
 
 
 @app.post("/api/orchestrate")
 async def orchestrate_ep(req: OrchestrateReq):
-    """多代理编排：按任务图并行调度受限子代理，返回结构化结果（含 waves / 各任务结论 / 合成）。"""
+    """多代理编排：按任务图并行调度受限子代理，返回结构化结果。
+
+    含 waves / 各任务结论 / merged 合成 / replans 重规划次数。
+    `replan=True`（默认）时任务失败会自动追加补救任务（受 `max_replans` 限制）。
+    """
     a = _agent_for(req.session_id or "default")
     rep = await run_in_threadpool(
-        a.orchestrate, {"tasks": req.tasks, "synth": req.synth}, req.synth,
-        (req.max_parallel or None),
+        a.orchestrate, {"tasks": req.tasks}, req.synth,
+        (req.max_parallel or None), None, req.replan,
+        (None if req.max_replans < 0 else req.max_replans),
     )
     return {"ok": bool(rep.get("ok")), "report": rep}
 

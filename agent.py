@@ -40,6 +40,8 @@ SUBAGENT_MAX_STEPS = int(os.getenv("DOCMIND_SUBAGENT_MAX_STEPS", "4"))
 # 并行工具批次开关与并发上限（一轮返回多个只读工具调用时并发执行）
 PARALLEL_TOOLS = os.getenv("DOCMIND_PARALLEL_TOOLS", "1") != "0"
 PARALLEL_MAX = int(os.getenv("DOCMIND_PARALLEL_MAX", "4"))
+# 编排动态重规划：任务失败后最多追加几次补救（0 = 关闭）
+ORCH_MAX_REPLANS = int(os.getenv("DOCMIND_ORCH_MAX_REPLANS", "2"))
 # 明确有副作用、**不可并发**的工具：批内只要出现一个就整体退回顺序执行。
 # （delegate 允许并发——子代理各自持独立 LLMClient，见 _delegate）
 _NO_PARALLEL_TOOLS = {"apply_edit", "create_file", "dev_region_edit", "run_command",
@@ -90,7 +92,7 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
 - dev_approve(action, target?): 审批门禁——执行敏感操作前必须先调用它记录一次审批（30 分钟内该操作放行）。action ∈ {commit_region, commit_all, rollback_changeset, apply_regions}。target 精确匹配、不是通配符：commit_region 传具体分区 key（逐区审批，不能传 * 代替），rollback_changeset 传变更集 id，commit_all / apply_regions 固定传 *。
 - dev_approval_status(action, target?): 查询某敏感操作当前是否已审批通过，决定是否需要先 dev_approve。返回已通过/未通过。
 - delegate(role, task): 把一个**相对独立**的子任务委派给受限子代理执行并取回结论。role 取 researcher（检索查证）/ coder（在授权范围改码）/ reviewer（只读评审）/ tester（跑受控命令验证）；task 写清这一件子任务的目标与验收点。适合把大任务拆成互不干扰的检索/实现/评审/验证子任务；**不要**用它转交模糊的整轮问题，也不要在子任务需要与你共享上下文时使用。
-- orchestrate(plan_json): 按【任务图】并行调度多个受限子代理并合成结论，适合需要多角色协作、有先后依赖、或需要交叉验证的复杂任务。输入为 JSON：`{"tasks":[{"id":"a","role":"researcher","task":"...","depends_on":["b"],"optional":false}],"synth":true,"max_parallel":4}`。无依赖的任务并行执行；下游任务会拿到上游结论当上下文；上游失败会阻断其下游（optional 上游除外）；synth=true 时额外合成一次并标注冲突。**任务要拆到"一个子代理一轮能做完"的粒度**，别把整轮问题原样塞进一个 task。
+- orchestrate(plan_json): 按【任务图】并行调度多个受限子代理并合成结论，适合需要多角色协作、有先后依赖、或需要交叉验证的复杂任务。输入为 JSON：`{"tasks":[{"id":"a","role":"researcher","task":"...","depends_on":["b"],"optional":false}],"synth":true,"max_parallel":4,"replan":true}`。无依赖的任务并行执行；下游任务会拿到上游结论当上下文；`replan`（默认开）会在某任务失败时自动追加**补救任务**并继续跑（受 `max_replans` 限制），失败且不再补救时才阻断其下游（optional 上游除外）；`synth=true` 时额外合成一次并标注冲突。**任务要拆到"一个子代理一轮能做完"的粒度**，别把整轮问题原样塞进一个 task。
 - dev_use_skill(name): 取回某项目技能的完整正文。系统提示会列出【可用技能】目录（只给名称与适用范围）；当问题落在某技能适用范围内时，先 dev_use_skill 取回正文再作答，不要凭目录名臆测内容。
 - dev_asset_get(asset_id/path, consumer_region?): 通过素材区接口取得素材引用，只返回 assets 区内的安全路径和元数据。
 - dev_asset_register(asset_id, path, type?, license?, tags?): 将素材区已有文件注册到 manifest.json。
@@ -500,8 +502,10 @@ def _register_dynamic_tools():
         "description": "按【任务图】并行调度多个受限子代理并合成结论。输入为 JSON："
                        "{\"tasks\":[{\"id\":\"a\",\"role\":\"researcher|coder|reviewer|tester\","
                        "\"task\":\"...\",\"depends_on\":[\"其他id\"],\"optional\":false}],"
-                       "\"synth\":true,\"max_parallel\":4}。无依赖的任务并行执行；"
-                       "下游任务会拿到上游结论作为上下文；上游失败会阻断其下游（optional 上游除外）；"
+                       "\"synth\":true,\"max_parallel\":4,\"replan\":true,\"max_replans\":2}"
+                       "。无依赖的任务并行执行；下游任务会拿到上游结论作为上下文；"
+                       "replan=true（默认）时某任务失败会自动追加**补救任务**（换做法而非原样重试）继续跑，"
+                       "最多 max_replans 次；不重规划或补救耗尽后，上游失败会阻断其下游（optional 上游除外）；"
                        "synth=true 时额外做一次结论合成并标注冲突。适合需要多角色协作、"
                        "有先后依赖、或需要交叉验证的复杂任务。",
         "func": _orchestrate_tool_placeholder,
@@ -1406,21 +1410,70 @@ class Agent:
             out = "（合成模型不可用，以下是各子任务原始结论）\n\n" + "\n\n".join(parts)
         return _clip(out.strip(), OBS_MAX_CHARS)
 
-    def orchestrate(self, plan, synth=True, max_parallel=None, turn=None):
-        """执行一张任务图，返回结构化结果（工具与 /api/orchestrate 共用）。"""
+    def _replanner(self, failed, results, attempt, turn=None):
+        """失败后让模型给出**补救任务**（JSON 数组）。解析失败/无补救 → []（停止重规划）。
+
+        关键约束（写在提示里）：补救要换做法（换角色 / 换检索策略 / 缩小范围），
+        而不是把失败的任务原样重试。
+        """
+        brief = []
+        for t in failed:
+            r = results.get(t["id"]) or {}
+            brief.append(f"- 任务 {t['id']}（{t.get('role')}）目标：{t['task']}\n"
+                         f"  失败原因：{r.get('error') or '未知'}")
+        ok_lines = [f"- {tid}：{(r.get('conclusion') or '')[:200]}"
+                    for tid, r in results.items()
+                    if r.get("status") == "ok" and r.get("conclusion")]
+        prompt = (
+            f"第 {attempt} 次重规划。以下子任务失败了：\n" + "\n".join(brief) +
+            ("\n\n已成功的子任务结论：\n" + "\n".join(ok_lines) if ok_lines else "") +
+            "\n\n请给出**补救任务**（最多 3 个），用 JSON 数组输出，每项形如 "
+            '{"id":"r1","role":"researcher|coder|reviewer|tester","task":"...",'
+            '"depends_on":["可引用已存在的任务id"],"optional":false}。'
+            "补救必须**换一种做法**（换角色、换检索策略、缩小范围、先补前置信息），"
+            "不要把失败的任务原样重试。若确实无法补救，直接输出 []。只输出 JSON，不要解释。"
+        )
+        llm = self._child_llm()
+        try:
+            out = llm.chat([{"role": "user", "content": _clip(prompt, 6000)}],
+                           stream=False, temperature=0.2)
+        except Exception:  # noqa: BLE001
+            return []
+        if turn is not None:
+            turn.add_usage(getattr(llm, "last_usage", None))
+        obj, err = _load_json_arg(out or "")
+        if err:
+            return []
+        if isinstance(obj, dict):
+            obj = obj.get("tasks")
+        return obj if isinstance(obj, list) else []
+
+    def orchestrate(self, plan, synth=True, max_parallel=None, turn=None,
+                    replan=True, max_replans=None):
+        """执行一张任务图，返回结构化结果（工具与 /api/orchestrate 共用）。
+
+        `replan=True` 时，某轮有任务失败会调用 `_replanner` 追加补救任务，
+        最多 `max_replans`（默认 `DOCMIND_ORCH_MAX_REPLANS`）次。
+        """
         try:
             tasks = _orchestrator.parse_plan(plan)
         except _orchestrator.PlanError as e:
             return {"ok": False, "error": f"任务图不合法：{e}", "tasks": [],
                     "results": {}, "waves": [], "order": [], "blocked": [],
-                    "merged": "", "n_tasks": 0, "n_ok": 0, "n_failed": 0, "elapsed_ms": 0}
+                    "merged": "", "replans": 0, "n_tasks": 0, "n_ok": 0,
+                    "n_failed": 0, "elapsed_ms": 0}
         mp = PARALLEL_MAX if max_parallel is None else max(1, int(max_parallel))
         synth_runner = (lambda ts, rs: self._synth(ts, rs, turn=turn)) if synth else None
+        rp = None
+        if replan:
+            rp = lambda fs, rs, att: self._replanner(fs, rs, att, turn=turn)  # noqa: E731
         return _orchestrator.run_plan(
             tasks,
             lambda t, ctx: self._task_runner(t, ctx, turn=turn),
             synth_runner=synth_runner,
             max_parallel=mp,
+            replanner=rp,
+            max_replans=(ORCH_MAX_REPLANS if max_replans is None else int(max_replans)),
         )
 
     def _orchestrate_tool(self, arg, turn=None):
@@ -1430,15 +1483,21 @@ class Agent:
             return ("[orchestrate 参数错误] " + err +
                     "。需要 JSON：{\"tasks\":[{\"id\":\"a\",\"role\":\"researcher\","
                     "\"task\":\"...\"}],\"synth\":true}")
-        synth = True
-        mp = PARALLEL_MAX
+        synth, replan, mp, mrp = True, True, PARALLEL_MAX, None
         if isinstance(raw, dict):
             synth = bool(raw.get("synth", True))
+            replan = bool(raw.get("replan", True))
             try:
                 mp = int(raw.get("max_parallel", PARALLEL_MAX))
             except (TypeError, ValueError):
                 mp = PARALLEL_MAX
-        rep = self.orchestrate(raw, synth=synth, max_parallel=mp, turn=turn)
+            if raw.get("max_replans") is not None:
+                try:
+                    mrp = int(raw["max_replans"])
+                except (TypeError, ValueError):
+                    mrp = None
+        rep = self.orchestrate(raw, synth=synth, max_parallel=mp, turn=turn,
+                               replan=replan, max_replans=mrp)
         if rep.get("error"):
             return f"[orchestrate] {rep['error']}"
         return _orchestrator.format_report(rep)
