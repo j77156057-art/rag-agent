@@ -116,24 +116,31 @@ def calculate(expression):
 
 
 def web_search(query):
-    """联网搜索（DuckDuckGo HTML，无需 API Key）。
+    """联网搜索（默认 DuckDuckGo HTML，无需 API Key；可用 env WEB_SEARCH_BACKEND=bing 切换）。
 
     返回前 5 条结果的标题/摘要/链接；网络不可达时优雅降级并说明原因。
-    注意：依赖运行环境能访问外网；若所在网络屏蔽 DuckDuckGo，可后续替换为
-    带 Key 的搜索引擎（SerpAPI / Bing 等），只需改本函数。
+    注意：依赖运行环境能访问外网。部分网络屏蔽 DuckDuckGo，可设
+    WEB_SEARCH_BACKEND=bing 改用 Bing（同样无需 Key）。
     """
     q = (query or "").strip().strip("'\"")
     if not q:
         return "未提供搜索关键词。"
+    backend = (os.getenv("WEB_SEARCH_BACKEND") or "ddg").lower()
     try:
-        url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q)
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0 (compatible; DocMind/1.0)"}
-        )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            page = r.read().decode("utf-8", "replace")
+        if backend == "bing":
+            return _bing_search(q)
+        return _ddg_search(q)
     except Exception as e:  # noqa: BLE001
         return f"搜索失败: {type(e).__name__}: {e}（请确认运行环境能访问外网，或换用带 Key 的搜索引擎）"
+
+
+def _ddg_search(q):
+    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q)
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; DocMind/1.0)"}
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        page = r.read().decode("utf-8", "replace")
 
     def _clean(s):
         s = re.sub(r"<[^>]+>", "", s or "")
@@ -160,6 +167,44 @@ def web_search(query):
             except Exception:
                 pass
         lines.append(f"· {t}\n  {s}\n  {link}")
+    return "\n".join(lines)
+
+
+def _bing_search(q):
+    """Bing HTML 搜索（无需 Key）。用于 DuckDuckGo 被屏蔽的网络环境。"""
+    url = "https://www.bing.com/search?q=" + urllib.parse.quote(q)
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; DocMind/1.0)"}
+    )
+    with urllib.request.urlopen(req, timeout=12) as r:
+        page = r.read().decode("utf-8", "replace")
+
+    def _clean(s):
+        s = re.sub(r"<[^>]+>", "", s or "")
+        return urllib.parse.unquote(s).strip()
+
+    # 每个结果都在 <li class="b_algo"> 块内：
+    #   标题 = <h2 ...><a ... href="URL">文本</a></h2>（注意 h2 可能带 class 属性）
+    #   摘要 = <p class="b_lineclampN ...">文本</p>
+    blocks = re.split(r'<li class="b_algo"', page)[1:]
+    results = []
+    for blk in blocks:
+        hm = re.search(
+            r'<h2[^>]*>\s*<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>\s*</h2>',
+            blk, re.S,
+        )
+        if not hm:
+            continue
+        link = hm.group(1)
+        title = _clean(hm.group(2))
+        sm = re.search(r'<p class="b_lineclamp[^"]*"[^>]*>(.*?)</p>', blk, re.S)
+        snippet = _clean(sm.group(1)) if sm else ""
+        results.append((title, snippet, link))
+        if len(results) >= 5:
+            break
+    if not results:
+        return "搜索未返回结果，可能是网络受限或该关键词无结果。"
+    lines = [f"· {t}\n  {s}\n  {link}" for (t, s, link) in results]
     return "\n".join(lines)
 
 def web_fetch(url):

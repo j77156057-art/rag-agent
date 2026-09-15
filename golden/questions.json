@@ -70,5 +70,25 @@
       "must_not_include": ["没有相关代码", "无法回答", "I cannot", "未配置代码库"],
       "no_error": true
     }
+  },
+  {
+    "id": "G9",
+    "question": "请使用联网搜索（web_search 工具）查一下 Vue.js 官方网站的网址是什么，并给出链接。",
+    "expect": {
+      "must_call": ["web_search"],
+      "any_of": ["vuejs.org", "vuejs", "Vue.js", "官网"],
+      "must_not_include": ["无法回答", "I cannot", "没有相关代码", "未配置代码库"],
+      "no_error": true
+    }
+  },
+  {
+    "id": "G10",
+    "question": "请使用联网搜索（web_search 工具）查一下 Python 当前最新的稳定版本号是多少，并给出 python.org 官方下载页链接。",
+    "expect": {
+      "must_call": ["web_search"],
+      "any_of": ["python.org", "Python", "版本"],
+      "must_not_include": ["无法回答", "I cannot", "没有相关代码", "未配置代码库"],
+      "no_error": true
+    }
   }
 ]
