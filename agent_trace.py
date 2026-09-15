@@ -78,6 +78,7 @@ class Turn:
         self.outcome = None      # 回合结局：completed/max_steps/truncated/evidence_fallback/...
         self.finish_reason = None
         self.final_chars = 0
+        self.cost_cny = 0.0     # 本轮按 provider 计价的花费（元）
         self.error = None
         self.aborted = False
         self._t0 = time.monotonic()
@@ -140,6 +141,7 @@ class Turn:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.prompt_tokens + self.completion_tokens,
+            "cost_cny": round(self.cost_cny, 8),
             "llm_calls": self.llm_calls,
             "llm_ms": self.llm_ms,
             "steps": self.steps,

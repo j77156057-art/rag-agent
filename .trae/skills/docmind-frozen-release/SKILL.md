@@ -23,9 +23,19 @@ $env:PATH = "C:\Users\h'h'h\.local\bin\MinGit\cmd;" + $env:PATH   # 用户名含
 
 ## 阶段 0：发布前检查
 
-1. 全量测试通过（当前基线 **49 tests，4 skipped**；4 skip 为无 git 环境用例，属正常）。
+1. 全量测试通过（基线以 `HANDOFF.md` 头部为准，当前 **387 tests**）。
 2. 前端已 `npm run build`（cwd=`frontend`）并在浏览器实测过；`emptyOutDir:false` 会累积旧 hash，**构建前/后手动删除 `web/assets/` 上一版 `workbench-*` 旧文件**；vendor 三个分包哈希应保持不变（业务改动不该使 vendor 失效）。
 3. GetDiagnostics 零问题；`git status` 明确本轮白名单（web/assets、dist 均 gitignore，不入库）。
+4. **Agent 黄金题回归门**（打包含 agent/工具/提示词改动时必跑；纯前端或文档改动可跳）：
+   ```powershell
+   $env:GOLDEN_QUESTIONS = "D:\eval\questions.json"      # 题库（含 expect 字段）
+   $env:GOLDEN_BASELINE  = "D:\eval\results_baseline.jsonl"
+   .\.venv\Scripts\python.exe ".trae\skills\agent-golden-eval\assets\gate.py"
+   ```
+   - 退出码 **0 = 通过或跳过**（无题库 / 服务不可达 / 无本地模型时自动 SKIP）；**1 = 检出回归**（pass→fail 或通过率下滑）→ **本版不得发布**，先修再重跑；2 = 执行失败。
+   - 需要本地模型与已索引题仓：先起 dev 服务（`:8000`）并按 `agent-golden-eval` Skill 准备题库/baseline。
+   - gate 会打印一行 `摘要（贴 BUILD.md）`，**原样记入 `DocMind_BUILD.md` 本轮「验证」小节**；若为 SKIP，也必须把跳过原因写进构建档案（不得留空、不得假装跑过）。
+   - 规则打分逻辑本身由 `tests/test_agent_eval.py` 常驻单测守着——**即使本轮 SKIP，离线部分也已被全量测试覆盖**。
 
 ## 阶段 1：停服务 → PyInstaller（SQLite 锁是头号坑）
 

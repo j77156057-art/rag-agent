@@ -80,6 +80,54 @@ def retry_call(fn, deadline=None, attempts=None, base=None):
     raise last  # pragma: no cover
 
 
+def _fn_get(fn, key, default=""):
+    """兼容 dict / pydantic 对象两种形态读取 function 字段。"""
+    if fn is None:
+        return default
+    if isinstance(fn, dict):
+        return fn.get(key, default)
+    return getattr(fn, key, default)
+
+
+def normalize_tool_calls(raw):
+    """把 OpenAI / Ollama 的 tool_calls 归一为 [{id, name, arguments(字符串)}]。"""
+    out = []
+    for c in raw or []:
+        fn = c.get("function") if isinstance(c, dict) else getattr(c, "function", None)
+        if fn is None and isinstance(c, dict):
+            fn = c                       # 有些服务端直接给 {name, arguments}
+        name = _fn_get(fn, "name", "") or ""
+        args = _fn_get(fn, "arguments", "") or ""
+        if not isinstance(args, str):
+            args = json.dumps(args, ensure_ascii=False)
+        cid = c.get("id") if isinstance(c, dict) else getattr(c, "id", "")
+        if name:
+            out.append({"id": cid or "", "name": name, "arguments": args})
+    return out
+
+
+def args_to_input(args_str):
+    """把原生 function-calling 的 arguments 映射回文本协议的多行 Action Input。
+
+    工具 schema 统一只暴露一个 `input` 字符串参数，所以绝大多数情况直接取它；
+    若模型给了多个具名参数，则转成 `key: value` 多行文本，交给既有的
+    `_normalize_tool_arg` 继续处理（护栏完全复用）。
+    """
+    if not args_str:
+        return ""
+    try:
+        obj = json.loads(args_str)
+    except (ValueError, TypeError):
+        return str(args_str)
+    if isinstance(obj, dict):
+        if list(obj.keys()) == ["input"]:
+            return str(obj["input"])
+        if "input" in obj and len(obj) == 1:
+            return str(obj["input"])
+        return "\n".join(f"{k}: {v}" for k, v in obj.items())
+    return str(obj)
+
+
 class StreamChat:
     """包装 OpenAI 流式响应：迭代时只产出正文 content token，
     结束后可从 finish_reason 判断是否因长度被截断（"length"）。
@@ -88,11 +136,40 @@ class StreamChat:
     长度到 reasoning_chars，供上层判断"只有思考、没有正文"的情况。
     """
 
-    def __init__(self, stream, usage_sink=None):
+    def __init__(self, stream, usage_sink=None, tool_sink=None):
         self._stream = stream
         self._usage = usage_sink if usage_sink is not None else {}
+        self._tool_sink = tool_sink if tool_sink is not None else []
+        self._partial = {}          # index -> {"id":.., "name":.., "arguments":..}
         self.finish_reason = None
         self.reasoning_chars = 0
+
+    def _capture_tool_deltas(self, choice):
+        """OpenAI 流式 tool_calls 是按 index 分片的，逐片累加。"""
+        delta = getattr(choice, "delta", None)
+        calls = getattr(delta, "tool_calls", None) if delta is not None else None
+        if not calls:
+            return
+        for c in calls:
+            idx = getattr(c, "index", 0) or 0
+            slot = self._partial.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+            cid = getattr(c, "id", None)
+            if cid:
+                slot["id"] = cid
+            fn = getattr(c, "function", None)
+            nm = _fn_get(fn, "name", "")
+            if nm:
+                slot["name"] = nm
+            frag = _fn_get(fn, "arguments", "")
+            if frag:
+                slot["arguments"] += frag
+
+    def _flush_tools(self):
+        for idx in sorted(self._partial):
+            slot = self._partial[idx]
+            if slot.get("name"):
+                self._tool_sink.append({"id": slot["id"], "name": slot["name"],
+                                        "arguments": slot["arguments"]})
 
     def _capture_usage(self, chunk):
         """尾包（choices 为空）带 usage：OpenAI 需请求时开 include_usage。"""
@@ -106,20 +183,25 @@ class StreamChat:
                 self._usage[k] = v
 
     def __iter__(self):
-        for chunk in self._stream:
-            self._capture_usage(chunk)
-            if not chunk.choices:
-                continue
-            choice = chunk.choices[0]
-            if choice.finish_reason:
-                self.finish_reason = choice.finish_reason
-            delta = choice.delta
-            reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning:
-                self.reasoning_chars += len(reasoning)
-            content = getattr(delta, "content", None)
-            if content:
-                yield content
+        try:
+            for chunk in self._stream:
+                self._capture_usage(chunk)
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    self.finish_reason = choice.finish_reason
+                self._capture_tool_deltas(choice)
+                delta = choice.delta
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    self.reasoning_chars += len(reasoning)
+                content = getattr(delta, "content", None)
+                if content:
+                    yield content
+        finally:
+            # 消费方提前中断（如客户端断连）也要把已收到的工具调用交给上层
+            self._flush_tools()
 
 
 class _OllamaStream:
@@ -129,10 +211,12 @@ class _OllamaStream:
     末行 done=true 带 done_reason（"stop" / "length"），映射到 finish_reason。
     """
 
-    def __init__(self, resp, on_close=None, usage_sink=None):
+    def __init__(self, resp, on_close=None, usage_sink=None, tool_sink=None):
         self._resp = resp
         self._on_close = on_close
         self._usage = usage_sink if usage_sink is not None else {}
+        self._tool_sink = tool_sink if tool_sink is not None else []
+        self._seen_tools = set()
         self.finish_reason = None
         self.reasoning_chars = 0
 
@@ -150,6 +234,12 @@ class _OllamaStream:
             thinking = msg.get("thinking")
             if thinking:
                 self.reasoning_chars += len(thinking)
+            # ollama 的 tool_calls 是"完整"对象（非分片），去重后并入 sink
+            for call in normalize_tool_calls(msg.get("tool_calls")):
+                sig = (call["name"], call["arguments"])
+                if sig not in self._seen_tools:
+                    self._seen_tools.add(sig)
+                    self._tool_sink.append(call)
             content = msg.get("content")
             if content:
                 yield content
@@ -172,6 +262,8 @@ class LLMClient:
         self.model = model or get_runtime("llm_model") or LLM_MODEL or cfg["default_model"]
         # 最近一次调用的 token 用量（由 chat()/流式包装器原地更新），供 trace 账本读取
         self.last_usage = {}
+        # 最近一次调用返回的原生 tool_calls（[{id,name,arguments}]），供 agent 的原生通道读取
+        self.last_tool_calls = []
         self.max_retries = LLM_RETRIES
         self.retry_base = LLM_RETRY_BASE
         self.timeout = LLM_TIMEOUT
@@ -187,15 +279,17 @@ class LLMClient:
             key = key or os.getenv(cfg["api_key_env"], "")
         self.client = OpenAI(base_url=cfg["base_url"], api_key=key or "EMPTY", timeout=self.timeout)
 
-    def chat(self, messages, stream=False, temperature=0.3, timeout=None, deadline=None):
+    def chat(self, messages, stream=False, temperature=0.3, timeout=None, deadline=None, tools=None):
         """统一的对话入口。stream=True 时返回一个 token 生成器。
 
         timeout：单次调用超时（秒），默认 self.timeout。
         deadline：time.monotonic() 基准的绝对截止时刻；到达即不再重试并抛 TimeoutError。
-        每次调用都重置 self.last_usage；成功后由 trace 账本读取本轮 token 用量。
+        tools：OpenAI 风格函数 schema 列表；给出则走原生 function-calling 通道。
+        每次调用都重置 self.last_usage / self.last_tool_calls；成功后由 agent 读取。
         可重试错误（429/5xx/网络/超时）按指数退避自动重试。
         """
         self.last_usage = {}
+        self.last_tool_calls = []
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("本轮已超出截止时间")
 
@@ -211,6 +305,7 @@ class LLMClient:
                 lambda: self._ollama_chat(
                     messages, stream=stream, temperature=temperature,
                     timeout=timeout, usage_sink=self.last_usage,
+                    tool_sink=self.last_tool_calls, tools=tools,
                 ),
                 deadline=deadline, attempts=self.max_retries, base=self.retry_base,
             )
@@ -226,6 +321,8 @@ class LLMClient:
         if not LLM_ENABLE_THINKING and self.provider in ("llamacpp", "ollama"):
             kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
         call_timeout = self.timeout if timeout is None else timeout
+        if tools:
+            kwargs["tools"] = tools
 
         if stream:
             def _open(with_usage):
@@ -234,7 +331,7 @@ class LLMClient:
                     model=self.model, messages=oai_messages, stream=True,
                     temperature=temperature, timeout=call_timeout, **kwargs, **extra
                 )
-                return StreamChat(resp, usage_sink=self.last_usage)
+                return StreamChat(resp, usage_sink=self.last_usage, tool_sink=self.last_tool_calls)
             try:
                 return retry_call(lambda: _open(True), deadline=deadline,
                                   attempts=self.max_retries, base=self.retry_base)
@@ -258,7 +355,9 @@ class LLMClient:
             for k in ("prompt_tokens", "completion_tokens"):
                 if isinstance(dump.get(k), int):
                     self.last_usage[k] = dump[k]
-        return resp.choices[0].message.content
+        msg = resp.choices[0].message
+        self.last_tool_calls = normalize_tool_calls(getattr(msg, "tool_calls", None))
+        return msg.content
 
     @staticmethod
     def _sniff_image_mime(b64):
@@ -307,7 +406,8 @@ class LLMClient:
         root = str(self.client.base_url).rstrip("/").removesuffix("/v1").rstrip("/")
         return root + path
 
-    def _ollama_chat(self, messages, stream=False, temperature=0.3, timeout=None, usage_sink=None):
+    def _ollama_chat(self, messages, stream=False, temperature=0.3, timeout=None,
+                     usage_sink=None, tool_sink=None, tools=None):
         if not _gpu_acquire("ollama", 2): raise RuntimeError("GPU 正忙：ComfyUI 正在使用中，请稍后重试。")
         # 打点：空闲卸载计时器以"真正发起 Ollama 推理"为活动依据，
         # 仅持有租约（排队等待）不算活动，避免把等待误判成模型在用。
@@ -329,6 +429,9 @@ class LLMClient:
         }
         if not LLM_ENABLE_THINKING:
             payload["think"] = False
+        if tools:
+            # ollama 原生 /api/chat 的 tools 直接收 function 对象列表（不含 type 包装）
+            payload["tools"] = [t.get("function", t) for t in tools]
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             self._ollama_url("/api/chat"), data=data,
@@ -346,7 +449,7 @@ class LLMClient:
                 # 流式收尾再打一次点：长回答结束时间作为"最后活动"更准确
                 _gpu_note_activity("ollama")
                 _gpu_release("ollama")
-            return _OllamaStream(resp, _stream_done, usage_sink=usage_sink)
+            return _OllamaStream(resp, _stream_done, usage_sink=usage_sink, tool_sink=tool_sink)
         body = json.loads(resp.read().decode("utf-8"))
         _gpu_note_activity("ollama")
         _gpu_release("ollama")
@@ -355,7 +458,10 @@ class LLMClient:
                 v = body.get(k)
                 if isinstance(v, int):
                     usage_sink[k] = v
-        return (body.get("message") or {}).get("content", "")
+        msg = body.get("message") or {}
+        if tool_sink is not None:
+            tool_sink.extend(normalize_tool_calls(msg.get("tool_calls")))
+        return msg.get("content", "")
 
     def count_tokens(self, text):
         """估算/精算文本 token 数，用于上下文预算裁剪。

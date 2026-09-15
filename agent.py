@@ -3,6 +3,7 @@
 这是整个项目的核心：它不是「检索完直接喂给 LLM」的朴素 RAG，而是让 LLM
 自主决定「调用哪个工具 / 何时停止」，形成一个可解释、可扩展的 Agent 推理链路。
 """
+import json
 import os
 import re
 import time
@@ -16,13 +17,24 @@ from config import (
     PROMPT_TOKEN_BUDGET,
     get_runtime,
 )
-from llm import LLMClient
-from tools import TOOLS
+from llm import LLMClient, args_to_input
+from tools import TOOLS, tool_schemas
 import agent_trace as _trace
 import sessions as _sessions
+import hooks as _hooks
+import skills as _skills
+import pricing as _pricing
 
 # 单轮总截止时间（秒）：0 或负数表示不限时。防止一次问答无限拖长。
 TURN_DEADLINE_S = float(os.getenv("DOCMIND_TURN_DEADLINE_S", "0"))
+# 工具调用通道：react(默认，文本协议) / native(原生 function-calling) / auto(按 provider 自动)
+TOOL_MODE = os.getenv("DOCMIND_TOOL_MODE", "react").strip().lower()
+# 支持原生 function-calling 的 provider（auto 模式下启用）
+_NATIVE_CAPABLE = {"qwen", "deepseek", "ollama", "llamacpp", "openai", "azure"}
+# 子代理最大递归深度（父=0）
+SUBAGENT_MAX_DEPTH = int(os.getenv("DOCMIND_SUBAGENT_MAX_DEPTH", "2"))
+# 子代理单次最多执行多少步
+SUBAGENT_MAX_STEPS = int(os.getenv("DOCMIND_SUBAGENT_MAX_STEPS", "4"))
 
 SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以下工具来获取信息或执行动作。
 若系统消息中还附有「本项目规则」（分区约定 / 修改约束），其优先级高于本通用指引，必须逐条遵守。
@@ -65,6 +77,8 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
 - dev_add_region(key, dir, name?, ...): 向现有配置追加/覆盖一个分区并立即初始化，用于按需增补单个分区。
 - dev_approve(action, target?): 审批门禁——执行敏感操作前必须先调用它记录一次审批（30 分钟内该操作放行）。action ∈ {commit_region, commit_all, rollback_changeset, apply_regions}。target 精确匹配、不是通配符：commit_region 传具体分区 key（逐区审批，不能传 * 代替），rollback_changeset 传变更集 id，commit_all / apply_regions 固定传 *。
 - dev_approval_status(action, target?): 查询某敏感操作当前是否已审批通过，决定是否需要先 dev_approve。返回已通过/未通过。
+- delegate(role, task): 把一个**相对独立**的子任务委派给受限子代理执行并取回结论。role 取 researcher（检索查证）/ coder（在授权范围改码）/ reviewer（只读评审）/ tester（跑受控命令验证）；task 写清这一件子任务的目标与验收点。适合把大任务拆成互不干扰的检索/实现/评审/验证子任务；**不要**用它转交模糊的整轮问题，也不要在子任务需要与你共享上下文时使用。
+- dev_use_skill(name): 取回某项目技能的完整正文。系统提示会列出【可用技能】目录（只给名称与适用范围）；当问题落在某技能适用范围内时，先 dev_use_skill 取回正文再作答，不要凭目录名臆测内容。
 - dev_asset_get(asset_id/path, consumer_region?): 通过素材区接口取得素材引用，只返回 assets 区内的安全路径和元数据。
 - dev_asset_register(asset_id, path, type?, license?, tags?): 将素材区已有文件注册到 manifest.json。
 - dev_capture_bug(error/traceback/source_region/reproduction/title/severity): 将异常归档到 bugs 区并生成可追踪 Bug ID。
@@ -403,8 +417,70 @@ def _is_failure(obs):
     return any(marker in obs for marker in _FAILURE_MARKERS)
 
 
+# ---------------------------------------------------------------------------
+# 子代理（受限委派）与技能工具
+# ---------------------------------------------------------------------------
+_SUBAGENT_ROLES = {
+    "researcher": {
+        "tools": ["search_knowledge", "search_code", "read_file", "grep",
+                  "web_search", "web_fetch", "web_research"],
+        "hint": "你是【检索专员】：只负责查证，产出带 文件:行号 或来源 URL 的要点清单；不要改任何文件。",
+    },
+    "coder": {
+        "tools": ["search_code", "read_file", "grep", "apply_edit", "create_file", "python_exec"],
+        "hint": "你是【实现专员】：在授权范围内改代码，最后说明改了哪些文件与为什么。",
+    },
+    "reviewer": {
+        "tools": ["search_code", "read_file", "grep"],
+        "hint": "你是【评审专员】：只读代码，指出问题与风险并附具体 文件:行号；禁止修改任何文件。",
+    },
+    "tester": {
+        "tools": ["read_file", "grep", "python_exec"],
+        "hint": "你是【验证专员】：运行受控命令/测试，回报真实输出与结论，不要臆测。",
+    },
+}
+
+
+def _delegate_tool(arg):
+    """TOOLS 注册用的占位实现；真正的委派在 Agent._delegate 内按父代理执行。"""
+    return ("delegate 需要在 Agent 回合内调用（子代理要继承父代理的模型与会话）。"
+            "若你看到这条，说明工具调用链路被绕开，请让主代理直接执行。")
+
+
+def _register_dynamic_tools():
+    """把子代理/技能工具挂进 TOOLS 注册表（幂等，多次导入安全）。"""
+    TOOLS.setdefault("delegate", {
+        "description": "把一个子任务委派给受限子代理执行并取回其结论。输入多行："
+                       "第一行 `role: researcher|coder|reviewer|tester`，"
+                       "第二行起 `task: <交给子代理的具体任务>`。"
+                       "适合把大任务拆成互不干扰的检索 / 实现 / 评审 / 验证子任务。",
+        "func": _delegate_tool,
+    })
+    TOOLS.setdefault("dev_use_skill", {
+        "description": "按名字取回某项目技能的完整正文。问题落在技能目录所列适用范围时，先取回再作答。输入为技能名。",
+        "func": _skills.use_skill,
+    })
+
+
+_register_dynamic_tools()
+
+_RE_PLAN_BLOCK = re.compile(r"Plan:\s*(.*?)(?=\n\s*(?:Thought|Action|Final Answer)\s*:|$)", re.S)
+_RE_NUMBERED = re.compile(r"^\s*(?:\d+[.、)]|[-*])\s+(.+)$", re.M)
+
+
+def _extract_plan(text):
+    """从模型输出抽取计划步骤：`Plan:` 块优先，否则退回编号/项目符号行。"""
+    m = _RE_PLAN_BLOCK.search(text or "")
+    seg = m.group(1) if m else (text or "")
+    steps = [s.strip() for s in _RE_NUMBERED.findall(seg)]
+    if not steps:
+        steps = [s.strip() for s in re.split(r"[；;]\s*", seg.strip()) if s.strip()][:6]
+    return [s[:200] for s in steps][:8]
+
+
 class Agent:
-    def __init__(self, llm=None, session_id=None):
+    def __init__(self, llm=None, session_id=None, tool_mode=None, plan_mode=False,
+                 depth=0, tool_allowlist=None):
         self.llm = llm or LLMClient()
         # session_id 为空 = 纯内存会话（测试/临时，行为与旧版一致）；
         # 非空则按会话落盘、跨重启恢复，并启用超阈值摘要压缩。
@@ -415,6 +491,21 @@ class Agent:
         else:
             self.history = []
             self.summary = ""
+        # 工具通道 / 计划模式 / 子代理层级 / 工具白名单
+        self.tool_mode = (tool_mode or TOOL_MODE or "react")
+        self.plan_mode = bool(plan_mode)
+        self.depth = int(depth or 0)
+        self.tool_allowlist = list(tool_allowlist) if tool_allowlist else None
+        self._native_queue = []
+
+    def _native_enabled(self):
+        """本轮是否走原生 function-calling。"""
+        mode = (self.tool_mode or "react").lower()
+        if mode == "react":
+            return False
+        if mode == "native":
+            return True
+        return getattr(self.llm, "provider", "") in _NATIVE_CAPABLE
 
     def _build_messages(self, question, images=None):
         """组装消息列表：系统提示 + 项目规则（若有）+ 多轮历史 + 当前问题。
@@ -435,6 +526,16 @@ class Agent:
                     "content": "【本项目规则，优先级高于上述通用指引，必须逐条遵守】\n" + rules,
                 }
             )
+        # 技能目录（热插拔）：只注入 name/description/when_to_use，正文由 dev_use_skill 按需取
+        cat = _skills.catalog_text()
+        if cat:
+            messages.append({"role": "system", "content": cat})
+        if self.plan_mode:
+            messages.append({"role": "system", "content": (
+                "【计划模式】收到问题后，先用 `Plan:` 开头输出 3-6 步编号计划"
+                "（每步一行、可执行、可验证），然后再开始调用工具或给出 Final Answer。"
+                "计划只输出一次。"
+            )})
         # 更早的会话已被压缩成一段摘要（见 sessions.maybe_compact），作为独立
         # system 消息注入，让模型在滑窗之外仍知道"之前聊过什么"。
         if self.summary:
@@ -497,6 +598,32 @@ class Agent:
         )
         if TURN_DEADLINE_S > 0 and deadline is None:
             deadline = time.monotonic() + TURN_DEADLINE_S
+
+        # ① 预算熔断：已超限直接拒绝本轮，不发起任何模型调用
+        try:
+            _bud = _pricing.check(self.session_id or "")
+        except Exception:  # noqa: BLE001
+            _bud = {"ok": True}
+        if not _bud.get("ok"):
+            turn.finish("budget_blocked")
+            _trace.record(turn.to_record())
+            yield {"type": "final",
+                   "text": f"（预算熔断）{_bud.get('reason', '预算已用尽')}。"
+                           f"可在 /api/budget 调整额度或清零后重试。"}
+            return
+
+        # ② pre_turn 钩子：可改写问题，或整轮拦截
+        try:
+            _blk, _reason, _q = _hooks.run_pre_turn(question)
+        except Exception:  # noqa: BLE001
+            _blk, _reason, _q = False, "", question
+        if _blk:
+            turn.finish("hook_blocked")
+            _trace.record(turn.to_record())
+            yield {"type": "final", "text": f"（钩子拦截）{_reason or '本轮被前置钩子阻止。'}"}
+            return
+        question = _q
+
         aborted = False
         error = None
         final_text = ""
@@ -529,7 +656,24 @@ class Agent:
                 error=error,
                 aborted=aborted,
             )
-            _trace.record(turn.to_record())
+            # ③ 按 provider 计价 + 预算累计（本地 provider 恒为 0，不影响离线演示）
+            try:
+                turn.cost_cny = _pricing.cost_cny(
+                    turn.provider, turn.model, turn.prompt_tokens, turn.completion_tokens)
+            except Exception:  # noqa: BLE001
+                turn.cost_cny = 0.0
+            rec = turn.to_record()
+            _trace.record(rec)
+            if turn.cost_cny:
+                try:
+                    _pricing.charge(turn.cost_cny, self.session_id or "")
+                except Exception:  # noqa: BLE001
+                    pass
+            # ④ post_turn 钩子（埋点/通知，返回值忽略）
+            try:
+                _hooks.run_post_turn(rec)
+            except Exception:  # noqa: BLE001
+                pass
             if self.session_id:
                 try:
                     kept, summary = _sessions.maybe_compact(self.session_id, self.history, self.llm)
@@ -561,6 +705,8 @@ class Agent:
         forced_finals = 0  # 已发出的强制收尾提示次数（步数耗尽 / 重复空转共用一次机会）
         forced_final_reason = ""  # 触发强制收尾的原因，证据兜底 final 里原样告知用户
         evidence = []  # 本轮已执行工具的简要清单（action(input)），耗尽时兜底用
+        plan_emitted = False  # 计划模式：计划只上抛一次
+        self._native_queue = []  # 原生通道：本轮剩余的 tool_calls（顺序执行）
 
         def _evidence_final(reason):
             """模型在强制收尾后仍不给出 Final Answer：用本轮真实观察做确定性兜底。"""
@@ -604,22 +750,49 @@ class Agent:
                 turn.snapshot_prompt(messages)
             acc = ""
             finish_reason = None
-            _t_llm = time.monotonic()
-            if stream:
-                chat_stream = self.llm.chat(messages, stream=True, deadline=deadline)
-                for tok in chat_stream:
-                    acc += tok
-                    yield {"type": "token", "text": tok}
-                finish_reason = getattr(chat_stream, "finish_reason", None)
+            native_override = None
+            use_tools = self._native_enabled()
+            tools_arg = tool_schemas(self.tool_allowlist) if use_tools else None
+            if self._native_queue:
+                # 原生通道：上一轮一次返回了多个 tool_call，逐条顺序执行（不再问模型）
+                _nm, _nin = self._native_queue.pop(0)
+                native_override = (_nm, _nin)
+                acc = f"Action: {_nm}\nAction Input: {_nin}"
+                finish_reason = "tool_calls"
             else:
-                acc = self.llm.chat(messages, stream=False, deadline=deadline)
-            if turn is not None:
-                turn.llm_step((time.monotonic() - _t_llm) * 1000, finish_reason)
-                turn.add_usage(getattr(self.llm, "last_usage", None))
+                _t_llm = time.monotonic()
+                if stream:
+                    chat_stream = self.llm.chat(messages, stream=True, deadline=deadline, tools=tools_arg)
+                    for tok in chat_stream:
+                        acc += tok
+                        yield {"type": "token", "text": tok}
+                    finish_reason = getattr(chat_stream, "finish_reason", None)
+                else:
+                    acc = self.llm.chat(messages, stream=False, deadline=deadline, tools=tools_arg)
+                if turn is not None:
+                    turn.llm_step((time.monotonic() - _t_llm) * 1000, finish_reason)
+                    turn.add_usage(getattr(self.llm, "last_usage", None))
+                calls = (getattr(self.llm, "last_tool_calls", None) or []) if use_tools else []
+                if calls:
+                    # 原生 tool_call 归一进文本协议：护栏 / 事件 / 账本完全复用
+                    self._native_queue = [(c["name"], args_to_input(c["arguments"])) for c in calls[1:]]
+                    _nm, _nin = calls[0]["name"], args_to_input(calls[0]["arguments"])
+                    native_override = (_nm, _nin)
+                    acc = (acc + "\n" if acc.strip() else "") + f"Action: {_nm}\nAction Input: {_nin}"
+                    finish_reason = "tool_calls"
 
             parsed = parse_response(acc)
+            if native_override is not None:
+                parsed = {"thought": parsed.get("thought") or "", "action": native_override[0],
+                          "action_input": native_override[1], "final": None}
             if parsed["thought"]:
                 yield {"type": "thought", "text": parsed["thought"]}
+            # 计划模式：从首轮输出抽取计划，作为 plan 事件上抛一次（正文仍走原流程）
+            if self.plan_mode and not plan_emitted:
+                _steps = _extract_plan(acc)
+                if _steps:
+                    plan_emitted = True
+                    yield {"type": "plan", "steps": _steps}
 
             if parsed["action"] and parsed["action"] in TOOLS:
                 action_name = parsed["action"]
@@ -758,6 +931,27 @@ class Agent:
                     # 防御性兜底：正常路径已被循环顶部的前置拦截覆盖
                     yield _evidence_final(forced_final_reason)
                     return
+                # 子代理白名单：不在名单内的工具直接拒绝（防止受限子代理越权）
+                if self.tool_allowlist and action_name not in self.tool_allowlist:
+                    _obs = (f"[受限] 本子代理只允许使用：{'、'.join(self.tool_allowlist)}。"
+                            f"{action_name} 不在白名单内，已拒绝。")
+                    trail.append({"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)})
+                    trail.append({"role": "user", "content": f"Observation: {_obs}"})
+                    yield {"type": "observation", "text": _obs}
+                    continue
+
+                # pre_tool 钩子：可改写参数，或拦截本次执行（热插拔）
+                _blk, _hreason, _harg = _hooks.run_pre_tool(action_name, action_arg)
+                if _blk:
+                    _obs = f"[钩子拦截] {action_name} 未执行：{_hreason}"
+                    trail.append({"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)})
+                    trail.append({"role": "user", "content": f"Observation: {_obs}"})
+                    if turn is not None:
+                        turn.tool_step(action_name, action_arg, 0, _obs, ok=False)
+                    yield {"type": "observation", "text": _obs}
+                    continue
+                action_arg = _harg
+
                 executed.add(sig)
                 tool_steps += 1
                 # 事件展示 / 证据清单 / 实际派发必须统一用归一化后的 action_arg：
@@ -765,7 +959,12 @@ class Agent:
                 evidence.append(f"{action_name}({_clip(action_arg, 120)})")
                 yield {"type": "action", "text": f"{action_name}({action_arg})"}
                 _t_tool = time.monotonic()
-                obs = TOOLS[action_name]["func"](action_arg)
+                if action_name == "delegate":
+                    # 子代理必须继承父代理的模型/会话，走特殊派发而非 TOOLS 里的占位实现
+                    obs = self._delegate(action_arg, turn=turn)
+                else:
+                    obs = TOOLS[action_name]["func"](action_arg)
+                obs = _hooks.run_post_tool(action_name, action_arg, obs)
                 if turn is not None:
                     turn.tool_step(
                         action_name, action_arg,
@@ -937,3 +1136,60 @@ class Agent:
                 return
             yield {"type": "final", "text": final_text}
             return
+
+    # ------------------------------------------------------------------
+    # 子代理（受限委派）
+    # ------------------------------------------------------------------
+    def _delegate(self, arg, turn=None):
+        """执行一次子代理委派，返回其结论文本（作为父代理的一条 Observation）。
+
+        - 角色决定工具白名单与角色提示（researcher / coder / reviewer / tester）；
+        - 子代理继承父代理的 llm（共享模型配置）但**独立会话**，不污染父会话历史；
+        - 递归深度受 SUBAGENT_MAX_DEPTH 限制，且白名单里不含 delegate（天然防无限套娃）；
+        - 子代理消耗的 token 计入父回合账本（`turn.add_usage`）。
+        """
+        role, task = "", ""
+        for line in (arg or "").splitlines():
+            low = line.strip()
+            if low.lower().startswith("role:"):
+                role = low.split(":", 1)[1].strip().lower()
+            elif low.lower().startswith("task:"):
+                task = arg.split("task:", 1)[1].strip()
+                break
+        if not task:
+            return ("[delegate 参数错误] 需要 `role:` 与 `task:` 两行。"
+                    "示例：role: researcher / task: 找出 _ready 定义在哪些文件")
+        spec = _SUBAGENT_ROLES.get(role)
+        if spec is None:
+            return (f"[delegate 角色错误] 未知角色「{role}」，"
+                    f"可选：{'、'.join(_SUBAGENT_ROLES)}")
+        if self.depth >= SUBAGENT_MAX_DEPTH:
+            return (f"[delegate 停止] 已达子代理最大嵌套深度 {SUBAGENT_MAX_DEPTH}，"
+                    "请由当前代理直接完成任务。")
+
+        child = Agent(
+            llm=self.llm,
+            session_id=None,                       # 子代理独立、不落盘、不串父会话
+            tool_mode=self.tool_mode,
+            plan_mode=False,
+            depth=self.depth + 1,
+            tool_allowlist=spec["tools"],
+        )
+        question = spec["hint"] + "\n\n子任务：" + task
+        cap = max(1, SUBAGENT_MAX_STEPS)
+        final_text, used = "", 0
+        try:
+            for ev in child.run(question, stream=False):
+                if ev.get("type") == "final":
+                    final_text = ev.get("text") or ""
+                elif ev.get("type") == "action":
+                    used += 1
+                if used > cap:
+                    break
+        except Exception as e:  # noqa: BLE001 —— 子代理失败不应炸掉父回合
+            return f"[delegate 失败] {type(e).__name__}: {e}"
+        if turn is not None:
+            # 子代理的 token 计入父回合账本（错误归因与成本核算都更准）
+            turn.add_usage(getattr(self.llm, "last_usage", None))
+        body = _clip(final_text.strip(), OBS_MAX_CHARS) or "（子代理未产出结论）"
+        return f"[子代理 {role} 结论 · 用了 {used} 步]\n{body}"

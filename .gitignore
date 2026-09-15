@@ -12,6 +12,8 @@ __pycache__/
 .docmind_traces.jsonl
 .docmind_traces.jsonl.1
 .docmind_sessions/
+.docmind_pricing.json
+.docmind_budget.json
 
 # ===== 运行产生的临时上传文件 =====
 uploads/

@@ -2305,3 +2305,36 @@ TOOLS = {
         "func": dev_approval_status,
     },
 }
+
+
+def tool_schemas(names=None):
+    """把 TOOLS 注册表导出为 OpenAI 风格函数 schema（原生 function-calling 用）。
+
+    所有工具统一暴露单个 `input` 字符串参数，与文本协议的 `Action Input` **同形**，
+    因此原生通道与文本通道共用同一套入参归一化（`_normalize_tool_arg`）与全部护栏。
+    `names` 可限定子集（子代理的工具白名单就用它）。
+    """
+    out = []
+    for name, meta in TOOLS.items():
+        if names and name not in names:
+            continue
+        desc = (meta.get("description") or "").strip()
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc[:1024],
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": "工具的输入，与文本协议 Action Input 同形"
+                                           "（多行 key: value，或纯文本参数）。",
+                        }
+                    },
+                    "required": ["input"],
+                },
+            },
+        })
+    return out

@@ -90,6 +90,9 @@ import web_export
 import unity_graph
 import agent_trace
 import sessions as session_store
+import hooks as agent_hooks
+import skills as agent_skills
+import pricing as pricing_mod
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
 from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_apply_parameters, comfy_queue, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
@@ -1116,6 +1119,8 @@ def _read_chat_images(uploads):
 async def chat(
     question: str = Form(""),
     session_id: str = Form("default"),
+    tool_mode: str = Form(""),
+    plan_mode: str = Form(""),
     images: list[UploadFile] = File(default=None),
 ):
     question = (question or "").strip()
@@ -1158,6 +1163,11 @@ async def chat(
         )
     routing = route_for(question)
     selected_agent = _agent_for(session_id)
+    # 本次请求可临时覆盖工具通道 / 计划模式（会话级 Agent 复用，属性可改）
+    if tool_mode.strip():
+        selected_agent.tool_mode = tool_mode.strip().lower()
+    if plan_mode.strip():
+        selected_agent.plan_mode = plan_mode.strip().lower() in ("1", "true", "yes", "on")
     is_cloud = False
     if routing.get('route') == 'cloud' and routing.get('auto_cloud_enabled'):
         cloud_provider = get_runtime('cloud_llm_provider') or os.getenv('AGENT_CLOUD_PROVIDER', 'deepseek')
@@ -1235,6 +1245,50 @@ async def session_delete_ep(session_id: str):
     # 同时丢弃常驻 Agent，避免删除后旧历史仍在内存里续用
     _SESSION_AGENTS.pop(str(session_id or "").strip() or "default", None)
     return {"ok": session_store.delete(session_id)}
+
+
+@app.get("/api/budget")
+async def budget_status_ep(session_id: str = ""):
+    """成本账本：全局/会话的花费与额度（按 provider 单价折算）。"""
+    return {"ok": True, "status": pricing_mod.status(), "check": pricing_mod.check(session_id)}
+
+
+class BudgetReq(BaseModel):
+    limit_cny: Optional[float] = None
+    session_id: str = ""
+    reset: bool = False
+
+
+@app.post("/api/budget")
+async def budget_set_ep(req: BudgetReq):
+    """设置预算上限（0 = 不限）或清零。`limit_cny` 与 `reset` 可单独使用。"""
+    if req.reset:
+        return {"ok": True, "check": pricing_mod.reset(req.session_id)}
+    if req.limit_cny is None:
+        return {"ok": False, "error": "需要 limit_cny 或 reset=true"}
+    return {"ok": True, "check": pricing_mod.set_limit(req.limit_cny, req.session_id)}
+
+
+@app.get("/api/hooks")
+async def hooks_list_ep():
+    return {"ok": True, **agent_hooks.list_hooks()}
+
+
+@app.post("/api/hooks/reload")
+async def hooks_reload_ep():
+    """热重载 .docmind/hooks/*.py（新增/修改钩子无需重启服务）。"""
+    return {"ok": True, **agent_hooks.reload()}
+
+
+@app.get("/api/skills")
+async def skills_list_ep():
+    return {"ok": True, **agent_skills.list_skills()}
+
+
+@app.post("/api/skills/reload")
+async def skills_reload_ep():
+    """热重载技能目录（新增/修改 SKILL.md 无需重启服务）。"""
+    return {"ok": True, **agent_skills.reload()}
 
 
 @app.get("/trace")
