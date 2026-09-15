@@ -103,7 +103,7 @@ cp .env.example .env
 8. **联网研究**：问时效性 / 外部问题时 Agent 自主 `web_search` / `web_fetch` / `web_research`，回答里的来源 URL 可点击。
 > 下面 9–11 三项属于本轮新增的 **Agent 运行时（Harness）**；完整清单与能力边界见 [README.md](README.md) 的「Harness 能力」一节。
 
-9. **Trace 账本**（浏览器开 `/trace`）：问一轮之后刷新，能看到这一回合结构化记录——调了哪些工具（含每步延迟）、tokens in/out、总耗时、结局（completed / evidence_fallback / 断连中止…）、以及**折算花费**。只记元数据、不存 prompt 与回答正文。
+9. **Trace 账本**（浏览器开 `/trace`）：问一轮之后刷新，能看到这一回合结构化记录——调了哪些工具（含每步延迟）、tokens in/out、总耗时、结局（completed / evidence_fallback / 断连中止…）、以及**折算花费**。只记元数据、不存 prompt 与回答正文。截图见 `docs/screenshots/trace-ledger.png`。
 10. **多代理编排**（`POST /api/orchestrate`，或让 Agent 自己用 `orchestrate` 工具）：给一张任务图，无依赖的并行跑、有依赖的等上游结论；某任务失败会**自动补一张补救任务**继续（可在返回里看到 `revisions` 审计与每个任务的 `trace`）。
 11. **成本熔断**（`GET/POST /api/budget`）：按 provider 计价并累计；先设一个很小的额度，再问一轮，就能看到"回合前拒绝"的效果。本地模型（ollama / llamacpp / mock）花费恒为 0，不会误伤离线演示。
 
