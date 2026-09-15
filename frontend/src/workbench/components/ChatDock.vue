@@ -170,13 +170,17 @@ function demoReply(q: string): string {
   ].join('\n')
 }
 
-// 欢迎页「去问问」按钮聚焦：展开对话台并定位输入框
-function onFocusChat() {
+// 概览页「去问问 / 试试问 AI」：展开对话台、（可选）预填问题、定位输入框
+function onFocusChat(ev?: Event) {
+  const q = (ev as CustomEvent<{ q?: string }> | undefined)?.detail?.q
   collapsed.value = false
-  nextTick(() => inputEl.value?.focus())
+  nextTick(() => {
+    if (q) input.value = q
+    inputEl.value?.focus()
+  })
 }
-onMounted(() => window.addEventListener('docmind:focus-chat', onFocusChat))
-onBeforeUnmount(() => window.removeEventListener('docmind:focus-chat', onFocusChat))
+onMounted(() => window.addEventListener('docmind:focus-chat', onFocusChat as EventListener))
+onBeforeUnmount(() => window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener))
 
 function scrollToBottom() {
   const el = scroller.value

@@ -51,8 +51,10 @@ class DesktopEntryTests(unittest.TestCase):
         path = os.path.join(ROOT, 'web', 'index.html')
         with open(path, encoding='utf-8') as f:
             html = f.read()
-        self.assertIn('href="/workbench"', html,
-                      'RAG 问答页（默认首页）里没有通往开发工作台的链接，用户找不到工作台')
+        # /workbench.html 在 FastAPI 静态挂载与 IGA Pages 纯静态托管下都能打开，
+        # /workbench 仅 FastAPI 路由可解析；两者都算有效入口。
+        self.assertTrue('href="/workbench"' in html or 'href="/workbench.html"' in html,
+                        'RAG 问答页（默认首页）里没有通往开发工作台的链接，用户找不到工作台')
 
     def test_workbench_links_back_to_question_page(self):
         path = os.path.join(ROOT, 'frontend', 'src', 'workbench', 'App.vue')

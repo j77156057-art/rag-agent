@@ -2,8 +2,11 @@
 // 对话框与右键菜单。组件只负责渲染与转发事件。
 import { computed, ref, shallowRef } from 'vue'
 import { EditorView } from '@codemirror/view'
-import { aiApi, fsApi, regionsApi, FsApiError } from '../api'
-import type { TreeNode, TreeResp, GitCommit, RegionInfo, ContractsResp } from '../api'
+import { aiApi, fsApi, regionsApi, semanticApi, FsApiError } from '../api'
+import type {
+  TreeNode, TreeResp, GitCommit, RegionInfo, ContractsResp,
+  SemanticTagRecord, LocateResp, RegionCard,
+} from '../api'
 
 // ---------------------------------------------------------------- 标签页
 export interface EditorTab {
@@ -109,6 +112,159 @@ function revealPath(path: string) {
   treeReveal.value = { path, nonce: Date.now() }
 }
 
+// ================================================================ 阶段 1：语义标签 + 大白话定位
+/** 路径 → 业务标签记录（供文件树徽章与定位结果展示）。 */
+const tagMap = shallowRef<Record<string, SemanticTagRecord>>({})
+const tagLoading = ref(false)
+const tagError = ref('')
+const tagMeta = ref({ total: 0, tagged: 0, pending: 0, stale: 0 })
+
+/** 定位态：locatePaths 中的文件在树里持续高亮，直到清空查询。 */
+const locateQuery = ref('')
+const locateLoading = ref(false)
+const locatePaths = ref<Set<string>>(new Set())
+const locateResult = shallowRef<LocateResp | null>(null)
+
+async function loadTags() {
+  try {
+    const r = await semanticApi.tags()
+    if (r.error) {
+      tagError.value = r.error
+      return
+    }
+    tagMap.value = r.files || {}
+    tagMeta.value = { total: r.total_files, tagged: r.tagged_files, pending: r.pending, stale: r.stale }
+    tagError.value = ''
+  } catch {
+    /* 标签是增强层：加载失败不打扰主流程 */
+  }
+}
+
+/** 调模型增量打标签；剩余文件可再次点击直到 pending=0。 */
+async function refreshTags(limit = 60) {
+  tagLoading.value = true
+  tagError.value = ''
+  try {
+    const r = await semanticApi.refreshTags(limit)
+    if (r.error) { tagError.value = r.error; return r }
+    tagMap.value = r.files || {}
+    tagMeta.value = { total: r.total_files, tagged: r.tagged_files, pending: r.pending, stale: r.stale }
+    return r
+  } finally {
+    tagLoading.value = false
+  }
+}
+
+async function runLocate(q: string) {
+  const query = q.trim()
+  locateQuery.value = query
+  if (!query) {
+    clearLocate()
+    return
+  }
+  locateLoading.value = true
+  try {
+    const r = await semanticApi.locate(query)
+    locateResult.value = r
+    locatePaths.value = new Set((r.files || []).map((f) => f.path))
+  } finally {
+    locateLoading.value = false
+  }
+}
+
+function clearLocate() {
+  locateQuery.value = ''
+  locateResult.value = null
+  locatePaths.value = new Set()
+}
+
+/** 命中某文件：打开并跳到符号所在行，同时让文件树展开/闪烁，定位高亮保留。 */
+async function openLocateFile(hit: { path: string; line: number | null }) {
+  revealPath(hit.path)
+  await jumpToLine(hit.path, hit.line || 1)
+}
+
+/** 命中某分区：展开并闪烁该分区文件夹。 */
+function openLocateRegion(dir: string) {
+  revealPath(dir.replace(/\\/g, '/').replace(/\/+$/, ''))
+}
+
+// ================================================================ 分区卡片（概览驾驶舱共享）
+const regionCards = shallowRef<RegionCard[]>([])
+const regionCardsLoading = ref(false)
+
+/** 概览页分区卡：统计文件数/未提交/最近提交；增强层，失败静默。 */
+async function loadRegionCards(force = false) {
+  if (!force && regionCardsLoading.value) return
+  if (!tree.value?.regions_enabled) {
+    regionCards.value = []
+    return
+  }
+  regionCardsLoading.value = true
+  try {
+    const r = await semanticApi.regionCards()
+    regionCards.value = r.regions || []
+  } catch {
+    /* 分区卡是导航增强层：读取失败保留旧数据，不弹错打扰 */
+  } finally {
+    regionCardsLoading.value = false
+  }
+}
+
+/** 离线演示态由 App 注入示例卡片（composable 不反向依赖 demo 模块）。 */
+function seedDemoRegionCards(cards: RegionCard[]) {
+  regionCards.value = cards
+}
+
+// ================================================================ 工作区视图
+// Godot 式工作区切换：概览驾驶舱 / 代码编辑。素材、画布、运行为后续阶段预留标签。
+export type WorkspaceView = 'overview' | 'code'
+const workspace = ref<WorkspaceView>('overview')
+
+function setWorkspace(v: WorkspaceView) {
+  // 没有打开的文件时，代码工作区无内容可看，忽略切换
+  if (v === 'code' && !tabs.value.length) return
+  workspace.value = v
+}
+
+// ---------------------------------------------------------------- 最近打开的文件
+interface RecentFile { root: string; path: string; name: string }
+const RECENT_KEY = 'docmind:recent-files'
+const RECENT_MAX = 12
+
+function readRecent(): RecentFile[] {
+  try {
+    const v = JSON.parse(window.localStorage.getItem(RECENT_KEY) || '[]')
+    return Array.isArray(v) ? v as RecentFile[] : []
+  } catch {
+    return []
+  }
+}
+
+/** 只列当前项目根下的最近文件，切换项目不串味。 */
+const recentFiles = computed<RecentFile[]>(() => {
+  const root = tree.value?.code_root
+  if (!root) return []
+  return readRecent().filter((r) => r.root === root)
+})
+
+function pushRecent(path: string) {
+  const root = tree.value?.code_root
+  if (!root) return
+  const name = path.split('/').pop() || path
+  const list = readRecent().filter((r) => !(r.root === root && r.path === path))
+  list.unshift({ root, path, name })
+  try {
+    window.localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, RECENT_MAX)))
+  } catch {
+    /* 隐私模式等场景写入失败可忽略 */
+  }
+}
+
+async function openRecent(path: string) {
+  await openPath(path)
+}
+
 /** tab.id -> 取当前编辑器文本（由 CodeView 注册，保存时取最新内容） */
 const contentGetters = new Map<number, () => string>()
 
@@ -203,6 +359,8 @@ async function loadTree(selectPath?: string | null) {
     tree.value = await fsApi.tree()
     syncTabGitStates()
     if (selectPath !== undefined) selectedPath.value = selectPath
+    void loadTags()  // 业务标签是增强层，静默加载（失败不弹错）
+    void loadRegionCards()  // 概览驾驶舱分区卡，同样静默
   } catch (e) {
     tree.value = null
     treeError.value = e as FsApiError
@@ -224,6 +382,8 @@ function syncTabGitStates() {
 
 // ---------------------------------------------------------------- 打开 / 切换 / 关闭
 async function openPath(path: string, preferWritable?: boolean) {
+  pushRecent(path)
+  workspace.value = 'code'  // 打开文件即进入代码工作区
   const existing = tabs.value.find((t) => t.path === path)
   if (existing) {
     activeId.value = existing.id
@@ -347,6 +507,7 @@ async function jumpToLine(path: string, line: number): Promise<void> {
 
 function activateTab(id: number) {
   activeId.value = id
+  workspace.value = 'code'  // 点编辑器标签即回到代码工作区
   const tab = tabs.value.find((t) => t.id === id)
   if (tab) selectedPath.value = tab.path
 }
@@ -372,6 +533,7 @@ async function closeTab(id: number) {
     const neighbor = next[Math.min(idx, next.length - 1)] ?? null
     activeId.value = neighbor ? neighbor.id : null
     selectedPath.value = neighbor ? neighbor.path : null
+    if (!neighbor) workspace.value = 'overview'  // 最后一个标签关闭 → 回到概览
   }
 }
 
@@ -1232,6 +1394,10 @@ export function useWorkbench() {
     tree, treeLoading, treeError, gitActive,
     tabs, activeId, activeTab, selectedPath,
     dialog, ctxMenu,
+    // 工作区视图（概览驾驶舱 / 代码）+ 分区卡 + 最近文件
+    workspace, setWorkspace,
+    regionCards, regionCardsLoading, loadRegionCards, seedDemoRegionCards,
+    recentFiles, openRecent,
     // tree
     loadTree, openNode, openPath,
     // AI 引用定位：文件树展开 + 闪烁
@@ -1259,5 +1425,10 @@ export function useWorkbench() {
     // P3 分区可视化
     regionMapOpen, regionMap, openRegionMap, closeRegionMap, locateRegion,
     busyRegionKey, createRegion, fillRegionExports,
+    // 阶段 1 语义标签 + 大白话定位
+    tagMap, tagLoading, tagError, tagMeta,
+    loadTags, refreshTags,
+    locateQuery, locateLoading, locatePaths, locateResult,
+    runLocate, clearLocate, openLocateFile, openLocateRegion,
   }
 }

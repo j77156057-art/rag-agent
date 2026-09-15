@@ -107,3 +107,84 @@ export const demoHooks = {
   counts: { pre_tool: 0, post_tool: 0, pre_turn: 0, post_turn: 0 },
   sources: {} as Record<string, unknown>, errors: [] as string[],
 }
+
+// ---------------------------------------------------------------- 阶段 1：语义定位 / 分区卡片演示数据
+export const demoLocateFiles = [
+  {
+    path: 'scripts/player/player_stats.gd', name: 'player_stats.gd', score: 12.5,
+    reasons: ['业务标签命中', '语义向量检索'], line: 14, symbol: 'take_damage',
+    region: 'values', region_name: '数值区',
+    tags: ['玩家属性', '生命与战斗数值'], summary: '管理玩家生命值、攻击力与受伤结算',
+  },
+  {
+    path: 'scripts/combat/damage_calc.gd', name: 'damage_calc.gd', score: 10.2,
+    reasons: ['语义向量检索'], line: 31, symbol: 'calc_final_damage',
+    region: 'values', region_name: '数值区',
+    tags: ['伤害计算', '战斗系统'], summary: '攻防换算、暴击与减伤公式',
+  },
+  {
+    path: 'scripts/player/player_controller.gd', name: 'player_controller.gd', score: 6.4,
+    reasons: ['文件名命中'], line: 8, symbol: '',
+    region: 'behaviors', region_name: '角色行为区',
+    tags: ['玩家角色', '输入控制'], summary: '玩家移动、跳跃与输入响应',
+  },
+]
+
+export const demoLocateRegions = [
+  { key: 'values', name: '数值区', dir: 'values', desc: '玩家与敌人的数值配置' },
+]
+
+export const demoTagMap = {
+  'scripts/player/player_stats.gd': {
+    mtime: 0, size: 0, tags: ['玩家属性', '生命与战斗数值'], summary: '管理玩家生命值',
+    symbols: ['take_damage', 'heal'], origin: 'llm',
+  },
+  'scripts/player/player_controller.gd': {
+    mtime: 0, size: 0, tags: ['玩家角色', '输入控制'], summary: '玩家移动与输入',
+    symbols: ['_physics_process'], origin: 'rules',
+  },
+  'scripts/inventory_system.gd': {
+    mtime: 0, size: 0, tags: ['背包道具'], summary: '道具拾取与背包管理',
+    symbols: ['add_item'], origin: 'rules',
+  },
+  'scripts/combat/damage_calc.gd': {
+    mtime: 0, size: 0, tags: ['伤害计算', '战斗系统'], summary: '伤害公式',
+    symbols: ['calc_final_damage'], origin: 'llm',
+  },
+  'scripts/enemy/enemy_ai.gd': {
+    mtime: 0, size: 0, tags: ['敌人AI'], summary: '巡逻与追击状态机',
+    symbols: ['patrol', 'chase_target'], origin: 'rules',
+  },
+} as Record<string, {
+  mtime: number; size: number; tags: string[]; summary: string;
+  symbols: string[]; origin: string;
+}>
+
+export const demoRegionCards = [
+  {
+    key: 'values', name: '数值区', dir: 'values', desc: '玩家与敌人的数值配置',
+    access: '', depends_on: [], exports: ['stats_api.gd'], missing_exports: [],
+    verify: '', exists: true, git: true, branch: 'main', dirty: true, files: 12,
+    dirty_count: 2, own_repo: true,
+    last_commit: {
+      hash: 'a1b2c3d', full_hash: 'a1b2c3d4', message: 'feat: 调整玩家初始生命值为 120',
+      author: '你', time: Date.now() / 1000 - 3600 * 5, time_raw: '',
+    },
+  },
+  {
+    key: 'behaviors', name: '角色行为区', dir: 'behaviors',
+    desc: '角色行为逻辑（玩家/敌人 AI）', access: '', depends_on: ['values'],
+    exports: ['behavior_api.gd'], missing_exports: [], verify: '', exists: true,
+    git: true, branch: 'main', dirty: false, files: 23, dirty_count: 0, own_repo: true,
+    last_commit: {
+      hash: 'e4f5g6h', full_hash: 'e4f5g6h7', message: 'fix: 敌人追击穿墙的问题',
+      author: '你', time: Date.now() / 1000 - 3600 * 30, time_raw: '',
+    },
+  },
+  {
+    key: 'ui', name: '界面区', dir: 'ui', desc: 'HUD、菜单与弹窗',
+    access: '', depends_on: ['values'], exports: [], missing_exports: [],
+    verify: '', exists: false, git: false, branch: '', dirty: false, files: 0,
+    dirty_count: 0, own_repo: false, last_commit: null,
+  },
+]

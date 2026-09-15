@@ -2,7 +2,7 @@
 // 递归树节点：文件夹（chevron + 文件夹 glyph）/ 文件（类型 chip + git 状态点）。
 // 分区根目录（depth=0 且带 region）使用分区色描边与中文区名。
 import { computed, ref, watch } from 'vue'
-import type { TreeNode } from '../api'
+import type { TreeNode, SemanticTagRecord } from '../api'
 import { regionColor, fileChip, gitState } from '../theme'
 
 const props = defineProps<{
@@ -12,6 +12,10 @@ const props = defineProps<{
   openPaths: Set<string>
   flashPath?: string | null
   flashNonce?: number
+  /** 阶段 1：全项目业务标签表（节点按自身路径取） */
+  tagMap?: Record<string, SemanticTagRecord>
+  /** 阶段 1：被大白话定位命中的文件集合（持续高亮） */
+  locatedPaths?: Set<string>
 }>()
 
 const emit = defineEmits<{
@@ -30,6 +34,20 @@ const isOpen = computed(() => props.openPaths.has(props.node.path))
 const isSelected = computed(() => props.selectedPath === props.node.path)
 const isFlashing = ref(false)
 const indent = computed(() => 8 + props.depth * 13)
+
+// 阶段 1：业务标签徽章（首个标签可见，其余进 title；文件改动后 stale 标签弱化）
+const tag = computed<SemanticTagRecord | null>(() => props.tagMap?.[props.node.path] || null)
+const located = computed(() => props.locatedPaths?.has(props.node.path) ?? false)
+const firstTag = computed(() => tag.value?.tags?.[0] || '')
+const tagTitle = computed(() => {
+  const t = tag.value
+  if (!t) return ''
+  const lines = t.tags.map((x) => `#${x}`)
+  if (t.summary) lines.push(t.summary)
+  if (t.stale) lines.push('（文件已改动，标签待刷新）')
+  if (t.origin === 'manual') lines.push('人工标签')
+  return lines.join('\n')
+})
 
 // AI 引用定位：闪烁 + 滚动到可见区域（nonce 变化重新触发动画）
 const rowEl = ref<HTMLElement | null>(null)
@@ -59,7 +77,8 @@ function onClick() {
     class="ft-row"
     :class="[
       `ft-${node.type}`,
-      { 'ft-region-root': isRegionRoot, 'ft-selected': isSelected, 'ft-dir-open': isOpen, 'ft-flash': isFlashing },
+      { 'ft-region-root': isRegionRoot, 'ft-selected': isSelected, 'ft-dir-open': isOpen,
+        'ft-flash': isFlashing, 'ft-located': located },
     ]"
     :style="{ paddingLeft: indent + 'px' }"
     @click="onClick"
@@ -93,13 +112,23 @@ function onClick() {
       {{ node.region_name }}
     </span>
 
-    <!-- 文件 git 状态点 -->
-    <span
-      v-else-if="node.type === 'file' && git.dot !== 'none' && git.dot !== 'clean'"
-      class="ft-gitdot"
-      :class="`ft-git-${git.dot}`"
-      :title="git.title"
-    />
+    <template v-else>
+      <!-- 阶段 1：业务标签徽章（首个可见，悬浮看全部；stale 弱化） -->
+      <span
+        v-if="node.type === 'file' && firstTag"
+        class="ft-tagbadge"
+        :class="{ 'ft-tag-stale': tag?.stale, 'ft-tag-manual': tag?.origin === 'manual' }"
+        :title="tagTitle"
+      >#{{ firstTag }}</span>
+
+      <!-- 文件 git 状态点 -->
+      <span
+        v-if="node.type === 'file' && git.dot !== 'none' && git.dot !== 'clean'"
+        class="ft-gitdot"
+        :class="`ft-git-${git.dot}`"
+        :title="git.title"
+      />
+    </template>
   </div>
 
   <template v-if="node.type === 'dir' && isOpen">
@@ -112,6 +141,8 @@ function onClick() {
       :open-paths="openPaths"
       :flash-path="flashPath"
       :flash-nonce="flashNonce"
+      :tag-map="tagMap"
+      :located-paths="locatedPaths"
       @toggle="emit('toggle', $event)"
       @select="emit('select', $event)"
       @contextmenu="(ev, n) => emit('contextmenu', ev, n)"

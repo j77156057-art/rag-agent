@@ -5,7 +5,10 @@
 import { ref, watch } from 'vue'
 import type { TreeNode, TreeResp } from '../api'
 import FileTreeNode from './FileTreeNode.vue'
+import { computed } from 'vue'
 import { useWorkbench } from '../composables/workbench'
+import { demoMode, demoTagMap } from '../composables/demo'
+import type { SemanticTagRecord } from '../api'
 
 const props = defineProps<{
   tree: TreeResp
@@ -17,7 +20,15 @@ const emit = defineEmits<{
   (e: 'select', node: TreeNode): void
 }>()
 
-const { loadTree, createAt, openNodeMenu, openRootMenu, treeReveal } = useWorkbench()
+const {
+  loadTree, createAt, openNodeMenu, openRootMenu, treeReveal,
+  tagMap, locatePaths,
+} = useWorkbench()
+
+// 离线演示态没有 /api/fs/semantic-tags，用内置示例标签渲染徽章
+const effectiveTagMap = computed<Record<string, SemanticTagRecord>>(
+  () => (demoMode.value ? (demoTagMap as Record<string, SemanticTagRecord>) : tagMap.value),
+)
 
 const openPaths = ref<Set<string>>(new Set())
 const flashPath = ref<string | null>(null)
@@ -81,6 +92,17 @@ function toggle(path: string) {
   openPaths.value = next
 }
 
+// 阶段 1：大白话定位结果到达后，自动展开所有命中文件的祖先目录
+watch(locatePaths, (paths) => {
+  if (!paths.size || !props.tree) return
+  const next = new Set(openPaths.value)
+  for (const p of paths) {
+    if (!findNode(props.tree.nodes, p)) continue
+    for (const d of ancestorDirs(p)) next.add(d)
+  }
+  openPaths.value = next
+})
+
 function rootLabel(p: string): string {
   const parts = p.replace(/\\/g, '/').replace(/\/+$/, '').split('/')
   return parts[parts.length - 1] || p
@@ -126,6 +148,8 @@ function rootLabel(p: string): string {
         :open-paths="openPaths"
         :flash-path="flashPath"
         :flash-nonce="flashNonce"
+        :tag-map="effectiveTagMap"
+        :located-paths="locatePaths"
         @toggle="toggle"
         @select="emit('select', $event)"
         @contextmenu="(ev, n) => openNodeMenu(ev, n)"

@@ -15,13 +15,12 @@ import { markdown } from '@codemirror/lang-markdown'
 import type { EditorTab } from '../composables/workbench'
 import { useWorkbench } from '../composables/workbench'
 import { regionColor, formatMtime, gitState } from '../theme'
-import { demoMode } from '../composables/demo'
+import OverviewView from './OverviewView.vue'
 
 const props = defineProps<{ tab: EditorTab | null }>()
 
 const {
   saveActive, closeTab, tabs, registerContentGetter, registerDocReplacer, setSelection,
-  openSymbolMap,
 } = useWorkbench()
 
 // 浅色编辑器主题（壳是浅色，代码区也用白底；语法色走 CM 默认高亮，浅底可读）。
@@ -242,15 +241,6 @@ function savedLabel(tab: EditorTab): string {
   return ''
 }
 
-// ---- 新手欢迎页：让第一次打开的人 30 秒知道这里能干什么 ----
-function focusChat() {
-  window.dispatchEvent(new CustomEvent('docmind:focus-chat'))
-}
-function showSymbolMap() {
-  // 演示模式没有项目数据，地图打开也是空的，不触发
-  if (demoMode.value) return
-  openSymbolMap()
-}
 </script>
 
 <template>
@@ -299,55 +289,8 @@ function showSymbolMap() {
       <button class="cv-close-btn" @click="closeTab(tab.id)">关闭标签</button>
     </div>
 
-    <!-- 新手欢迎页（未打开任何文件时） -->
-    <div v-else-if="!tab" class="welcome">
-      <div class="welcome-inner">
-        <span class="welcome-badge">👋 第一次使用，花 30 秒看一下</span>
-        <h2>用大白话指挥 AI 读懂你的项目</h2>
-        <p class="welcome-sub">
-          这里是 DocMind 代码工作台：不用自己翻代码，直接用中文问 AI——
-          「玩家受伤扣多少血在哪算的？」「这个按钮点了为什么没反应？」它会自己搜代码、给答案、标出位置。
-          按下面四步开始：
-        </p>
-
-        <div class="welcome-grid">
-          <a class="welcome-card" href="/">
-            <span class="welcome-num">1</span>
-            <span>
-              <h4>先让 AI「读完」你的项目</h4>
-              <p>到 AI 问答首页选择项目文件夹并建立索引。没建索引，AI 就像没读过课本就上考场。</p>
-            </span>
-          </a>
-          <button class="welcome-card" type="button" @click="focusChat">
-            <span class="welcome-num">2</span>
-            <span>
-              <h4>用大白话直接提问</h4>
-              <p>点这里，光标会跳到右下角「AI 助手」。试试问：玩家受伤的数值在哪段代码里算的？</p>
-            </span>
-          </button>
-          <button class="welcome-card" type="button" :disabled="demoMode" @click="showSymbolMap">
-            <span class="welcome-num">3</span>
-            <span>
-              <h4>看图秒懂项目结构</h4>
-              <p>顶部「代码地图」画出全项目函数在哪定义、谁调用谁；Unity 项目还能查资源引用、标红断链。<template v-if="demoMode">（演示版无真实数据）</template></p>
-            </span>
-          </button>
-          <div class="welcome-card welcome-static">
-            <span class="welcome-num">4</span>
-            <span>
-              <h4>改坏了也能「读档」</h4>
-              <p>每次 git 提交都是一个存档点。文件上的「历史版本」可以一键回到任意旧版本，放心改。</p>
-            </span>
-          </div>
-        </div>
-
-        <div class="welcome-foot">
-          <span>💡 左侧是项目文件，点击即可查看</span>
-          <span>Ctrl+S 保存</span>
-          <span>右键文件可新建 / 重命名 / 删除</span>
-        </div>
-      </div>
-    </div>
+    <!-- 概览驾驶舱（未进入代码工作区时） -->
+    <OverviewView v-else-if="!tab" />
 
     <div v-show="tab && !tab.loading && !tab.error" ref="host" class="cv-host" />
 

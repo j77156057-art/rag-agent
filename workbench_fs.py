@@ -433,6 +433,14 @@ def save_file(root, rel, content, if_mtime=None, reindex: bool = False) -> dict:
             code_chunks = _reindex_one(root_abs, target, rel_n)
         except Exception as e:  # noqa: BLE001  索引失败不回滚文件保存
             warnings.append(f"代码索引增量更新失败（可点「重新索引」修复）：{type(e).__name__}: {e}")
+    # 语义标签：内容变了就把旧标签置为待刷新（人工标签保留并标 stale）
+    if changed and ext in _CODE_EXT:
+        try:
+            import semantic_tags as stags
+            stags.invalidate_scan(root_abs)
+            stags.on_saved(root_abs, rel_n)
+        except Exception:  # noqa: BLE001
+            pass
     return {
         "ok": True,
         "path": rel_n,
@@ -472,6 +480,12 @@ def create_path(root, rel, kind: str, content: str = "") -> dict:
     with open(target, "w", encoding="utf-8", newline="") as fh:
         fh.write(data)
     invalidate_status(root)
+    if kind == "file":
+        try:
+            import semantic_tags as stags
+            stags.invalidate_scan(os.path.abspath(str(root)))
+        except Exception:  # noqa: BLE001
+            pass
     return {
         "ok": True,
         "path": rel_n,
@@ -529,6 +543,12 @@ def rename_path(root, rel, new_rel, reindex: bool = False) -> dict:
             _reindex_one(root_abs, dst, new_n)
         except Exception as e:  # noqa: BLE001
             warnings.append(f"代码索引更新失败（可点「重新索引」修复）：{type(e).__name__}: {e}")
+    try:
+        import semantic_tags as stags
+        stags.invalidate_scan(root_abs)
+        stags.on_renamed(root_abs, rel_n, new_n)
+    except Exception:  # noqa: BLE001
+        pass
     return {"ok": True, "from": rel_n, "to": new_n, "git_renamed": git_renamed, "reindex_warnings": warnings}
 
 
@@ -574,6 +594,12 @@ def delete_path(root, rel, recursive: bool = False, force: bool = False) -> dict
             )
         shutil.rmtree(target)
         invalidate_status(root)
+        try:
+            import semantic_tags as stags
+            stags.invalidate_scan(os.path.abspath(str(root)))
+            stags.on_deleted(os.path.abspath(str(root)), rel_n)
+        except Exception:  # noqa: BLE001
+            pass
         return {"ok": True, "deleted": rel_n, "recoverable": not untracked}
 
     # 单文件
@@ -591,6 +617,12 @@ def delete_path(root, rel, recursive: bool = False, force: bool = False) -> dict
             delete_by_source(rel_n, collection=CODE_COLLECTION_NAME)
         except Exception:  # noqa: BLE001
             pass
+    try:
+        import semantic_tags as stags
+        stags.invalidate_scan(os.path.abspath(str(root)))
+        stags.on_deleted(os.path.abspath(str(root)), rel_n)
+    except Exception:  # noqa: BLE001
+        pass
     return {"ok": True, "deleted": rel_n, "recoverable": tracked}
 
 
@@ -700,6 +732,12 @@ def revert_file(root, rel) -> dict:
     if not ok:
         raise FsError(400, f"git 回滚失败：{err[:300]}")
     invalidate_status(root)
+    if os.path.splitext(target)[1].lower() in _CODE_EXT:
+        try:
+            import semantic_tags as stags
+            stags.on_saved(os.path.abspath(str(root)), rel_n)
+        except Exception:  # noqa: BLE001
+            pass
     return {"ok": True, "path": rel_n, "reverted": True,
             "mtime": os.path.getmtime(target)}
 
@@ -1453,3 +1491,138 @@ def relation_graph_ep():
         return build_relation_graph(_runtime_root())
     except FsError as e:
         return _err(e)
+
+
+# ---------------------------------------------------------------------------
+# 阶段 1：分区卡片（首页用）——在 regions.list_regions 基础上补
+# 未提交改动计数 + 最近一次提交摘要，全部走本地 git 只读命令。
+# ---------------------------------------------------------------------------
+def build_region_cards(root) -> dict:
+    root_abs = _require_root(root)
+    from regions import list_regions
+    snap = _git_snapshot(root_abs)
+    root_is_repo = os.path.isdir(os.path.join(root_abs, ".git"))
+
+    def _repo_of(region_dir_rel: str):
+        rd = os.path.join(root_abs, *region_dir_rel.split("/"))
+        if os.path.isdir(os.path.join(rd, ".git")):
+            return rd, True
+        if root_is_repo:
+            return root_abs, False
+        return None, False
+
+    def _last_commit(repo: str):
+        ok, out = _git(
+            ["log", "-1", "--pretty=format:%H%x09%h%x09%s%x09%an%x09%ad",
+             "--date=iso-strict"],
+            cwd=repo,
+        )
+        if not ok or not out.strip():
+            return None
+        parts = out.split("\t", 4)
+        if len(parts) != 5:
+            return None
+        full, short, subject, author, dt = parts
+        ts = None
+        try:
+            ts = datetime.fromisoformat(dt).timestamp()
+        except Exception:  # noqa: BLE001
+            pass
+        return {"hash": short, "full_hash": full, "message": subject,
+                "author": author, "time": ts, "time_raw": dt}
+
+    cards = []
+    for r in list_regions(root_abs):
+        repo, own_repo = _repo_of(r["dir"]) if r["exists"] else (None, False)
+        dirty_count = 0
+        if repo is not None:
+            state = snap.get(os.path.realpath(repo))
+            if state:
+                if own_repo:
+                    dirty_count = len(state["dirty"])
+                else:
+                    prefix = r["dir"].replace("\\", "/").strip("/") + "/"
+                    dirty_count = sum(1 for p in state["dirty"]
+                                      if p == r["dir"].strip("/") or p.startswith(prefix))
+        last = _last_commit(repo) if repo is not None else None
+        cards.append({
+            **r,
+            "dirty_count": dirty_count,
+            "last_commit": last,
+            "own_repo": own_repo,
+        })
+    return {"ok": True, "code_root": root_abs, "regions": cards}
+
+
+@router.get("/region-cards")
+def region_cards_ep():
+    """分区首页卡片：契约状态/文件数/未提交改动数/最近一次提交。"""
+    try:
+        return build_region_cards(_runtime_root())
+    except FsError as e:
+        return _err(e)
+
+
+# ---------------------------------------------------------------------------
+# 阶段 1：语义业务标签 + 大白话定位
+# ---------------------------------------------------------------------------
+class TagUpdateReq(BaseModel):
+    path: str
+    tags: list[str]
+    summary: str = ""
+
+
+@router.get("/semantic-tags")
+def semantic_tags_ep(refresh: int = 0, limit: int = 60):
+    """业务标签。refresh=1 时现场跑增量标注（LLM 批量 + 规则降级），可能耗时数十秒。"""
+    try:
+        root = _runtime_root()
+        import semantic_tags as stags
+        if refresh:
+            return stags.ensure_tags(root, limit=max(1, min(int(limit or 60), 300)))
+        return stags.tag_status(root)
+    except FsError as e:
+        return _err(e)
+    except Exception as e:  # noqa: BLE001  LLM/依赖失败不搞挂整个面板
+        return JSONResponse(
+            {"ok": False, "error": f"语义标签生成失败：{type(e).__name__}: {e}"},
+            status_code=200,
+        )
+
+
+@router.post("/semantic-tags/update")
+def semantic_tags_update_ep(req: TagUpdateReq):
+    """人工修正标签：写入后 origin=manual，自动刷新不再覆盖。"""
+    try:
+        root = _runtime_root()
+        target, rel_n = _resolve(root, req.path, must_exist=True)
+        if os.path.isdir(target):
+            raise FsError(400, "只能给文件打标签。")
+        import semantic_tags as stags
+        stags.invalidate_scan(root)
+        return stags.manual_update(root, rel_n, req.tags, req.summary)
+    except FsError as e:
+        return _err(e)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    except FileNotFoundError as e:
+        return JSONResponse({"ok": False, "error": f"文件不存在：{e}"}, status_code=404)
+
+
+@router.get("/locate")
+def locate_ep(q: str, limit: int = 20):
+    """大白话定位代码：业务标签/文件名/符号 + 向量语义混合检索。"""
+    try:
+        root = _runtime_root()
+        import semantic_tags as stags
+        q = (q or "").strip()
+        if not q:
+            return {"ok": True, "query": q, "files": [], "regions": [], "total": 0}
+        return stags.locate(root, q, limit=max(1, min(int(limit or 20), 50)))
+    except FsError as e:
+        return _err(e)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(
+            {"ok": False, "error": f"定位失败：{type(e).__name__}: {e}"},
+            status_code=200,
+        )

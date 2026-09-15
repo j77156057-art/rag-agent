@@ -21,9 +21,17 @@ import ChatDock from './components/ChatDock.vue'
 import AgentPolicyPanel from './components/AgentPolicyPanel.vue'
 import GpuPanel from './components/GpuPanel.vue'
 import HarnessPanel from './components/HarnessPanel.vue'
+import SemanticLocateBar from './components/SemanticLocateBar.vue'
+import WorkspaceTabs from './components/WorkspaceTabs.vue'
 import { useWorkbench } from './composables/workbench'
-import { probeBackend, demoMode } from './composables/demo'
+import { probeBackend, demoMode, demoTagMap, demoRegionCards } from './composables/demo'
 import { regionColor } from './theme'
+
+// 演示侧栏的文件 → 业务标签（key 取文件名，与静态示例树对齐）
+const demoBadgeOf = (name: string) => {
+  const hit = Object.entries(demoTagMap).find(([p]) => p.endsWith('/' + name))
+  return hit ? hit[1].tags[0] : ''
+}
 
 const {
   tree, treeLoading, treeError, loadTree,
@@ -33,6 +41,7 @@ const {
   revertPath, openHistory,
   openRegionMap,
   aiPanelOpen,
+  workspace, setWorkspace, seedDemoRegionCards,
 } = useWorkbench()
 
 const dirtyCount = computed(() => tabs.value.filter((t) => t.dirty).length)
@@ -44,20 +53,35 @@ const canRevertActive = computed(() => {
 const canHistoryActive = computed(() => activeTab.value?.tracked === true)
 
 function beforeUnload(e: BeforeUnloadEvent) {
-  if (dirtyCount.value > 0) {
-    e.preventDefault()
-    e.returnValue = ''
-  }
+  if (dirtyCount.value > 0) e.preventDefault()
+}
+
+// Alt+1 概览 / Alt+2 代码（代码工作区需有打开的文件；输入框内不拦截）
+function onWorkspaceHotkey(e: KeyboardEvent) {
+  if (!e.altKey || e.altGraphKey) return
+  const tag = (e.target as HTMLElement | null)?.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement | null)?.isContentEditable) return
+  if (e.key === '1') { e.preventDefault(); setWorkspace('overview') }
+  else if (e.key === '2' && tabs.value.length) { e.preventDefault(); setWorkspace('code') }
 }
 
 onMounted(() => {
   // 先探测同源后端：静态预览（无 FastAPI）进演示模式，不发会失败的树请求。
   void probeBackend().then((online) => {
-    if (online) void loadTree()
+    if (online) {
+      void loadTree()
+    } else {
+      seedDemoRegionCards(demoRegionCards)
+    }
   })
   window.addEventListener('beforeunload', beforeUnload)
+  window.addEventListener('keydown', onWorkspaceHotkey)
 })
-onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
+
+onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', beforeUnload)
+  window.removeEventListener('keydown', onWorkspaceHotkey)
+})
 </script>
 
 <template>
@@ -87,13 +111,16 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
           {{ tree.regions_enabled ? `分区治理 · ${tree.regions.length} 区` : '分区未启用' }}
         </button>
       </div>
+      <SemanticLocateBar v-if="tree || demoMode" class="wb-locate-slot" />
       <div class="wb-topbar-right">
         <a class="wb-question-link" href="/" title="回到 AI 问答首页：用大白话提问，让 AI 在代码库里找答案">AI 问答</a>
-        <TaskEnginePanel />
-        <GpuPanel />
-        <HarnessPanel />
-        <AgentPolicyPanel />
-        <SceneRuntimePanel />
+        <!-- 引擎/生成类面板：窄屏按优先级分级隐藏（容器隐藏，不影响弹层逻辑） -->
+        <span class="wb-tool wb-tool-te"><TaskEnginePanel /></span>
+        <span class="wb-tool wb-tool-gp"><GpuPanel /></span>
+        <span class="wb-tool wb-tool-hp"><HarnessPanel /></span>
+        <span class="wb-tool wb-tool-ap"><AgentPolicyPanel /></span>
+        <span class="wb-tool wb-tool-sr"><SceneRuntimePanel /></span>
+        <span class="wb-topbar-maps">
         <button
           v-if="tree"
           class="wb-map-btn"
@@ -136,6 +163,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
           </svg>
           Unity 图
         </button>
+        </span>
         <button
           v-if="activeTab && canHistoryActive"
           class="wb-save-btn wb-history-btn"
@@ -197,11 +225,12 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
         />
 
         <main class="wb-main">
-          <EditorTabs />
+          <WorkspaceTabs />
+          <EditorTabs v-if="workspace === 'code'" />
           <div class="wb-editor-row">
-            <CodeView :tab="activeTab" />
-            <SelectionAiPanel v-if="aiPanelOpen" />
-            <SymbolOutline />
+            <CodeView :tab="workspace === 'code' ? activeTab : null" />
+            <SelectionAiPanel v-if="aiPanelOpen && workspace === 'code'" />
+            <SymbolOutline v-if="workspace === 'code'" />
           </div>
           <ChatDock />
           <footer class="wb-statusbar">
@@ -225,9 +254,23 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
             <li class="wb-demo-dir">📁 assets</li>
             <li class="wb-demo-dir">📁 scripts
               <ul>
-                <li>player_controller.gd</li>
-                <li>inventory_system.gd</li>
-                <li>damage_calc.gd</li>
+                <li class="wb-demo-dir">📁 player
+                  <ul>
+                    <li>player_stats.gd<span class="wb-demo-tag">#{{ demoBadgeOf('player_stats.gd') }}</span></li>
+                    <li>player_controller.gd<span class="wb-demo-tag">#{{ demoBadgeOf('player_controller.gd') }}</span></li>
+                  </ul>
+                </li>
+                <li class="wb-demo-dir">📁 combat
+                  <ul>
+                    <li>damage_calc.gd<span class="wb-demo-tag">#{{ demoBadgeOf('damage_calc.gd') }}</span></li>
+                  </ul>
+                </li>
+                <li class="wb-demo-dir">📁 enemy
+                  <ul>
+                    <li>enemy_ai.gd<span class="wb-demo-tag">#{{ demoBadgeOf('enemy_ai.gd') }}</span></li>
+                  </ul>
+                </li>
+                <li>inventory_system.gd<span class="wb-demo-tag">#{{ demoBadgeOf('inventory_system.gd') }}</span></li>
               </ul>
             </li>
             <li class="wb-demo-dir">📁 scenes</li>
@@ -237,6 +280,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
         </aside>
 
         <main class="wb-main">
+          <WorkspaceTabs />
           <EditorTabs />
           <div class="wb-editor-row">
             <CodeView :tab="null" />
