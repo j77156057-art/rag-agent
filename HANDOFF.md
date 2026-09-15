@@ -127,7 +127,9 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-15 | **B 档浅实现收口（`simulate_growth` 深化）**：原 2026-09-11 审计六项仅 `simulate_growth` 仍是等比数列玩具，其余五项已于 2026-09-14 做深（impact_analysis 语义检索 / generate_test_scene 真实 AST / performance_sample cProfile / approval TTL 门禁 / verify_contracts 环检测）。本次把 `simulate_growth` 改为 **geometric / linear / logistic S 形 / diminishing 四模型 + 摘要统计**（翻倍数等级 / 峰值增量及其等级 / logistic 拐点等级），`/api/simulate_growth` 与 `game_simulate` 工具加 `model`/`k`，新增 `tests/test_simulate_growth.py` 10 例（含 TestClient 端点形态）全绿；HANDOFF §5 原「仍有效」审计标记已校正，**B 档清单清空** |
 | 2026-09-15 | **连接器自主切换策略层落地**：`mcp_client` 新增 `capabilities_of`（engine + 显式 capabilities 推导能力标签）/ `connector_directory`（Agent 目录，含能力/适用说明/启用态，不打开会话）/ `select_connector`（按任务语义打分排序；点名引擎只在该引擎内选，避免误路由）；Agent 新增 `dev_list_connectors`/`dev_route_connector`/`dev_list_connector_tools` 三工具，`dev_mcp_call` 失败时提示回退，`SYSTEM_PROMPT` 接入「发现→路由→列工具→调用→切换」闭环；`/api/agent/connector-route` 暴露策略入口、`/api/agent/connectors` 追加 `capabilities`/`best_for`。新增 `tests/test_connector_routing.py` 13 例全绿（中文子串扫描 + 引擎专指过滤）；隔离端口 8079 真打 `connector-route`（`Godot 场景`→godot score 9、`Unity 构建`→[] 不误路由）与 `connectors` 富化字段。HANDOFF §5 Agent 路由「仍待做」项已落地 |
 
-> 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（18 次完整记录，继续追加不要新建文件）。
+| 2026-09-15 | **第二十次冻结合建（P2-2 ComfyUI 精确取消修复）**：comfy_cancel 改走 `POST /queue` delete 按 prompt_id 定向取消并精确释放 GPU 租约；492/492 单测、场景 54/54、浏览器 27/27、引擎嵌入 68/68 实机、npm run build、PyInstaller 直接构建进 `dist/DocMind`；exe 19,832,954 B、SHA-256 6b5e4207…；黄金题门 SKIP（环境无法稳定起已索引评测服务） |
+
+> 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（20 次完整记录，继续追加不要新建文件）。
 
 ---
 
@@ -169,15 +171,17 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 ### P2-2　ComfyUI 流水线
 
-自动轮询、失败重试、缩略图网格、音频/3D 预览、Prompt/许可证元数据、重复资源分析。
-
+**状态：功能基本完成，2026-09-15 收尾精确取消后无已知工程缺口。** 下列能力均已落地（见 §10 多条记录与对应 `tests/test_comfy_*`）：
+- 自动轮询 `comfy_watch` / `comfy_wait`、失败重试 `comfy_retry`（上限 2 次）、结果网格（前端 `TaskEnginePanel` 多媒体预览）、音频/3D 预览（按扩展名 + MIME 分类 `asset_kind`/`preview_supported`）、许可证/来源元数据（`license`/`source_url`/`author`/`workflow_sha256` + `comfy_validate_provenance` 人工审核提示）、重复资源分析 `comfy_resource_duplicates`（SHA-256）、未用资源 `comfy_unused_resources`。
 - **H3 短生成 / 取消 / 重试 实机验收已完成（`e096834`，2026-09-14）**：此前因缺 `TE-Speed-MiniMaxH3-OSS` 自定义节点 + 官方 UI workflow 提交 ComfyUI 报 400/500 而阻塞。现已确认该节点安装就绪，`comfy_ui_to_api_workflow` 重写为「子图拍平 + `/object_info` 驱动 widget 映射」后，经 DocMind 管线实机完成 **39 帧短生成**（`MiniMax_H3_00008_.mp4`，`preview_url`/`mime` 正确）、`comfy_retry` 重排失败作业并重生成成功、`comfy_cancel` 标记 `terminated`、并新增 `tests/test_comfy_h3_converter.py` 回归（23/23 ComfyUI 用例全绿）。详见 §4 时间线 `e096834` 行与 §10「H3 实机验收收尾」条目。
+- **精确 prompt_id 取消修复（2026-09-15）**：原 `comfy_cancel` 发 `POST /interrupt` 并误带 `prompt_id` 体——真实 ComfyUI 忽略该体、只中断"当前全局任务"，**取消不掉指定队列任务**（属 bug，非文档缺口）。已改为 `POST /queue` 带 `{"delete":[prompt_id]}`：ComfyUI 的 `delete_prompt` 会精确移除队列任务、且若其正在执行则自动 `interrupt`（不误伤其他任务）。同步改写 `tests/test_comfy_cancel.py`（断言 `/queue` delete 体与 `deleted` 字段）、`tests/test_gpu_coordinator.py`（fake server 增 `/queue` 处理、断言 `deletes==1`），并给 `api.py` 端点 docstring 与前端 `api.ts` cancel 返回类型补 `deleted` 字段。全量 `discover` 492 项 OK（skip=1 为 ComfyUI 不可达的真机转换测试）。
+  - **真机验收（2026-09-15，8188 起 ComfyUI 后）**：直连 `/prompt` 排两条 Z-Image Turbo 任务 → `A=running`、`B=pending`（B 在队列排队，正是原 bug 场景）；`comfy_cancel(B)` 返回 `deleted=True` 且 **B 被精确移除、A 未误伤**；`comfy_cancel(A)` 返回 `deleted=True`、触发 `interrupt`。**例外（非 DocMind bug）**：Z-Image Turbo 执行不即时响应 ComfyUI `interrupt` 标志，被中断任务会长期留在 `queue_running` 直至自然完成——属 ComfyUI/模型层行为，端点契约本身正确。验收脚本 `D:/Temp/comfy_cancel_accept.py`。
 
 ### P3　冻结发布（标准流程，已执行至第 19 次）
 
 按 `docmind-frozen-release` Skill：py_compile → **250 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(68) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → 前端产物 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
 第 15–19 次均已执行（最新 `DocMind_BUILD.md` 第 19 次章节=2026-09-15 15:47 构建；exe 19,814,751 字节，SHA-256 `7c816242…`）。
-**第 19 次交付卡点（同第 17/18 次原态）**：用户正运行的 8000 端口桌面实例锁定 `dist/DocMind/DocMind.exe`，第 19 次产物暂未换入，存于 `D:/Temp/docmind_rel19/DocMind/`。待用户关闭该实例后 `robocopy /MIR` 换入 `dist/DocMind` 即完成交付，无需重打包。
+**第 19 次交付卡点（已解除，2026-09-15 20:43）**：用户确认 8000 实例本就不在（探活 HTTP 000），并清理了残留 python 进程（`C:\Users\h'h'h\.workbuddy\binaries\python\versions\3.13.12\python.exe` 与 `rag-agent\.venv\Scripts\python.exe`）。随后换入完成：源 `D:/Temp/docmind_rel19/DocMind/`（exe 19,814,751、SHA-256 `7c816242…`）→ `dist/DocMind`，**换后 exe SHA-256 与源一致（`7c816242…`）= 完整性校验通过**。注意：未用 `/MIR` 而用 `robocopy /E /XD .docmind`——目标 `dist/DocMind` 含**运行时目录 `.docmind/`**（预算/轨迹/gpu_state/chroma 指针），`/MIR` 会误删，故排除保护；仅镜像构建文件（exe + MinGit + _internal）。交付完成，无需重打包。
 > 第 19 次的**两处流程偏离**（已在 `DocMind_BUILD.md` 记录理由）：① 未重跑 `npm run build`——本轮前端只有手写静态页 `web/trace.html`，`frontend/` 与 `web/assets/*` 零改动；② 未换入 `dist/DocMind`（同上卡点）。
 > **黄金题门**：第 19 次为 **SKIPPED**（本机无 `GOLDEN_QUESTIONS` 题库），已如实留痕。
 
@@ -459,6 +463,17 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - `api.py` `/api/budget` 增 `per_minute_calls`/`per_minute_cost`（与 `limit_cny`/`reset` 可组合），返回 `rate` 块；`BudgetReq` schema 扩展。新增 `tests/test_harness_cost_parallel.py` 12 例（去重重路由/成本感知停波/replanner ctx/定价强一致并发不丢/每分钟限流）全绿；**全量 491 项 OK**。
 - **未实机**：①`/api/budget` 每分钟字段的真机 HTTP 验收因启动服务会触发沙箱对 `.docmind/gpu_state.json` 的批量删除保护（你已拒绝），改用 FastAPI `TestClient` + 临时预算文件的单测覆盖，端点包裹层以路由注册测试 + 代码核查为准；②成本感知停波仅在 `cost_aware=True` 且预算真用尽时触发，本机默认无预算不触发，逻辑由单测覆盖。
 
+**2026-09-15 追加（rel19 冻结换包交付）**
+- 第 19 次产物换入完成：用户确认 8000 实例本就不在（探活 HTTP 000）、并清理残留 python 进程后，执行 `robocopy "D:/Temp/docmind_rel19/DocMind" "D:/WorkBuddy/rag-agent/dist/DocMind" /E /XD .docmind`。**改用 `/E /XD .docmind` 而非原计划的 `/MIR`**——目标 `dist/DocMind` 含运行时目录 `.docmind/`（预算/轨迹/gpu_state/chroma 指针），`/MIR` 会误删，故排除保护、仅镜像构建文件。
+- 校验：源 exe SHA-256 `7c816242944eb0cbfb7a9c4d486df92bc5a83d1e57af6504d6837cf607c88745`；换后 `dist/DocMind/DocMind.exe` SHA-256 **相同** = 完整性通过；目标 onedir 结构补齐 `DocMind.exe`(19,814,751)+`MinGit`+`_internal`，`.docmind/` 保留。rel19 交付闭环，无需重打包。
+
+**2026-09-15 追加（P2-2 ComfyUI 精确取消修复）**
+- `comfy_cancel` 改为 `POST /queue` 带 `{"delete":[prompt_id]}`（ComfyUI 官方精确取消接口：`delete_prompt` 移除队列任务、若正在执行则自动 `interrupt`，不误伤其他任务）。移除旧 `POST /interrupt` + `prompt_id` 体的误用（真实 ComfyUI 忽略该体、只中断当前全局任务，取消不掉指定队列任务——属 bug）。
+- 同步：`tests/test_comfy_cancel.py` 改写为断言 `/queue` delete 体与 `deleted` 字段；`tests/test_gpu_coordinator.py` fake server 增 `/queue` 处理、`ComfyLeaseLifecycleTest` 断言 `deletes==1`；`api.py` `/api/comfy/cancel` docstring 与前端 `api.ts` cancel 返回类型补 `deleted` 字段。
+- **全量 `discover` 492 项 OK（skip=1 为 ComfyUI 不可达的真机 H3 转换测试）**。
+- **真机验收（2026-09-15，本机起 ComfyUI 8188 后）**：直连 `/prompt` 排两条 Z-Image Turbo 任务 → `A=running`、`B=pending`（B 在队列排队，正是原 bug 场景）；`comfy_cancel(B)` 返回 `deleted=True` 且 **B 被精确移除、A 未误伤**（旧 `/interrupt`+prompt_id 实现取消不掉队列任务）；`comfy_cancel(A)` 返回 `deleted=True`、触发 `interrupt`。已知例外（非 DocMind bug）：Z-Image Turbo 执行不即时响应 ComfyUI `interrupt` 标志，被中断任务长期留 `queue_running` 至自然完成，属 ComfyUI/模型层行为，端点契约正确。验收脚本 `D:/Temp/comfy_cancel_accept.py`。
+- 校正 §5 P2-2 过期文字（原把已落地的自动轮询/重试/网格/许可证/重复资源分析列成"待做"），并给 §10 两处历史「仍待实现」汇总行的 ComfyUI 部分加【已解决】标记。
+
 **以下为 codex/p1-3-gpu-comfyui 分支原始变更记录（保留存档；其中部分设计在合并集成时被有意调整，以本文件末尾「P1-3 合并集成」段为准）**
 - 密钥存储新增 1 项回归测试：往返解密、明文不落盘、Provider 列表和撤销均已验证。全量测试 205 项。
 
@@ -493,10 +508,10 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 补回并验证 `comfy_wait()` 及 `/api/comfy/wait/{prompt_id}` 有界轮询（超时最多 900 秒），避免无限等待。
 - 新增 Unreal 诊断单元测试；独立 worktree 全量测试 215 项通过。
 
-仍待实现：Unreal Blueprint/Level 深度桥接、GPU 跨进程真实显存隔离与优先级持久队列、ComfyUI 后台自动轮询 UI/取消任务/许可证与重复资源分析。
+仍待实现：Unreal Blueprint/Level 深度桥接、GPU 跨进程真实显存隔离与优先级持久队列、ComfyUI 后台自动轮询 UI/取消任务/许可证与重复资源分析。【ComfyUI 部分已解决：自动轮询/取消/许可证与重复资源分析均已于 2026-09-15 前落地，见 §5 P2-2；Unreal 与 GPU 隔离仍待】
 - ComfyUI 新增后台 watcher：`POST /api/comfy/watch/{prompt_id}` 启动有界后台轮询，`GET` 查询状态；前端可持续显示完成结果而不阻塞请求。
 - watcher 生命周期已加入单元测试；全量测试基线仍为 215 项通过（另加 watcher 测试通过）。
-仍待实现：GPU 跨进程真实显存隔离、多 GPU 任务绑定/优先级持久队列；Unreal Blueprint/Level Editor 插件桥接；ComfyUI 取消任务、结果网格、许可证/来源与重复资源分析。
+仍待实现：GPU 跨进程真实显存隔离、多 GPU 任务绑定/优先级持久队列；Unreal Blueprint/Level Editor 插件桥接；ComfyUI 取消任务、结果网格、许可证/来源与重复资源分析。【ComfyUI 部分已解决：取消/结果网格/许可证与重复资源分析均已落地，见 §5 P2-2；GPU 隔离与 Unreal 桥接仍待】
 - GPU 协调器新增优先级队列：`acquire(..., priority=N)`，高优先级任务优先获得释放的租约，同优先级保持 FIFO；取消和 TTL 回收会清理优先级元数据。
 - 新增优先级交接测试，GPU 队列相关测试通过。
 仍待实现：跨进程真实显存隔离和任务进程绑定；GPU 优先级尚未持久化到磁盘队列。

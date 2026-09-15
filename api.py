@@ -947,7 +947,7 @@ async def comfy_watch_status_ep(prompt_id: str):
     return comfy_watch_status(prompt_id)
 @app.post("/api/comfy/cancel")
 async def comfy_cancel_ep(req: ComfyCancelReq):
-    """中断 ComfyUI 当前生成（/interrupt）并释放该作业的 GPU 租约。"""
+    """按 prompt_id 定向取消 ComfyUI 作业（`POST /queue` delete）并释放该作业的 GPU 租约。"""
     return await run_in_threadpool(comfy_cancel, req.prompt_id, req.url)
 @app.post("/api/comfy/import")
 async def comfy_import_ep(req: ComfyImportReq):

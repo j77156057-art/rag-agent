@@ -1353,20 +1353,29 @@ def comfy_history(prompt_id, url="http://127.0.0.1:8188", _release=True):
         return {"ok": False, "error": f"ComfyUI 状态查询失败：{e}"}
 
 def comfy_cancel(prompt_id, url="http://127.0.0.1:8188"):
-    """中断当前生成并释放作业租约（用户取消 / 排队取消的落地动作）。"""
+    """按 prompt_id 定向取消 ComfyUI 作业并释放 GPU 租约（用户取消 / 排队取消的落地动作）。
+
+    ComfyUI 正确取消口径（P2-2 收尾修正）：
+    - 唯一能按 prompt_id 精确取消的接口是 `POST /queue` 带 `{"delete":[prompt_id]}`。
+      ComfyUI 的 `delete_prompt` 会：① 从队列移除未执行的任务；② 若该任务正在执行，
+      自动调用 `interrupt()` 中断它——因此**不会误伤其他正在跑的任务**。
+    - `POST /interrupt`（全局、不带 prompt_id）只中断“当前正在执行”的任务，无法定向取消
+      某条队列任务；旧实现误带 `prompt_id` 体发 /interrupt，真实 ComfyUI 忽略该体，
+      等于取消不掉指定任务。此 bug 已修复。
+    """
     try: url = _safe_comfy_url(url)
     except ValueError as e: return {"ok": False, "error": str(e)}
     pid = str(prompt_id or "").strip()
     if not pid or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", pid):
         return {"ok": False, "error": "无效的 ComfyUI prompt_id。"}
-    interrupted = False
+    deleted = False
     err = ""
     try:
-        # ComfyUI 支持带 prompt_id 的定向 interrupt；不再发送全局空载荷。
-        req = urllib.request.Request(url.rstrip('/') + '/interrupt',
-                                     data=json.dumps({'prompt_id': pid}).encode(), headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(url.rstrip('/') + '/queue',
+                                     data=json.dumps({'delete': [pid]}).encode(),
+                                     headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=5) as r:
-            interrupted = 200 <= r.status < 300
+            deleted = 200 <= r.status < 300
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
     with _COMFY_JOBS_LOCK:
@@ -1377,20 +1386,20 @@ def comfy_cancel(prompt_id, url="http://127.0.0.1:8188"):
                         'cancel_requested_at': datetime.now().isoformat(timespec='seconds')})
             _save_comfy_history()
     # watcher 存在时等待 ComfyUI history 报告终态再释放租约；没有 watcher
-    # 的兼容调用才允许立即释放，避免中断请求尚未生效时发生 GPU 抢占。
+    # 的兼容调用才允许立即释放，避免取消请求尚未生效时发生 GPU 抢占。
     with _COMFY_JOBS_LOCK:
         has_watcher = pid in _COMFY_JOBS
     released = (not has_watcher) and (_gpu.force_release(_comfy_job_owner(pid)) is not None)
-    # ComfyUI 没在跑时 /interrupt 可能 400/404——租约释放仍算取消成功
-    if interrupted and has_watcher:
+    # ComfyUI 成功从队列删除即视为取消已生效
+    if deleted and has_watcher:
         with _COMFY_JOBS_LOCK:
             if pid in _COMFY_JOBS:
                 _COMFY_JOBS[pid]['cancel_state'] = 'requested'
                 _save_comfy_history()
-    return {"ok": released or interrupted, "prompt_id": pid,
-            "interrupted": interrupted, "lease_released": released,
-            "cancel_state": 'requested' if interrupted else 'failed',
-            "error": err if (err and not released) else ""}
+    return {"ok": released or deleted, "prompt_id": pid,
+            "deleted": deleted, "interrupted": deleted, "lease_released": released,
+            "cancel_state": 'requested' if deleted else 'failed',
+            "error": err if (err and not (released or deleted)) else ""}
 
 def comfy_wait(prompt_id, url="http://127.0.0.1:8188", timeout=120, interval=1.0):
     deadline=time.time()+max(1,min(int(timeout),600))

@@ -365,6 +365,7 @@ class _ComfyState:
     def __init__(self):
         self.phase = "running"   # running|finished
         self.interrupts = 0
+        self.deletes = 0
         self.counter = 0
 
 
@@ -391,6 +392,9 @@ def _make_comfy_server(state):
             elif self.path == "/interrupt":
                 state.interrupts += 1
                 self._json(200, {})
+            elif self.path == "/queue":
+                state.deletes += 1
+                self._json(200, {"deleted": ["pid-1"]})
             else:
                 self._json(404, {"error": "not found"})
 
@@ -452,16 +456,16 @@ class ComfyLeaseLifecycleTest(unittest.TestCase):
         h2 = gw.comfy_history("pid-1", self.url)
         self.assertFalse(h2.get("lease_released"))
 
-    def test_cancel_requests_interrupt_then_releases_on_terminal_history(self):
+    def test_cancel_requests_queue_delete_then_releases_on_terminal_history(self):
         r = gw.comfy_queue({}, self.url)
         self.assertTrue(r["ok"])
         owner = r["lease"]["owner"]
         c = gw.comfy_cancel("pid-1", self.url)
         self.assertTrue(c["ok"])
-        self.assertTrue(c["interrupted"])
+        self.assertTrue(c["deleted"])
         self.assertFalse(c["lease_released"])
         self.assertEqual(c["cancel_state"], "requested")
-        self.assertEqual(self.state.interrupts, 1)
+        self.assertEqual(self.state.deletes, 1)
         self.assertEqual(g.status()["active"], owner)
         self.state.phase = "finished"
         h = gw.comfy_history("pid-1", self.url)

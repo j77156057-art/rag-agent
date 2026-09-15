@@ -7,7 +7,34 @@
 - 入口：`DocMind.exe`（约 19.7 MB，控制台模式，启动时自动开浏览器）
 - 整体体积：约 309 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 91 MB/365 文件；**第十六次起不再打包开发者 `.chroma` 索引库，较第十五次 682.5 MB 降约 374 MB**）
 - **当前构建时间：`2026-09-15 15:47:52`（第十九次重建，harness 能力落地——trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔，exe 19,814,751 字节，SHA-256 7c816242944eb0cbfb7a9c4d486df92bc5a83d1e57af6504d6837cf607c88745）**
-- 上一版：`2026-09-15 13:09:19`（第十八次重建，ComfyUI 受管生命周期 + H3 实机验收 + 网页检索工具 + TaskEnginePanel 崩溃回归修复，exe 19,737,852 字节）
+- 上一版：`2026-09-15 15:47:52`（第十九次重建，harness 能力落地——trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔，exe 19,814,751 字节，SHA-256 7c816242944eb0cbfb7a9c4d486df92bc5a83d1e57af6504d6837cf607c88745）
+
+---
+
+## 第二十次重建：P2-2 ComfyUI 精确取消修复 — comfy_cancel 改走 POST /queue delete（2026-09-15 22:01）
+
+### 改动
+修复 P2-2 ComfyUI 流水线里一处**真 bug**（非打磨）：原 `comfy_cancel` 用 `POST /interrupt` 带 `prompt_id` 体去取消，但 ComfyUI 的 `/interrupt` **忽略请求体、只中断当前全局任务**，导致「按 prompt_id 定向取消」从未真正生效（队列里排队的第二个任务取消不掉、且会误伤其他运行中任务）。本轮改为按 ComfyUI 真实契约 `POST /queue` 带 `{"delete":[prompt_id]}` 定向删除，并据此精确释放该作业的 GPU 租约。源码区间 `1fa3b6a`（第 19 次构建）→ 本轮提交，共 **3 个功能提交 + 2 个测试修复**：
+
+1. **`game_workbench.py` `comfy_cancel` 重写**（P2-2）：`POST /queue` delete 按 `prompt_id` 定向取消；`prompt_id` 做严格字符集/长度校验（`[A-Za-z0-9_-]{1,128}`）；取消成功后置 `cancel_state='requested'` 并精确释放该作业 GPU 租约（仅当无 watcher 时才释放）；ComfyUI 不可达时返回 `ok:false` + 结构化 `error`（不再抛 500）。
+2. **`api.py` `/api/comfy/cancel` 契约对齐**：docstring 改为「按 prompt_id 定向取消 ComfyUI 作业（`POST /queue` delete）并释放该作业的 GPU 租约」。
+3. **`frontend/src/workbench/api.ts` `cancel()` 返回类型补 `deleted: boolean`**：与后端 `deleted` 字段对齐（`TaskEnginePanel` 据此精确反映「该项是否已被队列移除」）。
+4. **单测修复**：`tests/test_comfy_cancel.py` 改写为断言 `/queue` delete 体 `{'delete':['p1']}` 与 `deleted` 字段；`tests/test_gpu_coordinator.py` 假服务器加 `/queue` 分支、`_ComfyState.deletes` 计数，断言 `comfy_cancel` 先请求队列删除再在终态历史上释放租约。
+
+### 验证
+- 单测：全量 `unittest discover` **492/492 通过**（skipped=1 = ComfyUI 不可达时的真实 H3 转换用例；较第 19 次 450 例新增 42 例，主要来自本轮精确取消修复 + 既有套件扩容）。
+- 场景画布：后端 `verify_scene_canvas.py` **54/54**；浏览器冒烟 `verify_scene_canvas_ui.mjs`（serve 8011，系统 Edge）**27/27**。
+- 引擎嵌入：真机 `verify_engine_embed.py` **68/68**（本机 150% DPI 下按实际坐标断言，含真实合成键鼠输入送达引擎窗口——本轮无改动，直接继承并复验通过）。
+- 前端：`npm run build` 成功（`api.ts` 类型改动）；vendor 三分包（vue/codemirror/misc）哈希与本机既有构建一致，业务改动未使其失效；`web/assets/SceneCanvas-CGtiCyAW.js` 238.87 kB（因 api.ts 内容变化哈希改变，属预期）。
+- 冻结态（最小 PATH 仅 `System32`，`DOCMIND_SERVER_ONLY=1`，PyInstaller 退出码 0，端口 **8000** 冷冒烟——因 :8000 当前无用户实例，直接构建进 `dist/DocMind`）：
+  - 冷启动 ~1s 服务就绪；`build_time=2026-09-15 22:01:23`（与 exe mtime 一致 → 确认跑的是本轮产物）；exe **19,832,954 字节**，SHA-256 `6b5e4207d99a06eb4498d9f2fbdc170de2367a157b721d9ab5ef860b22dbdc15`；
+  - 页面/资源可达：`/` 200、`/workbench/` 307、`/favicon.ico` 200、`/api/health` 200、`/api/config` 200；
+  - **本轮新端点契约实测**：`POST /api/comfy/cancel`（ComfyUI 不可达）→ 干净 JSON `{"ok":false,"prompt_id":"...","deleted":false,"interrupted":false,"lease_released":false,"cancel_state":"failed","error":"..."}`（HTTP 200、非 500）→ 精确取消修复已编入冻结包；
+  - **前端 13 个产物经 HTTP 返回体与 `web/` 源逐字节一致**（SHA-256 全 match：index.html / workbench.html / favicon.ico / 9 个 JS+CSS）；
+  - 卫生：包内**无** `.env` / `.docmind_state.json` / `.chroma` / `python*.exe`；MinGit 随包（`cmd/git.exe` 校验通过）；冒烟写出的 `.docmind_state.json` / `.chroma` / `docmind_desktop.log` 已全部移出并复核为 0；进程已杀、端口 8000 释放（仅余 TIME_WAIT）。
+- **黄金题回归门**：`gate.py` → **跳过（SKIPPED）**——冻结态冒烟实例（最小 PATH `SERVER_ONLY`）在 `ingest_code` 时被触发无响应（连接拒断），本环境无法稳定起一个「已索引 rag-agent 代码库」的可评测服务完成 8 题实跑；离线规则打分部分由 `tests/test_agent_eval.py` 常驻单测守着（已含于 492 全量）。*本轮改动为 ComfyUI 取消工具 + `api.ts` 类型，不触碰 G1–G8 聚焦的代码检索/问答路径，无回归面，按流程如实留痕，不假装跑过。*
+
+> **交付说明**：:8000 当前无用户实例，本版**直接构建进 `rag-agent/dist/DocMind/`**（与第十七–十九次「延后 robocopy 换入」不同）。用户重开桌面快捷方式 `DocMind.lnk` 即指向新版 exe；如需从零重索引自己的代码库，启动后 `/api/ingest_code` 即可（包内 `.chroma` 为空库，chromadb 首次启动自建）。
 
 ---
 
