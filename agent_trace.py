@@ -20,6 +20,8 @@ import time
 import uuid
 from datetime import datetime
 
+# 并行工具批次会从多个线程写同一个 Turn，故对累加操作加锁（计数很小，开销可忽略）
+
 from config import BASE_DIR
 
 TRACE_FILE = os.getenv("DOCMIND_TRACE_FILE") or os.path.join(BASE_DIR, ".docmind_traces.jsonl")
@@ -83,6 +85,7 @@ class Turn:
         self.aborted = False
         self._t0 = time.monotonic()
         self._done = False
+        self._lk = threading.Lock()
 
     # ---- 采集 ----
     def snapshot_prompt(self, messages):
@@ -94,8 +97,9 @@ class Turn:
         """累加一次 LLM 调用的 token 用量（键名兼容 OpenAI 与 Ollama）。"""
         if not usage:
             return
-        self.prompt_tokens += _pick(usage, _USAGE_IN_KEYS)
-        self.completion_tokens += _pick(usage, _USAGE_OUT_KEYS)
+        with self._lk:
+            self.prompt_tokens += _pick(usage, _USAGE_IN_KEYS)
+            self.completion_tokens += _pick(usage, _USAGE_OUT_KEYS)
 
     def llm_step(self, latency_ms, finish_reason=None):
         self.llm_calls += 1
@@ -104,15 +108,16 @@ class Turn:
             self.finish_reason = finish_reason
 
     def tool_step(self, action, arg="", latency_ms=0, obs="", ok=True):
-        self.actions.append(action)
-        self.steps.append({
-            "i": len(self.steps),
-            "action": action,
-            "arg_chars": len(arg or ""),
-            "latency_ms": int(latency_ms or 0),
-            "obs_chars": len(obs or ""),
-            "ok": bool(ok),
-        })
+        with self._lk:
+            self.actions.append(action)
+            self.steps.append({
+                "i": len(self.steps),
+                "action": action,
+                "arg_chars": len(arg or ""),
+                "latency_ms": int(latency_ms or 0),
+                "obs_chars": len(obs or ""),
+                "ok": bool(ok),
+            })
 
     def note_reflection(self):
         self.reflections += 1

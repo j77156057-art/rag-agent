@@ -267,6 +267,9 @@ class LLMClient:
         self.max_retries = LLM_RETRIES
         self.retry_base = LLM_RETRY_BASE
         self.timeout = LLM_TIMEOUT
+        # 解析出来的 key 留档：子代理需要用它新建**独立**的 LLMClient（避免共享实例的
+        # last_usage / last_tool_calls 在并发下互相覆盖）
+        self.api_key = ""
 
         if self.provider == "mock":
             # 离线演示模式：不发起任何网络请求
@@ -277,7 +280,12 @@ class LLMClient:
         key = api_key or get_runtime("llm_api_key") or LLM_API_KEY
         if cfg["api_key_env"]:
             key = key or os.getenv(cfg["api_key_env"], "")
+        self.api_key = key or ""
         self.client = OpenAI(base_url=cfg["base_url"], api_key=key or "EMPTY", timeout=self.timeout)
+
+    def clone(self):
+        """复制一份**独立**的客户端（同 provider/model/key），供并发子代理使用。"""
+        return LLMClient(provider=self.provider, model=self.model, api_key=self.api_key)
 
     def chat(self, messages, stream=False, temperature=0.3, timeout=None, deadline=None, tools=None):
         """统一的对话入口。stream=True 时返回一个 token 生成器。

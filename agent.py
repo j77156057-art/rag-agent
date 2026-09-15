@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from config import (
     MAX_AGENT_STEPS,
@@ -35,6 +36,15 @@ _NATIVE_CAPABLE = {"qwen", "deepseek", "ollama", "llamacpp", "openai", "azure"}
 SUBAGENT_MAX_DEPTH = int(os.getenv("DOCMIND_SUBAGENT_MAX_DEPTH", "2"))
 # 子代理单次最多执行多少步
 SUBAGENT_MAX_STEPS = int(os.getenv("DOCMIND_SUBAGENT_MAX_STEPS", "4"))
+# 并行工具批次开关与并发上限（一轮返回多个只读工具调用时并发执行）
+PARALLEL_TOOLS = os.getenv("DOCMIND_PARALLEL_TOOLS", "1") != "0"
+PARALLEL_MAX = int(os.getenv("DOCMIND_PARALLEL_MAX", "4"))
+# 明确有副作用、**不可并发**的工具：批内只要出现一个就整体退回顺序执行。
+# （delegate 允许并发——子代理各自持独立 LLMClient，见 _delegate）
+_NO_PARALLEL_TOOLS = {"apply_edit", "create_file", "dev_region_edit", "run_command",
+                      "python_exec", "dev_mcp_call", "dev_commit", "dev_commit_all",
+                      "dev_rollback_changeset", "init_regions_tool", "dev_apply_regions",
+                      "dev_add_region", "dev_refactor", "dev_rebuild_index"}
 
 SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以下工具来获取信息或执行动作。
 若系统消息中还附有「本项目规则」（分区约定 / 修改约束），其优先级高于本通用指引，必须逐条遵守。
@@ -496,7 +506,8 @@ class Agent:
         self.plan_mode = bool(plan_mode)
         self.depth = int(depth or 0)
         self.tool_allowlist = list(tool_allowlist) if tool_allowlist else None
-        self._native_queue = []
+        self._native_queue = []    # 顺序回退用：逐个消化的 tool_calls
+        self._pending_batch = []   # 并行批次用：一轮的多个只读 tool_calls
 
     def _native_enabled(self):
         """本轮是否走原生 function-calling。"""
@@ -706,7 +717,8 @@ class Agent:
         forced_final_reason = ""  # 触发强制收尾的原因，证据兜底 final 里原样告知用户
         evidence = []  # 本轮已执行工具的简要清单（action(input)），耗尽时兜底用
         plan_emitted = False  # 计划模式：计划只上抛一次
-        self._native_queue = []  # 原生通道：本轮剩余的 tool_calls（顺序执行）
+        self._native_queue = []   # 原生通道：顺序回退时逐个消化的 tool_calls
+        self._pending_batch = []  # 原生通道：待并发执行的只读 tool_calls
 
         def _evidence_final(reason):
             """模型在强制收尾后仍不给出 Final Answer：用本轮真实观察做确定性兜底。"""
@@ -744,6 +756,35 @@ class Agent:
                 }
                 return
 
+            # 并行批次：一轮返回多个 tool_call 且【全部只读安全】→ 并发执行后一次回填，
+            # 省掉逐条往返。批内只要含写/副作用工具（或超并发上限）就整体退回顺序路径。
+            if self._pending_batch:
+                if PARALLEL_TOOLS and self._parallel_safe(self._pending_batch):
+                    batch, self._pending_batch = self._pending_batch[:PARALLEL_MAX], []
+                    for nm, ar in batch:
+                        executed.add((nm, ar))
+                    results = self._run_batch(batch, turn)
+                    for nm, ar, _obs, _ok in results:
+                        yield {"type": "action", "text": f"{nm}({ar})"}
+                    for nm, ar, obs, _ok in results:
+                        yield {"type": "observation", "text": obs}
+                    trail.append({
+                        "role": "assistant",
+                        "content": "（并行调用）" + "、".join(nm for nm, _a, _o, _k in results),
+                    })
+                    for nm, ar, obs, _ok in results:
+                        trail.append({"role": "user", "content": f"Observation: {_clip(obs, OBS_MAX_CHARS)}"})
+                    evidence.extend(f"{nm}({_clip(ar, 120)})" for nm, ar, _o, _k in results)
+                    tool_steps += len(results)
+                    last_action = results[-1][0]
+                    last_obs = results[-1][2]
+                    if any(nm in _WRITE_TOOLS for nm, _a, _o, _k in results):
+                        executed.clear()
+                    continue
+                # 含非只读安全工具：退回顺序执行
+                self._native_queue = self._pending_batch
+                self._pending_batch = []
+
             # 每轮送模型前都做一次 token 预算裁剪（trail 往返 -> head 历史）
             messages = self._fit_budget(head, trail)
             if turn is not None and turn.messages_hash is None:
@@ -775,10 +816,14 @@ class Agent:
                 calls = (getattr(self.llm, "last_tool_calls", None) or []) if use_tools else []
                 if calls:
                     # 原生 tool_call 归一进文本协议：护栏 / 事件 / 账本完全复用
-                    self._native_queue = [(c["name"], args_to_input(c["arguments"])) for c in calls[1:]]
-                    _nm, _nin = calls[0]["name"], args_to_input(calls[0]["arguments"])
-                    native_override = (_nm, _nin)
-                    acc = (acc + "\n" if acc.strip() else "") + f"Action: {_nm}\nAction Input: {_nin}"
+                    pairs = [(c["name"], args_to_input(c["arguments"])) for c in calls]
+                    if len(pairs) > 1:
+                        # 多调用：走并行批次（不安全的批次会在循环顶自动退回顺序）
+                        self._pending_batch = pairs
+                    else:
+                        _nm, _nin = pairs[0]
+                        native_override = (_nm, _nin)
+                        acc = (acc + "\n" if acc.strip() else "") + f"Action: {_nm}\nAction Input: {_nin}"
                     finish_reason = "tool_calls"
 
             parsed = parse_response(acc)
@@ -1138,8 +1183,59 @@ class Agent:
             return
 
     # ------------------------------------------------------------------
+    # 并行工具批次
+    # ------------------------------------------------------------------
+    def _parallel_safe(self, batch):
+        """批内全部为只读安全工具时才允许并发（写/副作用工具绝不并发）。"""
+        return bool(batch) and all(name not in _NO_PARALLEL_TOOLS for name, _ in batch)
+
+    def _run_batch(self, batch, turn):
+        """并发执行一批只读工具，返回 [(name, arg, obs, ok)]（保持入参顺序）。
+
+        每条仍完整走：pre_tool 钩子 → 白名单/写意图已在派发前拦过 → 执行 →
+        post_tool 钩子 → 账本记步。单条异常只影响本条，不拖垮整批。
+        """
+        out = [None] * len(batch)
+
+        def _one(i, name, arg):
+            try:
+                blocked, reason, arg2 = _hooks.run_pre_tool(name, arg)
+                if blocked:
+                    out[i] = (name, arg, f"[钩子拦截] {name} 未执行：{reason}", False)
+                    return
+                t0 = time.monotonic()
+                if name == "delegate":
+                    obs = self._delegate(arg2, turn=turn)
+                else:
+                    obs = TOOLS[name]["func"](arg2)
+                obs = _hooks.run_post_tool(name, arg2, obs)
+                ok = not _is_failure(obs)
+                if turn is not None:
+                    turn.tool_step(name, arg2, (time.monotonic() - t0) * 1000, obs, ok=ok)
+                out[i] = (name, arg2, obs, ok)
+            except Exception as e:  # noqa: BLE001 —— 单条失败不能炸整批
+                out[i] = (name, arg, f"[并行执行失败] {type(e).__name__}: {e}", False)
+
+        with ThreadPoolExecutor(max_workers=min(PARALLEL_MAX, max(1, len(batch)))) as ex:
+            futures = [ex.submit(_one, i, n, a) for i, (n, a) in enumerate(batch)]
+            for f in futures:
+                f.result()
+        return [r if r is not None else ("?", "", "[并行执行未返回]", False) for r in out]
+
+    # ------------------------------------------------------------------
     # 子代理（受限委派）
     # ------------------------------------------------------------------
+    def _child_llm(self):
+        """给子代理一份**独立**的 LLMClient：并发时不会互相覆盖
+        last_usage / last_tool_calls。测试替身无 clone() 时退回复用父实例。"""
+        clone = getattr(self.llm, "clone", None)
+        if callable(clone):
+            try:
+                return clone()
+            except Exception:  # noqa: BLE001
+                pass
+        return self.llm
+
     def _delegate(self, arg, turn=None):
         """执行一次子代理委派，返回其结论文本（作为父代理的一条 Observation）。
 
@@ -1167,8 +1263,9 @@ class Agent:
             return (f"[delegate 停止] 已达子代理最大嵌套深度 {SUBAGENT_MAX_DEPTH}，"
                     "请由当前代理直接完成任务。")
 
+        child_llm = self._child_llm()
         child = Agent(
-            llm=self.llm,
+            llm=child_llm,
             session_id=None,                       # 子代理独立、不落盘、不串父会话
             tool_mode=self.tool_mode,
             plan_mode=False,
@@ -1189,7 +1286,7 @@ class Agent:
         except Exception as e:  # noqa: BLE001 —— 子代理失败不应炸掉父回合
             return f"[delegate 失败] {type(e).__name__}: {e}"
         if turn is not None:
-            # 子代理的 token 计入父回合账本（错误归因与成本核算都更准）
-            turn.add_usage(getattr(self.llm, "last_usage", None))
+            # 子代理的 token 计入父回合账本（注意读的是子代理自己的 client）
+            turn.add_usage(getattr(child_llm, "last_usage", None))
         body = _clip(final_text.strip(), OBS_MAX_CHARS) or "（子代理未产出结论）"
         return f"[子代理 {role} 结论 · 用了 {used} 步]\n{body}"
