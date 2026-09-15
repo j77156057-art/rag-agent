@@ -1291,6 +1291,24 @@ async def skills_reload_ep():
     return {"ok": True, **agent_skills.reload()}
 
 
+class OrchestrateReq(BaseModel):
+    tasks: list = []
+    synth: bool = True
+    max_parallel: int = 0
+    session_id: str = "default"
+
+
+@app.post("/api/orchestrate")
+async def orchestrate_ep(req: OrchestrateReq):
+    """多代理编排：按任务图并行调度受限子代理，返回结构化结果（含 waves / 各任务结论 / 合成）。"""
+    a = _agent_for(req.session_id or "default")
+    rep = await run_in_threadpool(
+        a.orchestrate, {"tasks": req.tasks, "synth": req.synth}, req.synth,
+        (req.max_parallel or None),
+    )
+    return {"ok": bool(rep.get("ok")), "report": rep}
+
+
 @app.get("/trace")
 async def trace_page():
     """trace 查看页（静态 HTML，页面内拉 /api/trace 渲染）。"""

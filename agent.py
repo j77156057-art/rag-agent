@@ -25,6 +25,7 @@ import sessions as _sessions
 import hooks as _hooks
 import skills as _skills
 import pricing as _pricing
+import orchestrator as _orchestrator
 
 # 单轮总截止时间（秒）：0 或负数表示不限时。防止一次问答无限拖长。
 TURN_DEADLINE_S = float(os.getenv("DOCMIND_TURN_DEADLINE_S", "0"))
@@ -44,7 +45,8 @@ PARALLEL_MAX = int(os.getenv("DOCMIND_PARALLEL_MAX", "4"))
 _NO_PARALLEL_TOOLS = {"apply_edit", "create_file", "dev_region_edit", "run_command",
                       "python_exec", "dev_mcp_call", "dev_commit", "dev_commit_all",
                       "dev_rollback_changeset", "init_regions_tool", "dev_apply_regions",
-                      "dev_add_region", "dev_refactor", "dev_rebuild_index"}
+                      "dev_add_region", "dev_refactor", "dev_rebuild_index",
+                      "orchestrate"}
 
 SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以下工具来获取信息或执行动作。
 若系统消息中还附有「本项目规则」（分区约定 / 修改约束），其优先级高于本通用指引，必须逐条遵守。
@@ -88,6 +90,7 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
 - dev_approve(action, target?): 审批门禁——执行敏感操作前必须先调用它记录一次审批（30 分钟内该操作放行）。action ∈ {commit_region, commit_all, rollback_changeset, apply_regions}。target 精确匹配、不是通配符：commit_region 传具体分区 key（逐区审批，不能传 * 代替），rollback_changeset 传变更集 id，commit_all / apply_regions 固定传 *。
 - dev_approval_status(action, target?): 查询某敏感操作当前是否已审批通过，决定是否需要先 dev_approve。返回已通过/未通过。
 - delegate(role, task): 把一个**相对独立**的子任务委派给受限子代理执行并取回结论。role 取 researcher（检索查证）/ coder（在授权范围改码）/ reviewer（只读评审）/ tester（跑受控命令验证）；task 写清这一件子任务的目标与验收点。适合把大任务拆成互不干扰的检索/实现/评审/验证子任务；**不要**用它转交模糊的整轮问题，也不要在子任务需要与你共享上下文时使用。
+- orchestrate(plan_json): 按【任务图】并行调度多个受限子代理并合成结论，适合需要多角色协作、有先后依赖、或需要交叉验证的复杂任务。输入为 JSON：`{"tasks":[{"id":"a","role":"researcher","task":"...","depends_on":["b"],"optional":false}],"synth":true,"max_parallel":4}`。无依赖的任务并行执行；下游任务会拿到上游结论当上下文；上游失败会阻断其下游（optional 上游除外）；synth=true 时额外合成一次并标注冲突。**任务要拆到"一个子代理一轮能做完"的粒度**，别把整轮问题原样塞进一个 task。
 - dev_use_skill(name): 取回某项目技能的完整正文。系统提示会列出【可用技能】目录（只给名称与适用范围）；当问题落在某技能适用范围内时，先 dev_use_skill 取回正文再作答，不要凭目录名臆测内容。
 - dev_asset_get(asset_id/path, consumer_region?): 通过素材区接口取得素材引用，只返回 assets 区内的安全路径和元数据。
 - dev_asset_register(asset_id, path, type?, license?, tags?): 将素材区已有文件注册到 manifest.json。
@@ -457,8 +460,52 @@ def _delegate_tool(arg):
             "若你看到这条，说明工具调用链路被绕开，请让主代理直接执行。")
 
 
+def _orchestrate_tool_placeholder(arg):
+    """TOOLS 注册用的占位实现；真正的编排在 Agent._orchestrate_tool 内执行。"""
+    return ("orchestrate 需要在 Agent 回合内调用（子代理要继承父代理的模型）。"
+            "若你看到这条，说明工具调用链路被绕开，请让主代理直接执行。")
+
+
+def _parse_role_task(arg):
+    """从 `role: X` / `task: ...` 多行文本里解析角色与任务（task 可多行）。"""
+    role, task = "", ""
+    low_all = arg or ""
+    for line in low_all.splitlines():
+        low = line.strip()
+        if low.lower().startswith("role:"):
+            role = low.split(":", 1)[1].strip().lower()
+        elif low.lower().startswith("task:"):
+            task = low_all.split("task:", 1)[1].strip()
+            break
+    return role, task
+
+
+def _load_json_arg(arg):
+    """容错解析工具入参里的 JSON（剥掉 ``` 代码围栏）。返回 (obj, error)。"""
+    text = (arg or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    if not text:
+        return None, "入参为空"
+    try:
+        return json.loads(text), ""
+    except (ValueError, TypeError) as e:
+        return None, f"JSON 解析失败：{e}"
+
+
 def _register_dynamic_tools():
     """把子代理/技能工具挂进 TOOLS 注册表（幂等，多次导入安全）。"""
+    TOOLS.setdefault("orchestrate", {
+        "description": "按【任务图】并行调度多个受限子代理并合成结论。输入为 JSON："
+                       "{\"tasks\":[{\"id\":\"a\",\"role\":\"researcher|coder|reviewer|tester\","
+                       "\"task\":\"...\",\"depends_on\":[\"其他id\"],\"optional\":false}],"
+                       "\"synth\":true,\"max_parallel\":4}。无依赖的任务并行执行；"
+                       "下游任务会拿到上游结论作为上下文；上游失败会阻断其下游（optional 上游除外）；"
+                       "synth=true 时额外做一次结论合成并标注冲突。适合需要多角色协作、"
+                       "有先后依赖、或需要交叉验证的复杂任务。",
+        "func": _orchestrate_tool_placeholder,
+    })
     TOOLS.setdefault("delegate", {
         "description": "把一个子任务委派给受限子代理执行并取回其结论。输入多行："
                        "第一行 `role: researcher|coder|reviewer|tester`，"
@@ -1007,6 +1054,8 @@ class Agent:
                 if action_name == "delegate":
                     # 子代理必须继承父代理的模型/会话，走特殊派发而非 TOOLS 里的占位实现
                     obs = self._delegate(action_arg, turn=turn)
+                elif action_name == "orchestrate":
+                    obs = self._orchestrate_tool(action_arg, turn=turn)
                 else:
                     obs = TOOLS[action_name]["func"](action_arg)
                 obs = _hooks.run_post_tool(action_name, action_arg, obs)
@@ -1206,6 +1255,8 @@ class Agent:
                 t0 = time.monotonic()
                 if name == "delegate":
                     obs = self._delegate(arg2, turn=turn)
+                elif name == "orchestrate":
+                    obs = self._orchestrate_tool(arg2, turn=turn)
                 else:
                     obs = TOOLS[name]["func"](arg2)
                 obs = _hooks.run_post_tool(name, arg2, obs)
@@ -1236,57 +1287,158 @@ class Agent:
                 pass
         return self.llm
 
-    def _delegate(self, arg, turn=None):
-        """执行一次子代理委派，返回其结论文本（作为父代理的一条 Observation）。
+    def _run_child(self, role, task, context=None, turn=None):
+        """跑一个受限子代理，返回 {status, conclusion, steps, error}（delegate 与 orchestrate 共用）。
 
         - 角色决定工具白名单与角色提示（researcher / coder / reviewer / tester）；
-        - 子代理继承父代理的 llm（共享模型配置）但**独立会话**，不污染父会话历史；
-        - 递归深度受 SUBAGENT_MAX_DEPTH 限制，且白名单里不含 delegate（天然防无限套娃）；
-        - 子代理消耗的 token 计入父回合账本（`turn.add_usage`）。
+        - 子代理持**独立** LLMClient、独立会话（不落盘、不污染父会话历史）；
+        - 递归深度受 SUBAGENT_MAX_DEPTH 限制，白名单不含 delegate/orchestrate（天然防套娃）；
+        - `context`（{上游id: 结论}）会被注入子任务提示——这是"下游看得见上游"的关键；
+        - 子代理 token 计入父回合账本。
         """
-        role, task = "", ""
-        for line in (arg or "").splitlines():
-            low = line.strip()
-            if low.lower().startswith("role:"):
-                role = low.split(":", 1)[1].strip().lower()
-            elif low.lower().startswith("task:"):
-                task = arg.split("task:", 1)[1].strip()
-                break
-        if not task:
-            return ("[delegate 参数错误] 需要 `role:` 与 `task:` 两行。"
-                    "示例：role: researcher / task: 找出 _ready 定义在哪些文件")
-        spec = _SUBAGENT_ROLES.get(role)
+        spec = _SUBAGENT_ROLES.get(role or "")
         if spec is None:
-            return (f"[delegate 角色错误] 未知角色「{role}」，"
-                    f"可选：{'、'.join(_SUBAGENT_ROLES)}")
+            return {"status": "failed", "conclusion": "", "steps": 0,
+                    "error": f"未知角色「{role}」（可选：{'、'.join(_SUBAGENT_ROLES)}）"}
         if self.depth >= SUBAGENT_MAX_DEPTH:
-            return (f"[delegate 停止] 已达子代理最大嵌套深度 {SUBAGENT_MAX_DEPTH}，"
-                    "请由当前代理直接完成任务。")
+            return {"status": "failed", "conclusion": "", "steps": 0,
+                    "error": f"已达子代理最大嵌套深度 {SUBAGENT_MAX_DEPTH}"}
 
         child_llm = self._child_llm()
         child = Agent(
             llm=child_llm,
-            session_id=None,                       # 子代理独立、不落盘、不串父会话
+            session_id=None,
             tool_mode=self.tool_mode,
             plan_mode=False,
             depth=self.depth + 1,
             tool_allowlist=spec["tools"],
         )
         question = spec["hint"] + "\n\n子任务：" + task
+        if context:
+            ctx = "\n".join(f"- {k}：{_clip(str(v), 600)}" for k, v in context.items())
+            question += "\n\n【上游子任务结论（供参考，勿重复劳动）】\n" + ctx
         cap = max(1, SUBAGENT_MAX_STEPS)
         final_text, used = "", 0
+        thoughts, last_obs = [], ""
         try:
             for ev in child.run(question, stream=False):
-                if ev.get("type") == "final":
+                et = ev.get("type")
+                if et == "final":
                     final_text = ev.get("text") or ""
-                elif ev.get("type") == "action":
+                elif et == "action":
                     used += 1
+                elif et == "thought":
+                    thoughts.append(ev.get("text") or "")
+                elif et == "observation":
+                    last_obs = ev.get("text") or ""
                 if used > cap:
                     break
         except Exception as e:  # noqa: BLE001 —— 子代理失败不应炸掉父回合
-            return f"[delegate 失败] {type(e).__name__}: {e}"
+            return {"status": "failed", "conclusion": "", "steps": used,
+                    "error": f"{type(e).__name__}: {e}"}
         if turn is not None:
-            # 子代理的 token 计入父回合账本（注意读的是子代理自己的 client）
             turn.add_usage(getattr(child_llm, "last_usage", None))
-        body = _clip(final_text.strip(), OBS_MAX_CHARS) or "（子代理未产出结论）"
-        return f"[子代理 {role} 结论 · 用了 {used} 步]\n{body}"
+
+        degraded = False
+        conclusion = final_text.strip()
+        if not conclusion:
+            # 子代理在步数内没收尾：用它的过程要点兜底，**不要**给下游一个空结论
+            # （否则编排器会把"没结论"当成"没问题"，下游也拿不到任何上下文）
+            salvage = "\n".join(t for t in thoughts if t.strip()).strip() or last_obs.strip()
+            if salvage:
+                degraded = True
+                conclusion = "（子代理未在步数内收尾，以下为过程要点）\n" + _clip(salvage, 900)
+        return {"status": "ok", "conclusion": conclusion, "steps": used,
+                "error": "", "degraded": degraded}
+
+    def _delegate(self, arg, turn=None):
+        """单个子代理委派（delegate 工具）——返回给父代理的一条 Observation 文本。"""
+        role, task = _parse_role_task(arg)
+        if not task:
+            return ("[delegate 参数错误] 需要 `role:` 与 `task:` 两行。"
+                    "示例：role: researcher / task: 找出 _ready 定义在哪些文件")
+        out = self._run_child(role, task, turn=turn)
+        if out["status"] != "ok":
+            err = out["error"]
+            # 保持既有文案契约：角色问题报"角色错误"，深度问题报"停止"，其余为"失败"
+            tag = ("角色错误" if err.startswith("未知角色")
+                   else "停止" if err.startswith("已达子代理")
+                   else "失败")
+            return f"[delegate {tag}] {err}"
+        body = _clip(out["conclusion"], OBS_MAX_CHARS) or "（子代理未产出结论）"
+        return f"[子代理 {role} 结论 · 用了 {out['steps']} 步]\n{body}"
+
+    # ------------------------------------------------------------------
+    # 多代理编排（任务图）
+    # ------------------------------------------------------------------
+    def _task_runner(self, task, context, turn=None):
+        """orchestrator 的 runner 回调：把一个任务交给对应角色的子代理执行。"""
+        return self._run_child(task.get("role"), task.get("task"), context=context, turn=turn)
+
+    def _synth(self, tasks, results, turn=None):
+        """把所有子任务结论合成一段最终答复（一次 LLM 调用；失败退回原始拼接）。"""
+        parts = []
+        for t in tasks:
+            r = results.get(t["id"]) or {}
+            if r.get("status") == "ok" and r.get("conclusion"):
+                parts.append(f"### {t['id']}（{t.get('role')}）任务：{t['task']}\n{r['conclusion']}")
+            else:
+                parts.append(f"### {t['id']}（{t.get('role')}）状态：{r.get('status')}"
+                             f" —— {r.get('error') or '无结论'}")
+        if not parts:
+            return ""
+        prompt = (
+            "下面是若干子代理对同一个总目标的结论。请合成一段最终答复给用户：\n"
+            "1) 按主题归纳已确认的结论，保留具体的 文件:行号 / 命令 / 来源；\n"
+            "2) 明确指出各结论之间的**冲突或不一致**（如有）；\n"
+            "3) 列出仍未解决、需要用户确认的点；\n"
+            "4) 不要编造未出现在下面的信息。用中文、分点、简洁。\n\n" + "\n\n".join(parts)
+        )
+        llm = self._child_llm()
+        try:
+            out = llm.chat([{"role": "user", "content": _clip(prompt, 12000)}],
+                           stream=False, temperature=0.2)
+        except Exception:  # noqa: BLE001
+            out = ""
+        if turn is not None:
+            turn.add_usage(getattr(llm, "last_usage", None))
+        if not (out or "").strip():
+            out = "（合成模型不可用，以下是各子任务原始结论）\n\n" + "\n\n".join(parts)
+        return _clip(out.strip(), OBS_MAX_CHARS)
+
+    def orchestrate(self, plan, synth=True, max_parallel=None, turn=None):
+        """执行一张任务图，返回结构化结果（工具与 /api/orchestrate 共用）。"""
+        try:
+            tasks = _orchestrator.parse_plan(plan)
+        except _orchestrator.PlanError as e:
+            return {"ok": False, "error": f"任务图不合法：{e}", "tasks": [],
+                    "results": {}, "waves": [], "order": [], "blocked": [],
+                    "merged": "", "n_tasks": 0, "n_ok": 0, "n_failed": 0, "elapsed_ms": 0}
+        mp = PARALLEL_MAX if max_parallel is None else max(1, int(max_parallel))
+        synth_runner = (lambda ts, rs: self._synth(ts, rs, turn=turn)) if synth else None
+        return _orchestrator.run_plan(
+            tasks,
+            lambda t, ctx: self._task_runner(t, ctx, turn=turn),
+            synth_runner=synth_runner,
+            max_parallel=mp,
+        )
+
+    def _orchestrate_tool(self, arg, turn=None):
+        """orchestrate 工具实现：解析 JSON → 跑任务图 → 渲染成 Observation 文本。"""
+        raw, err = _load_json_arg(arg)
+        if err:
+            return ("[orchestrate 参数错误] " + err +
+                    "。需要 JSON：{\"tasks\":[{\"id\":\"a\",\"role\":\"researcher\","
+                    "\"task\":\"...\"}],\"synth\":true}")
+        synth = True
+        mp = PARALLEL_MAX
+        if isinstance(raw, dict):
+            synth = bool(raw.get("synth", True))
+            try:
+                mp = int(raw.get("max_parallel", PARALLEL_MAX))
+            except (TypeError, ValueError):
+                mp = PARALLEL_MAX
+        rep = self.orchestrate(raw, synth=synth, max_parallel=mp, turn=turn)
+        if rep.get("error"):
+            return f"[orchestrate] {rep['error']}"
+        return _orchestrator.format_report(rep)
