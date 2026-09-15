@@ -1,7 +1,7 @@
 # DocMind 项目交接清单（给接手 AI）
 
-> **更新时间**：2026-09-15（harness 并行化：只读工具批次并发 + 子代理并行扇出，见 §4）｜ **基线提交**：`eb8516a`（第 18 次冻结构建）
-> **全量测试**：**396 项全部通过**（387 + 9 新增 `test_parallel.py`）｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
+> **更新时间**：2026-09-15（多代理编排器：任务图 DAG + 上游上下文注入 + 结果合成，见 §4）｜ **基线提交**：`eb8516a`（第 18 次冻结构建）
+> **全量测试**：**417 项全部通过**（396 + 21 新增 `test_orchestrator.py`）｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
 > **引擎嵌入实机自检**：`verify_engine_embed.py` **68/68**（真 Godot 4.7.2 + 真 Win32 宿主，含真实合成键鼠与 UI 调用路径）｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` **27/27** ｜ **前端构建**：`npm run build` 通过
 > 本文是项目唯一权威交接文档，取代并删除了旧版 `HANDOFF.md`、`AI_BRIEF.md`、`DEV_WORKBENCH_AUDIT.md`、`HANDOFF_ENGINE_EMBEDDING.md`、`HANDOFF_REMAINING_WORK.md`（旧 HANDOFF.md 由本同名文件接管）。
 > **铁律：规划项一律写在第 5 节，不得描述为已完成；做完一项就把它移到第 4 节时间线并注明提交号。**
@@ -43,7 +43,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   界面照常可用；另有「聚焦 / 解除嵌入 / 停止桌面窗口」。关弹窗或切走 tab 会自动解除嵌入（视窗元素没了，
   继续嵌着只会让引擎画到别处）。浏览器模式下开关自动禁用并提示需要桌面端。
 - **LLM/Embedding**：mock / qwen / deepseek / ollama / llamacpp 多 Provider，页面内免重启切换；本机 Ollama(`11434`, bge-m3) 与 llama.cpp(`8080`, Qwen 35B) 免 Key；622fdbc 新增 native embedding。
-- **验证基线**：后端 `unittest discover` **396/396 通过**（含 `test_gpu_coordinator.py` 31 例、`test_agent_trace.py` 14 例、`test_llm_resilience.py` 8 例、`test_agent_eval.py` 11 例、`test_native_tools.py` 11 例、`test_subagent_plan.py` 9 例、`test_hooks_skills.py` 13 例、`test_pricing.py` 8 例、`test_parallel.py` 9 例）；
+- **验证基线**：后端 `unittest discover` **417/417 通过**（含 `test_gpu_coordinator.py` 31 例、`test_agent_trace.py` 14 例、`test_llm_resilience.py` 8 例、`test_agent_eval.py` 11 例、`test_native_tools.py` 11 例、`test_subagent_plan.py` 9 例、`test_hooks_skills.py` 13 例、`test_pricing.py` 8 例、`test_parallel.py` 9 例、`test_orchestrator.py` 21 例）；
   `verify_scene_canvas.py` 走真实 HTTP 路由 **54/54**（含"每个 op 的 undo 逐字节还原"）；
   `verify_engine_embed.py` 真 Godot + 真 Win32 宿主 **68/68**；
   `verify_scene_canvas_ui.mjs` 真浏览器 **27/27**（含"空间布局落点与场景坐标严格成比例"）；前端 build 通过。
@@ -57,13 +57,14 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 模块 | 职责 |
 |---|---|
 | `api.py`（78KB） | HTTP/SSE 总入口：chat、ingest、工作台 fs、regions、engine/*、desktop/host、selection_ai、MCP、GPU 等全部路由 |
-| `agent.py` | ReAct 循环（Thought→Action→Observation）、反思重试、弱模型 terminal 工具、代码优先路由（c543047）；**`run()` 现为埋点外壳**：预算熔断 + pre/post_turn 钩子 + trace + 会话落盘/摘要 + 按 provider 计价；`_run()` 接统一 deadline；`Agent(llm, session_id=, tool_mode=, plan_mode=, depth=, tool_allowlist=)` 支持会话隔离、**原生 function-calling 通道**（`native`/`auto`，tool_calls 归一进文本协议复用全部护栏）、**plan 模式**（上抛 `plan` 事件）、**子代理委派**（`delegate` → 受限子代理，各自持独立 `LLMClient`）、**并行批次**（一轮多条只读 tool_call 用 `ThreadPoolExecutor` 并发执行、结果保序回填；批内含写/副作用工具自动退回顺序） |
+| `agent.py` | ReAct 循环（Thought→Action→Observation）、反思重试、弱模型 terminal 工具、代码优先路由（c543047）；**`run()` 现为埋点外壳**：预算熔断 + pre/post_turn 钩子 + trace + 会话落盘/摘要 + 按 provider 计价；`_run()` 接统一 deadline；`Agent(llm, session_id=, tool_mode=, plan_mode=, depth=, tool_allowlist=)` 支持会话隔离、**原生 function-calling 通道**（`native`/`auto`，tool_calls 归一进文本协议复用全部护栏）、**plan 模式**（上抛 `plan` 事件）、**子代理委派**（`delegate` → 受限子代理，各自持独立 `LLMClient`）、**并行批次**（一轮多条只读 tool_call 用 `ThreadPoolExecutor` 并发执行、结果保序回填；批内含写/副作用工具自动退回顺序）、**多代理编排**（`orchestrate` 工具 / `Agent.orchestrate()` 走任务图，见 `orchestrator.py`） |
 | `agent_trace.py`（新） | **逐轮 trace + token 账本**：每回合一条 JSONL（turn_id / session_id / messages 哈希 / 工具序列 / tokens in-out / 各步延迟 / finish_reason / 结局），**只记元数据不记正文**，超上限轮转；页面 `GET /trace`、数据 `GET /api/trace` |
 | `sessions.py`（新） | **会话隔离与持久化**：按 session_id 落盘 history，超阈值把早期轮次压成摘要（只留最近 KEEP 轮原文）；`GET /api/sessions`、`DELETE /api/sessions/{id}` |
 | `agent_eval.py`（新） | **黄金题自动打分 + 回归门**：规则打分（must_include / any_of / must_not_include / regex / must_call / 动作边界 / no_error）+ 可选 LLM-judge；与 baseline 对比 pass→fail 或通过率下滑即退出码 1 |
 | `pricing.py`（新） | **按 provider 计价 + 预算熔断**：单价表（`<BASE_DIR>/.docmind_pricing.json` 可覆盖，本地 provider 恒 0）+ 全局/会话累计花费落 `.docmind_budget.json`；回合前 `check()` 拒绝超限、回合后 `charge()`；`GET/POST /api/budget` |
 | `hooks.py`（新） | **工具/回合钩子热插拔**：`.docmind/hooks/*.py` 的 `pre_tool` / `post_tool` / `pre_turn` / `post_turn`；异常隔离、坏钩子不影响主流程；`GET /api/hooks`、`POST /api/hooks/reload` |
 | `skills.py`（新） | **技能热插拔**：扫 `.docmind/skills/**/*.md`（frontmatter），只把目录注入系统提示、正文由 `dev_use_skill` 按需取；`GET /api/skills`、`POST /api/skills/reload` |
+| `orchestrator.py`（新） | **多代理编排器**（纯调度，不依赖 Agent）：任务图校验（id 重复/依赖缺失/循环依赖/超量）、`topological_waves()` 分波、同波并行、**下游注入上游结论**、上游失败阻断下游（`optional` 除外）、可选 `synth_runner` 合成并标注冲突；调用方通过 `runner(task, context)` 回调提供"怎么跑子任务"，故可完全离线单测 |
 | `tools.py`（105KB） | 工具注册表 `TOOLS`：9 基础 + 受控写（apply_edit/create_file/run_command）+ 11 个 dev_* 分区工具 + 研判分区工具 |
 | `regions.py`（47KB） | 分区 2.0：DEFAULT_REGIONS 8 区、regions.json 覆盖、契约校验（DAG 无环/导出存在）、init/scaffold/fill_exports、变更集与回滚 |
 | `game_workbench.py`（60KB） | Godot/Unity/Unreal catalog、引擎启停与自动嵌入、运行时事件、任务/资产/bug 工作流；**P2-1 ComfyUI 租约覆盖完整生成周期**：`comfy_queue` 用一次性提交 owner 拿租约（带 Ollama 驱逐钩子）→ 成功后 `reown` 为 `comfyui:{prompt_id}`（TTL 600s `DOCMIND_COMFY_JOB_TTL` 兜底），`comfy_history` 见终态（outputs/completed/error/failed）幂等释放，`comfy_cancel` 调 ComfyUI `/interrupt` 后释放。提交默认要求 `DOCMIND_COMFY_MIN_FREE_MB=1024` 显存余量：余量不足先触发 Ollama 卸载钩子，腾不出则直接拒绝不排队 |
@@ -117,6 +118,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-15 | **harness 运维层四件套（`ab6e253`）**：① **逐轮 trace + token 账本**（`agent_trace.py`：turn_id / session_id / messages 哈希 / 工具序列 / tokens in-out / 各步延迟 / finish_reason / 结局；只记元数据不记正文，超限轮转；`/trace` 查看页 + `GET /api/trace`）；`llm.py` 捕获 OpenAI/Ollama/mock 三路 usage；`agent.run` 埋点（aborted / outcome）。② **会话隔离 + 持久化 + 滚动摘要**（`sessions.py`；`Agent(llm, session_id=)` 取代 `api.py` 单例串台；`/api/chat` 加 `session_id`；`GET/DELETE /api/sessions`；golden runner 移除 `/api/config` 重置 hack）。③ **LLM 弹性**：重试 + 指数退避（429/5xx/timeout 可重试、4xx 不重试）+ 统一 `timeout`/`deadline`，SSE 断连即 `close()` 内层生成器中止回合。④ **评测自动化**：`agent_eval.py` 规则打分（must_include/any_of/must_not_include/regex/must_call/动作边界/no_error）+ 可选 LLM-judge + `--baseline` 回归门（回退退出码 1）。新增 33 例测试（313 → **346** 全绿）；新端点经 TestClient 端到端 **14/14**（trace 落账 / 会话隔离 / `/trace` 页面 / 删除会话） |
 | 2026-09-15 | **harness 能力补齐五件套（`ce7ff77`）**：① **原生 function-calling**：`tools.tool_schemas()` 由 TOOLS 生成 schema，`llm.chat(tools=)` 打通 OpenAI/ollama 并归一 `tool_calls`，`tool_mode=react|native|auto`，tool_calls 归一进文本协议后**复用全部护栏**、事件类型不变；② **子代理 + plan 模式**：`delegate` 工具 → 受限子代理（角色白名单 researcher/coder/reviewer/tester、独立会话、深度/步数上限、token 计入父回合），`plan_mode` 首轮上抛 `plan` 事件；③ **hooks + 技能热插拔**：`hooks.py`（pre/post_tool、pre/post_turn，异常隔离）+ `skills.py`（扫 SKILL.md，目录注入系统提示、正文由 `dev_use_skill` 取），`/api/hooks|/api/skills` 均可热重载；④ **成本熔断**：`pricing.py` 按 provider/model 计价 + 全局/会话累计预算，回合前拒绝、回合后 charge，trace 记 `cost_cny`，`/api/budget`；⑤ **golden 门入冻结流水线**：`gate.py`（健康检查→run_golden→agent_eval --baseline，缺题库/模型优雅 SKIP 并输出 BUILD.md 一行摘要），已接入 `docmind-frozen-release` 阶段 0。新增 41 例测试（346 → **387** 全绿）；新端点端到端 **13/13**；gate 跳过路径离线验证通过 |
 | 2026-09-15 | **harness 并行化（`89264ce`）**：① **并行工具批次**——原生通道一轮返回多条 tool_call 且**全部只读安全**时用 `ThreadPoolExecutor` 并发（上限 `DOCMIND_PARALLEL_MAX`，默认 4），结果**保序**聚合后一次回填多条 observation；批内含写/副作用工具（`_NO_PARALLEL_TOOLS`：apply_edit/run_command/python_exec/dev_commit…）则整批**退回顺序**，绝不并发写；单条异常只标记该条。② **子代理并行扇出**——`LLMClient.clone()` + 子代理改用**独立** client，消除共享实例 `last_usage`/`last_tool_calls` 的并发竞态；一轮多 `delegate` 并行执行、token 分别计入父回合；`Turn` 累加操作加锁。新增 `test_parallel.py` 9 例（真并发墙钟、3 线程、保序、失败隔离、写工具回退、clone 独立性、并行扇出），全量 387 → **396** 全绿 |
+| 2026-09-15 | **多代理编排器（`c31467a`）**：新增 `orchestrator.py`（**纯调度、不依赖 Agent、可离线单测**）——任务图校验（id 重复/依赖缺失/自依赖/超量）、`topological_waves()` 拓扑分波、同波并行、**下游任务注入上游结论**（补齐"子代理不共享父上下文"）、上游失败**阻断**下游（`optional` 豁免）、可选 `synth_runner` 合成并标注冲突。agent 侧抽出 `_run_child`（delegate 与 orchestrate 共用）、新增 `Agent.orchestrate()` 与 `orchestrate` 工具（JSON 入参）、子代理步数耗尽时**过程要点兜底**（标 `degraded`，不再给下游空结论）；`api.py` 加 `POST /api/orchestrate`。新增 `test_orchestrator.py` 21 例，全量 396 → **417** 全绿；端点端到端 8/8 |
 
 > 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（18 次完整记录，继续追加不要新建文件）。
 
@@ -175,8 +177,10 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 已补齐十项：逐轮 trace/token 账本、会话隔离+持久化+摘要、LLM 重试/退避/deadline/断连中止、黄金题自动打分+回归门、原生 function-calling、子代理+plan、hooks/技能热插拔、按 provider 计价+预算熔断、golden 门入冻结流水线、**并行工具批次 + 子代理并行扇出**（只读工具并发、结果保序、写/副作用工具自动退回顺序、子代理各持独立 `LLMClient`）。
 
 **仍缺（未实现，不得宣称）**：
-- **多代理编排器**：支持「一轮内并行扇出多个子代理」，但**没有**调度器 / 任务依赖图 / 结果仲裁与冲突消解；子代理**不共享**父上下文（各自独立视角，靠父代理汇总）。
-- **批次内去重与依赖排序**：同一批次的重复调用不去重、也互不感知依赖（各跑各的）。
+- **编排的"动态重规划"**：任务图是**一次性**提交并执行的；没有"某任务失败 → 自动追加补救任务"或中途改图的能力。
+- **结论可信度校验**：`synth` 只做**合成与冲突标注**，不会独立复核某个子任务的结论是否属实（没有 fact-check 环节）。
+- **成本感知调度**：`max_parallel` 是静态的；没有按预算/显存/延迟动态调整并发度。
+- **批次内去重与依赖排序**：并行工具批次的重复调用不去重、也互不感知依赖（各跑各的）。
 - **hooks 无沙箱**：钩子是以 `importlib` 在服务进程内直接加载的 `.py`，权限等同本服务本身（只适合可信本地代码）。
 - **技能仅是提示词注入**：`SKILL.md` 只提供指引文本，不携带可执行脚本或权限声明，也不参与工具白名单。
 - **成本熔断粒度**：按 provider/model 单价 + 会话/全局累计；**未**做每分钟限流、按工具计费、跨重启的日配额强一致。
