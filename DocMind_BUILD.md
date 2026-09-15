@@ -1,13 +1,49 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第十八次重建（ComfyUI 受管生命周期 + H3 实机验收 + 网页检索工具落定，并修回 17 次构建引入的 TaskEnginePanel 崩溃回归）」；历史构建清单保留在下文。
+> 最新构建见下方「第十九次重建（harness 能力落地：trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 19.7 MB，控制台模式，启动时自动开浏览器）
 - 整体体积：约 309 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 91 MB/365 文件；**第十六次起不再打包开发者 `.chroma` 索引库，较第十五次 682.5 MB 降约 374 MB**）
-- **当前构建时间：`2026-09-15 13:09:19`（第十八次重建，ComfyUI 受管生命周期 + H3 实机验收 + 网页检索工具 + TaskEnginePanel 崩溃回归修复，exe 19,737,852 字节，SHA-256 1772415d76788920d5b33b57b0253863903cba081804f3894e2cdcda591a17a1）**
-- 上一版：`2026-09-14 17:14:57`（第十五次重建，桌面入口改 RAG 问答页 + 引擎嵌入 + 场景画布 + Agent 路由收敛，exe 19,670,124 字节）
+- **当前构建时间：`2026-09-15 15:47:52`（第十九次重建，harness 能力落地——trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔，exe 19,814,751 字节，SHA-256 7c816242944eb0cbfb7a9c4d486df92bc5a83d1e57af6504d6837cf607c88745）**
+- 上一版：`2026-09-15 13:09:19`（第十八次重建，ComfyUI 受管生命周期 + H3 实机验收 + 网页检索工具 + TaskEnginePanel 崩溃回归修复，exe 19,737,852 字节）
+
+---
+
+## 第十九次重建：harness 能力落地 — trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔（2026-09-15 15:47）
+
+### 改动
+把「本地 RAG + ReAct Agent」补齐成一个**可观测、可编排、可回归**的运行时。源码区间 `eb8516a`（第 18 次构建）→ `1fa3b6a`，共 **14 个提交（7 功能 + 7 文档）**；新增 6 个后端模块：
+
+1. **逐轮 trace + token 账本**（`agent_trace.py`）：每回合一条 JSONL（`turn_id / session_id / provider·model / messages 哈希 / 工具调用序列 / tokens in-out / 各步延迟 / finish_reason / 结局 / cost_cny`），**只记元数据不记正文**，超 8 MB 轮转；`llm.py` 捕获 OpenAI / Ollama / mock 三路 usage；查看页 `/trace`（`web/trace.html`，手写静态页）+ `GET /api/trace`、`/api/trace/summary`、`POST /api/trace/clear`。
+2. **会话隔离 + 持久化 + 滚动摘要**（`sessions.py`）：`Agent(llm, session_id=)` 按会话隔离（`session_id` 为空=纯内存，行为与旧版一致），历史落盘、超阈值把早期轮次压成摘要；`/api/chat` 新增 `session_id` 表单字段；`GET /api/sessions`、`DELETE /api/sessions/{id}`；golden runner 移除旧的 `/api/config` 重置 hack。
+3. **LLM 弹性**（`llm.py`）：重试 + 指数退避（429 / 5xx / 超时 / 网络可重试，**4xx 明确不重试**）+ 统一 `timeout` / `deadline`；SSE 客户端断连即关闭内层生成器中止回合（记 `aborted`）。
+4. **评测自动化**（`agent_eval.py`）：规则打分（`must_include / any_of / must_not_include / regex / must_call / 动作边界 / no_error`）+ 可选 LLM-judge + `--baseline` 回归门（回退退出码 1）；配套 `agent-golden-eval/assets/gate.py` 已接进冻结发布流程阶段 0（缺题库/模型时优雅 SKIP 并留痕）。
+5. **原生 function-calling**（`tools.tool_schemas()` + `llm.chat(tools=)`）：`tool_mode=react|native|auto`；tool_calls 归一进文本协议后**复用全部既有护栏**，事件类型不变。
+6. **多代理编排器**（`orchestrator.py`）：任务图 DAG 校验 + 拓扑分波 + 同波并行 + **下游注入上游结论** + **失败自动重规划**（提案 `{add, drop, replace}`，只能改**尚未执行**的任务）+ 结果合成 + **子代理执行轨迹回传**给 replanner 做失败归因；`POST /api/orchestrate`。
+7. **成本熔断**（`pricing.py`）：按 provider/model 计价（可 `.docmind_pricing.json` 覆盖，本地 provider 恒 0）+ 全局/会话累计预算，回合前拒绝、回合后 charge；`GET/POST /api/budget`。
+8. **hooks / 技能热插拔**（`hooks.py` / `skills.py`）：`.docmind/hooks/*.py` 的 `pre/post_tool`、`pre/post_turn`（单个钩子异常被隔离）+ `.docmind/skills/**/*.md` 目录注入系统提示、正文由 `dev_use_skill` 按需取；`/api/hooks[/reload]`、`/api/skills[/reload]`。
+9. **并行工具批次**：一轮多条**只读** tool_call 并发执行（`ThreadPoolExecutor`，结果保序回填），含写/副作用工具的批次自动退回顺序；子代理改用**独立** `LLMClient`（消除并发竞态）。
+
+**范围决策（两处偏离默认流程，均有理由）**：
+- **未重跑 `npm run build`**：本轮唯一新增前端文件是**手写静态页** `web/trace.html`（不经 Vite 构建），直接随 `docmind.spec` 的 `("web", "web")` 打包；`frontend/` 与 `web/assets/*` **零改动**，vendor 三分包哈希与第 18 次完全一致。
+- **未换入 `dist/DocMind`**：用户当前运行的桌面实例锁定 `dist/DocMind/DocMind.exe`（:8000），本轮产物落在 `D:/Temp/docmind_rel19/DocMind/`；关闭该实例后 `robocopy /MIR` 即完成交付，无需重打包。
+
+### 验证
+- 单测：全量 `unittest discover` **450/450 通过**（第 18 次为 313；本轮新增 **137 例**：trace 14 / 弹性 8 / 评测 11 / 原生 FC 11 / 子代理+plan 9 / hooks+技能 13 / 计价 8 / 并行 9 / 编排 54）。
+- **黄金题回归门**：`gate.py` → **跳过（SKIPPED）**——本机未配置 `GOLDEN_QUESTIONS` 题库；离线规则打分部分由 `tests/test_agent_eval.py` 常驻单测守着。*按流程要求如实留痕，不假装跑过。*
+- 冻结态冒烟（**最小 PATH 仅 System32**、`DOCMIND_SERVER_ONLY=1`、端口 **8044**，PyInstaller 退出码 0）：
+  - **`build_time = 2026-09-15 15:47:52`**（与 exe mtime 一致 → 确认跑的是本轮产物）；
+  - exe **19,814,751 字节**，SHA-256 `7c816242944eb0cbfb7a9c4d486df92bc5a83d1e57af6504d6837cf607c88745`；整包 **309 MB**；
+  - 页面/资源**逐字节一致**：`/`（= `web/index.html`，80,983 字节）、`/workbench/`（307 → `workbench.html`）、**`/trace`（新页面，7,570 字节）**、`/assets/workbench-BBWdzMae.js`(182,945) / `/assets/SceneCanvas-BCwZps71.js`(240,029) 与源 SHA-256 全 match；包内 13 个前端文件逐个比对 **0 mismatch**；
+  - **本轮新端点实测全部可用**：`/api/trace`（items+summary）、`/api/budget`（status+check）、`/api/hooks`（counts/exists/sources）、`/api/skills`（count/items）均 **200 且 `ok:true`**；
+  - **`POST /api/orchestrate` 真跑一张两任务图**（researcher → reviewer 依赖）：`waves=[[a],[b]]`、`n_ok=2`、`merged` 非空，子代理**执行轨迹**随结果返回（`n_steps=5`、`outcome=completed`、5 步 action/obs）→ 证明编排器与轨迹回传都编进了冻结包；
+  - `/api/chat`（`session_id=rel19chat`，mock provider）→ 200 且 SSE 含 final；**trace 账本当条落账**（`turn_id=e47054c6ca81`、tokens、`cost_cny`、messages 哈希、`n_steps=6`）；`/api/sessions` 列出该会话；
+  - 卫生：包内**无** `.env` / `.docmind_state.json` / `.chroma` / `python*.exe`；MinGit 随包（`cmd/git.exe` 校验通过，91 MB）；**冒烟写出的 `.docmind_traces.jsonl` / `.docmind_sessions` / `.chroma` / `.docmind` 已全部移出并复核为 0**；进程已杀、端口 8044 释放（仅余 TIME_WAIT）。
+- 源码对应提交：`ab6e253`（运维四件套）→ `ce7ff77`（能力五件套）→ `89264ce`（并行化）→ `c31467a`（编排器）→ `f6b2179`（动态重规划）→ `78d1504`（回溯式重规划）→ `2689035`（执行轨迹回传），另有 7 个 docs 提交；详见 §4 时间线与 HANDOFF。
+
+> **交付说明**：同第十七/十八次——用户正运行的 :8000 桌面实例锁定 `dist/DocMind/DocMind.exe`，本版**未换入**。待用户关闭该实例后，将 `D:/Temp/docmind_rel19/DocMind/` 经 `robocopy /MIR` 换入 `rag-agent/dist/DocMind/` 即完成交付，无需重打包。
 
 ---
 

@@ -35,7 +35,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   桌面壳默认打开问答页；入口可用 `DOCMIND_HOME` 覆盖（例如 `/workbench`）。
   桌面壳历史包袱：它曾经硬编码打开 `/workbench/`，而浏览器回退路径打开 `/`，两条路进不同页面，用户看懵过。
   工作台的重组件用 `defineAsyncComponent` 异步分块，首屏 JS 体积不受影响（工作台 137KB / gzip 52KB）。
-- **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前**第 18 次**冻结构建，2026-09-15 13:09；含 ComfyUI 受管生命周期 + H3 实机验收 + 网页检索工具 + TaskEnginePanel 崩溃回归修复）；随包 MinGit。
+- **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前**第 19 次**冻结构建，2026-09-15 15:47；含本轮全部 harness 能力——trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔；exe 19,814,751 字节，SHA-256 `7c816242…`）；随包 MinGit。
 - **引擎嵌入（P0-1 已实机闭环，且 UI 可用）**：Godot 4.7.2（`D://Tools//Godot//Godot_v4.7.2-stable_win64.exe`）+ 真 Win32 宿主窗口下实测通过——
   置父/样式摘除、按客户区（或前端指定矩形）对齐、宿主 resize 跟随、**真实合成键鼠（SendInput）送达引擎并回显**、
   解除嵌入后窗口原样还原、停止后无孤儿进程/窗口、父子 DPI 一致（本机 **150% 缩放 = 144 DPI** 实测）。
@@ -169,11 +169,13 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 - **H3 短生成 / 取消 / 重试 实机验收已完成（`e096834`，2026-09-14）**：此前因缺 `TE-Speed-MiniMaxH3-OSS` 自定义节点 + 官方 UI workflow 提交 ComfyUI 报 400/500 而阻塞。现已确认该节点安装就绪，`comfy_ui_to_api_workflow` 重写为「子图拍平 + `/object_info` 驱动 widget 映射」后，经 DocMind 管线实机完成 **39 帧短生成**（`MiniMax_H3_00008_.mp4`，`preview_url`/`mime` 正确）、`comfy_retry` 重排失败作业并重生成成功、`comfy_cancel` 标记 `terminated`、并新增 `tests/test_comfy_h3_converter.py` 回归（23/23 ComfyUI 用例全绿）。详见 §4 时间线 `e096834` 行与 §10「H3 实机验收收尾」条目。
 
-### P3　冻结发布（标准流程，已执行至第 18 次）
+### P3　冻结发布（标准流程，已执行至第 19 次）
 
 按 `docmind-frozen-release` Skill：py_compile → **250 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(68) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → 前端产物 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
-第 15/16/17/18 次均已执行（最新 `DocMind_BUILD.md` 第 18 次章节=2026-09-15 13:09 构建；exe SHA-256 `1772415d…`）。
-**第 18 次交付卡点（同第 17 次原态）**：用户正运行的 8000 端口桌面实例锁定 `dist/DocMind/DocMind.exe`，第 18 次产物暂未换入，存于 `D:/Temp/docmind_rel18/DocMind/`。待用户关闭该实例后 `robocopy /MIR` 换入 `dist/DocMind` 即完成交付，无需重打包。
+第 15–19 次均已执行（最新 `DocMind_BUILD.md` 第 19 次章节=2026-09-15 15:47 构建；exe 19,814,751 字节，SHA-256 `7c816242…`）。
+**第 19 次交付卡点（同第 17/18 次原态）**：用户正运行的 8000 端口桌面实例锁定 `dist/DocMind/DocMind.exe`，第 19 次产物暂未换入，存于 `D:/Temp/docmind_rel19/DocMind/`。待用户关闭该实例后 `robocopy /MIR` 换入 `dist/DocMind` 即完成交付，无需重打包。
+> 第 19 次的**两处流程偏离**（已在 `DocMind_BUILD.md` 记录理由）：① 未重跑 `npm run build`——本轮前端只有手写静态页 `web/trace.html`，`frontend/` 与 `web/assets/*` 零改动；② 未换入 `dist/DocMind`（同上卡点）。
+> **黄金题门**：第 19 次为 **SKIPPED**（本机无 `GOLDEN_QUESTIONS` 题库），已如实留痕。
 
 ### harness 能力层（`ab6e253` 运维四件套 + `ce7ff77` 能力五件套 + 并行化 已完成；下列为剩余项）
 
