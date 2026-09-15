@@ -3,7 +3,9 @@
 这是整个项目的核心：它不是「检索完直接喂给 LLM」的朴素 RAG，而是让 LLM
 自主决定「调用哪个工具 / 何时停止」，形成一个可解释、可扩展的 Agent 推理链路。
 """
+import os
 import re
+import time
 
 from config import (
     MAX_AGENT_STEPS,
@@ -16,6 +18,11 @@ from config import (
 )
 from llm import LLMClient
 from tools import TOOLS
+import agent_trace as _trace
+import sessions as _sessions
+
+# 单轮总截止时间（秒）：0 或负数表示不限时。防止一次问答无限拖长。
+TURN_DEADLINE_S = float(os.getenv("DOCMIND_TURN_DEADLINE_S", "0"))
 
 SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以下工具来获取信息或执行动作。
 若系统消息中还附有「本项目规则」（分区约定 / 修改约束），其优先级高于本通用指引，必须逐条遵守。
@@ -397,9 +404,17 @@ def _is_failure(obs):
 
 
 class Agent:
-    def __init__(self, llm=None):
+    def __init__(self, llm=None, session_id=None):
         self.llm = llm or LLMClient()
-        self.history = []  # 多轮对话记忆：[{"user":..,"assistant":..}]
+        # session_id 为空 = 纯内存会话（测试/临时，行为与旧版一致）；
+        # 非空则按会话落盘、跨重启恢复，并启用超阈值摘要压缩。
+        self.session_id = session_id
+        if session_id:
+            self.history = _sessions.history(session_id)
+            self.summary = _sessions.summary_text(session_id)
+        else:
+            self.history = []
+            self.summary = ""
 
     def _build_messages(self, question, images=None):
         """组装消息列表：系统提示 + 项目规则（若有）+ 多轮历史 + 当前问题。
@@ -419,6 +434,12 @@ class Agent:
                     "role": "system",
                     "content": "【本项目规则，优先级高于上述通用指引，必须逐条遵守】\n" + rules,
                 }
+            )
+        # 更早的会话已被压缩成一段摘要（见 sessions.maybe_compact），作为独立
+        # system 消息注入，让模型在滑窗之外仍知道"之前聊过什么"。
+        if self.summary:
+            messages.append(
+                {"role": "system", "content": "【早期对话摘要（更早的轮次已压缩）】\n" + self.summary}
             )
         # 历史只回放最近 AGENT_HISTORY_TURNS 轮（滑窗），长回答截断后回放，
         # 避免多轮对话把本就紧张的上下文预算吃光。
@@ -460,7 +481,65 @@ class Agent:
             break
         return head + trail
 
-    def run(self, question, stream=True, images=None):
+    def run(self, question, stream=True, images=None, deadline=None):
+        """执行一次问答（带 trace 埋点与会话落盘的外壳）。
+
+        真正的推理循环在 _run；本壳负责：
+        ① 生成本回合 trace（token 账本 / 工具序列 / 各步延迟 / 结局）；
+        ② 把更新后的会话历史落盘并按阈值做摘要压缩。
+        客户端断连（生成器被 close）走 aborted 分支，仍留一条可观测记录。
+        """
+        turn = _trace.Turn(
+            session_id=self.session_id or "ephemeral",
+            provider=getattr(self.llm, "provider", ""),
+            model=getattr(self.llm, "model", ""),
+            question=question,
+        )
+        if TURN_DEADLINE_S > 0 and deadline is None:
+            deadline = time.monotonic() + TURN_DEADLINE_S
+        aborted = False
+        error = None
+        final_text = ""
+        inner = None
+        try:
+            inner = self._run(question, turn=turn, stream=stream, images=images, deadline=deadline)
+            for ev in inner:
+                et = ev.get("type")
+                if et == "reflection":
+                    turn.note_reflection()
+                elif et == "final":
+                    final_text = ev.get("text") or ""
+                yield ev
+        except GeneratorExit:
+            aborted = True
+            raise
+        except Exception as e:  # noqa: BLE001
+            error = f"{type(e).__name__}: {e}"
+            raise
+        finally:
+            # 断连时关闭内层循环，确保不再执行后续工具调用（已耗尽时 close 是空操作）。
+            if inner is not None:
+                try:
+                    inner.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            turn.finish(
+                reason=None if aborted else (turn.outcome or "completed"),
+                final_text=final_text,
+                error=error,
+                aborted=aborted,
+            )
+            _trace.record(turn.to_record())
+            if self.session_id:
+                try:
+                    kept, summary = _sessions.maybe_compact(self.session_id, self.history, self.llm)
+                    self.history = kept
+                    self.summary = summary
+                    _sessions.save(self.session_id, kept, summary)
+                except Exception:  # noqa: BLE001 —— 落盘失败不得影响回答
+                    pass
+
+    def _run(self, question, turn=None, stream=True, images=None, deadline=None):
         """执行一次问答，yield 出流式事件：
         token / thought / action / observation / reflection / final / done。
 
@@ -485,6 +564,8 @@ class Agent:
 
         def _evidence_final(reason):
             """模型在强制收尾后仍不给出 Final Answer：用本轮真实观察做确定性兜底。"""
+            if turn is not None:
+                turn.outcome = "evidence_fallback"
             steps_used = "；".join(evidence) or "（无）"
             last = _clip(last_obs or "", OBS_MAX_CHARS)
             return {
@@ -499,7 +580,18 @@ class Agent:
 
         while True:
             iterations += 1
+            # 统一 deadline：到点即中止本轮，避免一次问答无限拖长（0/负数 = 不限时）。
+            if deadline is not None and time.monotonic() > deadline:
+                if turn is not None:
+                    turn.outcome = "deadline_exceeded"
+                yield {
+                    "type": "final",
+                    "text": "（本轮已超出时间上限，已中止。请缩小问题范围或拆成更具体的问题后重试。）",
+                }
+                return
             if iterations > MAX_AGENT_STEPS + _MAX_NUDGES + _MAX_FORCED_FINALS + 4:
+                if turn is not None:
+                    turn.outcome = "max_steps"
                 yield {
                     "type": "final",
                     "text": "（已达到最大推理步数，请尝试更具体的问题，或补充知识库内容。）",
@@ -508,16 +600,22 @@ class Agent:
 
             # 每轮送模型前都做一次 token 预算裁剪（trail 往返 -> head 历史）
             messages = self._fit_budget(head, trail)
+            if turn is not None and turn.messages_hash is None:
+                turn.snapshot_prompt(messages)
             acc = ""
             finish_reason = None
+            _t_llm = time.monotonic()
             if stream:
-                chat_stream = self.llm.chat(messages, stream=True)
+                chat_stream = self.llm.chat(messages, stream=True, deadline=deadline)
                 for tok in chat_stream:
                     acc += tok
                     yield {"type": "token", "text": tok}
                 finish_reason = getattr(chat_stream, "finish_reason", None)
             else:
-                acc = self.llm.chat(messages, stream=False)
+                acc = self.llm.chat(messages, stream=False, deadline=deadline)
+            if turn is not None:
+                turn.llm_step((time.monotonic() - _t_llm) * 1000, finish_reason)
+                turn.add_usage(getattr(self.llm, "last_usage", None))
 
             parsed = parse_response(acc)
             if parsed["thought"]:
@@ -666,7 +764,14 @@ class Agent:
                 # 弱模型的 query:/pattern:/path: 关键字风格已在此处还原为工具真实入参。
                 evidence.append(f"{action_name}({_clip(action_arg, 120)})")
                 yield {"type": "action", "text": f"{action_name}({action_arg})"}
+                _t_tool = time.monotonic()
                 obs = TOOLS[action_name]["func"](action_arg)
+                if turn is not None:
+                    turn.tool_step(
+                        action_name, action_arg,
+                        (time.monotonic() - _t_tool) * 1000, obs,
+                        ok=not _is_failure(obs),
+                    )
                 yield {"type": "observation", "text": obs}
                 last_action = parsed["action"]
                 last_obs = obs
@@ -701,6 +806,8 @@ class Agent:
                 # "产出即答案"的工具：结果已经正确，直接作为最终回答返回，
                 # 不再给模型多一轮（避免小模型反复调用同一工具导致步数耗尽 / 死循环）。
                 if parsed["action"] in _VERBATIM_TOOLS:
+                    if turn is not None:
+                        turn.outcome = "verbatim"
                     final_text = _format_verbatim(parsed["action"], obs)
                     self.history.append({"user": question, "assistant": final_text})
                     yield {"type": "final", "text": final_text}
@@ -810,14 +917,20 @@ class Agent:
             # 续写纠偏后仍不完整：给出明确错误，不再把半句 Thought 冒充答案；
             # 这类错误结果不写入历史，避免污染下一轮上下文。
             if truncated:
+                if turn is not None:
+                    turn.outcome = "truncated"
                 final_text = (
                     "模型回答因上下文长度限制被截断，未能给出完整答案。"
                     "请缩小问题范围（例如指定具体文件/函数）或开新对话后重试。"
                 )
             elif not acc.strip():
+                if turn is not None:
+                    turn.outcome = "empty"
                 final_text = "模型本轮未返回有效正文（可能在思考阶段耗尽输出长度）。请重试或换一个更具体的问题。"
             else:
                 # 连纠偏后仍不合格式的残句：清洗 ReAct 标记后再兜底，不再把 Thought/Action 原样抛给用户
+                if turn is not None:
+                    turn.outcome = "fallback_cleaned"
                 final_text = _clean_fallback_answer(acc)
                 self.history.append({"user": question, "assistant": final_text})
                 yield {"type": "final", "text": final_text}

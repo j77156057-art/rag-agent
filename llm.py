@@ -5,6 +5,9 @@ OpenAI chat/completions 接口后面，运行时切换 provider 即可，业务�
 """
 import json
 import os
+import random
+import time
+import urllib.error
 import urllib.request
 from gpu_coordinator import acquire as _gpu_acquire, release as _gpu_release, note_activity as _gpu_note_activity
 
@@ -15,6 +18,67 @@ from config import (
     LLM_MAX_TOKENS, LLM_ENABLE_THINKING, PROMPT_TOKEN_BUDGET, get_runtime,
 )
 
+# 默认单次 LLM 调用超时（秒）与重试策略（可用环境变量覆盖）
+LLM_TIMEOUT = float(os.getenv("DOCMIND_LLM_TIMEOUT", "180"))
+LLM_RETRIES = int(os.getenv("DOCMIND_LLM_RETRIES", "3"))       # 总尝试次数（含首次）
+LLM_RETRY_BASE = float(os.getenv("DOCMIND_LLM_RETRY_BASE", "0.8"))  # 指数退避基数（秒）
+
+# 可重试的错误特征：限流 / 5xx / 网络与超时。鉴权/参数类（401/403/404）不重试。
+_RETRYABLE_HINTS = (
+    "429", "rate limit", "rate_limit", "too many requests",
+    "500", "502", "503", "504", "server error", "internal error",
+    "timed out", "timeout", "temporarily unavailable", "overloaded",
+    "connection", "reset by peer", "econnreset", "broken pipe", "eof",
+)
+
+
+def _status_of(exc):
+    for attr in ("status_code", "code", "status", "http_status"):
+        v = getattr(exc, attr, None)
+        if isinstance(v, int):
+            return v
+    return None
+
+
+def is_retryable(exc) -> bool:
+    """判断异常是否值得重试（限流、5xx、网络/超时）。"""
+    st = _status_of(exc)
+    if isinstance(st, int) and (st == 429 or st >= 500):
+        return True
+    if st is not None and 400 <= st < 500:
+        return False  # 明确的客户端错误不重试
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    msg = str(exc).lower()
+    return any(h in msg for h in _RETRYABLE_HINTS)
+
+
+def retry_call(fn, deadline=None, attempts=None, base=None):
+    """带指数退避的重试包装。
+
+    - 仅对 is_retryable 的异常重试；其余立即抛出（不浪费退避时间）。
+    - deadline 为 time.monotonic() 基准的绝对截止时刻；逼近或到达即停止重试。
+    - 流式场景：本包装只覆盖"建立连接"阶段；一旦开始吐 token 就不再重试
+      （已发出的 token 无法撤回，宁可让上层走续写纠偏）。
+    """
+    attempts = int(attempts or LLM_RETRIES)
+    base = LLM_RETRY_BASE if base is None else float(base)
+    last = None
+    for i in range(max(1, attempts)):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("LLM 调用已超出本轮截止时间")
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if i >= attempts - 1 or not is_retryable(e):
+                raise
+            delay = min(base * (2 ** i), 8.0) * (0.7 + 0.6 * random.random())
+            if deadline is not None and time.monotonic() + delay >= deadline:
+                raise
+            time.sleep(delay)
+    raise last  # pragma: no cover
+
 
 class StreamChat:
     """包装 OpenAI 流式响应：迭代时只产出正文 content token，
@@ -24,13 +88,26 @@ class StreamChat:
     长度到 reasoning_chars，供上层判断"只有思考、没有正文"的情况。
     """
 
-    def __init__(self, stream):
+    def __init__(self, stream, usage_sink=None):
         self._stream = stream
+        self._usage = usage_sink if usage_sink is not None else {}
         self.finish_reason = None
         self.reasoning_chars = 0
 
+    def _capture_usage(self, chunk):
+        """尾包（choices 为空）带 usage：OpenAI 需请求时开 include_usage。"""
+        u = getattr(chunk, "usage", None)
+        if u is None:
+            return
+        dump = u.model_dump() if hasattr(u, "model_dump") else (u if isinstance(u, dict) else {})
+        for k in ("prompt_tokens", "completion_tokens"):
+            v = dump.get(k)
+            if isinstance(v, int):
+                self._usage[k] = v
+
     def __iter__(self):
         for chunk in self._stream:
+            self._capture_usage(chunk)
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]
@@ -52,9 +129,10 @@ class _OllamaStream:
     末行 done=true 带 done_reason（"stop" / "length"），映射到 finish_reason。
     """
 
-    def __init__(self, resp, on_close=None):
+    def __init__(self, resp, on_close=None, usage_sink=None):
         self._resp = resp
         self._on_close = on_close
+        self._usage = usage_sink if usage_sink is not None else {}
         self.finish_reason = None
         self.reasoning_chars = 0
 
@@ -75,6 +153,11 @@ class _OllamaStream:
             content = msg.get("content")
             if content:
                 yield content
+            # ollama 原生 /api/chat 的末行带 prompt_eval_count / eval_count
+            for k in ("prompt_eval_count", "eval_count"):
+                v = obj.get(k)
+                if isinstance(v, int):
+                    self._usage[k] = v
             if obj.get("done"):
                 # ollama done_reason: stop/length；无该字段时按 stop 处理
                 self.finish_reason = obj.get("done_reason") or "stop"
@@ -87,6 +170,11 @@ class LLMClient:
         self.provider = provider or get_runtime("llm_provider") or LLM_PROVIDER
         cfg = PROVIDERS[self.provider]
         self.model = model or get_runtime("llm_model") or LLM_MODEL or cfg["default_model"]
+        # 最近一次调用的 token 用量（由 chat()/流式包装器原地更新），供 trace 账本读取
+        self.last_usage = {}
+        self.max_retries = LLM_RETRIES
+        self.retry_base = LLM_RETRY_BASE
+        self.timeout = LLM_TIMEOUT
 
         if self.provider == "mock":
             # 离线演示模式：不发起任何网络请求
@@ -97,10 +185,20 @@ class LLMClient:
         key = api_key or get_runtime("llm_api_key") or LLM_API_KEY
         if cfg["api_key_env"]:
             key = key or os.getenv(cfg["api_key_env"], "")
-        self.client = OpenAI(base_url=cfg["base_url"], api_key=key or "EMPTY")
+        self.client = OpenAI(base_url=cfg["base_url"], api_key=key or "EMPTY", timeout=self.timeout)
 
-    def chat(self, messages, stream=False, temperature=0.3):
-        """统一的对话入口。stream=True 时返回一个 token 生成器。"""
+    def chat(self, messages, stream=False, temperature=0.3, timeout=None, deadline=None):
+        """统一的对话入口。stream=True 时返回一个 token 生成器。
+
+        timeout：单次调用超时（秒），默认 self.timeout。
+        deadline：time.monotonic() 基准的绝对截止时刻；到达即不再重试并抛 TimeoutError。
+        每次调用都重置 self.last_usage；成功后由 trace 账本读取本轮 token 用量。
+        可重试错误（429/5xx/网络/超时）按指数退避自动重试。
+        """
+        self.last_usage = {}
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("本轮已超出截止时间")
+
         if self.provider == "mock":
             return self._mock_chat(messages, stream=stream)
 
@@ -109,7 +207,13 @@ class LLMClient:
             # 被忽略、加载仍为 4096）和 chat_template_kwargs，长 prompt 会被截断。
             # 改走原生 /api/chat：num_ctx / think / num_predict 全部服务端生效。
             # 消息内的 images: [base64...] 也是 ollama 原生多模态格式，直接透传。
-            return self._ollama_chat(messages, stream=stream, temperature=temperature)
+            return retry_call(
+                lambda: self._ollama_chat(
+                    messages, stream=stream, temperature=temperature,
+                    timeout=timeout, usage_sink=self.last_usage,
+                ),
+                deadline=deadline, attempts=self.max_retries, base=self.retry_base,
+            )
 
         # OpenAI 兼容路径：把 ollama 风格的 images 字段转成多模态 content parts，
         # 否则 SDK 的 pydantic 序列化会因未知字段报错。
@@ -121,17 +225,39 @@ class LLMClient:
         # 本地 qwen3 系思考模型：显式关闭 reasoning，避免预算被思考吃光而不行动。
         if not LLM_ENABLE_THINKING and self.provider in ("llamacpp", "ollama"):
             kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
-        if stream:
-            resp = self.client.chat.completions.create(
-                model=self.model, messages=oai_messages, stream=True,
-                temperature=temperature, **kwargs
-            )
-            return StreamChat(resp)
+        call_timeout = self.timeout if timeout is None else timeout
 
-        resp = self.client.chat.completions.create(
-            model=self.model, messages=oai_messages, stream=False,
-            temperature=temperature, **kwargs
+        if stream:
+            def _open(with_usage):
+                extra = {"stream_options": {"include_usage": True}} if with_usage else {}
+                resp = self.client.chat.completions.create(
+                    model=self.model, messages=oai_messages, stream=True,
+                    temperature=temperature, timeout=call_timeout, **kwargs, **extra
+                )
+                return StreamChat(resp, usage_sink=self.last_usage)
+            try:
+                return retry_call(lambda: _open(True), deadline=deadline,
+                                  attempts=self.max_retries, base=self.retry_base)
+            except Exception as e:  # noqa: BLE001
+                # 服务端不认 stream_options 这类参数错误：退回不带 usage 的调用；
+                # 网络/限流类错误则如实抛出（重试已用尽）。
+                if is_retryable(e):
+                    raise
+                return _open(False)
+
+        resp = retry_call(
+            lambda: self.client.chat.completions.create(
+                model=self.model, messages=oai_messages, stream=False,
+                temperature=temperature, timeout=call_timeout, **kwargs
+            ),
+            deadline=deadline, attempts=self.max_retries, base=self.retry_base,
         )
+        u = getattr(resp, "usage", None)
+        if u is not None:
+            dump = u.model_dump() if hasattr(u, "model_dump") else (u if isinstance(u, dict) else {})
+            for k in ("prompt_tokens", "completion_tokens"):
+                if isinstance(dump.get(k), int):
+                    self.last_usage[k] = dump[k]
         return resp.choices[0].message.content
 
     @staticmethod
@@ -181,7 +307,7 @@ class LLMClient:
         root = str(self.client.base_url).rstrip("/").removesuffix("/v1").rstrip("/")
         return root + path
 
-    def _ollama_chat(self, messages, stream=False, temperature=0.3):
+    def _ollama_chat(self, messages, stream=False, temperature=0.3, timeout=None, usage_sink=None):
         if not _gpu_acquire("ollama", 2): raise RuntimeError("GPU 正忙：ComfyUI 正在使用中，请稍后重试。")
         # 打点：空闲卸载计时器以"真正发起 Ollama 推理"为活动依据，
         # 仅持有租约（排队等待）不算活动，避免把等待误判成模型在用。
@@ -209,8 +335,9 @@ class LLMClient:
             headers={"Content-Type": "application/json"},
         )
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        _t = self._OLLAMA_TIMEOUT if timeout is None else float(timeout)
         try:
-            resp = opener.open(req, timeout=self._OLLAMA_TIMEOUT)
+            resp = opener.open(req, timeout=_t)
         except Exception:
             _gpu_release("ollama")
             raise
@@ -219,10 +346,15 @@ class LLMClient:
                 # 流式收尾再打一次点：长回答结束时间作为"最后活动"更准确
                 _gpu_note_activity("ollama")
                 _gpu_release("ollama")
-            return _OllamaStream(resp, _stream_done)
+            return _OllamaStream(resp, _stream_done, usage_sink=usage_sink)
         body = json.loads(resp.read().decode("utf-8"))
         _gpu_note_activity("ollama")
         _gpu_release("ollama")
+        if usage_sink is not None:
+            for k in ("prompt_eval_count", "eval_count"):
+                v = body.get(k)
+                if isinstance(v, int):
+                    usage_sink[k] = v
         return (body.get("message") or {}).get("content", "")
 
     def count_tokens(self, text):
@@ -268,6 +400,17 @@ class LLMClient:
     def _mock_chat(self, messages, stream=False):
         # mock 没有视觉能力：用户带图时明确告知，不假装能识别图片内容
         has_image = any(bool(m.get("images")) for m in messages)
+        # mock 无服务端 usage：用启发式估算填账本，保证离线演示下 trace 也有 token 数字
+        _prompt_est = self._heuristic_tokens(
+            "\n".join(m.get("content") for m in messages if isinstance(m.get("content"), str))
+        )
+
+        def _mark(text):
+            self.last_usage = {
+                "prompt_tokens": _prompt_est,
+                "completion_tokens": self._heuristic_tokens(text or ""),
+            }
+            return text
         if has_image:
             answer = (
                 "Thought: 用户附带了图片，mock 离线模型没有视觉能力，需如实告知。\n"
@@ -275,6 +418,7 @@ class LLMClient:
                 "不具备视觉能力，无法识别图片内容。请在 ⚙ 模型设置 中切换到支持视觉的"
                 "本地模型（如 Ollama qwen3.6 系列）后重试。"
             )
+            _mark(answer)
             if stream:
                 def g_img():
                     for ch in answer:
@@ -333,6 +477,7 @@ class LLMClient:
                     f"Action Input: {question}"
                 )
 
+        _mark(answer)
         if stream:
             def g():
                 for ch in answer:

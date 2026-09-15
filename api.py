@@ -88,6 +88,8 @@ import workbench_fs
 import mcp_client
 import web_export
 import unity_graph
+import agent_trace
+import sessions as session_store
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
 from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_apply_parameters, comfy_queue, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
@@ -110,7 +112,22 @@ async def _app_lifespan(app):
 
 
 app = FastAPI(title="DocMind RAG Agent", lifespan=_app_lifespan)
-agent = Agent()
+
+# 会话隔离：按 session_id 维护各自的 Agent（各持独立历史，跨重启从会话文件恢复）。
+# 不再共用一个模块级单例 —— 那会让不同用户/不同会话的历史串台。
+_SESSION_AGENTS: dict = {}
+
+
+def _agent_for(session_id):
+    sid = (str(session_id or "").strip() or "default")
+    a = _SESSION_AGENTS.get(sid)
+    if a is None:
+        a = Agent(session_id=sid)
+        _SESSION_AGENTS[sid] = a
+    return a
+
+
+agent = _agent_for("default")
 
 class AgentRouteReq(BaseModel):
     prompt: str = ''
@@ -1098,6 +1115,7 @@ def _read_chat_images(uploads):
 @app.post("/api/chat")
 async def chat(
     question: str = Form(""),
+    session_id: str = Form("default"),
     images: list[UploadFile] = File(default=None),
 ):
     question = (question or "").strip()
@@ -1139,13 +1157,16 @@ async def chat(
             f"请用 search_code / read_file / grep 工具。"
         )
     routing = route_for(question)
-    selected_agent = agent
+    selected_agent = _agent_for(session_id)
+    is_cloud = False
     if routing.get('route') == 'cloud' and routing.get('auto_cloud_enabled'):
         cloud_provider = get_runtime('cloud_llm_provider') or os.getenv('AGENT_CLOUD_PROVIDER', 'deepseek')
         if cloud_provider in PROVIDERS and PROVIDERS[cloud_provider].get('api_key_env'):
             key = get_runtime('llm_api_key') or os.getenv(PROVIDERS[cloud_provider]['api_key_env'], '')
             if key:
-                selected_agent = Agent(LLMClient(provider=cloud_provider, api_key=key))
+                selected_agent = Agent(LLMClient(provider=cloud_provider, api_key=key),
+                                       session_id=(str(session_id or '').strip() or 'default'))
+                is_cloud = True
             else:
                 routing = {**routing, 'route': 'local', 'reason': '云端未配置 API Key，已回退本地'}
     hints.append(f"模型路由建议：{routing['route']}（复杂度 {routing['complexity']}，{routing['reason']}）。若需云端模型，必须使用已配置且可审计的 provider。")
@@ -1157,10 +1178,12 @@ async def chat(
     def event_stream():
         # 注意：此处不得再申请 GPU 租约。llm.py 的 _ollama_chat 已以 owner="ollama"
         # 持租约，SSE 层若以别的 owner 再申请，serial 模式不可重入 → 必然自锁报"GPU 正忙"。
+        gen = None
         try:
             yield f"data: {json.dumps({'type':'route','route':routing['route'],'complexity':routing['complexity'],'reason':routing['reason']}, ensure_ascii=False)}\n\n"
-            cloud_grounded = redact_for_cloud(grounded) if selected_agent is not agent else grounded
-            for ev in selected_agent.run(cloud_grounded, stream=True, images=b64_images or None):
+            cloud_grounded = redact_for_cloud(grounded) if is_cloud else grounded
+            gen = selected_agent.run(cloud_grounded, stream=True, images=b64_images or None)
+            for ev in gen:
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as e:
             # LLM 崩溃 / Ollama CUDA 错 / 网络中断等：给前端一个明确的错误 final，不要让前端把检索原文当答案。
@@ -1171,9 +1194,56 @@ async def chat(
             except Exception:
                 pass
             yield f"data: {json.dumps({'type':'final','text':f'模型无响应：{err_msg[:300]}。请到「⚙ 模型设置」换一个能加载的模型再试。'}, ensure_ascii=False)}\n\n"
+        finally:
+            # 客户端断连时 Starlette 关闭本生成器（抛 GeneratorExit）：显式关闭内层
+            # agent 生成器，触发其 aborted 分支 —— 落一条 trace 并停止后续工具调用。
+            if gen is not None:
+                try:
+                    gen.close()
+                except Exception:  # noqa: BLE001
+                    pass
         yield "data: {\"type\":\"done\"}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/api/trace")
+async def trace_ep(limit: int = 50):
+    """逐轮 trace 账本：最近 limit 条回合记录 + 全局聚合（token/延迟/中止/错误）。"""
+    lim = max(1, min(int(limit or 50), 1000))
+    return {"ok": True, "items": agent_trace.recent(lim), "summary": agent_trace.summary()}
+
+
+@app.get("/api/trace/summary")
+async def trace_summary_ep():
+    return {"ok": True, **agent_trace.summary()}
+
+
+@app.post("/api/trace/clear")
+async def trace_clear_ep():
+    return {"ok": agent_trace.clear()}
+
+
+@app.get("/api/sessions")
+async def sessions_ep(limit: int = 50):
+    """会话概览：每个 session_id 的轮数、是否有摘要、最后更新时间。"""
+    return {"ok": True, "items": session_store.list_sessions(limit)}
+
+
+@app.delete("/api/sessions/{session_id}")
+async def session_delete_ep(session_id: str):
+    # 同时丢弃常驻 Agent，避免删除后旧历史仍在内存里续用
+    _SESSION_AGENTS.pop(str(session_id or "").strip() or "default", None)
+    return {"ok": session_store.delete(session_id)}
+
+
+@app.get("/trace")
+async def trace_page():
+    """trace 查看页（静态 HTML，页面内拉 /api/trace 渲染）。"""
+    page = os.path.join(PROJECT_WEB_DIR, "trace.html")
+    if not os.path.isfile(page):
+        return JSONResponse({"ok": False, "error": "trace 页面缺失"}, status_code=404)
+    return FileResponse(page, media_type="text/html")
 
 
 class EnhancePromptReq(BaseModel):

@@ -8,6 +8,11 @@ __pycache__/
 .chroma/
 .docmind_state.json
 
+# ===== Agent 运行账本与会话（本地元数据，不入库）=====
+.docmind_traces.jsonl
+.docmind_traces.jsonl.1
+.docmind_sessions/
+
 # ===== 运行产生的临时上传文件 =====
 uploads/
 

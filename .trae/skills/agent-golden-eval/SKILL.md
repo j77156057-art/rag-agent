@@ -37,9 +37,10 @@ $env:GOLDEN_QIDS      = "Q2,Q5"             # 可选：只跑部分题（复测�
 
 Runner 行为（SSE 真实请求，不用 mock）：
 
-- 每题前 POST `/api/config`（**JSON body** `{"provider":"ollama","model":...}`；multipart 会 422）重设同模型以清空 `agent.history`，每题独立会话，不重建向量集合
-- POST `/api/chat` 是 **multipart/form-data**，字段 `question`；响应按 `data: {json}\n\n` 解析 SSE
-- 每题一行 JSON 落盘（边跑边 flush）：`id/question/elapsed_s/n_actions/actions/thoughts/observations(各截200字)/reflections/final`；请求异常记 `error` 字段不中断批次
+- 每题用独立 `session_id`（`golden-<GOLDEN_RUN_TAG>-<qid>`）走服务端**会话隔离**，天然互不串台 —— 旧版"先 POST `/api/config` 重设模型以清空 `agent.history`"的 hack **已移除**，不必也不应再依赖它
+- POST `/api/chat` 是 **multipart/form-data**，字段 `question` 与 `session_id`；响应按 `data: {json}\n\n` 解析 SSE
+- 每题一行 JSON 落盘（边跑边 flush）：`id/question/model/session_id/expect/elapsed_s/n_actions/actions/thoughts/observations(各截200字)/reflections/final`；请求异常记 `error` 字段不中断批次
+- `GOLDEN_TOKEN`：服务端设了 `DOCMIND_API_TOKEN` 时填令牌（runner 会带 `x-docmind-token`）
 
 ### 输出文件命名（强制）
 
@@ -54,6 +55,34 @@ Runner 行为（SSE 真实请求，不用 mock）：
 4. **失败归因二分法**：
    - **框架事故**：空参空转、步数/重复护栏沉默终止、工具异常文本被当成"查无此物"的证据、参数归一化未接线（假"文件不存在"）、grep 未限定路径被噪声淹没、误路由到通用知识。→ 必须修框架 + 加测试。
    - **模型检索方差**：同题历史轮次跑对过、工具与观察均正常、仅模型选择的检索路径差。→ 记录，不改框架（至少两次复现再考虑 prompt 调整）。
+
+## 自动打分与回归门（CI 用）
+
+`agent_eval.py`（仓库根）给 results.jsonl 打分：默认**纯规则、离线可跑**，适合接 CI；可选叠加 LLM-judge。
+题库每题可带 `expect`（runner 会原样写进结果行，结果文件自包含）：
+
+```json
+{"id": "Q1", "question": "...", "expect": {
+  "must_include": ["player.gd:"], "any_of": [".gd:", "behaviors/"],
+  "must_not_include": ["player.py"], "regex": "\\w+\\.gd:\\d+",
+  "must_call": ["search_code"], "min_actions": 1, "max_actions": 8,
+  "no_error": true, "judge_criteria": "是否给出具体文件与行号且未编造（仅 --judge 时生效）"
+}}
+```
+
+```powershell
+# 只打分
+.\.venv\Scripts\python.exe agent_eval.py --results D:\eval\results_r1.jsonl
+# 回归门：与 baseline 对比，pass→fail 或通过率下滑 → 退出码 1
+.\.venv\Scripts\python.exe agent_eval.py --results D:\eval\results_r1.jsonl --baseline D:\eval\results_baseline.jsonl
+# 叠加 LLM-judge（需本地模型）
+.\.venv\Scripts\python.exe agent_eval.py --results r1.jsonl --baseline baseline.jsonl --judge --provider ollama
+# 机器可读（CI 解析）
+.\.venv\Scripts\python.exe agent_eval.py --results r1.jsonl --baseline baseline.jsonl --json
+```
+
+CI 串法（本地模型）：`run_golden.py` → `agent_eval.py --baseline`。规则打分逻辑本身由
+`tests/test_agent_eval.py` 常驻单测守着（离线、进全量回归），无需模型即可门禁。
 
 ## 定位框架缺陷的标准动作
 
