@@ -408,6 +408,16 @@ def close_all():
             pass
 
 
+def active_servers(root):
+    """返回当前在 root 下有活跃（已连接并保持）stdio 会话的服务器 key 列表。
+
+    HTTP 传输为无状态，不持有长驻会话，因此不会出现在返回值中。
+    """
+    target = os.path.abspath(root)
+    with _SESSIONS_LOCK:
+        return [k[1] for k in _SESSIONS.keys() if os.path.abspath(k[0]) == target]
+
+
 # ---------------------------------------------------------------- HTTP 传输（无状态）
 
 def _http_post(url, body, timeout=HTTP_TIMEOUT):

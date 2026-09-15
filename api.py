@@ -831,6 +831,22 @@ async def mcp_call_ep(req: McpCallReq):
         return await run_in_threadpool(mcp_client.call_tool, root, req.key, req.name, req.arguments)
     except mcp_client.MCPError as e: return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
 
+@app.post("/api/mcp/close")
+async def mcp_close_ep(req: McpServerKeyReq):
+    """断开一个已连接的服务器（仅关闭长驻会话，保留配置；HTTP 无状态服务无会话可关）。"""
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    try:
+        return mcp_client.close_server(root, req.key)
+    except mcp_client.MCPError as e: return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+@app.get("/api/mcp/status")
+async def mcp_status_ep():
+    """返回当前有活跃（已连接并保持）会话的服务器 key 列表，供前端反映真实连接状态。"""
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    return {"ok": True, "active": mcp_client.active_servers(root)}
+
 @app.get("/api/comfy/status")
 async def comfy_status_ep(url: str = "http://127.0.0.1:8188"):
     return comfy_status(url)

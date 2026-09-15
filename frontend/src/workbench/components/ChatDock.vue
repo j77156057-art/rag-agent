@@ -149,14 +149,26 @@ const enginePopOpen = ref(false)
 const servers = ref<McpServer[]>([])
 const probing = ref<string | null>(null)
 const probeResults = ref<Record<string, { ok: boolean; tool_count?: number; error?: string }>>({})
+const connected = ref<Record<string, boolean>>({})
 const addon = ref<Awaited<ReturnType<typeof mcpApi.addonStatus>> | null>(null)
 const installing = ref(false)
+const showAddForm = ref(false)
+const savingServer = ref(false)
+const newServer = ref<{ key: string; label: string; transport: 'stdio' | 'http'; command: string; url: string; enabled: boolean }>({
+  key: '', label: '', transport: 'stdio', command: '', url: '', enabled: true,
+})
 
 async function refreshEnginePop() {
   try {
-    const [s, a] = await Promise.allSettled([mcpApi.servers(), mcpApi.addonStatus()])
+    const [s, a, st] = await Promise.allSettled([mcpApi.servers(), mcpApi.addonStatus(), mcpApi.status()])
     if (s.status === 'fulfilled') servers.value = s.value.servers
     if (a.status === 'fulfilled') addon.value = a.value
+    if (st.status === 'fulfilled' && st.value.ok) {
+      const active = st.value.active || []
+      const next: Record<string, boolean> = {}
+      for (const k of active) next[k] = true
+      connected.value = next
+    }
   } catch {
     /* 弹层打开失败保持空态 */
   }
@@ -182,7 +194,10 @@ async function probe(key: string) {
       mcpApi.probe(key),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error('连接超时：请先在 Godot 编辑器中打开项目并启用 godot-ai 插件')), 8000)),
     ])
-    probeResults.value[key] = { ok: !!r.ok && !(r as { error?: string }).error, tool_count: r.tool_count, error: r.error }
+    const ok = !!r.ok && !(r as { error?: string }).error
+    probeResults.value[key] = { ok, tool_count: r.tool_count, error: r.error }
+    // stdio 为长驻会话，连接成功后保持「已连接」；HTTP 无状态，不持有会话
+    if (ok && servers.value.find((x) => x.key === key)?.transport === 'stdio') connected.value[key] = true
   } catch (e) {
     probeResults.value[key] = { ok: false, error: (e as Error).message }
   } finally {
@@ -218,6 +233,56 @@ async function installAddon() {
 
 function resultOf(s: McpServer) {
   return probeResults.value[s.key]
+}
+
+async function closeServer(key: string) {
+  try {
+    await mcpApi.close(key)
+  } catch {
+    /* 断开失败保持原状 */
+  } finally {
+    connected.value[key] = false
+  }
+}
+
+async function removeServer(key: string) {
+  const ok = await askConfirm({
+    title: '移除连接器',
+    message: `确定移除「${key}」？内置预设会被禁用，自定义项会被删除。`,
+    confirmText: '移除',
+  })
+  if (!ok) return
+  try {
+    await mcpApi.remove(key)
+    connected.value[key] = false
+    await refreshEnginePop()
+  } catch {
+    /* 移除失败保持原状 */
+  }
+}
+
+async function addServer() {
+  const ns = newServer.value
+  if (!ns.key) return
+  savingServer.value = true
+  try {
+    const cfg: Record<string, unknown> = { transport: ns.transport, enabled: ns.enabled }
+    if (ns.label) cfg.label = ns.label
+    if (ns.transport === 'stdio') cfg.command = ns.command
+    else cfg.url = ns.url
+    const r = await mcpApi.save(ns.key, cfg)
+    if (!r.ok) {
+      await askAlert({ title: '新增连接器失败', message: r.error || '未知错误' })
+      return
+    }
+    showAddForm.value = false
+    newServer.value = { key: '', label: '', transport: 'stdio', command: '', url: '', enabled: true }
+    await refreshEnginePop()
+  } catch (e) {
+    await askAlert({ title: '新增连接器失败', message: (e as Error).message })
+  } finally {
+    savingServer.value = false
+  }
 }
 function connectorGuide(s: McpServer) {
   if (s.key.includes('godot')) return '让 AI 读取场景、节点和运行日志；请先打开 Godot 项目。'
@@ -288,24 +353,52 @@ function connectorGuide(s: McpServer) {
       </div>
       <div v-for="s in servers" :key="s.key" class="cd-server">
         <div class="cd-server-row">
-          <span class="cd-dot" :class="resultOf(s)?.ok ? 'cd-dot-ok' : (!s.enabled ? 'cd-dot-off' : 'cd-dot-idle')" />
+          <span class="cd-dot" :class="connected[s.key] ? 'cd-dot-ok' : (!s.enabled ? 'cd-dot-off' : 'cd-dot-idle')" />
           <span class="cd-server-name">{{ s.label || s.key }}</span>
           <span class="cd-server-meta">{{ s.transport === 'stdio' ? '本机插件' : '本机服务' }}</span>
           <span class="cd-spacer" />
           <button class="cd-mini" :disabled="probing === s.key || !s.enabled" @click="probe(s.key)">
-            {{ probing === s.key ? '连接中…' : (resultOf(s.key) ? '重试' : '连接') }}
+            {{ probing === s.key ? '连接中…' : (connected[s.key] ? '重连' : '连接') }}
           </button>
+          <button class="cd-mini cd-mini-stop" :disabled="!connected[s.key] || s.transport !== 'stdio'"
+                  title="断开 stdio 长驻会话（HTTP 无状态服务无需断开）" @click="closeServer(s.key)">断开</button>
         </div>
         <div class="cd-server-guide">{{ connectorGuide(s) }}</div>
-        <div v-if="resultOf(s.key)" class="cd-server-result">
-          <span v-if="resultOf(s.key)?.ok" class="cd-ok-text">
-            已连接 · {{ resultOf(s.key)?.tool_count }} 个工具可用
-          </span>
-          <span v-else class="cd-err-text" :title="resultOf(s.key)?.error">
-            {{ resultOf(s.key)?.error || '连接失败（确认对应引擎/插件已运行）' }}
-          </span>
+        <div v-if="connected[s.key]" class="cd-server-result">
+          <span class="cd-ok-text">已连接{{ resultOf(s)?.tool_count != null ? ' · ' + resultOf(s)?.tool_count + ' 个工具可用' : '' }}</span>
         </div>
-        <div v-if="s.help && !resultOf(s.key)" class="cd-server-help">{{ s.help }}</div>
+        <div v-else-if="resultOf(s)" class="cd-server-result">
+          <span v-if="resultOf(s)?.ok" class="cd-ok-text">已断开（上次连接成功）</span>
+          <span v-else class="cd-err-text" :title="resultOf(s)?.error">{{ resultOf(s)?.error || '连接失败（确认对应引擎/插件已运行）' }}</span>
+        </div>
+        <div v-if="s.help && !resultOf(s) && !connected[s.key]" class="cd-server-help">{{ s.help }}</div>
+        <div class="cd-server-actions">
+          <span class="cd-spacer" />
+          <button class="cd-mini cd-mini-danger" @click="removeServer(s.key)">移除</button>
+        </div>
+      </div>
+
+      <button class="cd-mini cd-add-toggle" @click="showAddForm = !showAddForm">+ 新增连接器</button>
+      <div v-if="showAddForm" class="cd-add-form">
+        <div class="cd-add-row">
+          <input v-model="newServer.key" class="cd-input-sm" placeholder="key（字母数字_-，≤40）" />
+          <input v-model="newServer.label" class="cd-input-sm" placeholder="显示名（可选）" />
+        </div>
+        <div class="cd-add-row">
+          <select v-model="newServer.transport" class="cd-input-sm">
+            <option value="stdio">stdio</option>
+            <option value="http">http</option>
+          </select>
+          <label class="cd-add-chk"><input type="checkbox" v-model="newServer.enabled" /> 启用</label>
+        </div>
+        <div class="cd-add-row">
+          <input v-if="newServer.transport === 'stdio'" v-model="newServer.command" class="cd-input-sm" placeholder="命令（如 uvx）" />
+          <input v-else v-model="newServer.url" class="cd-input-sm" placeholder="url（http://…）" />
+        </div>
+        <div class="cd-add-actions">
+          <button class="cd-mini" :disabled="savingServer || !newServer.key" @click="addServer">保存</button>
+          <button class="cd-mini" @click="showAddForm = false">取消</button>
+        </div>
       </div>
     </div>
 
@@ -449,6 +542,23 @@ function connectorGuide(s: McpServer) {
 }
 .cd-mini:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
 .cd-mini:disabled { opacity: .45; cursor: default; }
+.cd-mini-stop { border-color: var(--border-strong); }
+.cd-mini-stop:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
+.cd-mini-danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
+
+.cd-server-actions { display: flex; align-items: center; padding-top: 5px; }
+.cd-add-toggle { margin-top: 6px; }
+.cd-add-form { margin-top: 6px; padding: 8px; border: 1px dashed var(--border); border-radius: 6px; display: flex; flex-direction: column; gap: 6px; }
+.cd-add-row { display: flex; gap: 6px; align-items: center; }
+.cd-input-sm {
+  flex: 1; min-width: 0; height: 24px; padding: 0 7px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 5px;
+  font-size: 11px; font-family: inherit; outline: none;
+}
+.cd-input-sm:focus { border-color: var(--accent); }
+.cd-add-chk { font-size: 11px; color: var(--text-muted); display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.cd-add-actions { display: flex; gap: 6px; justify-content: flex-end; }
 
 .cd-server { padding: 7px 0; border-top: 1px dashed var(--border); }
 .cd-server-name { font-size: 12px; }

@@ -988,6 +988,19 @@ export const mcpApi = {
       Promise<{ ok: boolean; text?: string; is_error?: boolean; error?: string }> {
     return postJson('/api/mcp/call', { key, name, arguments: args })
   },
+  save(key: string, config: Record<string, unknown>):
+      Promise<{ ok: boolean; servers?: McpServer[]; error?: string }> {
+    return postJson('/api/mcp/servers', { key, config })
+  },
+  remove(key: string): Promise<{ ok: boolean; servers?: McpServer[]; error?: string }> {
+    return postJson('/api/mcp/servers/remove', { key })
+  },
+  close(key: string): Promise<{ ok: boolean; closed?: boolean; error?: string }> {
+    return postJson('/api/mcp/close', { key })
+  },
+  status(): Promise<{ ok: boolean; active?: string[]; error?: string }> {
+    return request('/api/mcp/status')
+  },
   addonStatus(): Promise<GodotAddonStatus> {
     return request('/api/engine/addon/status')
   },

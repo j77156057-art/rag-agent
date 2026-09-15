@@ -123,6 +123,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-15 | **回溯式重规划（`78d1504`）**：`replanner` 提案升级为 `{add, drop, replace}`（裸任务数组仍等价于 `{add}`，向后兼容）——**add** 追加补救任务、**drop** 取消尚未执行的任务（记为 `dropped` 并阻断其下游）、**replace** 原地改写未执行任务的 role/task/deps（常用来把被阻断的下游**救回来**）。**安全边界**：只能动**尚未执行**的任务，已执行者不可删改（记入 `ignored`），本编排器**不回滚已产生的副作用**。非法项逐条忽略不抛异常；每次改动记入 `report.revisions` 审计。修了两个要点：被 drop 的任务移出 `by_id` 后，`ok` 与依赖判定改用 `.get` 兜底且把 `optional` 留在结果条目里（可选任务被 drop 后下游仍豁免）；`drop` 不就地修改调用方传入的 plan。agent 侧 `_replanner` 提示升级并放行 dict 形态提案。`test_orchestrator.py` 34 → 45 例，全量 430 → **441** 全绿；端点端到端 **13/13** |
 | 2026-09-15 | **执行轨迹回传（`2689035`）**：`replanner` 此前只拿到失败任务的错误串与各任务结论，无法判断"为什么没成"。现在 `Agent.run` 把每回合 trace 留在 **`last_turn_record`**，`_run_child` 采集**有界**逐步轨迹（`{action, obs片段}` + thoughts/reflections + 子回合 outcome/llm_calls/tokens/耗时/成本；上限 `DOCMIND_ORCH_TRACE_STEPS`=6 步、每步观察 `DOCMIND_ORCH_TRACE_OBS_CHARS`=240 字，超出只计数），随结果一起进 `results`（`/api/orchestrate` 返回值里也有）；`_replanner` 把失败任务的轨迹逐条渲染进提示（无轨迹时明写"未留下可用执行轨迹"）；`format_report` 给失败/被取消任务补一行轨迹摘要。`test_orchestrator.py` 45 → 54 例，全量 441 → **450** 全绿；端点端到端 **16/16** |
 | 2026-09-15 | **黄金题题库建成（`golden/questions.json` 8 题 + `golden/results_baseline.jsonl` 8/8 通过）**：门不再默认 SKIP——`docmind-frozen-release` 阶段 0 的 `GOLDEN_QUESTIONS` 已指向入仓题库。源码类题（G2/G3/G4/G6/G7）依赖 `code_root` 指向本仓库且 `ingest_code` 已索引；SKILL 已写明**隔离 chroma 的专用评测服务**起法（`CHROMA_DIR` 复制自 `.chroma` + `CODE_ROOT=<repo>` + POST `/api/ingest_code`），避免污染你 `:8000` 的游戏代码索引。断言用 `any_of`+`must_not_include`+`no_error` 鲁棒匹配、不依赖逐字；离线规则打分常驻 `tests/test_agent_eval.py` |
+| 2026-09-15 | **连接器启停 UI 落地**：ChatDock「引擎」弹层新增 **断开**（关闭 stdio 长驻会话，新增 `POST /api/mcp/close` + `mcp_client.close_server` 复用）、**真实连接状态**（新增 `GET /api/mcp/status` + `mcp_client.active_servers()`，弹层打开时回填 connected 态）、**新增/移除连接器**（`POST /api/mcp/servers` / `/remove` 接入 UI 表单）；修正原模板 `resultOf(s.key)` 误传字符串（应为 server 对象）导致「已连接 · N 工具」状态**永不显示**的 bug。新增 `tests/test_mcp_connector.py` 6 例全绿。**未实机**：`active` 仅在真实 stdio 引擎（Godot/uvx）连接后填入，本沙箱无引擎未跑该路径 |
 
 > 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（18 次完整记录，继续追加不要新建文件）。
 
@@ -135,7 +136,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 ### Agent 模型路由与权限（基础层 + UI 已落地，2026-09-14 接手核对）
 
 `agent_policy.py`、`/api/agent/route`、`/api/agent/routing`、`/api/agent/connectors`、`/api/agent/permission`、`/api/agent/secrets`(GET/DELETE)、`/api/agent/approvals`(含 decide 与 before/after unified diff)、`/api/agent/external-write` 和 Skill `agent-model-routing` 均已落地；前端 `AgentPolicyPanel.vue` 已在工作台顶栏接线（路由状态/连接器清单/外部路径审批/Diff 批准拒绝）。`/api/chat` SSE 首事件返回路由建议并注入上下文；`AGENT_AUTO_CLOUD=1` + 云端密钥时复杂请求走云端 Agent，缺密钥自动回退本地；云端发送前经 `redact_for_cloud` 脱敏并截断上下文；`dev_mcp_call` 校验连接器启用状态、可选 task_id 绑定与参数路径越权；外部写入需 approved approval_id + 精确路径，写前生成 `.docmind.bak`；密钥 DPAPI/Fernet 往返、撤销、授权均有回归测试。外部授权写项目内 `.docmind_permissions.jsonl` 审计日志，Agent 自身项目始终拒绝写入。
-**仍待做（非阻塞）**：连接器 UI 目前只展示清单与启用状态，启停/配置管理界面未做；ReAct 内部连接器选择依赖工具清单读取，尚无"Agent 自主切换连接器"的策略层。
+**仍待做（非阻塞）**：ReAct 内部连接器选择依赖工具清单读取，尚无"Agent 自主切换连接器"的策略层（连接器**启停/配置管理 UI 已于 2026-09-15 落地**：ChatDock「引擎」弹层，后端新增 `POST /api/mcp/close` 与 `GET /api/mcp/status`，见 §4 时间线）。
 
 ### P1-2　Unity 深度适配（GUID 引用图已落地，编辑器联机未做）
 
@@ -429,6 +430,13 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 新建 `docs/integrations.md`（MCP 引擎桥接 + Web 试玩导出的产品级使用文档与边界说明，提交 `60afe5b`）。
 - 本次在 `README.md` / `README_en.md`（配套能力段 + 目录树 `mcp_client.py`/`web_export.py` 注释）与 `HANDOFF.md` §9 文档地图补 `docs/integrations.md` 引用，使其从"docs/ 下第一份孤立 .md"变为被三处引用。
 - 提交：本引用补完（独立提交，仅文档引用变动）。
+
+**2026-09-15 追加（连接器启停 UI，`mcp_client.py`+`api.py`+`ChatDock.vue`+`api.ts`+`tests/test_mcp_connector.py`）**
+- 后端新增 `POST /api/mcp/close`（复用 `close_server`，仅关会话保留配置；HTTP 无状态服务无会话可关）与 `GET /api/mcp/status`（`active_servers` 返回当前有长驻会话的 key 列表，供前端反映真实连接态）。`mcp_client` 新增 `active_servers(root)`。
+- 前端 `api.ts` 的 `mcpApi` 补 `close/status/save/remove`；`ChatDock.vue`「引擎」弹层每服务器加 **断开** 按钮（仅 stdio 且已连接可点）、连接态经 `status` 回填、并加 **新增/移除连接器** 表单（key/label/transport/command|url/enabled）。
+- 修一个旧 bug：原模板用 `resultOf(s.key)`（传字符串）而 `resultOf` 接收 server 对象，导致「已连接 · N 工具」**永不显示**；统一改为传 `resultOf(s)`。
+- 新增 `tests/test_mcp_connector.py` 6 例（active 空/有会话+close/未知 key 安全/status 形状/close 形状/save-remove 往返），全绿。**未实机**：`active` 仅在真实引擎（Godot/uvx）建立 stdio 会话后填入，本沙箱无引擎未跑该路径。
+- **未跑 `npm run build`**（铁律：会重建 `web/assets` 打断 `:8000` 实例/对面前端写入者），前端编译待你或下个发布构建核对；改完后端用隔离端口 8078 真打 `status`(`active:[]`) 与 `close`(`ok,closed:false`) 验收。
 
 **以下为 codex/p1-3-gpu-comfyui 分支原始变更记录（保留存档；其中部分设计在合并集成时被有意调整，以本文件末尾「P1-3 合并集成」段为准）**
 - 密钥存储新增 1 项回归测试：往返解密、明文不落盘、Provider 列表和撤销均已验证。全量测试 205 项。
