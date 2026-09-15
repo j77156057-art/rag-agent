@@ -23,22 +23,24 @@ DocMind 的应对分两层：
 | **场景画布** | Godot `.tscn` 的**可视化 + 可编辑**画布：层级树 / 空间坐标两种布局，节点父子层级、实例（instance）、position / transform、资源引用一目了然；新增 / 删除 / 改名 / 换父 / 复制 / 改属性 / 拖拽写回位置，**全部可撤销，且撤销能逐字节还原文件** |
 | **运行时时间线** | 把游戏跑起来产生的事件（掉血 / 死亡 / 生成 / 变量变化）画成多轨道时间轴：类型筛选、时间缩放、会话分组、数值曲线、导出 JSON、点事件跳代码行 |
 
-配套：**引擎嵌入**（Godot / Unity / Unreal 启停 + Win32 HWND 嵌进工作台）、**Web 试玩**（导出 WASM 在画布里边玩边改）、**MCP 桥接**、**GPU 租约队列**、**桌面打包**（PyInstaller onedir，双击即用）。
+配套：**引擎嵌入**（Godot / Unity / Unreal 启停 + Win32 HWND 嵌进工作台）、**Web 试玩**（导出 WASM 在画布里边玩边改）、**MCP 桥接**、**GPU 租约队列**、**桌面打包**（PyInstaller onedir，双击即用），以及一套 **Agent 运行时（Harness）**——trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔，见下文「Harness 能力」。
 
 ## 🧱 技术栈
 
 - 后端：Python · FastAPI（HTTP + SSE）· Chroma 双集合（文档 / 代码）· OpenAI 兼容多 Provider（qwen / deepseek / ollama / llamacpp / mock）· PyInstaller + pywebview
 - 前端：Vue 3.5 · Vite 5 · TypeScript · CodeMirror 6 · Vue Flow · 手写深色设计系统
-- 验证：`unittest` 202 项 · 场景画布自检 54 项 · 浏览器冒烟 27 项（Playwright + 系统 Edge）· 引擎嵌入实机自检 64 项
+- 验证：`unittest` **450 项** · 场景画布自检 54 项 · 浏览器冒烟 27 项（Playwright + 系统 Edge）· 引擎嵌入实机自检 68 项
 
 ## 📁 目录结构
 
 ```
 rag-agent/
-├── api.py                 # HTTP / SSE 总入口（105 条路由：chat / ingest / 工作台 fs / regions /
-│                          #   engine / desktop-host / selection-ai / scene / runtime / MCP / GPU）
-├── agent.py               # ReAct 循环、反思重试、代码优先路由、证据护栏
-├── tools.py               # 42 个工具：9 基础 + 受控写 + 24 个分区 / 研发工具
+├── api.py                 # HTTP / SSE 总入口（159 条路由：chat / ingest / 工作台 fs / regions /
+│                          #   engine / desktop-host / selection-ai / scene / runtime / MCP / GPU /
+│                          #   trace / sessions / budget / hooks / skills / orchestrate）
+├── agent.py               # ReAct 循环、反思重试、代码优先路由、证据护栏；run/_run 埋点外壳；
+│                          #   原生 function-calling、plan 模式、子代理委派、并行批次
+├── tools.py               # 47 个工具：9 基础 + 受控写 + 分区/研发工具 + delegate/orchestrate/dev_use_skill
 ├── regions.py             # 分区 2.0：声明式配置、契约校验（DAG 无环 / 导出存在）、变更集与回滚
 ├── scene_runtime.py       # 场景画布内核：.tscn 行块解析 → 图模型 → 受控编辑（可回滚 + 可撤销）
 ├── workbench_fs.py        # 沙箱文件树、读写、git 状态 / 历史 / 回滚、符号地图、关系图
@@ -51,11 +53,18 @@ rag-agent/
 ├── mcp_client.py          # MCP（Model Context Protocol）桥接
 ├── web_export.py          # Godot Web 导出与本地试玩
 ├── llm.py / embeddings.py / vectorstore.py / ingest.py / config.py
+├── agent_trace.py         # 逐轮 trace + token 账本（JSONL，只记元数据；/trace 查看页）
+├── sessions.py            # 会话隔离 + 持久化 + 滚动摘要
+├── pricing.py             # 按 provider 计价 + 全局/会话预算熔断
+├── hooks.py               # 工具/回合钩子热插拔（.docmind/hooks/*.py）
+├── skills.py              # 技能热插拔（.docmind/skills/**/*.md + dev_use_skill）
+├── agent_eval.py          # 黄金题自动打分 + baseline 回归门
+├── orchestrator.py        # 多代理编排：任务图 DAG + 并行 + 重规划 + 结果合成
 ├── frontend/              # Vue 工作台（构建产物输出到 ../web）
 │   └── src/workbench/components/
 │       ├── SceneCanvas.vue / SceneNodeCard.vue / SceneFileCard.vue   # 场景画布
 │       └── RuntimeTimeline.vue                                       # 运行时时间线
-├── tests/                 # unittest 202 项
+├── tests/                 # unittest 450 项
 ├── verify_scene_canvas.py / verify_scene_canvas_ui.mjs   # 场景画布自检 + 浏览器冒烟
 ├── HANDOFF.md             # ★ 唯一权威交接文档（原因 / 基线 / 待办 / 坑，接手先读它）
 ├── DocMind_BUILD.md       # 冻结构建档案（发布流程强制在其中追加，不新建文件）
@@ -108,7 +117,7 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文
 ```
 
 - **引擎嵌入**：Godot / Unity / Unreal 的窗口按 Win32 HWND 规则嵌进工作台（`desktop_bridge.py`）。
-  **已在 Godot 4.7.2 + 真 Win32 宿主下实机验证**（`verify_engine_embed.py` 64 项全绿）：置父与样式摘除、按客户区（或前端指定的"引擎视窗"矩形）铺排、
+  **已在 Godot 4.7.2 + 真 Win32 宿主下实机验证**（`verify_engine_embed.py` 68 项全绿）：置父与样式摘除、按客户区（或前端指定的"引擎视窗"矩形）铺排、
   宿主 resize 跟随、**真实合成键鼠（SendInput）送达引擎并回显事件**、解除嵌入后窗口原样还原、停止后无孤儿进程/窗口、父子 DPI 一致（本机 150% 缩放实测）。
   嵌入是**可逆**的：`detach` 会恢复原始父窗口、窗口样式与屏幕位置——不保存这些状态直接 `SetParent(NULL)`，窗口会带着 `WS_CHILD` 变成看不见的顶层窗口。
   试玩器里有「嵌入工作台」开关：勾上后点「桌面窗口启动」，游戏画面直接落在弹窗的引擎视窗上，工作台界面照常可用；
@@ -117,10 +126,48 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文
 - **打包成独立 exe（onedir 目录分发）**：`docmind.spec` 一条命令产出 `dist\DocMind\DocMind.exe`，把整个 `dist\DocMind` 目录一起分发即可，目标机器无需安装 Python。完整流程见 [DocMind_BUILD.md](DocMind_BUILD.md) 与 `.trae/skills/docmind-frozen-release/SKILL.md`。
 - **分发版能力边界**：分包 `builtin:py` 校验在进程内做语法检查（exe 与源码行为一致）；但 playtest 自动测试、cProfile 剖析、`python_exec` 需要真实 Python 环境，请在源码 `.venv` 里用；分区的 git 操作要求目标机器装有 Git。
 
+## 🧭 Harness 能力（Agent 运行时）
+
+把「能跑的 agent」补齐成「**可观测、可编排、可回归**」的运行时。以下能力都在仓库根，纯本地、无外部依赖：
+
+| 能力 | 说明 | 入口 |
+|---|---|---|
+| **逐轮 trace + token 账本** | 每个回合一条 JSONL：`turn_id / session_id / messages 哈希 / 工具调用序列 / tokens in-out / 各步延迟 / finish_reason / 结局 / cost_cny`。**只记元数据不记正文**（不落 prompt/回答原文），超 8 MB 自动轮转 | 页面 **`/trace`**；`GET /api/trace`、`/api/trace/summary`、`POST /api/trace/clear` |
+| **会话隔离 + 持久化** | `Agent(session_id=)` 按会话隔离（传空=纯内存，行为与旧版一致）；历史落盘、超阈值把早期轮次**压成摘要**；不再共用单例导致历史串台 | `/api/chat` 的 `session_id`；`GET /api/sessions`、`DELETE /api/sessions/{id}` |
+| **LLM 弹性** | 重试 + 指数退避（429 / 5xx / 超时 / 网络可重试，**4xx 明确不重试**）+ 统一 `timeout`/`deadline`；SSE 客户端断连即关闭内层生成器中止回合并记账 | `DOCMIND_LLM_*`、`DOCMIND_TURN_DEADLINE_S` |
+| **评测自动化** | 黄金题规则打分（`must_include / any_of / must_not_include / regex / must_call / 动作边界 / no_error`）+ 可选 LLM-judge + **baseline 回归门**（pass→fail 即退出码 1） | `agent_eval.py`、`agent-golden-eval` skill 的 `gate.py`（已接入冻结发布流程） |
+| **原生 function-calling** | 由工具表生成 OpenAI 风格 schema；`tool_calls` 归一进文本协议后**复用全部既有护栏**（写意图 / 防重复 / 步数 / 证据兜底），事件类型不变 | `DOCMIND_TOOL_MODE=react\|native\|auto` |
+| **多代理编排器** | 任务图 DAG（校验 + 拓扑分波 + 同波并行）+ **下游注入上游结论** + **失败自动重规划**（提案 `add / drop / replace`，只能改**尚未执行**的任务）+ 结果合成 + **子代理执行轨迹回传**给 replanner 做失败归因 | `orchestrate` 工具、`POST /api/orchestrate` |
+| **成本熔断** | 按 provider/model 计价（可 `.docmind_pricing.json` 覆盖；本地 provider 恒 0）+ 全局/会话累计预算；**回合前拒绝、回合后累计** | `GET/POST /api/budget` |
+| **hooks / 技能热插拔** | `.docmind/hooks/*.py` 的 `pre/post_tool`、`pre/post_turn`（单个钩子异常被隔离）；`.docmind/skills/**/*.md` 目录注入系统提示、正文由 `dev_use_skill` 按需取 | `POST /api/hooks/reload`、`POST /api/skills/reload` |
+| **并行工具批次** | 一轮多条**只读**调用并发执行（结果**保序**回填）；批内只要含写/副作用工具就整批退回顺序，**绝不并发写** | `DOCMIND_PARALLEL_TOOLS`、`DOCMIND_PARALLEL_MAX` |
+
+**三条设计取向**：① **护栏复用**——原生 FC 与并行批次都不新开执行路径，直接走既有护栏，避免"两套语义"；② **有界**——轨迹、观察、历史、批次全部截断或摘要，不让上下文与提示词爆炸；③ **不越权**——编排器只能改未执行任务（不回滚已产生的副作用）、写工具绝不并发、钩子异常一律吞掉。
+
+快速上手（起服务后）：
+
+```bash
+# 看一眼逐轮账本（谁调了什么工具、烧了多少 token、花了多少钱、什么结局）
+http://127.0.0.1:8000/trace
+
+# 跑一张任务图（无依赖的并行、有依赖的等上游结论；失败会自动补图）
+curl --noproxy '*' -X POST http://127.0.0.1:8000/api/orchestrate -H "Content-Type: application/json" \
+  -d '{"tasks":[{"id":"a","role":"researcher","task":"查 X 的实现"},
+                {"id":"b","role":"reviewer","task":"评审上一结论","depends_on":["a"]}],"synth":true}'
+
+# 设一个 5 元成本上限（本地模型恒 0 花费，不会误伤离线演示）
+curl --noproxy '*' -X POST http://127.0.0.1:8000/api/budget -H "Content-Type: application/json" \
+  -d '{"limit_cny":5}'
+```
+
+新增环境变量全部列在 `.env.example`（`DOCMIND_TRACE*` / `DOCMIND_SESSION_*` / `DOCMIND_LLM_*` / `DOCMIND_TOOL_MODE` / `DOCMIND_ORCH_*` / `DOCMIND_BUDGET_CNY` / `DOCMIND_HOOKS_DIR` / `DOCMIND_SKILLS_DIR` / `DOCMIND_PARALLEL_*`）。
+
+> **能力边界（不夸大）**：子代理**不共享**父上下文（靠上游结论注入传递）；重规划只改**未执行**的计划、**不回滚**已执行任务；轨迹是**有界摘要**（全文在 `.docmind_traces.jsonl`）；hooks 无沙箱（`.py` 直载，权限等同本服务）；技能只是提示词注入、不带可执行脚本。
+
 ## 🧪 测试与自检
 
 ```bash
-# 全量单元测试（202 项；MinGit 在 PATH 时 git 用例会实际执行）
+# 全量单元测试（450 项；MinGit 在 PATH 时 git 用例会实际执行）
 .venv\Scripts\python.exe -B -m unittest discover -s tests
 
 # 场景画布 —— 后端自检：进程内起 FastAPI + 临时 Godot 工程，走真实路由，不占端口

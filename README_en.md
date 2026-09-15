@@ -29,16 +29,20 @@ Supporting pieces: **engine embedding** (Godot / Unity / Unreal launch + Win32 H
 
 - Backend: Python · FastAPI (HTTP + SSE) · Chroma dual collections (docs / code) · OpenAI-compatible multi-provider (qwen / deepseek / ollama / llamacpp / mock, plus native embedding) · PyInstaller + pywebview
 - Frontend: Vue 3.5 · Vite 5 · TypeScript · CodeMirror 6 · Vue Flow · hand-written dark design system
-- Verification: `unittest` **298/298** · scene-canvas self-check **54/54** · browser smoke **27/27** (Playwright + system Edge) · engine-embed real-machine self-check **68/68** · `npm run build` (Vite 5.4.21)
+- Verification: `unittest` **450/450** · scene-canvas self-check **54/54** · browser smoke **27/27** (Playwright + system Edge) · engine-embed real-machine self-check **68/68** · `npm run build` (Vite 5.4.21)
+- Agent runtime (harness): per-turn trace ledger + token/cost accounting · session isolation & persistence · LLM retry/deadline · eval gate · native function-calling · multi-agent orchestrator · cost fuse · hot-pluggable hooks & skills (see "Harness" below)
 
 ## 📁 Structure
 
 ```
 rag-agent/
-├── api.py                 # HTTP / SSE entry point (~105 routes: chat / ingest / workbench-fs /
-│                          #   regions / engine / desktop-host / selection-ai / scene / runtime / MCP / GPU)
-├── agent.py               # ReAct loop, reflection-retry, code-first routing, evidence guardrails
-├── tools.py               # 40+ tools: 9 base + controlled-write + 30+ dev/region tools
+├── api.py                 # HTTP / SSE entry point (159 routes: chat / ingest / workbench-fs /
+│                          #   regions / engine / desktop-host / selection-ai / scene / runtime / MCP / GPU /
+│                          #   trace / sessions / budget / hooks / skills / orchestrate)
+├── agent.py               # ReAct loop, reflection-retry, code-first routing, evidence guardrails;
+│                          #   run/_run instrumentation shell; native function-calling, plan mode,
+│                          #   sub-agent delegation, parallel tool batches
+├── tools.py               # 47 tools: 9 base + controlled-write + dev/region tools + delegate/orchestrate/dev_use_skill
 ├── regions.py             # Region 2.0: declarative config, contract validation (DAG acyclic / exports exist),
 │                          #   changesets and rollback
 ├── scene_runtime.py       # Scene-canvas core: .tscn line-block parse → graph model → controlled edit
@@ -54,13 +58,20 @@ rag-agent/
 ├── desktop_bridge.py      # Win32: find host window / SetParent embed / resize / focus
 ├── desktop.py             # Desktop launcher (single-instance guard + pywebview window)
 ├── llm.py / embeddings.py / vectorstore.py / ingest.py / config.py
+├── agent_trace.py         # per-turn trace + token ledger (JSONL, metadata only; /trace viewer)
+├── sessions.py            # session isolation + persistence + rolling summary
+├── pricing.py             # per-provider pricing + global/session budget fuse
+├── hooks.py               # hot-pluggable tool/turn hooks (.docmind/hooks/*.py)
+├── skills.py              # hot-pluggable skills (.docmind/skills/**/*.md + dev_use_skill)
+├── agent_eval.py          # golden-question auto-scoring + baseline regression gate
+├── orchestrator.py        # multi-agent orchestration: task DAG + parallel + re-plan + synthesis
 ├── frontend/              # Vue workbench (build output → ../web)
 │   └── src/workbench/components/
 │       ├── SceneCanvas.vue / SceneNodeCard.vue / SceneFileCard.vue   # scene canvas
 │       ├── RuntimeTimeline.vue                                       # runtime timeline
 │       ├── UnityGraph.vue                                            # Unity GUID graph (P1-2)
 │       └── GpuPanel.vue                                              # GPU lease panel (P2-1)
-├── tests/                 # unittest 298 items
+├── tests/                 # unittest 450 items
 ├── verify_scene_canvas.py / verify_scene_canvas_ui.mjs   # scene-canvas self-check + browser smoke
 ├── verify_engine_embed.py # engine-embed real-machine self-check
 ├── HANDOFF.md             # ★ sole authority handoff doc (why / baseline / todos / pitfalls — read first)
@@ -121,10 +132,40 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=What file formats does 
 - **Package as a standalone exe (onedir distribution)**: `docmind.spec` produces `dist\DocMind\DocMind.exe` in one command; ship the whole `dist\DocMind` folder, the target machine needs no Python. Full flow in [DocMind_BUILD.md](DocMind_BUILD.md) and `.trae/skills/docmind-frozen-release/SKILL.md`.
 - **Packaged build capability boundary**: the bundled `builtin:py` does in-process syntax checks (exe behaves like source); but playtest auto-test, cProfile, and `python_exec` need a real Python environment — use them in the source `.venv`. Region git operations require Git on the target machine.
 
+## 🧭 Harness (the agent runtime)
+
+Turns "an agent that runs" into "an agent runtime you can **observe, orchestrate and regression-test**". All of it lives in the repo root — local-only, no external dependency:
+
+| Capability | What it does | Entry point |
+|---|---|---|
+| **Per-turn trace + token ledger** | One JSONL record per turn: `turn_id / session_id / messages hash / tool-call sequence / tokens in-out / per-step latency / finish_reason / outcome / cost_cny`. **Metadata only** (never stores prompt/answer text); auto-rotates at 8 MB | Page **`/trace`**; `GET /api/trace`, `/api/trace/summary`, `POST /api/trace/clear` |
+| **Session isolation + persistence** | `Agent(session_id=)` isolates sessions (empty = in-memory, identical to old behaviour); history is persisted and old turns get **summarised** past a threshold; no more shared singleton leaking history across sessions | `session_id` on `/api/chat`; `GET /api/sessions`, `DELETE /api/sessions/{id}` |
+| **LLM resilience** | Retry + exponential backoff (429 / 5xx / timeout / network are retryable, **4xx explicitly is not**) + unified `timeout`/`deadline`; an SSE client disconnect aborts the turn and is accounted for | `DOCMIND_LLM_*`, `DOCMIND_TURN_DEADLINE_S` |
+| **Eval automation** | Rule-based golden-question scoring (`must_include / any_of / must_not_include / regex / must_call / action bounds / no_error`) + optional LLM judge + a **baseline regression gate** (pass→fail exits non-zero) | `agent_eval.py`, `gate.py` in the `agent-golden-eval` skill (wired into the frozen-release pipeline) |
+| **Native function-calling** | OpenAI-style schemas generated from the tool registry; `tool_calls` are normalised into the text protocol so **every existing guardrail still applies** and event types are unchanged | `DOCMIND_TOOL_MODE=react\|native\|auto` |
+| **Multi-agent orchestrator** | Task-graph DAG (validated, topologically waved, same-wave parallel) + **downstream tasks receive upstream conclusions** + **automatic re-planning on failure** (proposals `add / drop / replace` — only tasks that have **not run yet** may change) + result synthesis + **sub-agent execution traces fed back** to the re-planner for failure attribution | `orchestrate` tool, `POST /api/orchestrate` |
+| **Cost fuse** | Prices per provider/model (overridable via `.docmind_pricing.json`; local providers are always 0) + global/session budgets; **refuses before the turn, charges after it** | `GET/POST /api/budget` |
+| **Hot-pluggable hooks & skills** | `pre/post_tool`, `pre/post_turn` hooks from `.docmind/hooks/*.py` (a broken hook is isolated); skill catalog from `.docmind/skills/**/*.md` injected into the system prompt with bodies fetched on demand via `dev_use_skill` | `POST /api/hooks/reload`, `POST /api/skills/reload` |
+| **Parallel tool batches** | Multiple **read-only** calls from one turn run concurrently (results re-ordered back into place); a batch containing any write/side-effecting tool falls back to sequential — **writes are never concurrent** | `DOCMIND_PARALLEL_TOOLS`, `DOCMIND_PARALLEL_MAX` |
+
+**Three design stances**: ① **guardrail reuse** — native FC and parallel batches do not open a second execution path, so semantics never fork; ② **bounded** — traces, observations, history and batches are all truncated or summarised so context/prompts cannot explode; ③ **no over-reach** — the orchestrator may only edit not-yet-executed tasks (side effects are never rolled back), writes are never parallel, hook exceptions are swallowed.
+
+```bash
+# Inspect the per-turn ledger (what tools ran, tokens, cost, outcome)
+http://127.0.0.1:8000/trace
+
+# Run a task graph (independent tasks run in parallel; dependents wait for upstream conclusions)
+curl --noproxy '*' -X POST http://127.0.0.1:8000/api/orchestrate -H "Content-Type: application/json" \
+  -d '{"tasks":[{"id":"a","role":"researcher","task":"find where X is implemented"},
+                {"id":"b","role":"reviewer","task":"review the above","depends_on":["a"]}],"synth":true}'
+```
+
+> **Honest boundaries**: sub-agents do **not** share the parent context (it is passed via upstream conclusions); re-planning only edits the **not-yet-executed** plan and **never rolls back** executed tasks; traces are **bounded summaries** (full text lives in `.docmind_traces.jsonl`); hooks have **no sandbox** (plain `.py` loaded in-process); skills are prompt injection only, with no executable scripts.
+
 ## 🧪 Tests & Self-Checks
 
 ```bash
-# Full unit tests (298 items; git cases actually run when MinGit is on PATH)
+# Full unit tests (450 items; git cases actually run when MinGit is on PATH)
 .venv\Scripts\python.exe -B -m unittest discover -s tests
 
 # Scene canvas — backend self-check: in-process FastAPI + temp Godot project, real routes, no port
