@@ -1,11 +1,11 @@
 <script setup lang="ts">
 // 主区工作区标签条（Godot 式上下文切换）：
-// 概览驾驶舱 / 代码 为当前可用工作区；素材、画布、运行为后续阶段的路线图，
-// 视觉上弱化成右侧浅色 ghost 组（不伪装成可点的页签），阶段 2/3/4 直接点亮。
+// 概览驾驶舱 / 代码 / 素材 为当前可用工作区；画布、运行为真实功能入口，
+// 点击打开「运行游戏」弹窗并切到对应 tab（场景画布 / 试玩）。
 import { useWorkbench } from '../composables/workbench'
 import type { WorkspaceView } from '../composables/workbench'
 
-const { workspace, setWorkspace, tabs } = useWorkbench()
+const { workspace, setWorkspace, tabs, runtimeOpen, runtimeTab, openRuntime } = useWorkbench()
 
 const real: { key: WorkspaceView; name: string; icon: string }[] = [
   { key: 'overview', name: '概览', icon: 'home' },
@@ -13,10 +13,10 @@ const real: { key: WorkspaceView; name: string; icon: string }[] = [
   { key: 'assets', name: '素材', icon: 'assets' },
 ]
 
-// 路线图：◌ + 悬浮说明来自哪个阶段
+// 真实功能入口：点开「运行游戏」弹窗并切到对应 tab
 const soon = [
-  { key: 'canvas', name: '画布', tip: '阶段 3：AI 工具流画布，把多步操作连成流水线' },
-  { key: 'runtime', name: '运行', tip: '阶段 4：内置 Godot，边玩边让 AI 改' },
+  { key: 'canvas', name: '画布', tip: '场景画布：把 Godot .tscn 画成可操作节点图' },
+  { key: 'runtime', name: '运行', tip: '运行游戏：导出 / 启动 Godot，边玩边让 AI 改' },
 ] as const
 
 const HOTKEY: Record<string, number> = { overview: 1, code: 2, assets: 3 }
@@ -24,6 +24,19 @@ const HOTKEY: Record<string, number> = { overview: 1, code: 2, assets: 3 }
 function pick(key: WorkspaceView) {
   if (key === 'code' && !tabs.value.length) return
   setWorkspace(key)
+}
+
+// 顶层「画布 / 运行」→ 弹窗对应 tab
+function pickSoon(key: string) {
+  if (key === 'canvas') openRuntime('scene')
+  else if (key === 'runtime') openRuntime('play')
+}
+// 顶层入口高亮：与弹窗当前 tab 对齐
+function soonActive(key: string) {
+  if (!runtimeOpen.value) return false
+  if (key === 'canvas') return runtimeTab.value === 'scene'
+  if (key === 'runtime') return runtimeTab.value === 'play'
+  return false
 }
 </script>
 
@@ -57,15 +70,17 @@ function pick(key: WorkspaceView) {
       <span>{{ item.name }}</span>
     </button>
 
-    <!-- 路线图：浅色 ghost，不占页签语义 -->
-    <span class="ws-soon-group" aria-label="即将推出">
+    <!-- 画布 / 运行：真实功能入口，点击打开「运行游戏」弹窗并切到对应 tab -->
+    <span class="ws-soon-group">
       <span class="ws-soon-sep" aria-hidden="true" />
       <button
         v-for="item in soon"
         :key="item.key"
         type="button"
         class="ws-soon"
+        :class="{ 'ws-soon-on': soonActive(item.key) }"
         :title="item.tip"
+        @click="pickSoon(item.key)"
       >
         <span class="ws-soon-mark" aria-hidden="true">◌</span>{{ item.name }}
       </button>
@@ -122,12 +137,17 @@ function pick(key: WorkspaceView) {
 .ws-soon {
   display: inline-flex; align-items: center; gap: 4px;
   height: 26px; padding: 0 9px;
-  border: none; background: transparent; border-radius: 7px;
+  border: 1px solid transparent; background: transparent; border-radius: 7px;
   color: var(--text-faint);
   font-family: var(--font-ui); font-size: 11px; font-weight: 500;
-  cursor: help;
-  transition: color .12s, background .12s;
+  cursor: pointer;
+  transition: color .12s, background .12s, border-color .12s;
 }
-.ws-soon:hover { color: var(--text-muted); background: var(--bg-hover); }
-.ws-soon-mark { font-size: 10px; opacity: .8; }
+.ws-soon:hover { color: var(--text); background: rgba(47,111,237,.07); }
+.ws-soon-on {
+  color: var(--accent);
+  background: var(--bg-raised);
+  border-color: var(--border);
+}
+.ws-soon-mark { display: none; }
 </style>

@@ -8,9 +8,15 @@ import { useWorkbench } from '../composables/workbench'
 const SceneCanvas = defineAsyncComponent(() => import('./SceneCanvas.vue'))
 const RuntimeTimeline = defineAsyncComponent(() => import('./RuntimeTimeline.vue'))
 
-const { jumpToLine, openPath, activeTab } = useWorkbench()
+const { jumpToLine, openPath, activeTab, runtimeOpen, runtimeTab } = useWorkbench()
 const open = ref(false)
 const tab = ref<'play' | 'scene' | 'timeline'>('play')
+
+// 顶层「画布 / 运行」tab 与弹窗联动：外部（WorkspaceTabs）请求打开时同步到本地状态，
+// 本地关闭/切 tab 也写回共享态，保证顶层 tab 高亮与实际面板一致。
+watch(runtimeOpen, v => { if (open.value !== v) open.value = v })
+watch(runtimeTab, v => { if (tab.value !== v) tab.value = v })
+watch(open, v => { if (runtimeOpen.value !== v) runtimeOpen.value = v })
 
 /* ---------------- 试玩器 ---------------- */
 const iframeEl = ref<HTMLIFrameElement | null>(null)

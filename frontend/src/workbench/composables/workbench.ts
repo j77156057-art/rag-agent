@@ -227,6 +227,20 @@ function setWorkspace(v: WorkspaceView) {
   workspace.value = v
 }
 
+// ---------------------------------------------------------------- 画布 / 运行：顶层 tab 联动 SceneRuntimePanel
+// 顶层「画布 / 运行」是真实功能入口（场景画布 / 运行游戏），点击打开弹窗并切到对应 tab。
+export type RuntimePanelTab = 'play' | 'scene' | 'timeline'
+const runtimeOpen = ref(false)
+const runtimeTab = ref<RuntimePanelTab>('play')
+
+function openRuntime(t: RuntimePanelTab) {
+  runtimeTab.value = t
+  runtimeOpen.value = true
+}
+function closeRuntime() {
+  runtimeOpen.value = false
+}
+
 // ---------------------------------------------------------------- 最近打开的文件
 interface RecentFile { root: string; path: string; name: string }
 const RECENT_KEY = 'docmind:recent-files'
@@ -1430,5 +1444,7 @@ export function useWorkbench() {
     loadTags, refreshTags,
     locateQuery, locateLoading, locatePaths, locateResult,
     runLocate, clearLocate, openLocateFile, openLocateRegion,
+    // 顶层「画布 / 运行」tab：联动 SceneRuntimePanel
+    runtimeOpen, runtimeTab, openRuntime, closeRuntime,
   }
 }
