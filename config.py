@@ -362,6 +362,11 @@ EXTERNAL_API_ALLOWLIST = [
     if h.strip()
 ]
 
+# ---- AI 越界访问模式：safe=仅项目内；high=允许受控越界读写（须配置白名单）----
+EXTERNAL_ACCESS_MODE = os.getenv("DOCMIND_ACCESS_MODE", "safe").strip().lower()
+if EXTERNAL_ACCESS_MODE not in ("safe", "high"):
+    EXTERNAL_ACCESS_MODE = "safe"
+
 # ---- 聊天图片输入（视觉模型，如 qwen3.6 系列）----
 CHAT_IMAGE_MAX_FILES = int(os.getenv("CHAT_IMAGE_MAX_FILES", "4"))  # 单条消息最多图片数
 CHAT_IMAGE_MAX_BYTES = int(os.getenv("CHAT_IMAGE_MAX_BYTES", str(10 * 1024 * 1024)))  # 单图大小上限（压缩前）
@@ -479,6 +484,10 @@ def _apply_persisted_state():
         for k, v in ov.items():
             if isinstance(k, str) and "/" in k and isinstance(v, int) and v > 0:
                 _CONTEXT_WINDOW_OVERRIDES[k] = v
+    # 越界访问模式（safe/high）：UI 切换后跨重启恢复；显式 set_runtime 优先
+    m = data.get("external_access_mode")
+    if m in ("safe", "high") and "external_access_mode" not in _RUNTIME:
+        _RUNTIME["external_access_mode"] = m
 
 
 # 注：过去此处 import 期直接调用 _apply_persisted_state()（导入即磁盘读）。
@@ -493,3 +502,31 @@ def edit_confirm_enabled():
     if v is not None:
         return bool(v)
     return EDIT_CONFIRM
+
+
+# ---- AI 越界访问模式 ----
+# safe：工具只能读写当前代码库（code_root）内文件，禁止任何项目外访问；
+# high：在配置 DOCMIND_EXTERNAL_DIRS 白名单的前提下，允许对其他目录增删改查。
+# 默认取 .env 的 DOCMIND_ACCESS_MODE；运行时经 /api/config 切换并持久化（见
+# set_external_access_mode）。所有受控越界工具都须先过 get_external_access_mode()。
+def get_external_access_mode():
+    """返回 'safe' | 'high'：运行时覆盖优先，否则取 .env DOCMIND_ACCESS_MODE。"""
+    v = get_runtime("external_access_mode")
+    if v in ("safe", "high"):
+        return v
+    return EXTERNAL_ACCESS_MODE
+
+
+def external_access_high():
+    """便捷判断：当前是否处于高权限（越界）模式。"""
+    return get_external_access_mode() == "high"
+
+
+def set_external_access_mode(mode):
+    """切换越界访问模式：'safe' 或 'high'；非法值回落 'safe'。跨重启持久化。"""
+    mode = (mode or "").strip().lower()
+    if mode not in ("safe", "high"):
+        mode = "safe"
+    set_runtime("external_access_mode", mode)
+    save_state("external_access_mode", mode)
+    return mode

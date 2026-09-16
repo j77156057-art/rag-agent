@@ -12,9 +12,10 @@ import sys
 import threading
 import urllib.request
 import urllib.parse
+import datetime
 import mcp_client
 
-from config import TOP_K, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime, edit_confirm_enabled, EXTERNAL_API_ALLOWLIST
+from config import TOP_K, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime, edit_confirm_enabled, external_access_high, EXTERNAL_API_ALLOWLIST
 from embeddings import EmbeddingClient
 from vectorstore import query as vs_query, pretty_source
 from ingest import _CODE_EXT, _SKIP_DIRS
@@ -284,6 +285,17 @@ def calculate(expression):
 _SEARCH_EMPTY_MARKERS = ("搜索失败", "搜索未返回结果")
 
 
+def _search_recency_query(q: str) -> str:
+    """默认偏好近一年结果：给查询追加 after:<去年>；可用 env WEB_SEARCH_PREFER_RECENT=0 关闭，
+    或查询已含 after:/before:/年份范围时跳过，避免重复拼接。"""
+    if os.getenv("WEB_SEARCH_PREFER_RECENT", "1").strip().lower() in ("0", "false", "no"):
+        return q
+    if re.search(r"\b(after|before):", q) or re.search(r"\b\d{4}\.\.\d{4}\b", q):
+        return q
+    year = datetime.date.today().year - 1
+    return f"{q} after:{year}"
+
+
 def web_search(query):
     """联网搜索（无需 API Key）。
 
@@ -295,6 +307,7 @@ def web_search(query):
     q = (query or "").strip().strip("'\"")
     if not q:
         return "未提供搜索关键词。"
+    q = _search_recency_query(q)
     forced = (os.getenv("WEB_SEARCH_BACKEND") or "auto").strip().lower()
     order = [forced] if forced in ("ddg", "bing") else ["ddg", "bing"]
     last = ""
@@ -1081,6 +1094,226 @@ def _strip_arg_quotes(text):
     return text
 
 
+def read_external_file(path):
+    """读取【项目外】白名单目录内的文件（受控越界读）。
+
+    仅允许读取 DOCMIND_EXTERNAL_DIRS（分号分隔的绝对目录）之内的文件；其它路径一律拒绝。
+    用于用户明确授权让 AI 访问代码库之外的资料（如另一个项目、下载目录里的文档）。
+    输入 path 为文件绝对路径；返回文件内容（截断到 4000 字）。
+    """
+    if not external_access_high():
+        return ("当前为安全模式（仅限项目内）。读取项目外文件需要在「模型设置」中"
+                "切换为高权限模式（high）后方可执行。")
+    dirs_raw = (os.getenv("DOCMIND_EXTERNAL_DIRS") or "").strip()
+    if not dirs_raw:
+        return ("未配置允许访问的外部目录。如需让 AI 读取项目外文件，请设置环境变量 "
+                "DOCMIND_EXTERNAL_DIRS 为分号分隔的绝对路径白名单，例如 "
+                "D:/OtherProject;D:/Downloads。未配置时出于安全默认拒绝越界读取。")
+    allowed = [os.path.normpath(d) for d in re.split(r"[;；]", dirs_raw) if d.strip()]
+    if not allowed:
+        return "未配置允许访问的外部目录（DOCMIND_EXTERNAL_DIRS 为空）。"
+    target = os.path.normpath(os.path.abspath(path))
+    ok = any(target == d or target.startswith(d + os.sep) for d in allowed)
+    if not ok:
+        return f"拒绝访问：{path} 不在允许访问的外部目录白名单内（{', '.join(allowed)}）。"
+    if not os.path.isfile(target):
+        return f"文件不存在：{path}"
+    try:
+        with open(target, encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except Exception as e:  # noqa: BLE001
+        return f"读取失败: {e}"
+    if len(content) > 4000:
+        content = content[:4000] + "\n…（已截断，仅显示前 4000 字）"
+    _READ_EXTERNAL_FILES.add(os.path.normcase(target))
+    return f"=== {target} ===\n{content}"
+
+
+# --- 受控越界读写：仅在「高权限模式」+ DOCMIND_EXTERNAL_DIRS 白名单内生效 ---
+# 安全模式下以下三个工具一律拒绝（见 _resolve_external_path 的第一道门禁）。
+# 设计意图：让用户可授权 AI 访问其它项目并增删改查，但路径被钉死在白名单目录，
+# 既不会误伤系统目录，也不会因 mode 误开而"无限制越界"。
+_READ_EXTERNAL_FILES = set()  # 本次会话内已用 read_external_file 读过的文件（整体重写护栏）
+
+
+def _resolve_external_path(path):
+    """解析受控越界路径：返回 (target, err)。err 非空即拒绝原因。
+
+    门禁链：① 必须处于高权限模式（external_access_high）；② 必须配置
+    DOCMIND_EXTERNAL_DIRS 白名单；③ 目标必须落在白名单目录内。任一不满足返回 err。
+    """
+    if not external_access_high():
+        return None, ("当前为安全模式（仅限项目内）。对其他项目增删改查需要在「模型设置」中"
+                      "切换为高权限模式（high）后方可执行。")
+    dirs_raw = (os.getenv("DOCMIND_EXTERNAL_DIRS") or "").strip()
+    if not dirs_raw:
+        return None, ("未配置允许越界的外部目录白名单（DOCMIND_EXTERNAL_DIRS 为空）。"
+                      "高权限模式下也必须在环境变量中显式列出允许访问的目录，"
+                      "例如 D:/OtherProject;D:/Downloads。")
+    allowed = [os.path.normpath(d) for d in re.split(r"[;；]", dirs_raw) if d.strip()]
+    target = os.path.normpath(os.path.abspath(path))
+    ok = any(target == d or target.startswith(d + os.sep) for d in allowed)
+    if not ok:
+        return None, f"拒绝访问：{path} 不在允许越界的目录白名单内（{', '.join(allowed)}）。"
+    return target, None
+
+
+def create_external_file(arg):
+    """在白名单目录内【新建】文件（不覆盖已有文件），受控越界写。格式同 create_file。
+
+    门禁：高权限模式 + DOCMIND_EXTERNAL_DIRS 白名单。输入 path: <绝对路径>，
+    new_text: <内容>。护栏：不覆盖已存在；200KB 上限；.py 语法校验；「人工确认」开启时暂存。
+    """
+    path, _, content = _parse_edit_input(arg)
+    if not path:
+        return "参数缺失：请提供 path: <文件绝对路径> 与 new_text: <文件内容>。"
+    if content is None:
+        return "参数缺失：请提供 new_text: <文件内容（可多行）>。"
+    target, err = _resolve_external_path(path)
+    if err:
+        return err
+    if os.path.exists(target):
+        return f"文件已存在：{path}（create_external_file 不覆盖已有文件；修改请用 edit_external_file）。"
+    if len(content.encode("utf-8", "ignore")) > _APPLY_MAX_BYTES:
+        return f"拒绝写入：新文件大小超过上限（{_APPLY_MAX_BYTES // 1024}KB）。"
+    ext = os.path.splitext(target)[1].lower()
+    if ext == ".py":
+        import tempfile
+        import py_compile
+
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tf:
+                tf.write(content)
+                tmp = tf.name
+            py_compile.compile(tmp, doraise=True)
+        except py_compile.PyCompileError as e:
+            return f"语法校验失败，已取消创建：\n{e.msg}"
+        except Exception as e:  # noqa: BLE001
+            return f"语法校验异常，已取消创建：{e}"
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+    if _edit_confirm_on():
+        pid = stage_edit("create_file", target, path, None, content,
+                         "新建外部文件：\n" + (content[:2000] + ("…" if len(content) > 2000 else "")))
+        return f"待人工确认 #{pid}（未写入）。确认后才会真正创建文件。\n新建外部文件：{path}"
+    parent = os.path.dirname(target)
+    if parent and not os.path.isdir(parent):
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception as e:  # noqa: BLE001
+            return f"创建目录失败: {e}"
+    try:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:  # noqa: BLE001
+        return f"写入失败: {e}"
+    _READ_EXTERNAL_FILES.add(os.path.normcase(target))
+    return f"已在白名单目录内创建 {path}（{len(content.encode('utf-8', 'ignore'))} 字节）。"
+
+
+def edit_external_file(arg):
+    """在白名单目录内修改【已存在】文件，受控越界写。格式同 apply_edit。
+
+    门禁：高权限模式 + 白名单。两种用法：
+      · 局部替换：path + old_text + new_text（唯一定位，匹配 0/>1 处拒绝）；
+      · 整体重写：path + new_text（须先用 read_external_file 读过该文件确认内容）。
+    护栏：200KB 上限；.py 语法校验失败回滚；「人工确认」开启时暂存。
+    """
+    path, old_text, new_text = _parse_edit_input(arg)
+    if not path:
+        return "参数缺失：请提供 path: <文件绝对路径> 与 new_text: <新内容>。"
+    if new_text is None:
+        return "参数缺失：请提供 new_text: <新内容>（局部替换还需 old_text: <旧片段>）。"
+    target, err = _resolve_external_path(path)
+    if err:
+        return err
+    if not os.path.isfile(target):
+        return f"文件不存在：{path}（edit_external_file 只修改已存在文件）。"
+    try:
+        with open(target, encoding="utf-8", errors="ignore") as f:
+            old_content = f.read()
+    except Exception as e:  # noqa: BLE001
+        return f"读取原文件失败: {e}"
+    if old_text is not None:
+        if old_text == "":
+            return "old_text 为空，无法确定替换范围（整体重写请省略 old_text；局部替换请提供精确片段）。"
+        cnt = old_content.count(old_text)
+        if cnt == 0:
+            return "安全限制：未找到 old_text 的匹配，可能内容已变化。请重新 read_external_file 确认当前内容后再改。"
+        if cnt > 1:
+            return f"安全限制：old_text 匹配到 {cnt} 处，存在歧义。请提供更精确的 old_text（含前后上下文）。"
+        new_content = old_content.replace(old_text, new_text, 1)
+    else:
+        if os.path.normcase(target) not in _READ_EXTERNAL_FILES:
+            return ("安全限制：整体重写前请先调用 read_external_file 读取该文件确认内容，"
+                    "或改用 old_text 参数做局部安全替换。")
+        new_content = new_text
+    if len(new_content.encode("utf-8", "ignore")) > _APPLY_MAX_BYTES:
+        return f"拒绝写入：新文件大小超过上限（{_APPLY_MAX_BYTES // 1024}KB）。"
+    ext = os.path.splitext(target)[1].lower()
+    if ext == ".py":
+        import tempfile
+        import py_compile
+
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tf:
+                tf.write(new_content)
+                tmp = tf.name
+            py_compile.compile(tmp, doraise=True)
+        except py_compile.PyCompileError as e:
+            return f"语法校验失败，已取消写入（原文件未改动）：\n{e.msg}"
+        except Exception as e:  # noqa: BLE001
+            return f"语法校验异常，已取消写入（原文件未改动）：{e}"
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+    nbytes = len(new_content.encode("utf-8", "ignore"))
+    summary = _diff_summary(old_content, new_content)
+    if _edit_confirm_on():
+        pid = stage_edit("apply_edit", target, path, old_content, new_content, summary)
+        return f"待人工确认 #{pid}（未写入）。确认后才会真正修改文件。\n{summary}"
+    try:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except Exception as e:  # noqa: BLE001
+        return f"写入失败: {e}"
+    return f"已写入白名单目录内文件 {path}（{nbytes} 字节）。\n{summary}"
+
+
+def delete_external_file(arg):
+    """删除白名单目录内的【文件】（危险操作，受控越界删）。
+
+    门禁：高权限模式 + 白名单。输入 path: <绝对路径> 且必须含 `confirm: yes`
+    明确确认（防误删）。只删文件不删目录。「人工确认」开启时改为暂存待批准。
+    """
+    # delete 是单行命令式输入（path: 一行 + confirm: yes 一行），用独立解析避免
+    # `confirm:` 被 _parse_edit_input 误并入 path 值（它只认 path/old_text/new_text）。
+    m = re.search(r"(?im)^\s*path\s*:\s*(.+?)\s*$", arg or "")
+    path = m.group(1).strip() if m else ""
+    if not path:
+        return "参数缺失：请提供 path: <文件绝对路径> 以及 confirm: yes。"
+    target, err = _resolve_external_path(path)
+    if err:
+        return err
+    if not re.search(r"(?im)^\s*confirm\s*:\s*yes\b", arg or ""):
+        return "删除是危险操作：请在输入中加入 `confirm: yes` 以明确确认删除。"
+    if os.path.isdir(target):
+        return f"拒绝：{path} 是目录，delete_external_file 只删除单个文件。"
+    if not os.path.isfile(target):
+        return f"文件不存在：{path}"
+    if _edit_confirm_on():
+        pid = stage_edit("delete_external_file", target, path, None, "", f"删除外部文件：{path}")
+        return f"待人工确认 #{pid}（未删除）。确认后才会真正删除文件：{path}"
+    try:
+        os.remove(target)
+    except Exception as e:  # noqa: BLE001
+        return f"删除失败: {e}"
+    return f"已删除白名单目录内文件 {path}。"
+
+
 def grep(pattern):
     """在代码库中按正则搜索文本/符号，返回匹配的文件路径与行号。
 
@@ -1295,6 +1528,13 @@ def confirm_edit(pid):
             parent = os.path.dirname(target)
             if parent and not os.path.isdir(parent):
                 os.makedirs(parent, exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(e["new_content"])
+            _READ_FILES.add(os.path.normcase(target))
+        elif kind == "delete_external_file":
+            if not os.path.isfile(target):
+                return _discard(f"目标文件已不存在：{e['rel']}（暂存后已被删除，已取消）。")
+            os.remove(target)
         else:  # apply_edit
             if not os.path.isfile(target):
                 return _discard(f"目标文件已不存在：{e['rel']}")
@@ -1306,13 +1546,15 @@ def confirm_edit(pid):
                 return False, f"读取目标失败: {ex}"
             if cur != e["old_content"]:
                 return _discard("目标文件在暂存后被修改，内容已变化；请重新 read_file 后再改。")
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(e["new_content"])
-        _READ_FILES.add(os.path.normcase(target))
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(e["new_content"])
+            _READ_FILES.add(os.path.normcase(target))
     except Exception as ex:  # noqa: BLE001
-        return False, f"写入失败: {ex}"
+        return False, f"写入/删除失败: {ex}"
     with _PENDING_LOCK:
         _PENDING_EDITS.pop(pid, None)
+    if kind == "delete_external_file":
+        return True, f"已删除 {e['rel']}。"
     nbytes = len(e["new_content"].encode("utf-8", "ignore"))
     return True, f"已应用修改 {e['rel']}（{nbytes} 字节）。"
 
@@ -2436,6 +2678,22 @@ TOOLS = {
     "read_file": {
         "description": "读取代码库中的某个文件内容（path 为相对代码根目录的路径或文件名）。需要看完整文件、或某文件细节时用。返回文件内容（截断到 4000 字）。",
         "func": read_file,
+    },
+    "read_external_file": {
+        "description": "读取【项目之外】白名单目录内的文件（受控越界读）。仅允许读取 DOCMIND_EXTERNAL_DIRS（分号分隔的绝对目录）之内的文件，越界拒绝；用于用户授权 AI 访问仓库外的资料（如其它项目、下载目录文档）。输入为文件绝对路径。未配置白名单时提示如何开启。注意：只有在「高权限模式」下越界读才被放行；安全模式下本工具会拒绝。",
+        "func": read_external_file,
+    },
+    "create_external_file": {
+        "description": "在白名单目录内【新建】文件（受控越界写，不覆盖已有文件）。仅在「高权限模式」+ 已配置 DOCMIND_EXTERNAL_DIRS 白名单时生效；安全模式或被列出白名单外一律拒绝。用于给其他项目新增文件/模块。输入同 create_file：第一行 path: <绝对路径>，最后 new_text: <文件内容（可多行）>。受单文件 200KB 上限与 .py 语法校验约束；「人工确认」开启时只暂存不落盘。",
+        "func": create_external_file,
+    },
+    "edit_external_file": {
+        "description": "在白名单目录内修改【已存在】文件（受控越界写）。仅在「高权限模式」+ 白名单内生效。两种用法：① 局部替换——path + old_text（精确旧片段）+ new_text；② 整体重写——path + new_text（须先用 read_external_file 读过该文件）。受 200KB 上限与 .py 语法校验约束；「人工确认」开启时暂存。",
+        "func": edit_external_file,
+    },
+    "delete_external_file": {
+        "description": "删除白名单目录内的【单个文件】（危险操作，受控越界删）。仅在「高权限模式」+ 白名单内生效。输入需含 path: <绝对路径> 与 confirm: yes 明确确认；只删文件不删目录；「人工确认」开启时改为暂存待批准。用于清理其它项目的无用文件。",
+        "func": delete_external_file,
     },
     "grep": {
         "description": "在代码库中按正则表达式搜索文本/符号，返回匹配的文件路径与行号。定位某段代码、某变量、某错误出现位置时用。输入为正则表达式。",

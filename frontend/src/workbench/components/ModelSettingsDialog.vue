@@ -28,6 +28,9 @@ const ctxMsg = ref('')
 const ctxMsgOk = ref(false)
 const lookupResult = ref<ContextLookupResult | null>(null)
 
+// AI 越界访问模式：safe=仅限项目内；high=允许受控越界读写（须配置白名单目录）
+const accessMode = ref<'safe' | 'high'>('safe')
+
 const meta = computed(() => props.config?.provider_meta?.[provider.value])
 const isCustom = computed(() => provider.value === 'custom')
 const isOllama = computed(() => provider.value === 'ollama')
@@ -68,6 +71,7 @@ watch(
     apiKey.value = ''
     baseUrl.value = props.config.custom_base_url || ''
     ctxWindow.value = props.config.context_window_override ? String(props.config.context_window_override) : ''
+    accessMode.value = props.config.external_access_mode || 'safe'
     ctxBusy.value = ''
     ctxMsg.value = ''
     lookupResult.value = null
@@ -157,6 +161,8 @@ async function save() {
       base_url: isCustom.value ? baseUrl.value.trim() : '',
       // 空=0：清除覆盖回到自动（Ollama 实时探测/内置画像）
       context_window: ctxVal,
+      // 越界访问模式：safe/high（与模型切换一并保存，幂等）
+      external_access_mode: accessMode.value,
     })
     if (res.model_error) {
       // Ollama 探活失败：HTTP 200 + ok:false + model_error（切到 rawJson 后真正可达）
@@ -171,6 +177,7 @@ async function save() {
     // 保存已生效；告警（如缺 Key）非致命，弹窗保持打开让用户看完再手动关
     warnings.value = res.warnings || []
     ctxWindow.value = res.context_window_override ? String(res.context_window_override) : ''
+    accessMode.value = (res.external_access_mode as 'safe' | 'high') || accessMode.value
     emit('saved', res)
     if (!warnings.value.length) emit('close')
   } catch (e) {
@@ -262,6 +269,25 @@ async function save() {
         </div>
       </div>
       <p v-else-if="lookupResult && !lookupResult.ok" class="ms-hint ms-hint-err">{{ lookupResult.error }}</p>
+
+      <div class="ms-sep"></div>
+      <label class="ms-label">AI 越界访问权限</label>
+      <div class="ms-seg" role="radiogroup" aria-label="越界访问模式">
+        <button type="button" class="ms-seg-opt" :class="{ 'ms-seg-on': accessMode === 'safe' }"
+                :disabled="saving" @click="accessMode = 'safe'">
+          <span class="ms-seg-name">安全模式</span>
+          <span class="ms-seg-desc">仅限当前项目内读写</span>
+        </button>
+        <button type="button" class="ms-seg-opt" :class="{ 'ms-seg-on ms-seg-high': accessMode === 'high' }"
+                :disabled="saving" @click="accessMode = 'high'">
+          <span class="ms-seg-name">高权限模式</span>
+          <span class="ms-seg-desc">可越界读写其他项目</span>
+        </button>
+      </div>
+      <p class="ms-hint ms-acm-note">
+        高权限模式允许 AI 对 <code>DOCMIND_EXTERNAL_DIRS</code> 白名单内的其他项目进行增删改查；
+        未配置该环境变量时保存会被拒绝。安全模式始终禁止任何项目外访问。
+      </p>
 
       <template v-if="meta?.needs_key || isCustom">
         <label class="ms-label">
@@ -389,6 +415,21 @@ async function save() {
 }
 .ms-cap-off { opacity: .65; }
 .ms-tip { font-size: 11px; color: var(--text-faint); margin: 8px 0 0; line-height: 1.5; }
+/* 越界访问模式分段选择 */
+.ms-sep { height: 1px; background: var(--border); margin: 12px 0 2px; }
+.ms-seg { display: flex; gap: 8px; }
+.ms-seg-opt {
+  flex: 1; display: flex; flex-direction: column; gap: 2px;
+  padding: 9px 12px; border: 1px solid var(--border); border-radius: 9px;
+  background: var(--bg); color: var(--text); cursor: pointer; text-align: left;
+}
+.ms-seg-opt:hover:not(:disabled) { border-color: var(--accent); }
+.ms-seg-on { border-color: var(--accent); background: var(--bg-selected); }
+.ms-seg-high.ms-seg-on { border-color: #d97706; background: #fff7ed; }
+.ms-seg-name { font-size: 13px; font-weight: 600; }
+.ms-seg-desc { font-size: 11px; color: var(--text-faint); }
+.ms-acm-note { color: var(--text-faint); margin-top: 6px; line-height: 1.5; }
+.ms-acm-note code { background: var(--bg-selected); padding: 0 4px; border-radius: 4px; font-size: 11px; }
 .ms-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .ms-btn {
   padding: 7px 16px; font-size: 13px; border-radius: 8px;

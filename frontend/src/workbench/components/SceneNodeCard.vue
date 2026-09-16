@@ -9,6 +9,20 @@ defineProps<{
     node: SceneNode
     color: string
     flash?: 'ok' | 'err' | ''
+    /** 搜索命中（searchActive 时高亮） */
+    match?: boolean
+    /** 搜索/关系高亮下需要淡化的节点 */
+    dim?: boolean
+    /** 关系高亮下属于关联集合的节点 */
+    rel?: boolean
+    searchActive?: boolean
+    highlightActive?: boolean
+    /** 层级布局下是否有子节点（决定折叠按钮显隐） */
+    hasChildren?: boolean
+    collapsed?: boolean
+    collapsible?: boolean
+    onToggle?: (id: string) => void
+    onHover?: (id: string | null) => void
   }
   selected?: boolean
 }>()
@@ -25,10 +39,17 @@ function posText(node: SceneNode) {
   <Handle type="target" :position="Position.Top" id="parent" class="sc-handle" />
   <div
     class="sc-node"
-    :class="{ sel: selected, dim: data.node.overridden, flash: !!data.flash, bad: data.flash === 'err' }"
+    :class="{ sel: selected, dim: data.node.overridden, flash: !!data.flash, bad: data.flash === 'err', hit: !!data.match && !!data.searchActive, faded: !!data.dim, rel: !!data.rel }"
     :style="{ '--nc': data.color }"
+    @mouseenter="data.onHover && data.onHover(data.node.id)"
+    @mouseleave="data.onHover && data.onHover(null)"
   >
     <div class="sc-node-head">
+      <button v-if="data.collapsible && data.hasChildren" type="button"
+        class="sc-collapse" :title="data.collapsed ? '展开子树' : '折叠子树'"
+        @click.stop="data.onToggle && data.onToggle(data.node.id)">
+        {{ data.collapsed ? '▸' : '▾' }}
+      </button>
       <span class="sc-node-dot" />
       <span class="sc-node-name" :title="data.node.id">{{ data.node.name }}</span>
       <span v-if="posText(data.node)" class="sc-node-pos">{{ posText(data.node) }}</span>

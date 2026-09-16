@@ -5,7 +5,17 @@ import { Handle, Position } from '@vue-flow/core'
 import type { SceneFile } from '../api'
 
 defineProps<{
-  data: { file: SceneFile; color: string }
+  data: {
+    file: SceneFile
+    color: string
+    id?: string
+    match?: boolean
+    dim?: boolean
+    rel?: boolean
+    searchActive?: boolean
+    highlightActive?: boolean
+    onHover?: (id: string | null) => void
+  }
   selected?: boolean
 }>()
 
@@ -16,9 +26,11 @@ const emit = defineEmits<{ (e: 'open', file: SceneFile): void }>()
   <Handle type="target" :position="Position.Left" id="in" class="sc-handle" />
   <div
     class="sc-file"
-    :class="{ sel: selected, ghost: !data.file.resolved }"
+    :class="{ sel: selected, ghost: !data.file.resolved, hit: !!data.match && !!data.searchActive, faded: !!data.dim, rel: !!data.rel }"
     :style="{ '--fc': data.color }"
     :title="data.file.raw || data.file.rel"
+    @mouseenter="data.onHover && data.onHover(data.id ?? null)"
+    @mouseleave="data.onHover && data.onHover(null)"
     @dblclick.stop="data.file.resolved && emit('open', data.file)"
   >
     <span class="sc-file-chip">{{ data.file.chip }}</span>

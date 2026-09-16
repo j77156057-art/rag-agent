@@ -35,7 +35,7 @@ const emit = defineEmits<{ (e: 'open-file', rel: string): void }>()
 const nodeTypes = { sceneNode: SceneNodeCard, sceneFile: SceneFileCard }
 const COLORS = { '2d': '#58a6ff', '3d': '#bc8cff', root: '#e3a83a', instance: '#2ec4b6' }
 const EDGE = {
-  hierarchy: '#4a5563',
+  hierarchy: '#5b6675',
   script: '#d2a8ff',
   instance: '#2ec4b6',
 }
@@ -60,8 +60,21 @@ const showResources = ref(false)
 const undoStack = ref<SceneUndo[]>([])
 const redoStack = ref<SceneUndo[]>([])
 const spaceScale = ref(1)
+/** 已为哪个场景路径固定过空间缩放；同路径内编辑不再重算，避免一拖全图塌缩 */
+const scaleFixedFor = ref<string>('')
 /** 刚被本次操作改动过的节点 id -> 高亮态，用于给用户"改到哪了"的即时反馈 */
 const flash = ref<Record<string, string>>({})
+
+// —— 交互增强状态 ——
+const searchQuery = ref('')                       // 节点/类型搜索关键字
+const collapsedIds = ref<Set<string>>(new Set())  // 已折叠（隐藏子树）的节点 id
+const hoverId = ref<string | null>(null)          // 悬停高亮源（选中优先）
+// 关系高亮用的邻接表（reload 时构建）
+const parentOf = ref<Map<string, string>>(new Map())
+const childMap = ref<Map<string, Set<string>>>(new Map())
+const fileIdSet = ref<Set<string>>(new Set())
+// Vue Flow 实例（聚焦选中 / 导出用）
+const vf = ref<any>(null)
 
 const scene = computed(() => graph.value)
 const nodeById = computed(() => new Map((graph.value?.nodes ?? []).map(n => [n.id, n])))
@@ -95,6 +108,8 @@ function buildOrder(list: SceneNode[]): { node: SceneNode; depth: number }[] {
       seen.add(node.id)
       out.push({ node, depth })
     }
+    // 折叠的节点：自身仍画出，但不再向下递归其子树（仅层级布局下生效；空间布局保留坐标不隐藏）
+    if (node && collapsedIds.value.has(node.id) && layoutMode.value === 'hierarchy') return
     for (const child of byParent.get(id) ?? []) walk(child.id, node ? depth + 1 : depth)
   }
   walk(graph.value?.root_id ?? '.', 0)
@@ -103,19 +118,25 @@ function buildOrder(list: SceneNode[]): { node: SceneNode; depth: number }[] {
   return out
 }
 
+// 空间缩放只在场景首次加载时算一次（见 reload 中按 path 固定），编辑后保持稳定，
+// 避免「拖一个节点→reload 重算全局缩放→所有节点朝原点塌缩聚拢」的 bug。
+function computeSpaceScale(nodes: Array<{ position?: [number, number] }> | undefined) {
+  const pts = (nodes || []).filter(n => n.position)
+  const span = pts.reduce((acc, n) => Math.max(acc, Math.abs(n.position![0]), Math.abs(n.position![1])), 0)
+  spaceScale.value = span > 2400 ? 2400 / span : 1
+}
+
 function layout(): { nodes: Node[]; edges: Edge[]; maxX: number; minY: number } {
   const g = graph.value
   if (!g) return { nodes: [], edges: [], maxX: 0, minY: 0 }
   const ordered = buildOrder(g.nodes)
 
-  // 空间布局：先按场景坐标算包围盒，过大就整体缩放，保证落点仍在可视范围
-  let scale = 1
-  if (layoutMode.value === 'space') {
-    const pts = g.nodes.filter(n => n.position)
-    const span = pts.reduce((acc, n) => Math.max(acc, Math.abs(n.position![0]), Math.abs(n.position![1])), 0)
-    scale = span > 2400 ? 2400 / span : 1
-  }
-  spaceScale.value = scale
+  // 哪些节点有子节点（决定折叠按钮显隐）
+  const kids = new Set<string>()
+  for (const n of g.nodes) if (n.parent) kids.add(n.parent)
+
+  // 使用已固定的空间缩放（不在每次 reload 重算），保证拖拽后节点坐标稳定不塌缩
+  const scale = spaceScale.value
 
   const placed = new Map<string, { x: number; y: number }>()
   const overflow = new Map<string, number>()
@@ -142,7 +163,15 @@ function layout(): { nodes: Node[]; edges: Edge[]; maxX: number; minY: number } 
       type: 'sceneNode',
       position: pos,
       draggable: layoutMode.value === 'space' && !isRoot,
-      data: { node, color, flash: flash.value[node.id] ?? '' },
+      data: {
+        node, color,
+        flash: flash.value[node.id] ?? '',
+        hasChildren: kids.has(node.id),
+        collapsed: collapsedIds.value.has(node.id),
+        collapsible: layoutMode.value === 'hierarchy',
+        onToggle: toggleCollapse,
+        onHover: setHover,
+      },
     })
   }
 
@@ -160,7 +189,12 @@ function layout(): { nodes: Node[]; edges: Edge[]; maxX: number; minY: number } 
         ? { x: (placed.size ? Math.max(...[...placed.values()].map(p => p.x)) : 0) + FILE_COL, y: index * 88 }
         : { x: maxX + FILE_COL, y: index * 88 },
       draggable: true,
-      data: { file, color: file.kind === 'instance' ? EDGE.instance : file.kind === 'script' ? EDGE.script : EDGE.hierarchy },
+      data: {
+        file,
+        color: file.kind === 'instance' ? EDGE.instance : file.kind === 'script' ? EDGE.script : EDGE.hierarchy,
+        id: file.id,
+        onHover: setHover,
+      },
     })
   })
 
@@ -193,6 +227,7 @@ function rebuild() {
   nodes.value = list
   edges.value = list2
   if (selectedId.value && !nodeById.value.has(selectedId.value)) selectedId.value = null
+  decorate()
 }
 
 function onNodesChange(changes: NodeChange[]) {
@@ -240,6 +275,25 @@ async function reload() {
       return
     }
     graph.value = g
+    // 关系高亮邻接表：parentOf / childMap / fileIdSet
+    const pMap = new Map<string, string>()
+    const cMap = new Map<string, Set<string>>()
+    const fSet = new Set<string>()
+    for (const n of g.nodes) {
+      if (n.parent) {
+        pMap.set(n.id, n.parent)
+        if (!cMap.has(n.parent)) cMap.set(n.parent, new Set())
+        cMap.get(n.parent)!.add(n.id)
+      }
+    }
+    for (const f of g.files) fSet.add(f.id)
+    parentOf.value = pMap
+    childMap.value = cMap
+    fileIdSet.value = fSet
+    if (scaleFixedFor.value !== props.path.trim()) {
+      computeSpaceScale(g.nodes)
+      scaleFixedFor.value = props.path.trim()
+    }
     rebuild()
     const warn = g.structure_errors?.length
       ? `（结构异常 ${g.structure_errors.length} 项，编辑已锁定）`
@@ -456,8 +510,183 @@ watch([showScripts, showInstances, showResources], rebuild)
 watch(() => props.path, () => { undoStack.value = []; redoStack.value = []; void reload() })
 onMounted(reload)
 
+/* ------------------------------------------------------------------ 交互增强 */
+function setHover(id: string | null) { hoverId.value = id }
+function clearHover() { hoverId.value = null }
+
+// 折叠/展开子树：切换集合后重排（layout 会据此剪枝）
+function toggleCollapse(id: string) {
+  const s = new Set(collapsedIds.value)
+  if (s.has(id)) s.delete(id)
+  else s.add(id)
+  collapsedIds.value = s
+  rebuild()
+}
+
+// 选中或悬停某节点时，算出「关联集合」：祖先链 + 子孙 + 脚本/实例化引用文件（反之亦然）
+function computeRelated(id: string | null): Set<string> | null {
+  if (!id) return null
+  const g = graph.value
+  if (!g) return null
+  const set = new Set<string>([id])
+  let cur = parentOf.value.get(id)
+  while (cur) { set.add(cur); cur = parentOf.value.get(cur) }
+  const stack = [...(childMap.value.get(id) ?? [])]
+  while (stack.length) {
+    const c = stack.pop()!
+    if (!set.has(c)) {
+      set.add(c)
+      for (const k of childMap.value.get(c) ?? []) stack.push(k)
+    }
+  }
+  for (const e of g.edges) {
+    if (e.kind !== 'script' && e.kind !== 'instance') continue
+    if (e.source === id) set.add(e.target)
+    else if (e.target === id) set.add(e.source)
+  }
+  return set
+}
+
+// 在不重排的前提下，给节点/边打上 match/dim/rel 装饰态（搜索 + 关系高亮共用）
+function decorate() {
+  const q = searchQuery.value.trim().toLowerCase()
+  const active = hoverId.value || selectedId.value
+  const related = computeRelated(active)
+  nodes.value = nodes.value.map(n => {
+    const d = n.data as Record<string, unknown>
+    const label = d.node
+      ? ((d.node as SceneNode).name + ' ' + (d.node as SceneNode).type).toLowerCase()
+      : d.file ? ((d.file as SceneFile).rel || (d.file as SceneFile).raw || '').toLowerCase() : ''
+    const hit = q ? label.includes(q) : false
+    const inRel = related ? related.has(n.id) : false
+    const dim = !!(related ? !inRel : (q && !hit))
+    return { ...n, data: { ...d, match: hit, dim, rel: !!related && inRel, searchActive: !!q, highlightActive: !!related } }
+  })
+  edges.value = edges.value.map(e => {
+    const inRel = related ? (related.has(e.source) && related.has(e.target)) : false
+    return { ...e, class: related ? (inRel ? 'sc-edge-rel' : 'sc-edge-dim') : '' }
+  })
+}
+
+// 聚焦选中节点：用 Vue Flow 实例把视口居中到该节点
+function focusSelected() {
+  const id = selectedId.value
+  if (!id || !vf.value) return
+  const n = vf.value.getNode(id)
+  if (!n) return
+  const p = n.position as { x: number; y: number }
+  const zoom = Math.max(1, (vf.value.getViewport()?.zoom) || 1)
+  vf.value.setCenter(p.x + 122, p.y + 30, { zoom, duration: 400 })
+}
+
+// 选中节点的祖先路径面包屑（可点击跳转）
+const breadcrumb = computed(() => {
+  const node = selected.value
+  if (!node) return [] as { id: string; name: string }[]
+  const chain: { id: string; name: string }[] = []
+  let cur: SceneNode | undefined = node
+  while (cur) {
+    chain.unshift({ id: cur.id, name: cur.name })
+    cur = cur.parent ? nodeById.value.get(cur.parent) : undefined
+  }
+  return chain
+})
+
+function basename(p: string) { return (p.split(/[\\/]/).pop() || 'scene').replace(/\.tscn$/i, '') }
+function downloadBlob(blob: Blob, name: string) {
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+}
+
+// 由当前 nodes/edges 生成一张矢量示意图（不依赖第三方库），用于导出 SVG/PNG
+function buildSceneSvg(): string {
+  const ns = nodes.value
+  if (!ns.length) return ''
+  const pos = new Map(ns.map(n => [n.id, n.position]))
+  const W = 244
+  const H = 54
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+  for (const n of ns) {
+    const p = n.position
+    minX = Math.min(minX, p.x); minY = Math.min(minY, p.y)
+    maxX = Math.max(maxX, p.x + W); maxY = Math.max(maxY, p.y + H)
+  }
+  const pad = 24
+  const vbX = minX - pad, vbY = minY - pad
+  const vbW = (maxX - minX) + pad * 2, vbH = (maxY - minY) + pad * 2
+  const esc = (s: string) => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!))
+  let body = ''
+  for (const e of edges.value) {
+    const a = pos.get(e.source), b = pos.get(e.target)
+    if (!a || !b) continue
+    const x1 = a.x + W, y1 = a.y + H / 2, x2 = b.x, y2 = b.y + H / 2
+    const col = ((e.style as { stroke?: string } | undefined)?.stroke) || '#5b6675'
+    const dash = (e.style as { strokeDasharray?: string } | undefined)?.strokeDasharray
+    const da = dash ? ` stroke-dasharray="${dash}"` : ''
+    body += `<path d="M${x1},${y1} C${(x1 + x2) / 2},${y1} ${(x1 + x2) / 2},${y2} ${x2},${y2}" fill="none" stroke="${col}" stroke-width="1.4"${da} marker-end="url(#arrow)"/>`
+  }
+  for (const n of ns) {
+    const d = n.data as Record<string, unknown>
+    const node = d.node as SceneNode | undefined
+    const file = d.file as SceneFile | undefined
+    const col = (d.color as string) || (node ? '#5b6675' : '#888')
+    const name = esc(node ? node.name : (file ? (file.rel || file.raw) : n.id))
+    const sub = esc(node ? node.type : (file ? (file.kind === 'script' ? '脚本' : file.kind === 'scene' ? '被实例化场景' : '资源') : ''))
+    body += `<g transform="translate(${n.position.x},${n.position.y})">`
+      + `<rect width="${W}" height="${H}" rx="8" fill="#ffffff" stroke="#c4cedd"/>`
+      + `<rect width="4" height="${H}" rx="2" fill="${col}"/>`
+      + `<text x="14" y="22" font-family="Consolas,monospace" font-size="12.5" fill="#1f2733">${name}</text>`
+      + `<text x="14" y="40" font-family="Consolas,monospace" font-size="10" fill="#5b6675">${sub}</text>`
+      + `</g>`
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${vbW}" height="${vbH}" viewBox="${vbX} ${vbY} ${vbW} ${vbH}">`
+    + `<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5b6675"/></marker></defs>`
+    + `<rect x="${vbX}" y="${vbY}" width="${vbW}" height="${vbH}" fill="#f5f8fc"/>`
+    + body + `</svg>`
+}
+
+function exportScene(fmt: 'svg' | 'png') {
+  const g = graph.value
+  if (!g) return
+  const svg = buildSceneSvg()
+  if (!svg) { say('没有可导出的内容', 'err'); return }
+  const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' })
+  if (fmt === 'svg') {
+    downloadBlob(blob, `${basename(g.path)}.svg`)
+    say('已导出 SVG', 'ok')
+    return
+  }
+  const url = URL.createObjectURL(blob)
+  const img = new Image()
+  img.onload = () => {
+    const scale = 2
+    const canvas = document.createElement('canvas')
+    canvas.width = img.width * scale
+    canvas.height = img.height * scale
+    const ctx = canvas.getContext('2d')
+    if (!ctx) { URL.revokeObjectURL(url); say('导出 PNG 失败', 'err'); return }
+    ctx.scale(scale, scale)
+    ctx.drawImage(img, 0, 0)
+    URL.revokeObjectURL(url)
+    canvas.toBlob(b => { if (b) { downloadBlob(b, `${basename(g.path)}.png`); say('已导出 PNG', 'ok') } }, 'image/png')
+  }
+  img.onerror = () => { URL.revokeObjectURL(url); say('导出 PNG 失败', 'err') }
+  img.src = url
+}
+
+// 搜索 / 悬停 / 选中变化只重打装饰态（不重排）；布局类变化由 rebuild 顺带 decorate
+watch(searchQuery, decorate)
+watch(hoverId, decorate)
+watch(selectedId, decorate)
+
 // 暴露给自动化探针（与 spike 一样留一个窄门面，避免探针依赖 Vue Flow store 形状）
-function onPaneReady(instance: { findNode: (id: string) => Node | undefined; nodes: Node[] }) {
+function onPaneReady(instance: { findNode: (id: string) => Node | undefined; nodes: Node[]; getNode: (id: string) => Node | undefined; setCenter: (x: number, y: number, o?: unknown) => void; getViewport: () => { zoom: number } }) {
+  vf.value = instance
   ;(window as unknown as { __sceneCanvas: unknown }).__sceneCanvas = {
     findNode: (id: string) => instance.findNode(id),
     nodeList: () => instance.nodes,
@@ -488,9 +717,18 @@ defineExpose({ reload, undo, redo, addChildNew })
       <label class="sc-check"><input v-model="showInstances" type="checkbox" />实例化边</label>
       <label class="sc-check"><input v-model="showResources" type="checkbox" />资源引用</label>
       <span class="sc-sep" />
+      <div class="sc-search">
+        <input v-model="searchQuery" class="sc-search-input" placeholder="搜索节点 / 类型…" spellcheck="false" />
+        <button v-if="searchQuery" class="sc-search-x" title="清除搜索" @click="searchQuery = ''">×</button>
+      </div>
+      <button class="sc-btn" :disabled="!selectedId" title="把视口居中到选中节点" @click="focusSelected">聚焦选中</button>
+      <span class="sc-sep" />
       <button class="sc-btn" :disabled="!undoStack.length || busy" title="Ctrl+Z" @click="undo">撤销 {{ undoStack.length || '' }}</button>
       <button class="sc-btn" :disabled="!redoStack.length || busy" title="Ctrl+Y" @click="redo">重做 {{ redoStack.length || '' }}</button>
       <button class="sc-btn" :disabled="busy" @click="deleteSelected">删除所选</button>
+      <span class="sc-sep" />
+      <button class="sc-btn" :disabled="!scene" title="导出当前画布为 SVG" @click="exportScene('svg')">导出SVG</button>
+      <button class="sc-btn" :disabled="!scene" title="导出当前画布为 PNG" @click="exportScene('png')">导出PNG</button>
       <span class="sc-spacer" />
       <span v-if="scene" class="sc-guard" :class="{ ro: !canEdit }">
         <template v-if="!canEdit">🔒 {{ scene.guard.reason || '只读' }}</template>
@@ -528,7 +766,7 @@ defineExpose({ reload, undo, redo, addChildNew })
           @node-drag-stop="onNodeDragStop"
           @pane-ready="onPaneReady"
         >
-          <Background :gap="22" :size="1.4" color="#1c2530" />
+          <Background :gap="22" :size="1.4" color="#c6d0de" />
           <Controls />
           <MiniMap pannable zoomable :node-color="miniColor" />
         </VueFlow>
@@ -538,10 +776,25 @@ defineExpose({ reload, undo, redo, addChildNew })
         <div v-else class="sc-hint">
           层级布局：上→下为父子关系；虚线是脚本引用，点线是实例化引用；双击文件卡打开文件
         </div>
+        <div class="sc-legend">
+          <span class="sc-leg-title">图例</span>
+          <span class="sc-leg"><i class="sc-leg-dot" style="background:#58a6ff"></i>2D</span>
+          <span class="sc-leg"><i class="sc-leg-dot" style="background:#bc8cff"></i>3D</span>
+          <span class="sc-leg"><i class="sc-leg-dot" style="background:#e3a83a"></i>根</span>
+          <span class="sc-leg"><i class="sc-leg-dot" style="background:#2ec4b6"></i>实例</span>
+          <span class="sc-leg-line"><i class="sc-leg-bar" style="background:#5b6675"></i>父子</span>
+          <span class="sc-leg-line"><i class="sc-leg-bar dash" style="background:#d2a8ff"></i>脚本</span>
+          <span class="sc-leg-line"><i class="sc-leg-bar dot" style="background:#2ec4b6"></i>实例化</span>
+        </div>
       </div>
 
       <aside class="sc-side">
         <template v-if="selected">
+          <nav v-if="breadcrumb.length" class="sc-crumbs">
+            <button v-for="(c, i) in breadcrumb" :key="c.id" type="button"
+              class="sc-crumb" :class="{ cur: i === breadcrumb.length - 1 }"
+              :title="c.id" @click="selectedId = c.id">{{ c.name }}</button>
+          </nav>
           <div class="sc-side-head">
             <b>{{ selected.name }}</b>
             <span class="sc-side-path">{{ selected.id }}</span>
@@ -670,9 +923,22 @@ defineExpose({ reload, undo, redo, addChildNew })
 .sc-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--text-faint); border: 1px dashed var(--border); border-radius: 8px; }
 .sc-empty small { max-width: 380px; text-align: center; line-height: 1.7; }
 .sc-body { flex: 1; display: flex; min-height: 0; gap: 10px; }
-.sc-canvas { flex: 1; min-width: 0; position: relative; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: #fcfdff; }
+.sc-canvas { flex: 1; min-width: 0; position: relative; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: linear-gradient(180deg, #f7f9fd, #eef2f8); }
 .sc-hint { position: absolute; left: 12px; bottom: 12px; background: rgba(255, 255, 255, 0.92); border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px; font-size: 11px; color: var(--text-muted); pointer-events: none; }
 .sc-hint code { color: var(--accent); font-family: var(--font-mono); }
+.sc-legend {
+  position: absolute; right: 12px; top: 12px; display: flex; flex-wrap: wrap; gap: 4px 10px;
+  max-width: 226px; background: rgba(255, 255, 255, .92); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 10px; font-size: 10.5px; color: var(--text-muted);
+  pointer-events: none; box-shadow: 0 2px 8px rgba(22, 33, 54, .08);
+}
+.sc-leg-title { width: 100%; font-weight: 600; color: var(--text); margin-bottom: 1px; }
+.sc-leg { display: inline-flex; align-items: center; gap: 4px; }
+.sc-leg-dot { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+.sc-leg-line { display: inline-flex; align-items: center; gap: 4px; }
+.sc-leg-bar { width: 16px; height: 0; border-top: 2px solid; flex: none; }
+.sc-leg-bar.dash { border-top-style: dashed; }
+.sc-leg-bar.dot { border-top-style: dotted; }
 .sc-side { width: 306px; flex: 0 0 306px; border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; min-height: 0; overflow: auto; padding: 9px 10px; gap: 8px; }
 .sc-side-head { display: flex; align-items: baseline; gap: 7px; }
 .sc-side-head b { font-size: 13px; }
@@ -707,6 +973,17 @@ defineExpose({ reload, undo, redo, addChildNew })
 .sc-ref small { color: var(--text-faint); }
 .sc-file-chip { flex: none; font-family: var(--font-mono); font-size: 9px; font-weight: 700; color: var(--fc); background: color-mix(in srgb, var(--fc) 14%, transparent); border-radius: 3px; padding: 1px 4px; }
 .sc-warn { margin: 0; padding-left: 16px; font-size: 10.5px; color: var(--text-muted); line-height: 1.7; }
+/* 搜索框 / 面包屑 */
+.sc-search { display: flex; align-items: center; position: relative; }
+.sc-search-input { width: 150px; box-sizing: border-box; background: var(--bg); border: 1px solid var(--border-strong); color: var(--text); font-size: 11px; padding: 5px 22px 5px 8px; border-radius: 5px; }
+.sc-search-input:focus { border-color: var(--accent); outline: none; }
+.sc-search-x { position: absolute; right: 4px; border: 0; background: none; color: var(--text-faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 0; }
+.sc-search-x:hover { color: var(--danger); }
+.sc-crumbs { display: flex; flex-wrap: wrap; gap: 2px 3px; align-items: center; margin-bottom: 2px; }
+.sc-crumb { border: 0; background: none; color: var(--accent); font-size: 11px; cursor: pointer; padding: 1px 2px; border-radius: 4px; max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sc-crumb:hover { background: var(--bg-hover); }
+.sc-crumb.cur { color: var(--text); font-weight: 600; cursor: default; }
+.sc-crumb:not(:last-child)::after { content: '›'; color: var(--text-faint); margin-left: 3px; }
 </style>
 
 <style>
@@ -727,14 +1004,15 @@ defineExpose({ reload, undo, redo, addChildNew })
   background: #ffffff;
   border: 1px solid var(--border-strong);
   border-left: 3px solid var(--nc);
-  border-radius: 7px;
+  border-radius: 8px;
   padding: 6px 9px;
   cursor: grab;
-  transition: border-color .12s ease, box-shadow .12s ease;
+  box-shadow: 0 1px 2px rgba(22, 33, 54, .07), 0 6px 14px rgba(22, 33, 54, .05);
+  transition: border-color .12s ease, box-shadow .12s ease, transform .12s ease;
 }
 .sc-node:active { cursor: grabbing; }
-.sc-node:hover { border-color: color-mix(in srgb, var(--nc) 55%, #c4cedd); }
-.sc-node.sel { box-shadow: 0 0 0 2px color-mix(in srgb, var(--nc) 32%, transparent); border-color: var(--nc); }
+.sc-node:hover { border-color: color-mix(in srgb, var(--nc) 55%, #c4cedd); box-shadow: 0 2px 4px rgba(22, 33, 54, .1), 0 12px 24px rgba(22, 33, 54, .1); transform: translateY(-1px); }
+.sc-node.sel { box-shadow: 0 0 0 2px color-mix(in srgb, var(--nc) 32%, transparent), 0 8px 18px rgba(22, 33, 54, .12); border-color: var(--nc); transform: none; }
 .sc-node.dim { opacity: .78; border-left-style: dashed; }
 .sc-node.flash { box-shadow: 0 0 0 2px rgba(28, 158, 102, 0.55); }
 .sc-node.flash.bad { box-shadow: 0 0 0 2px rgba(224, 72, 79, 0.55); }
@@ -757,14 +1035,28 @@ defineExpose({ reload, undo, redo, addChildNew })
   display: flex; align-items: center; gap: 8px;
   width: 258px; padding: 6px 9px;
   background: #ffffff; border: 1px solid var(--border); border-left: 3px solid var(--fc);
-  border-radius: 7px; cursor: pointer;
+  border-radius: 8px; cursor: pointer;
+  box-shadow: 0 1px 2px rgba(22, 33, 54, .07), 0 6px 14px rgba(22, 33, 54, .05);
+  transition: border-color .12s ease, box-shadow .12s ease, transform .12s ease;
 }
-.sc-file:hover { border-color: color-mix(in srgb, var(--fc) 50%, #c4cedd); }
-.sc-file.sel { box-shadow: 0 0 0 2px color-mix(in srgb, var(--fc) 25%, transparent); }
+.sc-file:hover { border-color: color-mix(in srgb, var(--fc) 50%, #c4cedd); box-shadow: 0 2px 4px rgba(22, 33, 54, .1), 0 12px 24px rgba(22, 33, 54, .1); transform: translateY(-1px); }
+.sc-file.sel { box-shadow: 0 0 0 2px color-mix(in srgb, var(--fc) 25%, transparent), 0 8px 18px rgba(22, 33, 54, .12); }
 .sc-file.ghost { border-style: dashed; opacity: .7; }
 .sc-file-chip { flex: none; font-family: Consolas, monospace; font-size: 9px; font-weight: 700; color: var(--fc); background: color-mix(in srgb, var(--fc) 14%, transparent); border-radius: 3px; padding: 2px 5px; }
 .sc-file-meta { min-width: 0; flex: 1; }
 .sc-file-name { font-family: Consolas, monospace; font-size: 11.5px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sc-file-sub { font-size: 9.5px; color: var(--text-faint); }
 .sc-file-warn { color: #b5791f; }
+/* 折叠按钮（节点卡内，仅层级布局显示） */
+.sc-collapse { flex: none; width: 16px; height: 16px; margin-right: 2px; border: 1px solid var(--border-strong); background: var(--bg); border-radius: 4px; font-size: 9px; line-height: 1; color: var(--text-muted); cursor: pointer; padding: 0; }
+.sc-collapse:hover { border-color: var(--accent); color: var(--accent); }
+/* 搜索命中 / 关系高亮装饰态 */
+.sc-node.hit { box-shadow: 0 0 0 2px var(--accent), 0 8px 18px rgba(22, 33, 54, .12); border-color: var(--accent); }
+.sc-node.faded { opacity: .2; filter: saturate(.55); }
+.sc-node.rel { box-shadow: 0 0 0 2px color-mix(in srgb, var(--nc) 45%, transparent), 0 8px 18px rgba(22, 33, 54, .12); }
+.sc-file.hit { box-shadow: 0 0 0 2px var(--accent), 0 8px 18px rgba(22, 33, 54, .12); border-color: var(--accent); }
+.sc-file.faded { opacity: .2; }
+.sc-file.rel { box-shadow: 0 0 0 2px color-mix(in srgb, var(--fc) 42%, transparent), 0 8px 18px rgba(22, 33, 54, .12); }
+.sc-canvas .vue-flow__edge.sc-edge-rel .vue-flow__edge-path { stroke: #2f6fed !important; stroke-width: 2 !important; }
+.sc-canvas .vue-flow__edge.sc-edge-dim { opacity: .12; }
 </style>

@@ -37,6 +37,8 @@ const sending = ref(false)
 let abortCtl: AbortController | null = null
 
 const scroller = ref<HTMLElement | null>(null)
+/** 仅当用户已贴底时才自动滚；用户上滚看历史时暂停自动滚动，回到底部再恢复 */
+const stickToBottom = ref(true)
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 
 // ---------------------------------------------------------------- 折叠
@@ -145,6 +147,7 @@ async function send(text?: string) {
   const q = (text ?? input.value).trim()
   if (!q || sending.value) return
   input.value = ''
+  stickToBottom.value = true  // 用户主动发送，恢复贴底自动滚动
   messages.value.push({ id: msgSeq++, role: 'user', text: q, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
   const turn: ChatMsg = { id: msgSeq++, role: 'assistant', text: '', status: 'streaming', trace: [], reasoning: '', notices: [], plan: [] }
   messages.value.push(turn)
@@ -322,9 +325,16 @@ onMounted(() => {
 })
 onBeforeUnmount(() => window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener))
 
+function isNearBottom(el: HTMLElement) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 80
+}
+function onScroll() {
+  const el = scroller.value
+  if (el) stickToBottom.value = isNearBottom(el)
+}
 function scrollToBottom() {
   const el = scroller.value
-  if (el) el.scrollTop = el.scrollHeight
+  if (el && stickToBottom.value) el.scrollTop = el.scrollHeight
 }
 
 // ---------------------------------------------------------------- 答案引用卡片
@@ -635,7 +645,7 @@ function connectorGuide(s: McpServer) {
     </div>
 
     <template v-if="!collapsed">
-      <div ref="scroller" class="cd-body">
+      <div ref="scroller" class="cd-body" @scroll="onScroll">
         <div v-if="messages.length === 0" class="cd-empty">
           <p class="cd-empty-title">用大白话提问，AI 自己搜代码，并把答案定位到具体文件和行号 👇</p>
           <div class="cd-quicks">

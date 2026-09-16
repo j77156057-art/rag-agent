@@ -38,6 +38,8 @@ from config import (
     save_state,
     load_state,
     edit_confirm_enabled,
+    get_external_access_mode,
+    set_external_access_mode,
     API_TOKEN,
     DOCMIND_CORS_ORIGINS,
     CHAT_IMAGE_MAX_FILES,
@@ -1900,6 +1902,8 @@ class ConfigReq(BaseModel):
     edit_confirm: Optional[bool] = None
     # 用户手填的上下文窗口（token）：>0 设置覆盖；=0 清除覆盖回到自动；None=不变
     context_window: Optional[int] = None
+    # AI 越界访问模式：'safe'=仅项目内；'high'=允许受控越界读写。None=不变
+    external_access_mode: Optional[str] = None
 
 
 def _build_time() -> str:
@@ -1986,6 +1990,8 @@ async def get_config():
         "project_rules_loaded": bool(get_runtime("project_rules")),
         "edit_confirm": edit_confirm_enabled(),
         "build_time": _build_time(),
+        # AI 越界访问模式：safe=仅项目内；high=允许受控越界读写（须配置白名单）
+        "external_access_mode": get_external_access_mode(),
         # 同步 urllib 探活放线程池，Ollama 不可达时不阻塞事件循环/拖慢面板打开
         "ollama_status": await run_in_threadpool(check_ollama),
     }
@@ -2546,6 +2552,21 @@ async def set_config(req: ConfigReq):
     if req.edit_confirm is not None:
         set_runtime("edit_confirm", bool(req.edit_confirm))
 
+    # AI 越界访问模式：safe=仅项目内；high=允许受控越界读写（须配置白名单目录）
+    if req.external_access_mode is not None:
+        if req.external_access_mode not in ("safe", "high"):
+            return JSONResponse(
+                {"ok": False, "error": "越界访问模式仅支持 'safe' 或 'high'。"}, status_code=400)
+        if req.external_access_mode == "high":
+            # 高权限必须先配置白名单，否则等于「无限制越界」——明确拒绝，避免误开
+            ext_dirs = os.getenv("DOCMIND_EXTERNAL_DIRS", "").strip()
+            if not ext_dirs:
+                return JSONResponse(
+                    {"ok": False, "error": "开启高权限模式前，请先配置环境变量 DOCMIND_EXTERNAL_DIRS"
+                                "（分号分隔的允许越界目录白名单）。未配置时不可用高权限模式。"},
+                    status_code=400)
+        set_external_access_mode(req.external_access_mode)
+
     # 云端厂商需要 key 但未提供（custom 可能是免 key 的内网代理，不警告）
     envk = PROVIDERS[req.provider].get("api_key_env", "")
     if envk and not (get_runtime("llm_api_key") or LLM_API_KEY or os.getenv(envk, "")):
@@ -2566,6 +2587,7 @@ async def set_config(req: ConfigReq):
         "context_window_override": get_context_window_override(prov, eff_model) or 0,
         "ingested_files": sorted(_INGESTED),
         "warnings": warnings,
+        "external_access_mode": get_external_access_mode(),
     }
 
 

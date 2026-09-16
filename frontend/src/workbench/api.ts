@@ -1321,6 +1321,8 @@ export interface ModelConfigInfo {
   context_window_override?: number
   /** 当前生效窗口来源：custom 手填 / probe Ollama 实时探测 / profile 内置画像 */
   context_source?: 'custom' | 'probe' | 'profile'
+  /** AI 越界访问模式：safe=仅限项目内；high=允许受控越界读写（须配置白名单） */
+  external_access_mode?: 'safe' | 'high'
 }
 
 export interface SaveModelReq {
@@ -1330,6 +1332,8 @@ export interface SaveModelReq {
   base_url?: string
   /** >0 设置窗口覆盖；0 清除覆盖回到自动；undefined=不改动 */
   context_window?: number | null
+  /** AI 越界访问模式：'safe' | 'high'；undefined=不改动 */
+  external_access_mode?: 'safe' | 'high'
 }
 
 /** 联网识别出的候选窗口（附带出处片段，由用户判断后采用） */
