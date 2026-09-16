@@ -239,12 +239,119 @@ class RawHistoryTests(unittest.TestCase):
         self.assertIn('video%2FX', vid['preview_url'])
 
 
+class ComfyFreeModelsTests(unittest.TestCase):
+    def _cm(self, payload=b''):
+        m = mock.MagicMock()
+        m.__enter__.return_value.read.return_value = b'{}'
+        return m
+
+    def test_free_posts_unload_when_idle(self):
+        with mock.patch.object(g.gw, 'comfy_queue_running', return_value=False), \
+             mock.patch.object(g.gw, 'gpu_free_mb', side_effect=[500, 9000]), \
+             mock.patch.object(g.gw.time, 'sleep'), \
+             mock.patch.object(g.gw.urllib.request, 'urlopen', return_value=self._cm()) as up:
+            r = g.gw.comfy_free_models('http://127.0.0.1:8188', timeout=2)
+        self.assertTrue(r['ok'])
+        self.assertEqual(up.call_count, 1)
+        self.assertIn('/free', up.call_args[0][0].full_url)
+        self.assertIn(b'unload_models', up.call_args[0][0].data)
+
+    def test_free_skipped_when_queue_running(self):
+        with mock.patch.object(g.gw, 'comfy_queue_running', return_value=True), \
+             mock.patch.object(g.gw.urllib.request, 'urlopen') as up:
+            r = g.gw.comfy_free_models('http://127.0.0.1:8188')
+        self.assertFalse(r['ok'])
+        up.assert_not_called()
+
+
+class VramHeadroomTests(unittest.TestCase):
+    def test_enough_free_does_nothing(self):
+        with mock.patch.object(g.gw, 'gpu_free_mb', return_value=8000), \
+             mock.patch.object(g.gw, 'comfy_free_models') as fm:
+            g.ensure_vram_headroom('http://x', 1024)
+            fm.assert_not_called()
+
+    def test_low_frees_models_and_recovers(self):
+        seq = [600, 900, 2200]  # /free 后轮询到 2200MB
+        with mock.patch.object(g.gw, 'gpu_free_mb', side_effect=seq), \
+             mock.patch.object(g.gw, 'comfy_free_models', return_value={'ok': True}) as fm, \
+             mock.patch.object(g.time, 'sleep'):
+            g.ensure_vram_headroom('http://x', 1024)
+            fm.assert_called_once_with('http://x', wait=False)
+
+    def test_queue_running_skips_without_error(self):
+        # ComfyUI 有任务执行中：不打断、不报错，交给提交门槛
+        with mock.patch.object(g.gw, 'gpu_free_mb', return_value=100), \
+             mock.patch.object(g.gw, 'comfy_free_models',
+                               return_value={'ok': False, 'error': '任务执行中'}) as fm, \
+             mock.patch.object(g.time, 'sleep'):
+            g.ensure_vram_headroom('http://x', 1024)
+            fm.assert_called_once()
+
+    def test_still_low_after_free_raises(self):
+        ticks = iter([0.0, 0.1, 0.2, 0.3, 0.4])
+        with mock.patch.object(g.gw, 'gpu_free_mb', return_value=400), \
+             mock.patch.object(g.gw, 'comfy_free_models', return_value={'ok': True}), \
+             mock.patch.object(g.time, 'sleep'), \
+             mock.patch.object(g.time, 'time', side_effect=lambda: next(ticks)):
+            with self.assertRaises(g.GenError) as cm:
+                g.ensure_vram_headroom('http://x', 1024, timeout=0.2)
+            self.assertIn('显存不足', str(cm.exception))
+
+    def test_no_gpu_probe_skips_check(self):
+        with mock.patch.object(g.gw, 'gpu_free_mb', return_value=None), \
+             mock.patch.object(g.gw, 'comfy_free_models') as fm:
+            g.ensure_vram_headroom('http://x', 1024)
+            fm.assert_not_called()
+
+    def test_cross_kind_forces_free_even_with_headroom(self):
+        # 生完图（模型驻留）再切视频：哪怕空闲高于视频门槛也必须卸载图模型
+        old = g._LAST_COMFY_KIND
+        g._LAST_COMFY_KIND = 'image'
+        try:
+            phases = []
+            with mock.patch.object(g.gw, 'gpu_free_mb', return_value=8000), \
+                 mock.patch.object(g.gw, 'comfy_free_models', return_value={'ok': True}) as fm:
+                g.ensure_vram_headroom(
+                    'http://x', 256, kind='video',
+                    on_phase=lambda cross: phases.append(cross))
+            fm.assert_called_once_with('http://x', wait=False)
+            self.assertEqual(phases, [True])
+        finally:
+            g._LAST_COMFY_KIND = old
+
+    def test_same_kind_with_headroom_keeps_cache(self):
+        old = g._LAST_COMFY_KIND
+        g._LAST_COMFY_KIND = 'image'
+        try:
+            with mock.patch.object(g.gw, 'gpu_free_mb', return_value=8000), \
+                 mock.patch.object(g.gw, 'comfy_free_models') as fm:
+                g.ensure_vram_headroom('http://x', 1024, kind='image')
+                fm.assert_not_called()
+        finally:
+            g._LAST_COMFY_KIND = old
+
+
 class JobManagerTests(unittest.TestCase):
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()
         self.root = self._td.name
+        # 隔离真实 GPU：默认显存充足、租约释放只记录调用
+        self._free_p = mock.patch.object(g.gw, 'gpu_free_mb', return_value=99999)
+        self._rel_p = mock.patch.object(g.gw, 'comfy_release_job')
+        self._unload_p = mock.patch.object(g.gw, 'comfy_free_models',
+                                           return_value={'ok': True, 'freed_mb': 0})
+        self._old_kind = g._LAST_COMFY_KIND
+        g._LAST_COMFY_KIND = ''
+        self.mock_release = self._rel_p.start()
+        self._free_p.start()
+        self._unload_p.start()
 
     def tearDown(self):
+        g._LAST_COMFY_KIND = self._old_kind
+        self._free_p.stop()
+        self._rel_p.stop()
+        self._unload_p.stop()
         self._td.cleanup()
 
     def _wait(self, jm, jid, timeout=10):
@@ -271,6 +378,7 @@ class JobManagerTests(unittest.TestCase):
         bw.assert_called_once()
         ms.assert_called_once()
         mw.assert_called_once()
+        self.mock_release.assert_called_once_with('pid1')
         # 素材库可见
         lib = assets.library(self.root)
         self.assertTrue(any(it['path'] == j['result']['paths'][0]
@@ -297,6 +405,7 @@ class JobManagerTests(unittest.TestCase):
         self.assertEqual(j['result']['cols'], 4)
         ef.assert_called_once()
         bh.assert_called_once()
+        self.mock_release.assert_called_once_with('pid2')
         lib = assets.library(self.root)
         anims = [it for d in lib['dirs'] for it in d['items'] if it['kind'] == 'animation']
         self.assertEqual(len(anims), 1)
@@ -310,6 +419,8 @@ class JobManagerTests(unittest.TestCase):
             j = self._wait(jm, jid)
         self.assertEqual(j['status'], 'failed')
         self.assertIn('ComfyUI', j['error'])
+        # 提交前失败没有 pid，不应调用释放
+        self.mock_release.assert_not_called()
 
 
 class GenerateRouteTests(unittest.TestCase):

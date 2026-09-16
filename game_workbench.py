@@ -868,6 +868,78 @@ def _comfy_job_owner(prompt_id):
     return f"comfyui:{prompt_id}"
 
 
+def gpu_free_mb():
+    """当前 GPU 空闲显存（MB）；探测不到返回 None。单卡/聚合取总和。"""
+    mem = _gpu.memory_info()
+    return None if not mem else int(mem.get('free_mb') or 0)
+
+
+def comfy_queue_running(url="http://127.0.0.1:8188"):
+    """ComfyUI 当前是否有正在执行/排队的提示（腾显存前必须确认没有在跑的任务）。"""
+    try:
+        url = _safe_comfy_url(url)
+        with urllib.request.urlopen(url.rstrip('/') + '/queue', timeout=5) as r:
+            q = json.loads(r.read().decode())
+    except Exception:
+        return False
+    running = q.get('queue_running') or []
+    pending = q.get('queue_pending') or []
+    return bool(running or pending)
+
+
+def comfy_free_models(url="http://127.0.0.1:8188", *, wait=True, timeout=20):
+    """让 ComfyUI 卸载已加载模型并释放缓存显存（POST /free）。
+
+    用于跨链路切换：生图前卸掉视频大模型、生视频前卸掉生图模型。
+    有任务在跑时不执行（卸载会打断执行）；5xx 时重试一次（实测 ComfyUI
+    在异常状态后第一次 /free 偶发 500）。返回 {'ok', 'freed_mb', 'error'}。
+    """
+    try:
+        url = _safe_comfy_url(url)
+    except ValueError as e:
+        return {'ok': False, 'freed_mb': 0, 'error': str(e)}
+    if comfy_queue_running(url):
+        return {'ok': False, 'freed_mb': 0, 'error': 'ComfyUI 有任务执行中，跳过显存回收'}
+    before = gpu_free_mb() or 0
+    payload = json.dumps({'unload_models': True, 'free_memory': True}).encode()
+    last_err = ''
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(
+                url.rstrip('/') + '/free', data=payload,
+                headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                r.read()
+            last_err = ''
+            break
+        except Exception as e:  # noqa: BLE001 - 卸载失败要返回可展示原因而非抛出
+            last_err = str(e)
+            time.sleep(2)
+    if last_err:
+        return {'ok': False, 'freed_mb': 0, 'error': f'ComfyUI 卸载模型失败：{last_err}'}
+    freed = 0
+    if wait:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(1.0)
+            now = gpu_free_mb()
+            if now is None:
+                break
+            freed = max(freed, now - before)
+            if now - before >= 256:
+                break
+    return {'ok': True, 'freed_mb': freed, 'error': ''}
+
+
+def comfy_release_job(prompt_id):
+    """作业终态后释放 GPU 租约（asset_gen 自轮询路径不走 comfy_history，
+    需要显式调用，否则租约要等 600s TTL 才回收，挡住下一次生成）。"""
+    pid = str(prompt_id or '').strip()
+    if not pid:
+        return False
+    return _gpu.force_release(_comfy_job_owner(pid)) is not None
+
+
 def _gpu_busy_error(res):
     if res.get("reason") == "insufficient_memory":
         msg = "显存不足，低于 DOCMIND_GPU_MIN_FREE_MB 门槛，已拒绝（未排队）。"
@@ -1261,7 +1333,7 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188", min_free_mb=None):
     lease = _gpu.acquire_lease(submit_owner, timeout=2, purpose="comfyui",
                                ttl=COMFY_JOB_TTL,
                                min_free_mb=threshold or None,
-                               evict=("ollama",))
+                               evict=("ollama", "comfyui"))
     if not lease.get("ok"):
         return {"ok": False, "error": _gpu_busy_error(lease)}
     payload = json.dumps({"prompt": workflow}).encode()

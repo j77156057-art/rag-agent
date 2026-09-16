@@ -40,6 +40,9 @@ VIDEO_EXTS = ('.mp4', '.webm', '.mov', '.mkv')
 # 视频大模型（20GB+）靠 ComfyUI 逐层 offload 在小显存卡上也能跑，
 # 提交门槛比生图低；可用 DOCMIND_VIDEO_MIN_FREE_MB 覆盖。
 VIDEO_MIN_FREE_MB = int(os.getenv('DOCMIND_VIDEO_MIN_FREE_MB', '256') or 256)
+# 生图提交前要求的空闲显存；与协调器 COMFY_MIN_FREE_MB 默认对齐。
+IMAGE_MIN_FREE_MB = int(os.getenv('DOCMIND_IMAGE_MIN_FREE_MB',
+                                  str(int(gw.COMFY_MIN_FREE_MB))) or int(gw.COMFY_MIN_FREE_MB))
 
 # Z-Image 文生图链路：相对 <comfy>/models 的权重路径
 IMAGE_MODEL_FILES = {
@@ -357,6 +360,52 @@ def submit(workflow: dict, url: str, min_free_mb=None) -> str:
     return pid
 
 
+# 本进程内上一次 ComfyUI 任务的链路（'image'/'video'）。
+# 生图模型与 H3 视频模型不同家族，跨链路切换必须腾退；同链路连跑则可吃缓存。
+_LAST_COMFY_KIND = ''
+
+
+def ensure_vram_headroom(url: str, required_mb: int, *, kind: str = '', on_phase=None,
+                         timeout: float = 25.0) -> None:
+    """提交前确保 GPU 有 required_mb 空闲显存；不够或跨链路时让 ComfyUI 卸载驻留模型。
+
+    ComfyUI 默认会把上一次的模型缓存在显存里（H3 约 10GB），导致同卡的下一次
+    生成在协调器门槛处被拦、或跨链路（生图↔生视频）加载时 OOM。策略：
+    - 同链路且空闲已够：不动缓存，同类型连跑不付重载代价；
+    - 跨链路（如生完图再生视频）：无论空闲多少都卸载，给新模型家族腾出整卡；
+    - 空闲不够且 ComfyUI 有任务在跑：不打断，直接放行交提交门槛判定；
+    - 卸载后仍不够：明确报缺多少，不静默排队。
+    显存探测不到（无 nvidia-smi 等）且非跨链路时不拦截。
+    """
+    global _LAST_COMFY_KIND
+    free = gw.gpu_free_mb()
+    cross = bool(kind) and bool(_LAST_COMFY_KIND) and kind != _LAST_COMFY_KIND
+    under_threshold = free is not None and free < required_mb
+    if not cross and (free is None or not under_threshold):
+        return
+    if on_phase:
+        try:
+            on_phase(cross)
+        except Exception:  # noqa: BLE001 - 进度回调不能影响腾退
+            pass
+    r = gw.comfy_free_models(url, wait=False)
+    if not r.get('ok'):
+        # 有任务执行中/服务异常：不在这里误杀，让提交时的门槛给出结论
+        return
+    if cross:
+        # /free 同步返回后模型已卸载，跨链路不再按门槛硬等，显存读数稍后刷新即可
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(1.0)
+        free = gw.gpu_free_mb()
+        if free is not None and free >= required_mb:
+            return
+    raise GenError(
+        f'显存不足：已让 ComfyUI 卸载驻留模型，当前空闲 {free} MB，'
+        f'本次生成需要 {required_mb} MB。请关闭其他占用显存的程序后重试。')
+
+
 def wait(prompt_id: str, url: str, *, timeout: int = 1200, interval: float = 2.0,
          on_progress=None) -> dict:
     deadline = time.time() + timeout
@@ -620,9 +669,18 @@ class JobManager:
         return cb
 
     def _run_image(self, job_id, root, url, **kw):
+        global _LAST_COMFY_KIND
+        pid = ''
         try:
+            ensure_vram_headroom(
+                url, IMAGE_MIN_FREE_MB, kind='image',
+                on_phase=lambda cross: self._update(
+                    job_id,
+                    phase='正在切换模型，腾出生图显存…' if cross else '正在腾出显存…',
+                    progress=3))
             wf = build_image_workflow(**kw)
             pid = submit(wf, url)
+            _LAST_COMFY_KIND = 'image'
             self._update(job_id, prompt_id=pid)
             hist = wait(pid, url, on_progress=self._on_progress(job_id, '本地生成图片中', (5, 80)))
             imgs = [o for o in hist['outputs']
@@ -639,9 +697,16 @@ class JobManager:
             self._fail(job_id, str(e))
         except Exception as e:  # noqa: BLE001 - 后台任务必须收口
             self._fail(job_id, f'本地生图异常：{e}')
+        finally:
+            # 自轮询路径不走 comfy_history，必须显式释放 GPU 租约，
+            # 否则 600s TTL 内的下一次生成会被"GPU 正忙"挡住。
+            if pid:
+                gw.comfy_release_job(pid)
 
     def _run_animation(self, job_id, root, url, **kw):
+        global _LAST_COMFY_KIND
         tmp_path = ''
+        pid = ''
         try:
             # 已有 ComfyUI input 文件名（走 upload-frame 上传或素材库转存）时直接用；
             # 否则本任务随带字节时现场上传。
@@ -653,7 +718,14 @@ class JobManager:
             wf = build_h3_workflow(
                 url, prompt=kw['prompt'], duration=kw['duration'], seed=kw['seed'],
                 image_name=image_name, turbo=kw['turbo'])
+            ensure_vram_headroom(
+                url, VIDEO_MIN_FREE_MB, kind='video',
+                on_phase=lambda cross: self._update(
+                    job_id,
+                    phase='正在切换模型，腾出生视频显存…' if cross else '正在腾出显存…',
+                    progress=5))
             pid = submit(wf, url, min_free_mb=VIDEO_MIN_FREE_MB)
+            _LAST_COMFY_KIND = 'video'
             self._update(job_id, prompt_id=pid)
             hist = wait(pid, url, timeout=1800,
                         on_progress=self._on_progress(job_id, 'H3 视频模型生成中（较慢）', (6, 70)))
@@ -690,6 +762,8 @@ class JobManager:
         except Exception as e:  # noqa: BLE001
             self._fail(job_id, f'帧动画生成异常：{e}')
         finally:
+            if pid:
+                gw.comfy_release_job(pid)
             if tmp_path:
                 try:
                     os.remove(tmp_path)

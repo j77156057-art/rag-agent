@@ -97,7 +97,7 @@ import skills as agent_skills
 import pricing as pricing_mod
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
-from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_apply_parameters, comfy_queue, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
+from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_apply_parameters, comfy_queue, comfy_free_models, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
 
 
 @asynccontextmanager
@@ -109,6 +109,7 @@ async def _app_lifespan(app):
     poll_s = get_runtime("gpu_poll_interval")
     gpu.configure(idle_unload_seconds=idle_s, poll_interval=poll_s)
     gpu.register_hook("ollama", _gpu_ollama_evict_hook)
+    gpu.register_hook("comfyui", _gpu_comfy_evict_hook)
     gpu.start_background()
     try:
         yield
@@ -2090,6 +2091,18 @@ def _gpu_ollama_evict_hook():
             if not pending:
                 break
     return freed
+
+
+def _gpu_comfy_evict_hook():
+    """GPU 协调器驱逐钩子：让 ComfyUI 卸载驻留模型（生图/生视频切换时腾显存）。
+
+    ComfyUI 不在线或有任务在跑时返回 False；任何异常吞掉，不拖死协调线程。
+    """
+    try:
+        r = comfy_free_models(COMFY_URL_DEFAULT)
+        return bool(r.get('ok') and r.get('freed_mb', 0) > 0)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _ollama_expires_minutes(expires_at: str):
