@@ -237,8 +237,18 @@ def parse_response(text):
 _MAX_REFLECTIONS = 2
 # 回答被截断 / 为空 / 不合格式时的「自动续写纠偏」次数上限（不额外消耗工具步数）
 _MAX_NUDGES = 2
-_FAILURE_MARKERS = ("未找到相关内容", "计算失败", "表达式包含非法字符",
-                    "搜索失败", "搜索未返回结果", "未提供", "安全限制", "拒绝写入")
+# 工具失败文案白名单：工具观察里命中以下任一子串即判为失败（触发反思 / trace ok=False）。
+# 与各工具失败文案字面保持一致；新增工具失败文案时请同步补这里并更新 test_failure_markers。
+_FAILURE_MARKERS = (
+    "未找到相关内容", "计算失败", "表达式包含非法字符",
+    "搜索失败", "搜索未返回结果", "网页读取失败",   # 联网类（web_search / web_fetch / web_research）
+    "读取失败", "文件不存在", "拒绝访问",           # read_file 类（含路径越界拒绝）
+    "未提供", "安全限制", "拒绝写入",
+)
+
+# 历史回放「整段计数」时的轮间分隔符：仅用于把候选轮拼成 1 条文本、只发 1 次
+# count_tokens（替代过去逐轮 O(N) 次网络往返）；分隔符本身计入的少量 token 可忽略。
+_HISTORY_TURN_SEP = "\n---- 历史轮次 ----\n"
 
 # 形如 "Final Answer: 实际内容"（冒号后至少有非空白内容），用于判定模型是否真答完了
 _RE_HAS_REAL_FINAL = re.compile(r"Final Answer:\s*\S")
@@ -700,23 +710,65 @@ class Agent:
 
         目标体积 = prompt 预算 × COMPACT_KEEP_RATIO（与落盘压缩的保留口径一致，
         保证刚压缩完的历史能完整回放），轮数不超过 AGENT_HISTORY_TURNS 硬上限。
+
+        计数优化：逐轮调用 count_tokens 会产生 O(N) 次网络往返（ollama / llamacpp
+        每次都是真实请求）。这里先把候选轮拼成 1 条文本，**只发 1 次**计数得 total：
+        - total ≤ limit：整段都在预算内，全部回放（不再逐轮计数）；
+        - total > limit：按「各轮字符数占比 × total」估算每轮 token，从近到远累加，
+          超过 limit 即停；保持「至少保留最近 1 轮」的语义不变。
         """
         limit = max(256, int(self._prompt_budget() * COMPACT_KEEP_RATIO))
-        picked, used = [], 0
-        for turn in reversed(self.history[-AGENT_HISTORY_TURNS:]):
+        cand = self.history[-AGENT_HISTORY_TURNS:]
+        if not cand:
+            return []
+        rows = []
+        for turn in cand:
             clip_ans = _clip(turn.get("assistant", ""), HISTORY_ANSWER_CHARS)
-            t = self.llm.count_tokens((turn.get("user", "") or "") + "\n" + clip_ans)
-            if picked and used + t > limit:
+            rows.append({
+                "user": turn.get("user", ""),
+                "assistant": clip_ans,
+                "text": (turn.get("user", "") or "") + "\n" + clip_ans,
+            })
+        # 整段只发一次网络计数（唯一一次 count_tokens 调用）
+        total = int(self.llm.count_tokens(_HISTORY_TURN_SEP.join(r["text"] for r in rows)) or 0)
+        if total <= limit:
+            return [{"user": r["user"], "assistant": r["assistant"]} for r in rows]
+        # 超预算：按字符占比估算每轮 token，从近到远累加、超 limit 即停
+        total_chars = sum(len(r["text"]) for r in rows)
+        picked, used = [], 0
+        for r in reversed(rows):
+            share = (len(r["text"]) / total_chars) if total_chars else (1.0 / len(rows))
+            est = max(1, int(total * share))   # 至少 1，避免空轮被估成 0 而永不触发上限
+            if picked and used + est > limit:
                 break
-            picked.insert(0, {"user": turn.get("user", ""), "assistant": clip_ans})
-            used += t
+            picked.insert(0, {"user": r["user"], "assistant": r["assistant"]})
+            used += est
         return picked
 
-    def context_stats(self, question: str = "") -> dict:
-        """当前会话的上下文占用（不含本轮工具往返），供前端「上下文已用 N%」展示。
+    def _history_tokens(self) -> int:
+        """会话历史的 token 占用（与 sessions.maybe_compact 触发压缩同口径）。
 
-        百分比分母用「可用 prompt 额度」（窗口扣除输出预留后的 prompt_budget），
-        而非完整窗口：这样 80% 即对应压缩触发线，65% 转黄、80% 转红贴合真实余量；
+        所有轮次的 user+assistant 拼成整段后一次计数——这正是 maybe_compact 里
+        _turns_tokens 用来判断「是否达到压缩触发线」的口径，二者务必同源，
+        否则 UI 展示的压缩进度会和真实触发时机对不上。
+        """
+        turns = self.history or []
+        if not turns:
+            return 0
+        text = "\n".join(
+            (t.get("user", "") or "") + "\n" + (t.get("assistant", "") or "")
+            for t in turns if isinstance(t, dict)
+        )
+        return int(self.llm.count_tokens(text) or 0)
+
+    def context_stats(self, question: str = "") -> dict:
+        """当前会话的上下文占用（不含本轮工具往返），供前端展示与压缩预警。
+
+        两套口径并存（都随字段下发，前端按需用）：
+        - percent：本轮 prompt 体积 / 可用 prompt 额度（沿用旧口径，进度条用）；
+        - compact_percent：**会话历史** token / 压缩触发线，与 sessions.maybe_compact
+          真正据以触发压缩的口径一致（历史达到触发线即会压缩）。level 由此分级：
+          ≥100%（即将/已触发压缩）→ high，≥80% → warn，否则 ok。
         完整窗口仍随 context_window 字段下发，供悬停提示展示。
         """
         msgs = self._build_messages(question or "")
@@ -724,13 +776,28 @@ class Agent:
         win = self.context_window
         budget = self._prompt_budget()
         percent = max(0, min(100, round(used * 100 / budget))) if budget else 0
-        level = "warn" if percent >= 80 else ("high" if percent >= 65 else "ok")
+        # 压缩口径：history_tokens 与 maybe_compact 的触发判定同源
+        history_tokens = self._history_tokens()
+        compact_trigger = int(budget * COMPACT_TRIGGER_RATIO) if budget else 0
+        compact_percent = (
+            max(0, min(100, round(history_tokens * 100 / compact_trigger)))
+            if compact_trigger else 0
+        )
+        if compact_percent >= 100:
+            level = "high"
+        elif compact_percent >= 80:
+            level = "warn"
+        else:
+            level = "ok"
         return {
             "used_tokens": used,
             "context_window": win,
             "prompt_budget": budget,
             "percent": percent,
             "level": level,
+            "history_tokens": history_tokens,
+            "compact_trigger_tokens": compact_trigger,
+            "compact_percent": compact_percent,
         }
 
     def _prompt_tokens(self, head, trail):
@@ -761,7 +828,47 @@ class Agent:
             break
         return head + trail
 
-    def run(self, question, stream=True, images=None, deadline=None):
+    def run(self, question, stream=True, images=None, deadline=None, *,
+            web_enabled=None, thinking_enabled=None, tool_mode=None, plan_mode=None,
+            llm=None):
+        """执行一次问答（逐请求开关注入 + trace 埋点与会话落盘的外壳）。
+
+        逐请求覆盖（**仅关键字**，None=不改）：
+        - web_enabled / thinking_enabled / tool_mode / plan_mode 覆盖同名属性；
+        - llm 覆盖本轮使用的模型客户端（云端路由时由 api 传入云端 client，
+          请求结束即还原本地 llm，本会话不再被「黏」到云端）。
+        本方法在生成器体开头保存这些原值、应用非 None 覆盖，并用 try/finally
+        保证**任何出口**（正常结束 / 异常 / 生成器 close() / 客户端断连抛
+        GeneratorExit）都还原——避免某次请求的临时覆盖泄漏给同会话的并发请求。
+        安全性：Agent.__init__ 只存 self.llm，不缓存任何派生量；_prompt_budget()
+        与 context_window 均动态读 self.llm，替换后在运行期自然生效；self.history
+        属于会话、不受影响。
+
+        业务逻辑零改动：原「外壳」实现整体搬进 _run_shell（trace 埋点 + 会话落盘
+        + 摘要压缩），此处只负责覆盖注入与还原。
+        """
+        # 生成器体开头：快照原值，None 表示不改动该项。
+        prev = (self.web_enabled, self.thinking_enabled, self.tool_mode, self.plan_mode)
+        prev_llm = self.llm
+        if web_enabled is not None:
+            self.web_enabled = bool(web_enabled)
+        if thinking_enabled is not None:
+            self.thinking_enabled = bool(thinking_enabled)
+        if tool_mode is not None:
+            self.tool_mode = tool_mode
+        if plan_mode is not None:
+            self.plan_mode = bool(plan_mode)
+        if llm is not None:
+            self.llm = llm
+        try:
+            yield from self._run_shell(question, stream=stream, images=images, deadline=deadline)
+        finally:
+            # 任何出口（含 close()/断连）都还原为原值，杜绝逐请求覆盖污染共享单例。
+            (self.web_enabled, self.thinking_enabled,
+             self.tool_mode, self.plan_mode) = prev
+            self.llm = prev_llm
+
+    def _run_shell(self, question, stream=True, images=None, deadline=None):
         """执行一次问答（带 trace 埋点与会话落盘的外壳）。
 
         真正的推理循环在 _run；本壳负责：
@@ -1213,6 +1320,7 @@ class Agent:
                     trail.append({"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)})
                     trail.append({"role": "user", "content": f"Observation: {_obs}"})
                     yield {"type": "observation", "text": _obs}
+                    executed.add(sig)  # 登记已「处理」签名：同参重复出现时可触发防重复升级
                     continue
 
                 # 联网开关关闭：web_* 一律不执行（原生通道已在 schema 剔除，
@@ -1225,6 +1333,7 @@ class Agent:
                     trail.append({"role": "user", "content": f"Observation: {_obs}"})
                     yield {"type": "action", "text": f"{action_name}({action_arg})"}
                     yield {"type": "observation", "text": _obs}
+                    executed.add(sig)  # 登记已「处理」签名：同参重复出现时可触发防重复升级
                     continue
 
                 # pre_tool 钩子：可改写参数，或拦截本次执行（热插拔）
@@ -1508,6 +1617,10 @@ class Agent:
             depth=self.depth + 1,
             tool_allowlist=spec["tools"],
         )
+        # 子代理继承父代理的「联网 / 深度思考」开关：否则父代理已开联网时，
+        # 子代理 web_enabled 仍为 False，researcher 等子任务的 web_* 会被 _web_blocked 全拦截。
+        child.web_enabled = self.web_enabled
+        child.thinking_enabled = self.thinking_enabled
         question = spec["hint"] + "\n\n子任务：" + task
         if context:
             ctx = "\n".join(f"- {k}：{_clip(str(v), 600)}" for k, v in context.items())

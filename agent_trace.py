@@ -22,9 +22,9 @@ from datetime import datetime
 
 # 并行工具批次会从多个线程写同一个 Turn，故对累加操作加锁（计数很小，开销可忽略）
 
-from config import BASE_DIR
+from config import STATE_ROOT, state_path
 
-TRACE_FILE = os.getenv("DOCMIND_TRACE_FILE") or os.path.join(BASE_DIR, ".docmind_traces.jsonl")
+TRACE_FILE = state_path("DOCMIND_TRACE_FILE", os.path.join(STATE_ROOT, ".docmind_traces.jsonl"))
 TRACE_ENABLED = os.getenv("DOCMIND_TRACE", "1") != "0"
 MAX_BYTES = int(os.getenv("DOCMIND_TRACE_MAX_BYTES", str(8 * 1024 * 1024)))
 

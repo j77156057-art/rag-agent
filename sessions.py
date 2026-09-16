@@ -8,7 +8,7 @@
 - 摘要压缩：轮数/字符超阈值时，把最早的若干轮交给 LLM 压缩成一段摘要，
   只保留最近 KEEP 轮原文 —— 长会话不会把上下文预算吃光。
 
-存储：<BASE_DIR>/.docmind_sessions/<slug>.json（只存用户问题与模型回答，非敏感配置另存）。
+存储：<STATE_ROOT>/.docmind_sessions/<slug>.json（只存用户问题与模型回答，非敏感配置另存）。
 写盘失败一律静默降级，不影响主流程。
 """
 from __future__ import annotations
@@ -19,9 +19,9 @@ import re
 import threading
 from datetime import datetime
 
-from config import BASE_DIR
+from config import STATE_ROOT, state_path
 
-SESSIONS_DIR = os.getenv("DOCMIND_SESSIONS_DIR") or os.path.join(BASE_DIR, ".docmind_sessions")
+SESSIONS_DIR = state_path("DOCMIND_SESSIONS_DIR", os.path.join(STATE_ROOT, ".docmind_sessions"))
 # 压缩以 token 占用为准（阈值由 Agent 按模型真实窗口换算后传入），轮数只留两道
 # 硬保险：轮数上限防失控；保留轮数下限保证最近的上下文不被摘要掉。
 MAX_TURNS = int(os.getenv("DOCMIND_SESSION_MAX_TURNS", "200"))       # 轮数硬上限（超过必压缩）

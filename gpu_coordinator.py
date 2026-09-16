@@ -28,6 +28,8 @@ import time
 import json
 from pathlib import Path
 
+from config import STATE_ROOT, state_path
+
 GPU_MODE = os.getenv("DOCMIND_GPU_MODE", "serial").lower()  # serial|parallel|multi
 DEFAULT_TTL = float(os.getenv("DOCMIND_GPU_LEASE_TTL", "0") or 0)  # 秒，0=不限
 
@@ -72,7 +74,10 @@ _processes = {}  # pid -> owner/gpu/purpose/status/heartbeat
 _recovery_events = collections.deque(maxlen=200)
 _process_probe_cache = {"t": 0.0, "rows": None, "available": False}
 PROCESS_HEARTBEAT_TTL = float(os.getenv("DOCMIND_GPU_PROCESS_HEARTBEAT_TTL", "30") or 30)
-STATE_FILE = Path(os.getenv("DOCMIND_GPU_STATE_FILE", str(Path(".docmind") / "gpu_state.json")))
+STATE_FILE = Path(state_path("DOCMIND_GPU_STATE_FILE", str(Path(STATE_ROOT) / ".docmind" / "gpu_state.json")))
+# 采样曲线单独落一份文件：后台采样线程（默认 5s）此前会把 {samples,...} 覆盖写到
+# STATE_FILE，冲掉租约快照 {leases,queue}，导致 restore_runtime_state() 静默失效。
+SAMPLES_FILE = Path(state_path("DOCMIND_GPU_SAMPLES_FILE", str(Path(STATE_ROOT) / ".docmind" / "gpu_samples.json")))
 def _persist_runtime_locked():
     try:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -102,7 +107,15 @@ def restore_runtime_state():
     except Exception: pass
     return recovered
 
-restore_runtime_state()
+
+def init():
+    """显式初始化：恢复上次运行残留的租约/队列（转 recovered 事件）。
+
+    必须由调用方（api.py 的 lifespan）在 ``start_background()`` 之前调用；
+    **严禁**在模块导入期执行任何磁盘 I/O（导入副作用会导致测试隔离失效、
+    空转读写状态文件）。
+    """
+    return restore_runtime_state()
 
 
 # --------------------------------------------------------------------------- 探测
@@ -704,8 +717,8 @@ def _sample_once():
     with _lock:
         _samples.append(point)
         try:
-            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            STATE_FILE.write_text(json.dumps({"samples": list(_samples), "updated_at": time.time(), "available": bool(rows)}, ensure_ascii=False), encoding="utf-8")
+            SAMPLES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SAMPLES_FILE.write_text(json.dumps({"samples": list(_samples), "updated_at": time.time(), "available": bool(rows)}, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
     try:

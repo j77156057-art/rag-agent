@@ -356,6 +356,9 @@ class LLMClient:
         if (self.provider == "ollama"
                 and os.getenv("DOCMIND_OLLAMA_PROBE", "1").strip() not in ("0", "false", "no")
                 and not get_context_window_override(self.provider, self.model)):
+            # 注意：此处会发起一次 ≤3s 的**同步**探活网络请求（probe_ollama_context）。
+            # 调用方若在事件循环线程内构造 LLMClient，必须放到线程池
+            # （api.py 的 async 处理函数用 `await run_in_threadpool(...)`），否则会阻塞整个 asyncio。
             live_window = probe_ollama_context(self.model, self.base_url)
         self.context_source = (
             "custom" if get_context_window_override(self.provider, self.model)

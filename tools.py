@@ -158,6 +158,78 @@ _CALC_ALLOWED_NODES = (
     ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
     ast.Load,
 )
+# 幂运算防护：** 的指数必须「可静态求出」且是 |值| ≤ _CALC_MAX_POW_EXPONENT 的整数，
+# 且结果位数不得超过 _CALC_MAX_RESULT_DIGITS。否则 9**9**9 之类会让 eval 长时间占满
+# CPU/内存（实测 >6s 不返回）。前置拒绝，不依赖事后计时。
+_CALC_MAX_POW_EXPONENT = 512
+_CALC_MAX_RESULT_DIGITS = 4000
+# 静态求值中间结果的数值上界（bit_length）：超过即放弃（≈ 1.1e12），
+# 保证静态分析本身绝不发生指数爆炸。
+_CALC_STATIC_MAX_BITS = 40
+_CALC_POW_EXP_BAD = (
+    f"不支持的 ** 指数：指数必须是可静态求值且 ≤{_CALC_MAX_POW_EXPONENT} 的整数"
+    f"（如 2**10、2**3**2；不支持 9**9**9）。"
+)
+_CALC_RESULT_TOO_BIG = (
+    f"计算结果过大（超过 {_CALC_MAX_RESULT_DIGITS} 位），已拒绝以免卡死。"
+)
+
+
+def _calc_static_value(node, _depth=0):
+    """有界静态求值：把 AST 子表达式算成具体数值（int/float）；算不出返回 None。
+
+    仅支持：字面量、一元 +/-、以及 + - * / // % ** 运算。其中 `**` 只在
+    「底数与指数都是可静态求出的整数、且各自 |值| ≤ 32」时才递归求值——这样
+    9**9 可算出（供 2**3**2 之类的合法指数），而 9**9**9 的指数 9**9**9 在静态
+    阶段就会被限流拒绝。任何中间整数结果 bit_length > _CALC_STATIC_MAX_BITS 即
+    放弃。用于判断 ** 的指数是否「可静态求出」。
+    """
+    if _depth > 8:
+        return None
+    if isinstance(node, ast.Constant):
+        v = node.value
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return v
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        v = _calc_static_value(node.operand, _depth + 1)
+        if v is None:
+            return None
+        return -v if isinstance(node.op, ast.USub) else v
+    if isinstance(node, ast.BinOp):
+        left = _calc_static_value(node.left, _depth + 1)
+        right = _calc_static_value(node.right, _depth + 1)
+        if left is None or right is None:
+            return None
+        try:
+            if isinstance(node.op, ast.Pow):
+                # 仅当两侧都是可静态求出的整数且各自 ≤32 才计算，避开指数爆炸
+                if (isinstance(left, int) and not isinstance(left, bool)
+                        and isinstance(right, int) and not isinstance(right, bool)
+                        and abs(left) <= 32 and abs(right) <= 32):
+                    out = left ** right
+                else:
+                    return None
+            elif isinstance(node.op, ast.Add):
+                out = left + right
+            elif isinstance(node.op, ast.Sub):
+                out = left - right
+            elif isinstance(node.op, ast.Mult):
+                out = left * right
+            elif isinstance(node.op, ast.Div):
+                out = left / right
+            elif isinstance(node.op, ast.FloorDiv):
+                out = left // right
+            elif isinstance(node.op, ast.Mod):
+                out = left % right
+            else:
+                return None
+        except (ZeroDivisionError, ValueError, OverflowError):
+            return None
+        if isinstance(out, int) and out.bit_length() > _CALC_STATIC_MAX_BITS:
+            return None
+        return out
+    return None
 
 
 def calculate(expression):
@@ -166,6 +238,10 @@ def calculate(expression):
     支持数字、+ - * / % ** //、括号，以及比较运算 > < >= <= == !=
     （比较结果转成「成立/不成立」，方便模型解读为自然语言结论）。
     用 AST 白名单求值，名称/属性/调用等任何非算术节点一律拒绝。
+
+    幂运算加固：** 的指数必须「可静态求出」且为 |值| ≤512（`_CALC_MAX_POW_EXPONENT`）
+    的整数，结果位数不得超过 4000（`_CALC_MAX_RESULT_DIGITS`）；超限直接返回中文错误，
+    避免 9**9**9 这类表达式长时间占满 CPU。
     """
     expression = (expression or "").strip().strip("'\"").strip()
     if not expression:
@@ -178,12 +254,30 @@ def calculate(expression):
         return _CALC_BAD
     if any(not isinstance(node, _CALC_ALLOWED_NODES) for node in ast.walk(tree)):
         return _CALC_BAD
+    # 前置拒绝：遍历 ** 运算（BinOp 且 op 为 Pow，注意 ast.Pow 是运算符节点、
+    # 本身没有 left/right），要求其指数「可静态求出」且是 ≤512 的整数
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            exp = _calc_static_value(node.right)
+            if (not isinstance(exp, int) or isinstance(exp, bool)
+                    or abs(exp) > _CALC_MAX_POW_EXPONENT):
+                return _CALC_POW_EXP_BAD
     try:
         result = eval(compile(tree, "<calc>", "eval"), {"__builtins__": {}}, {})  # noqa: S307
     except Exception as e:  # noqa: BLE001
         return f"计算失败: {e}"
     if isinstance(result, bool):
         return "成立（True）" if result else "不成立（False）"
+    # 结果规模兜底：即使指数合规，多重乘法也可能堆出超长整数。
+    # str() 在超大整数上会触发 CPython 的 int↔str 转换上限（默认 4300 位）而抛
+    # ValueError，这里把该异常也视为「结果过大」，顺带覆盖超过 4300 位的情形。
+    if isinstance(result, int):
+        try:
+            too_big = len(str(result)) > _CALC_MAX_RESULT_DIGITS
+        except ValueError:
+            too_big = True
+        if too_big:
+            return _CALC_RESULT_TOO_BIG
     return str(result)
 
 
@@ -208,13 +302,14 @@ def web_search(query):
         try:
             r = _bing_search(q) if backend == "bing" else _ddg_search(q)
         except Exception as e:  # noqa: BLE001
-            last = f"{backend}: {type(e).__name__}: {e}"
+            last = f"搜索失败: {backend}: {type(e).__name__}: {e}"
             continue
         if not any(r.startswith(m) for m in _SEARCH_EMPTY_MARKERS):
             return r
         last = r
+    hard_error = last.startswith("搜索失败: ")
     return (last or "搜索失败：所有搜索后端均不可用。") + (
-        "" if last.startswith(_SEARCH_EMPTY_MARKERS) else
+        "" if (not hard_error and last.startswith(_SEARCH_EMPTY_MARKERS)) else
         "（DuckDuckGo/Bing 均不可达，请确认运行环境能访问外网，或配置带 Key 的搜索引擎）")
 
 

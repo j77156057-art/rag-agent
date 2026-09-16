@@ -1,6 +1,6 @@
 """工具/回合钩子注册表（支持热插拔）。
 
-钩子目录：`<BASE_DIR>/.docmind/hooks/*.py`（可用 `DOCMIND_HOOKS_DIR` 覆盖）。
+钩子目录：`<STATE_ROOT>/.docmind/hooks/*.py`（可用 `DOCMIND_HOOKS_DIR` 覆盖）。
 每个模块可用两种写法之一注册：
 
   # 写法 A：显式注册
@@ -28,9 +28,9 @@ import importlib.util
 import os
 import threading
 
-from config import BASE_DIR
+from config import STATE_ROOT, state_path
 
-HOOKS_DIR = os.getenv("DOCMIND_HOOKS_DIR") or os.path.join(BASE_DIR, ".docmind", "hooks")
+HOOKS_DIR = state_path("DOCMIND_HOOKS_DIR", os.path.join(STATE_ROOT, ".docmind", "hooks"))
 
 _lock = threading.Lock()
 _hooks = {"pre_tool": [], "post_tool": [], "pre_turn": [], "post_turn": []}

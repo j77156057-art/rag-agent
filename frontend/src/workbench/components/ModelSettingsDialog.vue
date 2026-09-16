@@ -159,7 +159,13 @@ async function save() {
       context_window: ctxVal,
     })
     if (res.model_error) {
+      // Ollama 探活失败：HTTP 200 + ok:false + model_error（切到 rawJson 后真正可达）
       errorMsg.value = `模型探活失败：${res.model_error}`
+      return
+    }
+    if (res.ok === false) {
+      // 其余业务失败（如自定义服务缺地址/模型名）读 error
+      errorMsg.value = res.error || res.model_error || '保存失败'
       return
     }
     // 保存已生效；告警（如缺 Key）非致命，弹窗保持打开让用户看完再手动关

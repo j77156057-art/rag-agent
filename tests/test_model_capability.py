@@ -106,18 +106,24 @@ class PromptBudgetScalingTests(unittest.TestCase):
         # 1M 窗口模型（如 gemini-1.5-pro / qwen-long 级别）：75% ≈ 786k，
         # 8000 字符（约 5k token）级历史在该预算下占比不到 1%，绝不会触发压缩。
         win = 1048576
-        budget = max(6144, min(win - LLM_MAX_TOKENS - 512, int(win * 0.75)))
+        budget = prompt_token_budget("custom", "zz-unit-only-model", context_window=win)
         self.assertEqual(budget, 786432)
         trigger = int(budget * 0.8)
         self.assertLess(5000, trigger)
         self.assertGreater(trigger, 600_000)
 
-    def test_tiny_window_keeps_floor(self):
-        # 极小窗口也保 6144 下限（由 num_ctx 封顶逻辑再做物理裁剪）
-        # 用一个不存在的 provider 画像走 32768 默认即可，下限逻辑直接验公式
-        win = 4096
-        budget = max(6144, min(win - LLM_MAX_TOKENS - 512, int(win * 0.75)))
-        self.assertEqual(budget, 6144)
+    def test_medium_window_scales_down(self):
+        # 16k 窗口：75% = 12288，受输出预留约束的 usable=12800，取 12288
+        budget = prompt_token_budget("custom", "zz-unit-only-model", context_window=16384)
+        self.assertEqual(budget, 12288)
+
+    def test_tiny_window_budget_never_exceeds_window(self):
+        # 极小窗口：预算必须严格小于窗口本身（否则提示词会被服务端静默截断），
+        # 同时保留一个不低于 256 的可用下限（由真实函数计算，不再本地复制公式）。
+        for win in (1024, 4096, 8192):
+            budget = prompt_token_budget("custom", "zz-unit-only-model", context_window=win)
+            self.assertGreaterEqual(budget, 256, f"win={win} 预算不应低于 256")
+            self.assertLess(budget, win, f"win={win} 预算不应越过窗口")
 
 
 class ContextWindowOverrideTests(unittest.TestCase):

@@ -63,26 +63,64 @@ class ContextStatsTests(_Base):
     def test_stats_fields_and_percent_range(self):
         a = agent_mod.Agent(llm=_FakeLLM(), session_id="s1")
         st = a.context_stats("你好")
-        self.assertEqual(set(st), {"used_tokens", "context_window", "prompt_budget", "percent", "level"})
+        self.assertEqual(set(st), {
+            "used_tokens", "context_window", "prompt_budget", "percent", "level",
+            "history_tokens", "compact_trigger_tokens", "compact_percent",
+        })
         self.assertEqual(st["context_window"], 32768)
         self.assertGreaterEqual(st["percent"], 0)
         self.assertLessEqual(st["percent"], 100)
         self.assertGreater(st["used_tokens"], 0)
         self.assertEqual(st["level"], "ok")
+        # 空历史时压缩口径应为 0，level 不误报
+        self.assertEqual(st["history_tokens"], 0)
+        self.assertEqual(st["compact_percent"], 0)
 
-    def test_level_high_and_warn(self):
-        # 分级按「可用 prompt 额度」计，与完整窗口无关
-        win, budget = 131072, 100000
+    def test_level_from_compact_percentile(self):
+        # level 由「历史 token / 压缩触发线」口径分级：budget=100000 -> 触发线 80000
+        budget = 100000
+        cap = {"context_window": 131072, "thinking": "none", "cloud": True}
+        high = _FakeLLM(capability=cap, prompt_budget=budget, token_fn=lambda _t: 90000)
+        a = agent_mod.Agent(llm=high, session_id="lv")
+        a.history = [{"user": "x", "assistant": "y", "ts": ""}]
+        st = a.context_stats("q")
+        self.assertEqual(st["compact_trigger_tokens"], 80000)
+        self.assertEqual(st["compact_percent"], 100)   # 90000/80000=112% 封顶 100
+        self.assertEqual(st["level"], "high")
+
+        warn = _FakeLLM(capability=cap, prompt_budget=budget, token_fn=lambda _t: 70000)
+        a2 = agent_mod.Agent(llm=warn, session_id="lv")
+        a2.history = [{"user": "x", "assistant": "y", "ts": ""}]
+        self.assertEqual(a2.context_stats("q")["level"], "warn")   # 87%
+
+        ok = _FakeLLM(capability=cap, prompt_budget=budget, token_fn=lambda _t: 10000)
+        a3 = agent_mod.Agent(llm=ok, session_id="lv")
+        a3.history = [{"user": "x", "assistant": "y", "ts": ""}]
+        self.assertEqual(a3.context_stats("q")["level"], "ok")     # 12%
+
+    def test_compact_fields_align_with_trigger(self):
+        import config as config_mod
+        budget = 12000
         llm = _FakeLLM(
-            capability={"context_window": win, "thinking": "none", "cloud": True},
-            prompt_budget=budget,
-            token_fn=lambda _t: int(budget * 0.75),  # 75% -> high
-        )
-        self.assertEqual(agent_mod.Agent(llm=llm, session_id="lv").context_stats("q")["level"], "high")
-        llm._token_fn = lambda _t: int(budget * 0.95)                  # 95% -> warn
-        self.assertEqual(agent_mod.Agent(llm=llm, session_id="lv").context_stats("q")["level"], "warn")
-        llm._token_fn = lambda _t: 10                                  # 极低 -> ok
-        self.assertEqual(agent_mod.Agent(llm=llm, session_id="lv").context_stats("q")["level"], "ok")
+            capability={"context_window": 16384, "thinking": "none", "cloud": False},
+            prompt_budget=budget, token_fn=lambda _t: 6000)
+        a = agent_mod.Agent(llm=llm, session_id="cmp")
+        a.history = [{"user": "u", "assistant": "a", "ts": ""}]
+        st = a.context_stats("q")
+        trigger = int(budget * config_mod.COMPACT_TRIGGER_RATIO)
+        self.assertEqual(st["compact_trigger_tokens"], trigger)
+        self.assertEqual(st["history_tokens"], 6000)
+        self.assertEqual(st["compact_percent"], round(6000 * 100 / trigger))
+        self.assertEqual(st["level"], "ok")
+        # compact_percent 恰为 100 时必须判为 high（历史达到压缩触发线）
+        llm2 = _FakeLLM(
+            capability={"context_window": 16384, "thinking": "none", "cloud": False},
+            prompt_budget=budget, token_fn=lambda _t: trigger)
+        a2 = agent_mod.Agent(llm=llm2, session_id="cmp2")
+        a2.history = [{"user": "u", "assistant": "a", "ts": ""}]
+        st2 = a2.context_stats("q")
+        self.assertEqual(st2["compact_percent"], 100)
+        self.assertEqual(st2["level"], "high")
 
     def test_percent_denominator_is_budget_not_full_window(self):
         # 用量恰好等于「可用额度」时即 100%，即便它只占完整窗口的一部分；

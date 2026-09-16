@@ -47,6 +47,8 @@ from config import (
     model_context_window,
     set_context_window_override,
     get_context_window_override,
+    ensure_dirs,
+    _apply_persisted_state,
 )
 from ingest import ingest_file, ingest_code_directory, load_project_rules
 from vectorstore import reset_collection, list_sources, count
@@ -107,6 +109,15 @@ from game_workbench import list_tasks, upsert_task, validate_task_scope, task_im
 
 @asynccontextmanager
 async def _app_lifespan(app):
+    # 惰性创建运行时目录（.chroma 等）——导入期不再产生磁盘副作用，改在此处显式初始化。
+    ensure_dirs()
+    # 恢复上次持久化的本地选择（code_root / GPU 偏好 / 自定义窗口）：过去挂在
+    # import config 时（导入期磁盘读），现改到启动期显式调用，须在读取 GPU 偏好
+    # （下方 get_runtime）与 gpu.init() 之前执行。
+    _apply_persisted_state()
+    # GPU 协调：先恢复上次残留的租约/队列（转 recovered），再起后台线程。
+    # 该恢复过去挂在 gpu_coordinator 导入期，现改为 lifespan 显式调用（gpu.init()）。
+    gpu.init()
     # GPU 协调后台线程：显存采样环、TTL 回收/FIFO pump、Ollama 空闲卸载。
     # Ollama 卸载钩子定义在下方（模块级函数，启动时已就绪）；用户在 GPU 面板
     # 保存的空闲卸载秒数/采样间隔从 .docmind_state.json 恢复。
@@ -1425,28 +1436,37 @@ async def chat(
         )
     routing = route_for(question)
     selected_agent = _agent_for(session_id)
-    # 本次请求可临时覆盖工具通道 / 计划模式（会话级 Agent 复用，属性可改）
-    if tool_mode.strip():
-        selected_agent.tool_mode = tool_mode.strip().lower()
-    if plan_mode.strip():
-        selected_agent.plan_mode = plan_mode.strip().lower() in ("1", "true", "yes", "on")
+    # 本次请求的逐请求开关改为传给 Agent.run(...)：不再写入共享单例属性，
+    # 避免把某次请求的临时开关（工具通道/计划模式）泄漏给同会话的并发请求
+    # （run 内部用 finally 还原，见 agent.Agent.run）。
+    tool_mode_override = tool_mode.strip().lower() or None
+    plan_mode_override = (plan_mode.strip().lower() in ("1", "true", "yes", "on")
+                          if plan_mode.strip() else None)
     is_cloud = False
+    cloud_llm = None
     if routing.get('route') == 'cloud' and routing.get('auto_cloud_enabled'):
         cloud_provider = get_runtime('cloud_llm_provider') or os.getenv('AGENT_CLOUD_PROVIDER', 'deepseek')
         if cloud_provider in PROVIDERS and PROVIDERS[cloud_provider].get('api_key_env'):
             key = get_runtime('llm_api_key') or os.getenv(PROVIDERS[cloud_provider]['api_key_env'], '')
             if key:
-                selected_agent = Agent(LLMClient(provider=cloud_provider, api_key=key),
-                                       session_id=(str(session_id or '').strip() or 'default'))
+                # 云端路由只为本轮造一个云端 client，随 run(llm=cloud_llm) 临时覆盖，
+                # 请求结束即还原——不再新建 Agent、不再改 _SESSION_AGENTS。旧做法
+                # `_SESSION_AGENTS[sid] = cloud_agent` 会把模块级 agent（会话单例）
+                # 变成孤儿：set_config/ingest 等仍打旧对象、且本会话被永久黏到云端。
+                # LLMClient 构造可能同步探活（≤3s）：放到线程池，避免阻塞事件循环。
+                cloud_llm = await run_in_threadpool(
+                    lambda: LLMClient(provider=cloud_provider, api_key=key)
+                )
                 is_cloud = True
             else:
                 routing = {**routing, 'route': 'local', 'reason': '云端未配置 API Key，已回退本地'}
     hints.append(f"模型路由建议：{routing['route']}（复杂度 {routing['complexity']}，{routing['reason']}）。若需云端模型，必须使用已配置且可审计的 provider。")
     # 逐请求开关：联网（默认关，空串也按关处理，避免漏传时误外联）；
-    # 深度思考空串=沿用模型画像/全局默认，显式 1/0 才覆盖。
-    selected_agent.web_enabled = web_mode.strip().lower() in ("1", "true", "yes", "on")
-    if thinking_mode.strip():
-        selected_agent.thinking_enabled = thinking_mode.strip().lower() in ("1", "true", "yes", "on")
+    # 深度思考空串=沿用模型画像/全局默认，显式 1/0 才覆盖（None=不改）。
+    # 这两个值同样随 Agent.run(...) 逐请求传入，不再写共享单例。
+    web_enabled_override = web_mode.strip().lower() in ("1", "true", "yes", "on")
+    thinking_enabled_override = (thinking_mode.strip().lower() in ("1", "true", "yes", "on")
+                                 if thinking_mode.strip() else None)
     if hints:
         grounded = "【系统提示】" + " ".join(hints) + f"\n\n用户问题：{question}"
     else:
@@ -1459,7 +1479,16 @@ async def chat(
         try:
             yield f"data: {json.dumps({'type':'route','route':routing['route'],'complexity':routing['complexity'],'reason':routing['reason']}, ensure_ascii=False)}\n\n"
             cloud_grounded = redact_for_cloud(grounded) if is_cloud else grounded
-            gen = selected_agent.run(cloud_grounded, stream=True, images=b64_images or None)
+            # 逐请求覆盖（含云端 llm）全部随 run(...) 传入：run 在 finally 里还原，
+            # 不污染共享单例；本地路由时 llm=None（用回会话自身的本地 client）。
+            gen = selected_agent.run(
+                cloud_grounded, stream=True, images=b64_images or None,
+                llm=cloud_llm,
+                web_enabled=web_enabled_override,
+                thinking_enabled=thinking_enabled_override,
+                tool_mode=tool_mode_override,
+                plan_mode=plan_mode_override,
+            )
             for ev in gen:
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as e:
@@ -1657,10 +1686,11 @@ async def enhance_prompt_ep(req: EnhancePromptReq):
                 "4. 若草稿过短或含糊，可合理补全上下文，但用「(推测)」标注补全部分。\n"
                 "5. 只输出改写后的提示词本身，不要解释、不要任何前缀或引号包裹。"
             )
-            enhanced = LLMClient().chat([
+            # LLMClient 构造可能同步探活、chat 本身是阻塞网络：整体放线程池避免阻塞事件循环
+            enhanced = await run_in_threadpool(lambda: LLMClient().chat([
                 {"role": "system", "content": sys_p},
                 {"role": "user", "content": "原始草稿：\n" + draft},
-            ], stream=False)
+            ], stream=False))
             enhanced = (enhanced or "").strip()
             if enhanced:
                 return {"ok": True, "mode": "llm", "enhanced": enhanced}
@@ -2472,12 +2502,13 @@ async def set_config(req: ConfigReq):
 
     # 重建 Agent 的 LLM 客户端（即时生效），并清空多轮上下文避免旧回答混淆
     try:
-        new_llm = LLMClient(
+        # LLMClient 构造可能同步探活（≤3s）：放到线程池，避免阻塞事件循环
+        new_llm = await run_in_threadpool(lambda: LLMClient(
             provider=req.provider,
             model=req.model or None,
             api_key=req.api_key or None,
             base_url=custom_base_url or None,
-        )
+        ))
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     agent.llm = new_llm

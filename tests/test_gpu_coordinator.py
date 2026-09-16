@@ -6,10 +6,12 @@
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -323,6 +325,37 @@ class GpuCoordinatorTest(unittest.TestCase):
         time.sleep(1.3)
         g.stop_background()
         self.assertGreaterEqual(len(g.recent_samples()), 3)
+
+    def test_samples_and_leases_persist_to_separate_files(self):
+        """回归 B3：后台采样不得冲掉租约快照。
+
+        采样写 SAMPLES_FILE、租约写 STATE_FILE；采样仍可从 STATE_FILE 恢复租约。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            old_state, old_samples = g.STATE_FILE, g.SAMPLES_FILE
+            g.STATE_FILE = Path(d) / "gpu_state.json"
+            g.SAMPLES_FILE = Path(d) / "gpu_samples.json"
+            try:
+                g.set_gpu_probe(lambda: _fake_gpus())
+                g.acquire_lease("worker", timeout=1.0, purpose="train")  # 触发 _persist_runtime_locked
+                g._sample_once()  # 采样，绝不能覆盖租约快照
+                state = json.loads(g.STATE_FILE.read_text(encoding="utf-8"))
+                samples = json.loads(g.SAMPLES_FILE.read_text(encoding="utf-8"))
+                # STATE_FILE 仍是租约/队列 schema
+                self.assertIn("leases", state)
+                self.assertIn("queue", state)
+                self.assertTrue(state["leases"], "租约快照必须保留")
+                self.assertNotIn("samples", state)
+                # SAMPLES_FILE 是采样 schema
+                self.assertIn("samples", samples)
+                self.assertNotIn("leases", samples)
+                # 采样后仍能从 STATE_FILE 产出 recovered 事件
+                g._recovery_events.clear()
+                recovered = g.restore_runtime_state()
+                self.assertGreaterEqual(recovered, 1, "STATE_FILE 未被采样冲掉，应能恢复租约")
+                self.assertTrue(any(ev.get("status") == "recovered" for ev in g._recovery_events))
+            finally:
+                g.STATE_FILE, g.SAMPLES_FILE = old_state, old_samples
 
     # ---- parallel 模式 ---------------------------------------------------
 

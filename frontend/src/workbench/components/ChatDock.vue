@@ -89,6 +89,11 @@ function applyUsage(ev: SseEvent) {
     prompt_budget: ev.prompt_budget ?? 0,
     percent: Math.max(0, Math.min(100, ev.percent)),
     level: (ev.level as ContextUsage['level']) || 'ok',
+    history_tokens: ev.history_tokens,
+    compact_trigger_tokens: ev.compact_trigger_tokens,
+    compact_percent: typeof ev.compact_percent === 'number'
+      ? Math.max(0, Math.min(100, ev.compact_percent))
+      : undefined,
   }
 }
 function fmtTokens(n: number): string {
@@ -101,14 +106,19 @@ function fmtTokens(n: number): string {
 const usageTitle = computed(() => {
   const u = usage.value
   if (!u) return ''
-  // 百分比按「可用 prompt 额度」计（模型窗口扣除输出预留），与压缩触发线同口径
-  const tail = u.level === 'warn'
-    ? '（已接近可用额度上限，早期对话即将自动压缩）'
-    : u.level === 'high'
-      ? '（占用偏高，达到 80% 后早期对话会自动压缩为摘要）'
-      : '（达到 80% 后早期对话会自动压缩为摘要，不影响新问答）'
-  return `上下文已用 ${fmtTokens(u.used_tokens)} / 可用额度 ${fmtTokens(u.prompt_budget)} tokens`
+  // 百分比按「可用 prompt 额度」计（模型窗口扣除输出预留）；level 现由「历史 / 压缩触发线」口径分级
+  const tail = u.level === 'high'
+    ? '（历史已达压缩触发线，早期对话会被自动压缩为摘要）'
+    : u.level === 'warn'
+      ? '（历史接近压缩触发线，即将自动压缩早期对话）'
+      : '（历史达到触发线后早期对话会自动压缩为摘要，不影响新问答）'
+  let line = `上下文已用 ${fmtTokens(u.used_tokens)} / 可用额度 ${fmtTokens(u.prompt_budget)} tokens`
     + `（模型窗口 ${fmtTokens(u.context_window)}，已预留输出空间）${tail}`
+  if (typeof u.compact_percent === 'number') {
+    line += `\n压缩进度：历史 ${fmtTokens(u.history_tokens ?? 0)}`
+      + ` / 触发线 ${fmtTokens(u.compact_trigger_tokens ?? 0)} tokens（${u.compact_percent}%）`
+  }
+  return line
 })
 
 async function loadModelConfig() {

@@ -35,7 +35,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   桌面壳默认打开问答页；入口可用 `DOCMIND_HOME` 覆盖（例如 `/workbench`）。
   桌面壳历史包袱：它曾经硬编码打开 `/workbench/`，而浏览器回退路径打开 `/`，两条路进不同页面，用户看懵过。
   工作台的重组件用 `defineAsyncComponent` 异步分块，首屏 JS 体积不受影响（工作台 172KB / gzip 63KB，第 19 次构建实测）。
-- **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前**第 19 次**冻结构建，2026-09-15 15:47；含本轮全部 harness 能力——trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔；exe 19,814,751 字节，SHA-256 `7c816242…`）；随包 MinGit。
+- **桌面分发**：PyInstaller **onedir** 控制台模式 `dist/DocMind/DocMind.exe`（当前**第 21 次**冻结构建，2026-09-16 19:22；本轮为**设计评审驱动的缺陷修复**——导入期副作用消除 / 运行时状态根可注入 + 测试隔离 / 前后端失败体契约 / 逐请求开关注入 / GPU 状态文件拆分 / calculate 指数与 Prompt 预算加固；exe 20,536,866 字节，SHA-256 `f67eac87…`）；随包 MinGit。
 - **引擎嵌入（P0-1 已实机闭环，且 UI 可用）**：Godot 4.7.2（`D://Tools//Godot//Godot_v4.7.2-stable_win64.exe`）+ 真 Win32 宿主窗口下实测通过——
   置父/样式摘除、按客户区（或前端指定矩形）对齐、宿主 resize 跟随、**真实合成键鼠（SendInput）送达引擎并回显**、
   解除嵌入后窗口原样还原、停止后无孤儿进程/窗口、父子 DPI 一致（本机 **150% 缩放 = 144 DPI** 实测）。
@@ -43,7 +43,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
   界面照常可用；另有「聚焦 / 解除嵌入 / 停止桌面窗口」。关弹窗或切走 tab 会自动解除嵌入（视窗元素没了，
   继续嵌着只会让引擎画到别处）。浏览器模式下开关自动禁用并提示需要桌面端。
 - **LLM/Embedding**：mock / qwen / deepseek / ollama / llamacpp 多 Provider，页面内免重启切换；本机 Ollama(`11434`, bge-m3) 与 llama.cpp(`8080`, Qwen 35B) 免 Key；622fdbc 新增 native embedding。
-- **验证基线**：后端 `unittest discover` **450/450 通过**（含 `test_gpu_coordinator.py` 31 例、`test_agent_trace.py` 14 例、`test_llm_resilience.py` 8 例、`test_agent_eval.py` 11 例、`test_native_tools.py` 11 例、`test_subagent_plan.py` 9 例、`test_hooks_skills.py` 13 例、`test_pricing.py` 8 例、`test_parallel.py` 9 例、`test_orchestrator.py` 54 例）；
+- **验证基线**：后端 `unittest discover` **707/707 通过**（skipped=1；含 `test_gpu_coordinator.py`、`test_agent_trace.py`、`test_llm_resilience.py`、`test_agent_eval.py`、`test_native_tools.py`、`test_subagent_plan.py`、`test_hooks_skills.py`、`test_pricing.py`、`test_parallel.py`、`test_orchestrator.py` 等；本轮新增 10 个测试文件：`test_failure_markers.py` / `test_web_search_markers.py` / `test_calculate.py` / `test_import_side_effects.py` / `test_state_root_isolation.py` / `test_state_isolation_hardening.py` / `test_persisted_state_lifespan.py` / `test_batch_d_agent.py` / `test_async_llm_construction.py` / `test_cloud_agent_registration.py`）；
   `verify_scene_canvas.py` 走真实 HTTP 路由 **54/54**（含"每个 op 的 undo 逐字节还原"）；
   `verify_engine_embed.py` 真 Godot + 真 Win32 宿主 **68/68**；
   `verify_scene_canvas_ui.mjs` 真浏览器 **27/27**（含"空间布局落点与场景坐标严格成比例"）；前端 build 通过。
@@ -128,6 +128,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 | 2026-09-15 | **连接器自主切换策略层落地**：`mcp_client` 新增 `capabilities_of`（engine + 显式 capabilities 推导能力标签）/ `connector_directory`（Agent 目录，含能力/适用说明/启用态，不打开会话）/ `select_connector`（按任务语义打分排序；点名引擎只在该引擎内选，避免误路由）；Agent 新增 `dev_list_connectors`/`dev_route_connector`/`dev_list_connector_tools` 三工具，`dev_mcp_call` 失败时提示回退，`SYSTEM_PROMPT` 接入「发现→路由→列工具→调用→切换」闭环；`/api/agent/connector-route` 暴露策略入口、`/api/agent/connectors` 追加 `capabilities`/`best_for`。新增 `tests/test_connector_routing.py` 13 例全绿（中文子串扫描 + 引擎专指过滤）；隔离端口 8079 真打 `connector-route`（`Godot 场景`→godot score 9、`Unity 构建`→[] 不误路由）与 `connectors` 富化字段。HANDOFF §5 Agent 路由「仍待做」项已落地 |
 
 | 2026-09-15 | **第二十次冻结合建（P2-2 ComfyUI 精确取消修复）**：comfy_cancel 改走 `POST /queue` delete 按 prompt_id 定向取消并精确释放 GPU 租约；492/492 单测、场景 54/54、浏览器 27/27、引擎嵌入 68/68 实机、npm run build、PyInstaller 直接构建进 `dist/DocMind`；exe 19,832,954 B、SHA-256 6b5e4207…；黄金题门 SKIP（环境无法稳定起已索引评测服务） |
+| 2026-09-16 | **设计评审驱动的缺陷修复（第 21 次冻结构建）**：对 4 个未推送提交（`1a1b597` / `9d9dd63` / `7186548` / `5c359d8`）做架构评审 + 缺陷排查（架构师与 QA 双线并行、逐条独立复现），按 **A→B→C→D 四批**修复，再由**未参与改动的第二位 QA** 复核（抓到 1 个由本轮修复引入的 P1 回归 + 4 个 P2）并追加 **R 批**修复、复验 PASS。① **导入期副作用消除**：`gpu_coordinator` 模块级 `restore_runtime_state()`（导入即 `unlink`，被拦时抛 `BaseException` 连锁炸 import）→ 显式 `init()` 由 lifespan 调用；`config` 模块级 `makedirs(CHROMA_DIR)` → 惰性 `ensure_dirs()`；`_apply_persisted_state()` 移入 lifespan；② **运行时状态根可注入 + 测试隔离**：`config.STATE_ROOT` + `state_path()`，10 项状态派生，测试进程默认隔离到临时目录（判据 `__main__.__spec__.name == "unittest.__main__"`），隔离时相对 env 也落 `STATE_ROOT`；③ **前后端失败体契约**：`modelApi.save/probeOllama/lookupModelContext` 改走 `rawJson`，`res.model_error` 分支从死代码恢复；④ **逐请求 llm/开关注入**：`Agent.run()` 5 个仅关键字覆盖（`web_enabled`/`thinking_enabled`/`tool_mode`/`plan_mode`/`llm`）+ `finally` 四出口还原；云端路由不再新建并注册 Agent（修掉模块级 `agent` 孤儿与会话黏云端）；⑤ **GPU 状态文件拆分**：采样样本独立 `SAMPLES_FILE`，修掉「两套 schema 互相覆盖 → 崩溃恢复静默失效」；⑥ **加固**：`calculate` 指数静态限幅（`9**9**9` 卡死 >6s → 毫秒级拒绝，`2**3**2` 不再误杀）、async 内 `LLMClient` 构造走线程池、`_history_window` 由 O(N) 次 `/api/tokenize` 降为 1 次、`context_stats` 与压缩口径对齐（新增 `compact_percent`）；⑦ 子代理继承联网/思考开关、搜索与 `read_file` 失败标记补全、两个早退分支补 `executed.add(sig)`（空转 15 轮 → 及时提示）、Prompt 预算下限不再超窗。**707/707 单测、场景 54/54、前端 build、最小 PATH 冻结冒烟 13/13 全 PASS、前端 14 产物逐字节一致**；exe 20,536,866 B、SHA-256 `f67eac87…`；黄金题门 SKIP（环境无法稳定起已索引评测服务） |
 
 > 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（20 次完整记录，继续追加不要新建文件）。
 
@@ -177,13 +178,24 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 - **精确 prompt_id 取消修复（2026-09-15）**：原 `comfy_cancel` 发 `POST /interrupt` 并误带 `prompt_id` 体——真实 ComfyUI 忽略该体、只中断"当前全局任务"，**取消不掉指定队列任务**（属 bug，非文档缺口）。已改为 `POST /queue` 带 `{"delete":[prompt_id]}`：ComfyUI 的 `delete_prompt` 会精确移除队列任务、且若其正在执行则自动 `interrupt`（不误伤其他任务）。同步改写 `tests/test_comfy_cancel.py`（断言 `/queue` delete 体与 `deleted` 字段）、`tests/test_gpu_coordinator.py`（fake server 增 `/queue` 处理、断言 `deletes==1`），并给 `api.py` 端点 docstring 与前端 `api.ts` cancel 返回类型补 `deleted` 字段。全量 `discover` 492 项 OK（skip=1 为 ComfyUI 不可达的真机转换测试）。
   - **真机验收（2026-09-15，8188 起 ComfyUI 后）**：直连 `/prompt` 排两条 Z-Image Turbo 任务 → `A=running`、`B=pending`（B 在队列排队，正是原 bug 场景）；`comfy_cancel(B)` 返回 `deleted=True` 且 **B 被精确移除、A 未误伤**；`comfy_cancel(A)` 返回 `deleted=True`、触发 `interrupt`。**例外（非 DocMind bug）**：Z-Image Turbo 执行不即时响应 ComfyUI `interrupt` 标志，被中断任务会长期留在 `queue_running` 直至自然完成——属 ComfyUI/模型层行为，端点契约本身正确。验收脚本 `D:/Temp/comfy_cancel_accept.py`。
 
-### P3　冻结发布（标准流程，已执行至第 19 次）
+### P3　冻结发布（标准流程，已执行至第 21 次）
 
-按 `docmind-frozen-release` Skill：py_compile → **250 项测试** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(68) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → 前端产物 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
-第 15–19 次均已执行（最新 `DocMind_BUILD.md` 第 19 次章节=2026-09-15 15:47 构建；exe 19,814,751 字节，SHA-256 `7c816242…`）。
+按 `docmind-frozen-release` Skill：py_compile → **全量单测** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(68) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → 前端产物 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
+第 15–21 次均已执行（最新 `DocMind_BUILD.md` 第 21 次章节=2026-09-16 19:22 构建；exe 20,536,866 字节，SHA-256 `f67eac87…`）。
+> 第 21 次的**流程偏离（已在 `DocMind_BUILD.md` 记录理由）**：未重跑 `verify_scene_canvas_ui.mjs`(27) 与 `verify_engine_embed.py`(68)——本轮改动面只有 `agent/api/config/llm/tools/sessions/pricing/agent_trace/gpu_coordinator/hooks/skills/vectorstore` 与前端 `api.ts`/`ChatDock.vue`/`ModelSettingsDialog.vue`，**未触碰** `scene_runtime.py` / `desktop_bridge.py` / `engine_adapters.py` / `game_workbench.py`，这两条验证路径的代码面不变；`verify_scene_canvas.py` 已实跑 **54/54**。
 **第 19 次交付卡点（已解除，2026-09-15 20:43）**：用户确认 8000 实例本就不在（探活 HTTP 000），并清理了残留 python 进程（`C:\Users\h'h'h\.workbuddy\binaries\python\versions\3.13.12\python.exe` 与 `rag-agent\.venv\Scripts\python.exe`）。随后换入完成：源 `D:/Temp/docmind_rel19/DocMind/`（exe 19,814,751、SHA-256 `7c816242…`）→ `dist/DocMind`，**换后 exe SHA-256 与源一致（`7c816242…`）= 完整性校验通过**。注意：未用 `/MIR` 而用 `robocopy /E /XD .docmind`——目标 `dist/DocMind` 含**运行时目录 `.docmind/`**（预算/轨迹/gpu_state/chroma 指针），`/MIR` 会误删，故排除保护；仅镜像构建文件（exe + MinGit + _internal）。交付完成，无需重打包。
 > 第 19 次的**两处流程偏离**（已在 `DocMind_BUILD.md` 记录理由）：① 未重跑 `npm run build`——本轮前端只有手写静态页 `web/trace.html`，`frontend/` 与 `web/assets/*` 零改动；② 未换入 `dist/DocMind`（同上卡点）。
-> **黄金题门**：第 19 次为 **SKIPPED**（本机无 `GOLDEN_QUESTIONS` 题库），已如实留痕。
+> **黄金题门**：第 19 / 20 / 21 次均为 **SKIPPED**（本机无法稳定起「已索引本仓库代码库」的可评测服务；离线规则打分由 `tests/test_agent_eval.py` 守在 707 全量里），已如实留痕。
+
+### 已知限制与后续项（2026-09-16 设计评审 / 缺陷排查产出）
+
+1. **同会话「真并发」仍可能串开关与 `llm`（已知限制，本轮评估后保留，未加锁）**：`Agent.run()` 的逐请求覆盖是「快照 → 跑 → `finally` 还原」，只保证**串行**语义。`event_stream` 是**同步生成器**、由 Starlette `iterate_in_threadpool` 在**工作线程**消费，而 `asyncio.Lock` 必须在**事件循环线程** acquire/release —— 跨边界释放不安全，且会把同会话请求串行化、改变流式响应行为，故不加锁。
+   **可达性**：前端 `aiApi.askGrounded` **不传 `session_id`** → 各标签页共用 `default` 会话，「同一用户两标签页并发提问」即可命中。
+   【方案】前端为每个标签页生成一个 `session_id`（存 `sessionStorage`）并随 `/api/chat` 传；后端 `_agent_for(sid)` 已按 sid 隔离，各页自然拿到不同 Agent，从根上绕开竞态且不改流式语义。【验收】两标签页并发提问，各自 `web_enabled`/`llm` 互不影响；`/api/context` 按 sid 分别返回。【状态】未做。
+2. **运行时状态根尚未覆盖「项目级」文件**（P2 残留）：`game_workbench` 的 `.docmind_comfy.json` / `.docmind_tasks.jsonl` / `.docmind_engine.*`、`semantic_tags` 的 `<root>/.docmind/semantic_tags.json`、`secrets_store` 的 `.docmind_secrets.json` / `.docmind_secret.key`、`agent_policy` 的 `.docmind_permissions.jsonl` / `.docmind_external_approvals.jsonl`、`mcp_client` 的 `.docmind_mcp.json`、`scene_runtime` 的 `.docmind_runtime.*`、`web_export` 的 `<root>/.docmind/web`、`regions` 的 `.docmind_backups` 仍按 `code_root` / `BASE_DIR` 落盘（本轮按「用户项目内容不搬」原则未动）。当前测试不会污染仓库根（已有断言），若要让测试**完全**隔离需逐个迁移。
+3. **仓库 `.env` 的 `CHROMA_DIR=./.chroma`**（未跟踪的用户文件）：**非隔离**进程仍把该相对路径解析到 cwd；隔离进程（测试）已改为落 `STATE_ROOT`。若想让 dev 也走统一口径，把该键从 `.env` 删掉即可（默认值派生自 `STATE_ROOT`，dev 下等价）。
+4. **`api.py::selection_ai_ep`** 内**嵌套同步生成器**里的 `client = LLMClient()` 未包线程池（D2 范围外，保持原样）：该生成器若将来在事件循环线程被迭代，同样有同步探活阻塞风险。
+5. **`read_file` 之外的其它工具失败文案**：本轮已把搜索 / 网页读取 / 文件读取三类补进 `_FAILURE_MARKERS` 并加表驱动测试；若后续新增工具返回新的失败文案，需同步加进该白名单（表驱动测试会反查漏项）。
 
 ### harness 能力层（`ab6e253` 运维四件套 + `ce7ff77` 能力五件套 + 并行化 已完成；下列为剩余项）
 
@@ -358,6 +370,36 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
     别把源码树的状态文件塞进包里当默认值——里面是绝对路径，换机器就失效。
 25. **浏览器默认会请求 `/favicon.ico`**：不接这条路由，每个页面都留一条 404，浏览器冒烟的
     "无失败请求"断言永远红。图标走 `frontend/public/favicon.ico` → Vite 拷进 `web/` → 后端路由。
+
+### 运行时状态 / 共享对象相关的坑（2026-09-16 设计评审后新增，都是真踩过的）
+
+26. **导入期绝不做磁盘 I/O**（2026-09-16 血案，本轮已修）：`gpu_coordinator` 曾在**模块导入期**调
+    `restore_runtime_state()` → `STATE_FILE.unlink()`。一旦删除被拦（沙箱守卫抛的是 `SystemExit`，
+    属 `BaseException`），应用层 `try/except Exception` **兜不住**，会连锁炸掉
+    `gpu_coordinator → llm → agent` 的 import。现场症状：46 个测试模块 `ImportError`、打包中途死掉，
+    且**看不出原因**。约定：**导入期只做纯定义**；恢复状态用显式 `init()`（由 `api.py` lifespan 在
+    `gpu.configure()` 之前调用）；建目录用惰性 `ensure_dirs()`；`_apply_persisted_state()` 也在 lifespan 里调。
+27. **跑测试不要往仓库根写运行时状态**（2026-09-16）：`config.STATE_ROOT`（`DOCMIND_STATE_ROOT` 优先）
+    + `state_path()` 统一派生 10 项状态；**测试进程**默认隔离到 `tempfile.mkdtemp()`。三个易踩点：
+    ① 判据**不能**用 `"unittest" in sys.modules`（任何 `import unittest` 的进程都会被误判，把用户状态
+    搬到临时目录、看起来像「状态丢了」）——正确判据是 `sys.modules["__main__"].__spec__.name == "unittest.__main__"`
+    （仅 `python -m unittest` 命中；`-c`/`script.py` 下 `__spec__` 为 `None`）；
+    ② 隔离生效时**相对路径** env 覆盖的解析基准是 `STATE_ROOT` 而非 cwd（否则 `.env` 里
+    `CHROMA_DIR=./.chroma` 仍会写仓库根）；③ 逃生阀 `DOCMIND_NO_TEST_ISOLATION=1`。
+28. **同一份「状态」不要写两套 schema**（2026-09-16）：GPU 协调器的**租约快照**与**采样样本**曾写同一个
+    `STATE_FILE`，5s 一次的采样线程会把租约冲掉 → 崩溃恢复**静默失效**（无报错、无异常，只是恢复永远不生效）。
+    现在拆成 `gpu_state.json`（leases/queue）与 `gpu_samples.json`（samples）。凡「后台定时写」与
+    「事件驱动写」共用一个文件的地方，都要拆开。
+29. **共享会话 Agent 上的可变属性必须按请求注入并还原**（2026-09-16）：`api.py` 每个 session 一个长驻
+    `Agent`，逐请求开关（`web_enabled`/`thinking_enabled`/`tool_mode`/`plan_mode`/`llm`）一律经
+    `Agent.run(...)` 的**仅关键字参数**传入，由 `run()` 开头快照 + `finally` 还原（正常/异常/`close()`/断连四出口）；
+    **不要**在调用方就地改共享单例属性。同理：云端路由**不要**新建并注册 `Agent` 到 `_SESSION_AGENTS`
+    —— 会让模块级 `agent` 沦为孤儿（`set_config` 换模型 / `reset_code` / `/api/ingest` 对活跃会话失效）、
+    且该会话此后「黏」云端而路由事件仍报 `local`。
+30. **失败判定靠文案白名单，新增工具必须同步**（2026-09-16）：`agent._FAILURE_MARKERS` 决定一次工具观察
+    是否算失败（进而决定是否触发 Reflection、trace 的 `ok`）。工具返回新的失败文案而没进白名单，就会
+    **失败被当成功**（静默）。本轮已补「搜索失败 / 搜索未返回结果 / 网页读取失败 / 读取失败 / 文件不存在 / 拒绝访问」，
+    并有表驱动测试 `tests/test_failure_markers.py` 反查漏项——新增失败文案时先跑它。
 
 ---
 
@@ -691,3 +733,12 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 已完成：web_search（DuckDuckGo）、web_fetch（公开 HTML 正文读取）、web_research（搜索+最多 3 个来源抓取）、标题/最终 URL/正文清理、非 HTML 与网络失败降级、回答中的来源 URL 可点击。
 
 未完善：B 站专用搜索与字幕提取、GitHub API 专用搜索、搜索结果缓存、来源可信度评分、多来源冲突检测、前端来源卡片/正文展开、登录/验证码/付费墙处理。当前能力可用于普通教程、GitHub 资料和引擎文档查询，但不可宣称达到 Perplexity/Claude Research 级别。
+
+### 2026-09-16 设计评审 + 缺陷修复（A→B→C→D + R 批）文档同步
+
+- §2：验证基线 450 → **707**；桌面分发版本 第 19 次 → **第 21 次**（exe 20,536,866 B / SHA-256 `f67eac87…`）。
+- §4：新增 2026-09-16 时间线行（四批修复 + 独立 QA 复核 + R 批回归修复 + 第 21 次冻结构建）。
+- §5：P3 版次推进到第 21 次，并记录本轮**流程偏离**（未重跑浏览器冒烟 `verify_scene_canvas_ui.mjs`(27) 与引擎嵌入 `verify_engine_embed.py`(68)，理由=本轮改动面未触碰 `scene_runtime.py`/`desktop_bridge.py`/`engine_adapters.py`/`game_workbench.py`）；新增「已知限制与后续项」小节共 5 条。
+- §8：新增「运行时状态 / 共享对象相关的坑」小节（第 26–30 条）。
+- `DocMind_BUILD.md`：顶部指引行与产物段更新为第二十一次；新增「第二十一次重建」章节（14 项改动 / 验证明细 / 已知限制）。
+- 本轮是**无新功能**的纯修复发布，流程为「评审 → 四批修复 → 独立 QA 复核 → R 批回归修复」；**未验证项**（同会话真并发、需真实硬件/外网的项）已如实列在 §5 与 BUILD.md，未宣称通过。

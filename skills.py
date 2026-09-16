@@ -1,6 +1,6 @@
 """技能热插拔：从目录扫 SKILL.md，注入系统提示 + 提供 dev_use_skill 工具。
 
-技能目录：`<BASE_DIR>/.docmind/skills/`（可用 `DOCMIND_SKILLS_DIR` 覆盖），
+技能目录：`<STATE_ROOT>/.docmind/skills/`（可用 `DOCMIND_SKILLS_DIR` 覆盖），
 支持 `<dir>/SKILL.md` 与直接 `<dir>/<name>.md` 两种布局。文件头可选 YAML frontmatter：
 
   ---
@@ -20,9 +20,9 @@ from __future__ import annotations
 import os
 import threading
 
-from config import BASE_DIR
+from config import STATE_ROOT, state_path
 
-SKILLS_DIR = os.getenv("DOCMIND_SKILLS_DIR") or os.path.join(BASE_DIR, ".docmind", "skills")
+SKILLS_DIR = state_path("DOCMIND_SKILLS_DIR", os.path.join(STATE_ROOT, ".docmind", "skills"))
 CATALOG_MAX = int(os.getenv("DOCMIND_SKILL_CATALOG_MAX", "20"))   # 注入目录最多几条
 BODY_MAX = int(os.getenv("DOCMIND_SKILL_BODY_MAX", "6000"))       # 单技能正文回传上限
 

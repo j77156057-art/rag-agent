@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import tempfile
 
 from dotenv import load_dotenv
 
@@ -25,6 +26,52 @@ else:
 # 项目根目录与前端目录（供 api.py 等模块复用）
 PROJECT_DIR = BASE_DIR
 PROJECT_WEB_DIR = os.path.join(PROJECT_DIR, "web")
+
+# 运行时状态根：.chroma / .docmind* / 会话 / trace / 预算等派生自此。
+# 显式 DOCMIND_STATE_ROOT 优先；测试进程默认隔离到临时目录（不污染仓库）。
+STATE_ROOT = os.getenv("DOCMIND_STATE_ROOT") or BASE_DIR
+
+
+def _running_under_unittest():
+    """当前进程是否由 `python -m unittest ...` 驱动（严格判据）。
+
+    过去判据是 `"unittest" in sys.modules`（外加 argv[0] 猜测），会把「任何 import
+    了 unittest 的进程」（如 `python -c "import unittest, config"`）也误判为测试
+    进程，把状态根搬到临时目录，让用户状态「看起来丢了」。这里改用 runpy 的精确
+    特征：`-m unittest` 时 `sys.modules["__main__"].__spec__.name == "unittest.__main__"`
+    （unittest/__main__.py 以 __main__ 身份执行，spec 名保留）；普通 `import unittest`
+    或 `python script.py` 的 __main__ 无此 spec，故只在真正的 `-m unittest` 进程命中。
+    """
+    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    return getattr(spec, "name", None) == "unittest.__main__"
+
+
+# 最小、可解释的测试隔离：仅 `python -m unittest` 进程生效。打包 exe / dev 服务不
+# 满足该判据，行为不变；显式设置 DOCMIND_STATE_ROOT 优先于本默认；
+# DOCMIND_NO_TEST_ISOLATION=1 可关闭（例如想跑真实状态根时）。
+_TEST_STATE_ISOLATED = bool(
+    not os.getenv("DOCMIND_STATE_ROOT")
+    and _running_under_unittest()
+    and os.getenv("DOCMIND_NO_TEST_ISOLATION") != "1"
+)
+if _TEST_STATE_ISOLATED:
+    STATE_ROOT = tempfile.mkdtemp(prefix="docmind_test_state_")
+
+
+def state_path(env_name, default):
+    """取运行时状态路径：显式 env 优先；测试隔离生效时相对路径以 STATE_ROOT 为基准。
+
+    - env 未设置（空串视为未设置）→ 返回 default（通常已派生自 STATE_ROOT）；
+    - env 是绝对路径 → 原样返回；
+    - env 是相对路径 且 测试隔离生效 → 挂到 STATE_ROOT 下（否则会相对 cwd 写进仓库根）；
+    - env 是相对路径 且 未隔离 → 原样返回（保持「显式 env 优先」语义）。
+    """
+    raw = os.getenv(env_name)
+    if not raw:
+        return default
+    if _TEST_STATE_ISOLATED and not os.path.isabs(raw):
+        return os.path.join(STATE_ROOT, raw)
+    return raw
 
 # ---- LLM Provider ----
 # 可选: qwen(通义千问) / deepseek / kimi(月之暗面) / zhipu(智谱) /
@@ -121,15 +168,25 @@ EMBEDDING_MODEL = os.getenv(
 LOCAL_EMBED_DIM = 256  # 本地兜底向量维度（仅离线演示用，非语义向量）
 
 # ---- 路径 / 参数 ----
-if getattr(sys, "frozen", False):
-    # 打包后使用随 exe 资源目录里的 .chroma。该目录**不随包分发**（见 docmind.spec，
-    # 否则会泄漏开发者的本地代码索引并额外增加约 377MB 体积），由 chromadb 首次启动时
-    # 自动创建空目录，用户通过 /api/ingest_code 索引自己的代码库。
-    CHROMA_DIR = os.path.join(BASE_DIR, ".chroma")
-else:
-    CHROMA_DIR = os.getenv("CHROMA_DIR", os.path.join(BASE_DIR, ".chroma"))
-# 确保索引目录存在（干净分发 / 首次启动时 chromadb 可能尚未建目录）
-os.makedirs(CHROMA_DIR, exist_ok=True)
+# .chroma 与其余状态文件同源于 STATE_ROOT（打包后 STATE_ROOT 默认 = 资源目录）。
+# 该目录**不随包分发**（见 docmind.spec，否则会泄漏开发者的本地代码索引并额外增加约
+# 377MB 体积），由 chromadb 首次启动时自动创建空目录，用户通过 /api/ingest_code 索引
+# 自己的代码库。CHROMA_DIR 显式 env 仍优先。
+CHROMA_DIR = state_path("CHROMA_DIR", os.path.join(STATE_ROOT, ".chroma"))
+
+
+def ensure_dirs():
+    """幂等创建运行时目录（惰性）。
+
+    严禁在模块导入期调用——导入不应产生任何磁盘副作用。由 api.py 的 lifespan 与
+    vectorstore 建立 chroma 客户端前显式调用。
+    """
+    try:
+        os.makedirs(CHROMA_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "docmind")
 CODE_COLLECTION_NAME = os.getenv("CODE_COLLECTION_NAME", "docmind_code")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
@@ -235,7 +292,8 @@ def prompt_token_budget(provider: str, model: str, context_window: int = None) -
     - env PROMPT_TOKEN_BUDGET 显式设置时强制采用（排障/压测用）；
     - context_window 可传入实时探测/自定义的窗口值（缺省走 model_context_window）；
     - 默认取「窗口的 75%」与「窗口 - 输出上限 - 512 余量」的较小值，
-      并保 6144 下限。16k 本地模型 ≈ 12k，131k 云端 ≈ 98k，1M 模型 ≈ 786k。
+      并保 6144 下限（但受窗口可用量约束）。16k 本地模型 ≈ 12k，131k 云端 ≈ 98k，
+      1M 模型 ≈ 786k；窗口过小时退化为窗口的一半（至少 256），绝不越过窗口。
     """
     env = os.getenv("PROMPT_TOKEN_BUDGET", "").strip()
     if env:
@@ -244,9 +302,17 @@ def prompt_token_budget(provider: str, model: str, context_window: int = None) -
         except ValueError:
             pass
     win = int(context_window) if context_window else model_context_window(provider, model)
-    usable = max(2048, win - LLM_MAX_TOKENS - 512)
-    scaled = int(win * 0.75)
-    return max(6144, min(usable, scaled))
+    reserve = LLM_MAX_TOKENS + 512
+    usable = win - reserve
+    if usable <= 0:
+        # 窗口连输出预留都放不下：退化为窗口的一半（至少 256）
+        budget = max(256, int(win * 0.5))
+    else:
+        scaled = int(win * 0.75)
+        budget = min(usable, scaled)
+        budget = max(min(6144, usable), budget)   # 保 6144 下限，但不得越过 usable
+        budget = max(256, budget)
+    return budget
 
 
 def model_thinking_mode(provider: str, model: str) -> str:
@@ -317,7 +383,7 @@ def get_runtime(key, default=None):
 # ---- 跨重启持久化的少量本地状态（当前仅 code_root）----
 # 与 .chroma 同目录（开发=源码根；冻结=_internal），只存路径类非敏感数据，
 # 避免重启后必须重新选择代码库。写入失败一律静默回落内存态，不影响主流程。
-STATE_FILE = os.path.join(BASE_DIR, ".docmind_state.json")
+STATE_FILE = os.path.join(STATE_ROOT, ".docmind_state.json")
 
 
 def save_state(key, value):
@@ -382,7 +448,12 @@ def clear_context_window_override(provider: str, model: str):
 
 
 def _apply_persisted_state():
-    """进程启动（import config）时恢复上次的本地选择；路径失效自动忽略。"""
+    """恢复上次持久化的本地选择（code_root / GPU 偏好 / 自定义窗口）。
+
+    过去在 import config 时调用（导入期磁盘读）——现改由服务启动期显式调用
+    （api.py 的 lifespan，紧接 ensure_dirs() 之后、gpu.init() 之前），
+    使导入 config 不再触碰磁盘。函数本身与调用点解耦：路径失效自动忽略。
+    """
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -404,7 +475,10 @@ def _apply_persisted_state():
                 _CONTEXT_WINDOW_OVERRIDES[k] = v
 
 
-_apply_persisted_state()
+# 注：过去此处 import 期直接调用 _apply_persisted_state()（导入即磁盘读）。
+# 现改为由服务启动期显式调用（api.py lifespan，见 _app_lifespan），
+# 使 `import config` 不产生任何磁盘 I/O；仅读取的持久化状态在进程真正
+# 对外提供服务前恢复，行为对外等价。
 
 
 def edit_confirm_enabled():

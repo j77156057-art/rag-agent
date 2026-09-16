@@ -358,6 +358,32 @@ class WebGateTests(unittest.TestCase):
         _run(a)
         self.assertEqual(calls, ["今天的新闻"])
 
+    def test_offline_repeat_same_web_call_stops_early(self):
+        """联网关闭时同参重复 web_search：既被拦截，又能触发防重复升级及时收尾。
+
+        回归缺陷：两个早退分支（联网拦截 / 子代理白名单拒绝）以前只 yield 观察就
+        continue，未登记已执行签名，导致 `sig in executed` 恒为假、repeats 永不增长，
+        弱模型同参空转要耗尽 15 次推理才报「已达到最大推理步数」。
+        """
+        calls = []
+
+        def fake_web(arg):
+            calls.append(arg)
+            return "不应被调用"
+
+        agent_mod.TOOLS = {"web_search": {"func": fake_web}}
+        # 单条脚本 → _ScriptedLLM 用最后一条兜底反复返回同一「同参 web_search」。
+        a = agent_mod.Agent(llm=_ScriptedLLM([_act("web_search", "x")]))
+        self.assertFalse(a.web_enabled, "新 Agent 的联网默认关闭")
+        events = _run(a)
+        self.assertEqual(calls, [], "联网关闭时 web_search 绝不能执行")
+        actions = [e for e in events if e["type"] == "action"]
+        self.assertLessEqual(len(actions), 4, "同参空转应被及时截停，而非刷满最大步数")
+        self.assertTrue(any("联网未开启" in e.get("text", "")
+                            for e in events if e["type"] == "observation"))
+        finals = [e["text"] for e in events if e["type"] == "final"]
+        self.assertEqual(len(finals), 1, "事件流最终必须产出 final")
+
     def test_effective_tool_schemas_filter_web_tools(self):
         a = agent_mod.Agent(llm=_ScriptedLLM([_FINAL_OK]))
         names_off = set(a._effective_tool_names())

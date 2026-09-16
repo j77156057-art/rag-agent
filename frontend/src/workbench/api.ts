@@ -1118,6 +1118,10 @@ export interface SseEvent {
   prompt_budget?: number
   percent?: number
   level?: 'ok' | 'high' | 'warn' | string
+  /** 会话历史 token（与压缩触发口径同源） */
+  history_tokens?: number
+  compact_trigger_tokens?: number
+  compact_percent?: number
 }
 
 /** 上下文窗口占用（GET /api/context 与 SSE context 事件同构） */
@@ -1127,6 +1131,12 @@ export interface ContextUsage {
   prompt_budget: number
   percent: number
   level: 'ok' | 'high' | 'warn'
+  /** 会话历史 token 占用（压缩口径，可选：旧后端可能不下发） */
+  history_tokens?: number
+  /** 压缩触发线（= prompt_budget × COMPACT_TRIGGER_RATIO） */
+  compact_trigger_tokens?: number
+  /** 历史 token / 压缩触发线（0-100）：level 即由此分级 */
+  compact_percent?: number
 }
 
 export interface SseStreamHandlers {
@@ -1305,15 +1315,17 @@ export const modelApi = {
     return request('/api/config')
   },
   save(req: SaveModelReq): Promise<ModelConfigInfo & { warnings?: string[]; model_error?: string }> {
-    return postJson('/api/config', req)
+    // 后端配置保存失败是 HTTP 200 + {ok:false, model_error?}：必须走 rawJson 原样返回失败体，
+    // 否则通用 request 会把真实原因吞成「请求失败（HTTP 200）」，model_error 分支永不触发。
+    return rawJson<ModelConfigInfo & { warnings?: string[]; model_error?: string }>('/api/config', req)
   },
   /** 实时探测本机已安装 Ollama 模型的真实上下文窗口 */
   probeOllama(model: string): Promise<OllamaProbeResult> {
-    return request(`/api/ollama/probe?model=${encodeURIComponent(model)}`)
+    return rawJson<OllamaProbeResult>(`/api/ollama/probe?model=${encodeURIComponent(model)}`)
   },
   /** 联网搜索模型公开的上下文窗口（返回候选列表，不自动写配置） */
   lookupModelContext(provider: string, model: string): Promise<ContextLookupResult> {
-    return postJson('/api/model_context_lookup', { provider, model })
+    return rawJson<ContextLookupResult>('/api/model_context_lookup', { provider, model })
   },
 }
 
@@ -1328,6 +1340,9 @@ export const contextApi = {
       prompt_budget: r.prompt_budget ?? 0,
       percent: r.percent ?? 0,
       level: (r.level as ContextUsage['level']) ?? 'ok',
+      history_tokens: r.history_tokens,
+      compact_trigger_tokens: r.compact_trigger_tokens,
+      compact_percent: r.compact_percent,
     }
   },
 }

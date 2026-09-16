@@ -1,8 +1,8 @@
 """按 provider 计价的成本核算 + 预算熔断。
 
-- **单价表**：优先读 `<BASE_DIR>/.docmind_pricing.json`（可随项目覆盖），缺省用内置表。
+- **单价表**：优先读 `<STATE_ROOT>/.docmind_pricing.json`（可随项目覆盖），缺省用内置表。
   单位：**元 / 1M tokens**。本地 provider（ollama / llamacpp / mock）默认 0（不产生 API 费用）。
-- **预算熔断**：按「全局 + 每会话」累计花费，落 `<BASE_DIR>/.docmind_budget.json`。
+- **预算熔断**：按「全局 + 每会话」累计花费，落 `<STATE_ROOT>/.docmind_budget.json`。
   单轮开始前 `check()` —— 已超限则直接拒绝该轮；单轮结束后 `charge()` 累计。
   离线工具/演示模式下费用恒为 0，熔断不会误伤。
 """
@@ -14,10 +14,10 @@ import os
 import time as _time
 from datetime import date, datetime
 
-from config import BASE_DIR
+from config import STATE_ROOT, state_path
 
-PRICING_FILE = os.getenv("DOCMIND_PRICING_FILE") or os.path.join(BASE_DIR, ".docmind_pricing.json")
-BUDGET_FILE = os.getenv("DOCMIND_BUDGET_FILE") or os.path.join(BASE_DIR, ".docmind_budget.json")
+PRICING_FILE = state_path("DOCMIND_PRICING_FILE", os.path.join(STATE_ROOT, ".docmind_pricing.json"))
+BUDGET_FILE = state_path("DOCMIND_BUDGET_FILE", os.path.join(STATE_ROOT, ".docmind_budget.json"))
 
 # 内置单价（元 / 1M tokens）。仅为量级参考，正式使用请用 .docmind_pricing.json 覆盖。
 DEFAULT_PRICING = {

@@ -1,13 +1,57 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第十九次重建（harness 能力落地：trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔）」；历史构建清单保留在下文。
+> 最新构建见下方「第二十一次重建（设计评审驱动的缺陷修复：导入期副作用 / 运行时状态隔离 / 前后端契约一致性 / 加固）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 19.7 MB，控制台模式，启动时自动开浏览器）
 - 整体体积：约 309 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 91 MB/365 文件；**第十六次起不再打包开发者 `.chroma` 索引库，较第十五次 682.5 MB 降约 374 MB**）
-- **当前构建时间：`2026-09-15 15:47:52`（第十九次重建，harness 能力落地——trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔，exe 19,814,751 字节，SHA-256 7c816242944eb0cbfb7a9c4d486df92bc5a83d1e57af6504d6837cf607c88745）**
-- 上一版：`2026-09-15 15:47:52`（第十九次重建，harness 能力落地——trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔，exe 19,814,751 字节，SHA-256 7c816242944eb0cbfb7a9c4d486df92bc5a83d1e57af6504d6837cf607c88745）
+- **当前构建时间：`2026-09-16 19:22:21`（第二十一次重建，设计评审驱动的缺陷修复——导入期副作用 / 运行时状态隔离 / 前后端契约一致性 / 加固，exe 20,536,866 字节，SHA-256 f67eac87acb0c447061b791c05a2ac643faa3ddcfae058f123c5e47ee8e9681a）**
+- 上一版：`2026-09-15 22:01:23`（第二十次重建，P2-2 ComfyUI 精确取消修复，exe 19,832,954 字节，SHA-256 6b5e4207d99a06eb4498d9f2fbdc170de2367a157b721d9ab5ef860b22dbdc15）
+
+---
+
+## 第二十一次重建：设计评审驱动的缺陷修复（A→B→C→D + R 批）— 导入期副作用 / 运行时状态隔离 / 前后端契约 / 加固（2026-09-16 19:22）
+
+### 改动
+本轮**不含新功能**：先对 HEAD 上 4 个未推送提交（`1a1b597` 模型切换·联网·思考流·压缩通知·OpenAI 兼容端点 / `9d9dd63` calculate 比较运算 / `7186548` 上下文用量%与压缩阈值按真实窗口 / `5c359d8` Ollama 实时探测·手填覆盖·联网查询·压缩触发线 80%）做一轮**设计评审 + 缺陷排查**（架构师与 QA 双线并行、逐条独立复现），再按 A→B→C→D 四批修复，最后由**未参与改动的第二位 QA** 独立复核（首轮 PASS with risks，抓出 1 个由本轮修复引入的 P1 回归 + 4 个 P2）并追加 R 批修复，复验 PASS。源码区间 `0431c05`（origin/main）→ 本轮提交。
+
+**批次 A（子代理开关 / 失败标记 / 早退空转 / 预算下限）**
+1. `agent.py::_run_child()`：子代理继承父代理的 `web_enabled` / `thinking_enabled`。此前开启联网后，`delegate` / `orchestrate` 的联网子任务**全被拦截**（子代理退回默认 False）。
+2. `tools.py::web_search()`：双后端异常时补回「搜索失败:」前缀（`agent._FAILURE_MARKERS` 才能识别 → 触发 Reflection、trace `ok` 不再误判为成功）；同时区分「后端返回空结果」与「后端硬异常」，恢复后者本应给出的「外网不可达」提示。
+3. `agent.py`：子代理白名单拒绝、联网关闭拦截两个**早退分支**补 `executed.add(sig)`。此前同参重复调用不会被防重复逻辑升级，实测空转 **15 轮**才报「已达最大推理步数」，而不是及时提示「请打开联网开关」。另把 `read_file` 的 `读取失败:` / `文件不存在:` / `拒绝访问:` 纳入失败判定（与上面同源），并加**表驱动**测试把这一类钉住。
+4. `config.py::prompt_token_budget()`：下限不再越过窗口可用量。此前 `context_window` = 1024 / 4096 / 8192 都算成 **6144**（预算大于窗口，提示词被服务端静默截断）；1M→786432 / 16K→12288 / 128K→98304 保持不变。
+
+**批次 B（契约与数据一致性）**
+5. 前端 `api.ts`：`modelApi.save` / `probeOllama` / `lookupModelContext` 改走 `rawJson()`。后端这三处失败是 **HTTP 200 + `{ok:false, model_error?}`**，走会抛错的 `request()` 会把真实原因吞成「请求失败（HTTP 200）」；改后 `ModelSettingsDialog.vue` 的 `res.model_error` / `res.ok===false` 分支从死代码恢复可达。
+6. `gpu_coordinator.py`：采样样本拆到独立 `SAMPLES_FILE`（`DOCMIND_GPU_SAMPLES_FILE`，默认 `.docmind/gpu_samples.json`）。此前采样线程（默认 5s 一次）与租约快照写**同一个** `STATE_FILE`，两套 schema 互相覆盖 → 崩溃恢复**静默失效**（实测到 61B `{leases,queue}` 与 306B `{samples}` 两种内容交替落盘）。
+7. `api.py::chat` 云端路由：**不再新建并注册** Agent（该写法会让模块级 `agent` 沦为孤儿、`set_config` 换模型 / `reset_code` / `/api/ingest` 对活跃会话失效，且会话会「黏」云端），改为把云端 client 作为**逐请求覆盖**传入 `run(llm=...)`（见第 12 项）。
+
+**批次 C（结构性：导入期副作用与运行时状态隔离）**
+8. `gpu_coordinator.py`：删除**模块级** `restore_runtime_state()`（它会在**导入期** `unlink` 状态文件；被拦时抛的是 `BaseException`，应用层 `except Exception` 兜不住，会让整批 import 连锁失败）；改显式 `init()`，由 `api.py` lifespan 在 `gpu.configure()` 之前调用。`config.py` 删除模块级 `os.makedirs(CHROMA_DIR)`，改惰性 `ensure_dirs()`（`vectorstore` 建客户端前兜底）。`config._apply_persisted_state()` 同样从导入期移到 lifespan（顺序实测 `ensure_dirs → apply_persisted_state → gpu.init → gpu.configure`）。**全仓 grep 结论：导入期已无「产生副作用」的磁盘 I/O。**
+9. 新增 `config.STATE_ROOT`（`DOCMIND_STATE_ROOT` 优先）+ `config.state_path()`：`.chroma`、`.docmind_state.json`、sessions、pricing、trace、gpu(state+samples)、hooks、skills 共 **10 项**运行时状态统一派生；**用户项目内容**（`CODE_ROOT` / `regions.json` / `uploads`）不搬。测试进程默认隔离到临时目录（判据 `__main__.__spec__.name == "unittest.__main__"`，**仅** `python -m unittest` 命中；`DOCMIND_NO_TEST_ISOLATION=1` 可关），隔离生效时**相对路径** env 覆盖也解析到 `STATE_ROOT` 下——此前跑测试会往仓库根写 `.docmind*` / `.chroma`。
+
+**批次 D（加固）**
+10. `tools.py::calculate()`：`**` 指数改为「必须可静态求出且 ≤512」（有界静态求值器：`**` 仅当两侧字面整数且各自 ≤32 才递归，中间整数 `bit_length()>40` 即放弃），结果 >4000 位拒绝。此前 `9**9**9` **卡死 >6s**（极端可 OOM）；现在毫秒级拒绝，且 `2**3**2`（=512）这类合法表达式不再误杀。
+11. `api.py`：async 处理函数内的 `LLMClient(...)` / `Agent(...)` 构造改 `run_in_threadpool`（构造内含 ≤3s 同步 Ollama 探活，此前会**阻塞事件循环**）。
+12. `agent.py::Agent.run(...)`：新增 5 个仅关键字**逐请求覆盖** `web_enabled` / `thinking_enabled` / `tool_mode` / `plan_mode` / `llm`（`None`=不改），生成器体开头快照、`finally` 无条件还原（正常结束 / 异常 / `close()` / 断连四出口全覆盖）；`api.py::chat` 不再就地改共享会话单例属性。
+13. `agent.py::_history_window()`：整段历史只发 **1 次** `count_tokens`（此前逐轮一次 `/api/tokenize` → O(N) 次网络往返）。
+14. `agent.py::context_stats()`：新增 `history_tokens` / `compact_trigger_tokens` / `compact_percent`，`level` 改由「离自动压缩还剩多远」分级（与压缩判定同口径）；前端 `api.ts` / `ChatDock.vue` 同步（悬停提示显示压缩进度）。
+
+### 验证
+- 单测：全量 `unittest discover` **707/707 通过**（skipped=1 = ComfyUI 不可达时的真实 H3 转换用例；较第 20 次 492 例净增 215 例，含本轮新增 **10 个测试文件**：`test_failure_markers` / `test_web_search_markers` / `test_calculate` / `test_import_side_effects` / `test_state_root_isolation` / `test_state_isolation_hardening` / `test_persisted_state_lifespan` / `test_batch_d_agent` / `test_async_llm_construction` / `test_cloud_agent_registration`）。
+- **独立 QA 复核**（第二位 QA，未参与改动，自写复现脚本）：首轮 **PASS with risks** —— 15/16 项独立复现通过，抓出 1 个**由本批修复引入的 P1 回归**（云端 Agent 注册致模块级 `agent` 成孤儿）与 4 个 P2；R 批修复后复验 **PASS**（R1 用 **14 条**独立断言确认：不再孤儿、随后 local 请求运行期确用本地 client、断连/异常出口也还原 `self.llm`、`set_config` 的 `agent.llm = new_llm` 能作用到活跃默认会话）。
+- 前端：`npm run build` 成功（vite 5.4.21，249 模块）；`workbench-CRi4v5IR.js` 280.46 kB、`SceneCanvas-Bp_fOnY-.js`、`RuntimeTimeline-Ddb_qH8v.js`（`api.ts` 改动波及），**vendor 三分包哈希不变**（业务改动未使其失效）。
+- 场景画布：`verify_scene_canvas.py` **54/54**（本轮未触碰 `scene_runtime.py`；脚本确认新前端哈希可达且 Vue Flow 样式同批加载）。
+- 冻结态（最小 PATH 仅 `System32`、`DOCMIND_SERVER_ONLY=1`、端口 **8000**，PyInstaller 退出码 0）：
+  - 冷启动 **2.1s** 就绪；`build_time=2026-09-16 19:22:21`（与 exe mtime 一致 → 确认跑的是本轮产物）；exe **20,536,866 字节**，SHA-256 `f67eac87acb0c447061b791c05a2ac643faa3ddcfae058f123c5e47ee8e9681a`；
+  - 页面/端点：`/` 200、`/workbench/` 200（跟随 307）、`/api/health` 200、`/api/config` 200；**本轮相关端点契约实测**：`GET /api/context`（default 会话 agent 存在 → `ok:true, active:true, budget=196608`）、`GET /api/ollama/probe?model=`（空模型名 → 干净 `ok:false`）、`POST /api/model_context_lookup`（空模型名 → 干净 `ok:false`）、`POST /api/comfy/cancel`（ComfyUI 不可达 → 干净 `ok:false`，非 500）；
+  - **前端 14 个产物「HTTP 返回体 vs `web/` 源」SHA-256 全 match**（index / workbench / trace / favicon + 10 个 assets）；
+  - 卫生：包内**无** `.env` / `.docmind_state.json` / `.chroma` / `python*.exe`；MinGit 随包（`cmd/git.exe` 校验通过）；冒烟写出的 3 项运行时态已清理并复核不存在；进程已杀、端口 8000 释放。
+- **黄金题回归门**：**SKIPPED**——本机无法稳定起一个「已索引本仓库代码库」的可评测服务；离线规则打分由 `tests/test_agent_eval.py` 守在 707 全量里。*按流程如实留痕，不假装跑过。*
+
+> **交付说明**：:8000 无用户实例，本版**直接构建进 `rag-agent/dist/DocMind/`**。用户重开桌面快捷方式 `DocMind.lnk` 即指向新版 exe。
+> **已知限制（本轮评估后保留，已写入 HANDOFF §5）**：同会话**真并发**（同一 Agent 对象同时跑两轮）理论上仍可互相覆盖逐请求开关 / `llm`。`event_stream` 是同步生成器、由 Starlette `iterate_in_threadpool` 在**工作线程**消费，而 `asyncio.Lock` 必须在**事件循环线程** acquire/release —— 跨边界释放不安全，且会串行化流式响应改变可观测行为，故**不加锁**。可达性：前端 `aiApi.askGrounded` 不传 `session_id`，各标签页共用 `default` 会话，「同一用户两标签页并发提问」即可命中。低成本缓解（待做）：前端为每个标签页生成 `session_id` 并随请求传（后端 `_agent_for` 已按 sid 隔离）。
 
 ---
 

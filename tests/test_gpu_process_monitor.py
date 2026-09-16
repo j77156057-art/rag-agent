@@ -43,13 +43,14 @@ class GpuProcessMonitorTests(unittest.TestCase):
             except OSError: pass
     def test_sample_persists_unavailable_state(self):
         import tempfile, pathlib, json, os
-        old=g.STATE_FILE; fd,path=tempfile.mkstemp(); os.close(fd); g.STATE_FILE=pathlib.Path(path)
+        # 采样曲线落在 SAMPLES_FILE（B3 后与租约 STATE_FILE 分离）
+        old=g.SAMPLES_FILE; fd,path=tempfile.mkstemp(); os.close(fd); g.SAMPLES_FILE=pathlib.Path(path)
         try:
             g.set_gpu_probe(lambda: None); g._sample_once()
             data=json.load(open(path,encoding='utf-8'))
             self.assertFalse(data['available']); self.assertFalse(data['samples'][-1]['available'])
         finally:
-            g.STATE_FILE=old
+            g.SAMPLES_FILE=old
             try: os.unlink(path)
             except OSError: pass
 
