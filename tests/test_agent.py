@@ -379,5 +379,71 @@ class WebGateTests(unittest.TestCase):
         self.assertIn("联网已开启", joined_on)
 
 
+class CalculateToolTests(unittest.TestCase):
+    """calculate：AST 白名单求值 + 比较运算支持（回归「9.9 和 9.11 哪个大」）。"""
+
+    def test_arithmetic(self):
+        self.assertEqual(tools_mod.calculate("23*45+12"), "1047")
+        self.assertEqual(tools_mod.calculate("(123+456)*2"), "1158")
+        self.assertEqual(tools_mod.calculate("2**10"), "1024")
+        self.assertEqual(tools_mod.calculate("7//2"), "3")
+        self.assertEqual(tools_mod.calculate("7%3"), "1")
+        self.assertTrue(tools_mod.calculate("9.11-9.9").startswith("-0.79"))
+
+    def test_comparison_returns_chinese_bool(self):
+        self.assertEqual(tools_mod.calculate("9.9 > 9.11"), "成立（True）")
+        self.assertEqual(tools_mod.calculate("9.11 > 9.9"), "不成立（False）")
+        self.assertEqual(tools_mod.calculate("9.11 != 9.9"), "成立（True）")
+        self.assertEqual(tools_mod.calculate("(2+3) >= 5"), "成立（True）")
+
+    def test_rejects_non_arithmetic_nodes(self):
+        bad = tools_mod._CALC_BAD
+        # 名称/调用/属性/布尔运算是代码注入的入口，必须一律拒绝
+        self.assertEqual(tools_mod.calculate("__import__('os')"), bad)
+        self.assertEqual(tools_mod.calculate("open('x')"), bad)
+        self.assertEqual(tools_mod.calculate("1 or 2"), bad)
+        self.assertEqual(tools_mod.calculate("().__class__"), bad)
+        self.assertIn("计算失败", tools_mod.calculate("1/0"))
+        self.assertEqual(tools_mod.calculate(""), "未提供表达式。")
+
+
+class CalculateInterpretTests(unittest.TestCase):
+    """calculate 成功后回填观察、让模型把数字解读成自然语言结论，而不是直接抛数字。"""
+
+    def test_result_fed_back_and_model_conclusion_used(self):
+        llm = _ScriptedLLM([
+            _act("calculate", "9.11 - 9.9"),
+            "Thought: t\nFinal Answer: 9.9 更大，因为 9.11 减 9.9 得到负数。",
+        ])
+        a = agent_mod.Agent(llm=llm)
+        events = _run(a)
+        self.assertEqual(llm.calls, 2, "成功后应再给模型一轮解读，而不是立即收尾")
+        obs = [e["text"] for e in events if e["type"] == "observation"]
+        self.assertTrue(any(t.startswith("-0.79") for t in obs), obs)
+        finals = [e["text"] for e in events if e["type"] == "final"]
+        self.assertEqual(len(finals), 1)
+        self.assertIn("9.9 更大", finals[0])
+        self.assertFalse(finals[0].startswith("计算结果为："))
+
+    def test_native_mode_also_interprets_calculate(self):
+        llm = _ScriptedLLM([
+            "Action: calculate\nAction Input: 9.9 > 9.11",
+            "Thought: t\nFinal Answer: 成立，所以 9.9 更大。",
+        ])
+        a = agent_mod.Agent(llm=llm, tool_mode="native")
+        events = _run(a)
+        finals = [e["text"] for e in events if e["type"] == "final"]
+        self.assertIn("9.9 更大", finals[-1])
+
+    def test_fallback_emits_value_when_model_never_concludes(self):
+        # 模型拿到 2 之后仍反复同一调用：强制收尾耗尽 -> 计算结果确定性兜底
+        llm = _ScriptedLLM([_act("calculate", "1+1")])
+        a = agent_mod.Agent(llm=llm)
+        events = _run(a)
+        finals = [e["text"] for e in events if e["type"] == "final"]
+        self.assertEqual(len(finals), 1)
+        self.assertEqual(finals[0], "计算结果为：2")
+
+
 if __name__ == "__main__":
     unittest.main()

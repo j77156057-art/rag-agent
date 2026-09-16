@@ -3,6 +3,7 @@
 每个工具含 description（给 LLM 看的说明）与 func（实际执行函数）。
 新增工具：在 TOOLS 字典里追加一项即可，Agent 会自动识别。
 """
+import ast
 import json
 import os
 import re
@@ -149,18 +150,41 @@ def search_knowledge(query):
     return "\n---\n".join(out)
 
 
+_CALC_BAD = "表达式包含非法字符，仅支持数字、+ - * / % ** //、括号与比较运算 > < >= <= == !=。"
+_CALC_ALLOWED_NODES = (
+    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Compare, ast.Constant,
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.FloorDiv,
+    ast.USub, ast.UAdd,
+    ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+    ast.Load,
+)
+
+
 def calculate(expression):
-    """对数学表达式求值，仅允许数字与 + - * / % 和括号。"""
+    """对数学表达式求值。
+
+    支持数字、+ - * / % ** //、括号，以及比较运算 > < >= <= == !=
+    （比较结果转成「成立/不成立」，方便模型解读为自然语言结论）。
+    用 AST 白名单求值，名称/属性/调用等任何非算术节点一律拒绝。
+    """
     expression = (expression or "").strip().strip("'\"").strip()
     if not expression:
         return "未提供表达式。"
-    allowed = set("0123456789+-*/().% ")
-    if not all(c in allowed for c in expression):
-        return "表达式包含非法字符，仅支持数字与 + - * / % 和括号。"
+    if len(expression) > 200:
+        return "表达式过长（上限 200 字符）。"
     try:
-        return str(eval(expression, {"__builtins__": {}}, {}))
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return _CALC_BAD
+    if any(not isinstance(node, _CALC_ALLOWED_NODES) for node in ast.walk(tree)):
+        return _CALC_BAD
+    try:
+        result = eval(compile(tree, "<calc>", "eval"), {"__builtins__": {}}, {})  # noqa: S307
     except Exception as e:  # noqa: BLE001
         return f"计算失败: {e}"
+    if isinstance(result, bool):
+        return "成立（True）" if result else "不成立（False）"
+    return str(result)
 
 
 _SEARCH_EMPTY_MARKERS = ("搜索失败", "搜索未返回结果")
@@ -2291,7 +2315,7 @@ TOOLS = {
         "func": search_assets,
     },
     "calculate": {
-        "description": "对数学表达式求值，例如 '23*45+12'。仅支持 + - * / % 和括号。",
+        "description": "对数学表达式求值，例如 '23*45+12'；也支持比较运算，例如 '9.9 > 9.11'（结果为「成立/不成立」）。仅支持数字、+ - * / % ** //、括号与 > < >= <= == !=。",
         "func": calculate,
     },
     "web_search": {

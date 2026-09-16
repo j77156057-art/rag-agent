@@ -116,8 +116,8 @@ class NativeDispatchTests(unittest.TestCase):
         self.assertEqual(rec["n_steps"], 1)
 
     def test_multiple_tool_calls_execute_sequentially(self):
-        # 注意：不能用 calculate —— 它属于"产出即答案"工具，第一次调用就会收尾（正确行为）。
-        # 这里用 search_code（非 verbatim）验证一次返回多个 tool_call 会被逐条执行。
+        # 注意：不能用 calculate —— 它成功后会回填观察、要求模型再走一轮解读，
+        # 这里用 search_code 验证一次返回多个 tool_call 会被逐条执行。
         llm = _NativeLLM([
             ("tools", [("search_code", {"input": "query: alpha"}),
                        ("search_code", {"input": "query: beta"})]),

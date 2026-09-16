@@ -62,7 +62,7 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
 可用工具：
 - search_knowledge(query): 在本地知识库中检索相关文档片段。回答"某文档里讲了什么/某概念怎么定义"类问题。
 - search_assets(query): 在精选游戏素材目录中检索素材（角色精灵/tileset/UI/音效等），回答"找素材/美术资源/角色精灵/tileset"类问题。
-- calculate(expression): 计算数学表达式，如 '23*45+12'。仅支持 + - * / % 和括号。
+- calculate(expression): 计算数学表达式，如 '23*45+12'；也支持比较运算，如 '9.9 > 9.11'（结果为「成立/不成立」）。支持 + - * / % ** //、括号与 > < >= <= == !=。比较/差值类问题算出结果后，必须用自然语言给出结论（如「所以 9.9 更大」），不要只丢一个数字。
 - web_search(query): 联网搜索（DuckDuckGo，无需 Key）。当知识库不足、信息有时效性、或需要外部资料时使用。
 - web_fetch(url): 读取搜索结果中的公开网页正文，保留来源 URL 和标题后再总结。
 - web_research(query): 一步完成搜索与最多 3 个来源正文读取，适合教程、GitHub、引擎文档和最新资料。
@@ -278,9 +278,12 @@ def _trail_pair_count(trail):
                 n += 1
     return n
 
-# 产出即最终交付物的工具：其返回内容应原样呈现给用户，不被模型二次改写
-# （小模型常常"重新生成"而非照抄，导致数字/格式出错，这里强制透传）。
-_VERBATIM_TOOLS = {"calculate", "python_exec", "gen_video_prompt"}
+# 产出即最终交付物的工具：成功后不再回炉模型，结果直接作为最终回答原样透传
+# （小模型常常"重新生成"而非照抄，导致格式/代码出错，这里强制透传）。
+# 注意 calculate 不在此列：算术结果可能只是「哪个大/差多少」等问题的中间证据，
+# 需要回填给模型再走一轮，由它把数字解读成自然语言结论；模型给不出结论时，
+# _evidence_final 会用「计算结果为：…」做确定性兜底。
+_VERBATIM_TOOLS = {"python_exec", "gen_video_prompt"}
 
 # 写工具：只有用户问题明确表达修改/新建意图才允许执行，防止审查类任务越权改代码。
 _WRITE_TOOLS = {"apply_edit", "create_file", "dev_region_edit"}
@@ -859,6 +862,12 @@ class Agent:
 
         def _evidence_final(reason):
             """模型在强制收尾后仍不给出 Final Answer：用本轮真实观察做确定性兜底。"""
+            # calculate 的有效结果本身就是一句可读结论，优先用「计算结果为：…」兜底，
+            # 不套检索证据模板（避免"以下为检索到的证据"式的错位话术）。
+            if last_action == "calculate" and last_obs and not _is_failure(last_obs):
+                if turn is not None:
+                    turn.outcome = "verbatim"
+                return {"type": "final", "text": _format_verbatim("calculate", last_obs)}
             if turn is not None:
                 turn.outcome = "evidence_fallback"
             steps_used = "；".join(evidence) or "（无）"
