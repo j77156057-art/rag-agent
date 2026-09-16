@@ -99,5 +99,70 @@ class LifespanRestoresTests(unittest.TestCase):
         self.assertEqual(len(calls), 1, "应用启动期应恰好调用一次 _apply_persisted_state")
 
 
+class ExplicitCodeRootPrecedenceTests(unittest.TestCase):
+    """P1 回归：显式设置的 code_root 不得被持久化状态覆盖。
+
+    `_apply_persisted_state()` 从 import 期搬到 lifespan 后，演示/校验脚本
+    「先 set_runtime('code_root', …) 再启动应用」的顺序被打破：lifespan 里的无条件
+    恢复会冲掉脚本显式指定的临时工程。这里钉死「显式设置优先于持久化恢复」。
+
+    隔离方式沿用本文件既有做法：子进程 + DOCMIND_STATE_ROOT 指向临时目录，
+    绝不触碰仓库根的 STATE_FILE。
+    """
+
+    def test_explicit_code_root_not_clobbered_by_persisted_state(self):
+        # 目录 A：持久化状态里记录的 code_root（有效目录）
+        state_root = tempfile.mkdtemp(prefix="docmind_pstate_")
+        dir_a = tempfile.mkdtemp(prefix="docmind_root_a_")
+        # 目录 B：调用方在启动前显式设置的 code_root（有效目录，且 A != B）
+        dir_b = tempfile.mkdtemp(prefix="docmind_root_b_")
+        self.assertNotEqual(os.path.realpath(dir_a), os.path.realpath(dir_b))
+        _write_state(state_root, {"code_root": dir_a})
+
+        code = (
+            "import sys, config;"
+            "config.set_runtime('code_root', sys.argv[1]);"
+            "config._apply_persisted_state();"
+            "assert config.get_runtime('code_root') == sys.argv[1], "
+            "'显式设置的 code_root 不应被持久化状态覆盖';"
+            "print('ok')"
+        )
+        env = dict(os.environ)
+        env["DOCMIND_STATE_ROOT"] = state_root
+        env["DOCMIND_TRACE"] = "0"
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        proc = subprocess.run(
+            [sys.executable, "-B", "-c", code, dir_b],
+            cwd=repo, env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("ok", proc.stdout)
+
+    def test_code_root_still_restored_when_not_preset(self):
+        # 正向对照：未预设时报文仍能从状态文件恢复（_RUNTIME 先清掉 code_root）
+        state_root = tempfile.mkdtemp(prefix="docmind_pstate_")
+        dir_a = tempfile.mkdtemp(prefix="docmind_root_a_")
+        _write_state(state_root, {"code_root": dir_a})
+
+        code = (
+            "import sys, config;"
+            "config._RUNTIME.pop('code_root', None);"
+            "config._apply_persisted_state();"
+            "assert (config.get_runtime('code_root') or '') == sys.argv[1], "
+            "'未预设时应从状态文件恢复 code_root';"
+            "print('ok')"
+        )
+        env = dict(os.environ)
+        env["DOCMIND_STATE_ROOT"] = state_root
+        env["DOCMIND_TRACE"] = "0"
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        proc = subprocess.run(
+            [sys.executable, "-B", "-c", code, dir_a],
+            cwd=repo, env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("ok", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

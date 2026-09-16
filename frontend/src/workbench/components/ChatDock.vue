@@ -5,7 +5,7 @@
 //   与 godot-ai 插件安装引导（安装前必须用户确认）。
 import { nextTick, ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
-import { aiApi, mcpApi, modelApi, contextApi } from '../api'
+import { aiApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId } from '../api'
 import type { McpServer, ModelConfigInfo, ContextUsage } from '../api'
 import type { SseEvent } from '../api'
 import { mdToHtml, extractFileRefs } from '../markdown'
@@ -232,6 +232,19 @@ function clearMessages() {
   if (sending.value) stop()
   messages.value = []
   usage.value = null
+}
+
+/** 头部「清空对话」：清空本地消息，并删除当前标签页会话在磁盘上的多轮历史。
+ *  会话 id 每标签页独立（见 api.ts::getSessionId），故这里只清理本标签页自己的会话，
+ *  不影响其它标签页；删除失败（无会话文件 / 服务未启动）不阻塞清空 UI。 */
+async function clearConversation() {
+  clearMessages()
+  if (demoMode.value) return
+  try {
+    await harnessApi.deleteSession(getSessionId())
+  } catch {
+    /* 会话文件不存在或服务不可达：忽略，本地已清空 */
+  }
 }
 
 async function loadContextUsage() {
@@ -533,7 +546,7 @@ function connectorGuide(s: McpServer) {
         </svg>
         <span>引擎</span>
       </button>
-      <button class="cd-btn" title="清空对话" @click.stop="clearMessages">
+      <button class="cd-btn" title="清空对话" @click.stop="clearConversation">
         <svg width="13" height="13" viewBox="0 0 13 13"><path d="M2.5 3.2 H10.5 M5.2 3.2 V2 Q5.2 1.5 5.7 1.5 H7.3 Q7.8 1.5 7.8 2 V3.2 M3.4 3.2 L3.8 11 Q3.8 11.6 4.4 11.6 H8.6 Q9.2 11.6 9.2 11 L9.6 3.2" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
     </header>

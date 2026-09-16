@@ -1,13 +1,44 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第二十一次重建（设计评审驱动的缺陷修复：导入期副作用 / 运行时状态隔离 / 前后端契约一致性 / 加固）」；历史构建清单保留在下文。
+> 最新构建见下方「第二十二次重建（R5 并发限制修复——每标签页独立 session_id；并修掉 `code_root` 顺序回归）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 19.7 MB，控制台模式，启动时自动开浏览器）
 - 整体体积：约 309 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 91 MB/365 文件；**第十六次起不再打包开发者 `.chroma` 索引库，较第十五次 682.5 MB 降约 374 MB**）
-- **当前构建时间：`2026-09-16 19:22:21`（第二十一次重建，设计评审驱动的缺陷修复——导入期副作用 / 运行时状态隔离 / 前后端契约一致性 / 加固，exe 20,536,866 字节，SHA-256 f67eac87acb0c447061b791c05a2ac643faa3ddcfae058f123c5e47ee8e9681a）**
-- 上一版：`2026-09-15 22:01:23`（第二十次重建，P2-2 ComfyUI 精确取消修复，exe 19,832,954 字节，SHA-256 6b5e4207d99a06eb4498d9f2fbdc170de2367a157b721d9ab5ef860b22dbdc15）
+- **当前构建时间：`2026-09-16 20:34:25`（第二十二次重建，R5 并发限制修复——前端每标签页独立 `session_id`；并修掉 `code_root` 顺序回归，exe 20,536,890 字节，SHA-256 4934b9c1429faa56aeeffbc97037aea0bdd926e920f7900fbfa792ddab9b6bbd）**
+- 上一版：`2026-09-16 19:22:21`（第二十一次重建，设计评审驱动的缺陷修复——导入期副作用 / 运行时状态隔离 / 前后端契约一致性 / 加固，exe 20,536,866 字节，SHA-256 f67eac87acb0c447061b791c05a2ac643faa3ddcfae058f123c5e47ee8e9681a）
+
+---
+
+## 第二十二次重建：R5 并发限制修复（每标签页独立 session_id）+ 修掉 `code_root` 顺序回归（2026-09-16 20:34）
+
+### 改动（共 4 个文件）
+
+**1. R5：前端每标签页独立 `session_id`**（`frontend/src/workbench/api.ts`、`components/ChatDock.vue`）
+- 新增导出 `getSessionId()`：读/写 `sessionStorage` 的 `docmind_session_id`；缺失则生成 `web-<12位十六进制>`（**slug 安全**——后端 `sessions.py::_slug()` 会用它拼文件名），模块内缓存；`sessionStorage` 不可用（隐私模式/非浏览器）时 `try/catch` 退回模块级 id，保证同页一致。
+- `aiApi.askGrounded`：追加 **form 字段** `session_id`（后端 `session_id: str = Form("default")`）；`contextApi.get()`：改为 `/api/context?session_id=<encodeURIComponent(...)>`（**query**，后端 `context_usage_ep(session_id: str = "")`）。
+- `ChatDock.vue`：把**已有**的「清空对话」按钮接到 `clearConversation()`（先清本地消息，再 `DELETE /api/sessions/<本标签页 id>`；demo 模式跳过、失败忽略、不阻塞 UI）。**未新增任何 UI**。
+- **为什么**：后端每个 `session_id` 一个长驻共享 `Agent`，逐请求开关（`web_enabled`/`thinking_enabled`/`tool_mode`/`plan_mode`/`llm`）由 `Agent.run(...)` 开头快照、`finally` 还原，**只保证串行**；而 `event_stream` 是**同步生成器**、由 Starlette `iterate_in_threadpool` 在**工作线程**消费 ⇒ 同会话两请求**真并行**、会互相覆盖；前端原先不传 `session_id`，各标签页共用 `default` ⇒「两标签页同时提问」即命中。**后端零改动、不加锁**（`asyncio.Lock` 需在事件循环线程 acquire/release，而消费在工作线程，跨边界释放不安全，且会把同会话请求串行化、改变流式响应行为）。
+- **刻意语义变更**：不同标签页 = **各自独立**会话（不共享历史/上下文）；同一标签页刷新仍保留（`sessionStorage`）；此前累积在 `default` 会话里的历史**不再被前端使用**（文件仍在 `STATE_ROOT/.docmind_sessions/`，可 `DELETE /api/sessions/default` 清理）。
+- **残余（已知限制）**：浏览器**「复制标签页」会把 `sessionStorage` 一并复制** ⇒ 副本与原标签页仍同 id、同时提问仍会命中；常见路径（新开标签页 / 手输 URL）已修好。彻底覆盖需让 id 参与 `window.name` 或 per-page-load 随机量（各浏览器对"复制标签页"是否继承 `window.name` 行为不一、收益窄），暂不做。
+
+**2. 修掉 `code_root` 顺序回归**（`config.py` + `tests/test_persisted_state_lifespan.py`）—— **本次由浏览器冒烟抓到，是第二十一次重建引入的**：
+- 第二十一次把 `_apply_persisted_state()` 从**导入期**移到 **lifespan** 后，**顺序反转**：该函数**无条件**写 `_RUNTIME["code_root"] = <持久化值>`；而 `verify_scene_canvas.py --serve`（`:285`）、`verify_engine_embed.py`（`:859`）、`verify_regions.py`（`:25`）都是「**先** `set_runtime('code_root', 临时工程)` **再**启动应用」→ 临时 Godot 工程被顶掉 → `/api/scene/graph` 为空 → 画布无节点 → 冒烟卡在 `verify_scene_canvas_ui.mjs:109` 等 `.vue-flow__node-sceneNode` **20s 超时**（症状是超时，不是报错）。改前它是导入期调用（`_RUNTIME` 还空）→ 脚本的 `set_runtime` 在其后执行、能赢。
+- **改法**：`code_root` 恢复改「**显式设置优先**」——`if isinstance(root, str) and root and os.path.isdir(root) and "code_root" not in _RUNTIME:` 才写；其余键（GPU 偏好 / 窗口覆盖）行为不变。新增 2 例回归（`ExplicitCodeRootPrecedenceTests`：预设 B 不被持久化的 A 覆盖 / 未预设时仍能恢复）。
+- **影响面仅校验脚本**：`desktop.py`、`run.py` **都不预设 code_root** ⇒ **用户正常启动不受影响**（持久化 code_root 仍照常恢复）。这也是为什么"单跑 54/54 通过"时 `--serve` 路径可能已经坏了——非 `--serve` 路径用 `TestClient(app)` 但**不进 `with`**，**不触发 lifespan**。
+
+### 验证
+- 单测：全量 **709/709 通过**（skipped=1 = ComfyUI 不可达时的真实 H3 转换用例；707 + 本轮新增 2 例）。
+- `verify_scene_canvas.py`（非 `--serve`）**54/54**。
+- **`verify_scene_canvas_ui.mjs`（真浏览器，serve 8011）通过 27 项、失败 0**（含「新增子节点 6→7 / 撤销 7→6 / 重做 7」「空间布局落点与场景坐标成比例」「时间线三轨道 + 按类型筛选」「无 JS 运行时错误与失败请求」）。**先证明修复再断言**：重启 8011 后 `GET /api/config` 的 `code_root = D:\Temp\docmind_verify_scene_<随机>`（临时 Godot 工程），不再是仓库根。
+- **`verify_engine_embed.py`（真机 Godot 4.7.2 + 真 Win32 宿主）通过 68 项，失败 0，跳过 0，未证实 0**（含真实合成键鼠送达引擎并回读、无孤儿窗口/进程、解除后幂等可重入、`POST /api/engine/embed` 走支持引擎视窗的新处理器、本机 150% DPI = 144）。
+- 前端：`npm run build` 成功（vite 5.4.21，249 模块）；`workbench-BVbj8-9U.js` 281.12 kB、`SceneCanvas-BRQbZgeF.js`、`RuntimeTimeline-BRL5yGys.js`（`api.ts` 改动波及）；**vendor 三分包哈希不变**；旧 hash 残留已清。
+- 冻结态（最小 PATH 仅 `System32`、`DOCMIND_SERVER_ONLY=1`、端口 **8000**，PyInstaller 退出码 0）：冷启动 **3.7s**；`build_time=2026-09-16 20:34:25`（与 exe mtime 一致）；exe **20,536,890 字节**，SHA-256 `4934b9c1429faa56aeeffbc97037aea0bdd926e920f7900fbfa792ddab9b6bbd`；`/` 200、`/workbench/` 200（跟随 307）、`/api/health` 200；`/api/ollama/probe?model=`、`POST /api/model_context_lookup`、`POST /api/comfy/cancel` 三处均**干净 `ok:false`**（非 500）；**前端 14 个产物「HTTP 返回体 vs `web/` 源」SHA-256 全 match**；清理后包内**无** `.env`/`.chroma`/状态文件/`python*.exe`，MinGit 随包 → **13/13 ALL PASS**。
+- **独立 QA 复核 R5：PASS with risks** —— 代码核对 + API 级隔离/并发实测 + 回归；`getSessionId` 生成 id 采样 5000 次**全部**匹配 `^[A-Za-z0-9_-]+$`；全前端**仅一处** `/api/chat` 调用点（两个调用方都经 `askGrounded`，**无遗漏**）；**同 id 负向对照**（历史递增 = 共享同一 Agent）；未用 id → `active:false`；**无参 `/api/context` 向后兼容**。残余即上面「复制标签页」一条。
+- **黄金题门**：**SKIPPED**（本机无法稳定起「已索引本仓库代码库」的可评测服务），如实留痕。
+
+> **交付说明**：:8000 无用户实例，本版直接构建进 `rag-agent/dist/DocMind/`；桌面安装 `D:\WorkBuddy\DocMind` 已用同一 `robocopy /E /XD .docmind` 方式镜像（`DocMind.lnk` 指向它，`.docmind/` 运行时数据与卸载器保留），旧版备份为 `D:\WorkBuddy\DocMind.bak-*`。
 
 ---
 

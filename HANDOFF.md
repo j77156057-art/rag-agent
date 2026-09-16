@@ -129,6 +129,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 | 2026-09-15 | **第二十次冻结合建（P2-2 ComfyUI 精确取消修复）**：comfy_cancel 改走 `POST /queue` delete 按 prompt_id 定向取消并精确释放 GPU 租约；492/492 单测、场景 54/54、浏览器 27/27、引擎嵌入 68/68 实机、npm run build、PyInstaller 直接构建进 `dist/DocMind`；exe 19,832,954 B、SHA-256 6b5e4207…；黄金题门 SKIP（环境无法稳定起已索引评测服务） |
 | 2026-09-16 | **设计评审驱动的缺陷修复（第 21 次冻结构建）**：对 4 个未推送提交（`1a1b597` / `9d9dd63` / `7186548` / `5c359d8`）做架构评审 + 缺陷排查（架构师与 QA 双线并行、逐条独立复现），按 **A→B→C→D 四批**修复，再由**未参与改动的第二位 QA** 复核（抓到 1 个由本轮修复引入的 P1 回归 + 4 个 P2）并追加 **R 批**修复、复验 PASS。① **导入期副作用消除**：`gpu_coordinator` 模块级 `restore_runtime_state()`（导入即 `unlink`，被拦时抛 `BaseException` 连锁炸 import）→ 显式 `init()` 由 lifespan 调用；`config` 模块级 `makedirs(CHROMA_DIR)` → 惰性 `ensure_dirs()`；`_apply_persisted_state()` 移入 lifespan；② **运行时状态根可注入 + 测试隔离**：`config.STATE_ROOT` + `state_path()`，10 项状态派生，测试进程默认隔离到临时目录（判据 `__main__.__spec__.name == "unittest.__main__"`），隔离时相对 env 也落 `STATE_ROOT`；③ **前后端失败体契约**：`modelApi.save/probeOllama/lookupModelContext` 改走 `rawJson`，`res.model_error` 分支从死代码恢复；④ **逐请求 llm/开关注入**：`Agent.run()` 5 个仅关键字覆盖（`web_enabled`/`thinking_enabled`/`tool_mode`/`plan_mode`/`llm`）+ `finally` 四出口还原；云端路由不再新建并注册 Agent（修掉模块级 `agent` 孤儿与会话黏云端）；⑤ **GPU 状态文件拆分**：采样样本独立 `SAMPLES_FILE`，修掉「两套 schema 互相覆盖 → 崩溃恢复静默失效」；⑥ **加固**：`calculate` 指数静态限幅（`9**9**9` 卡死 >6s → 毫秒级拒绝，`2**3**2` 不再误杀）、async 内 `LLMClient` 构造走线程池、`_history_window` 由 O(N) 次 `/api/tokenize` 降为 1 次、`context_stats` 与压缩口径对齐（新增 `compact_percent`）；⑦ 子代理继承联网/思考开关、搜索与 `read_file` 失败标记补全、两个早退分支补 `executed.add(sig)`（空转 15 轮 → 及时提示）、Prompt 预算下限不再超窗。**707/707 单测、场景 54/54、前端 build、最小 PATH 冻结冒烟 13/13 全 PASS、前端 14 产物逐字节一致**；exe 20,536,866 B、SHA-256 `f67eac87…`；黄金题门 SKIP（环境无法稳定起已索引评测服务） |
+| 2026-09-16 | **R5 并发限制修复 + 第 22 次冻结构建**：前端改为**每标签页独立 `session_id`**（`sessionStorage` 的 `docmind_session_id`；`askGrounded` 走 form 字段、`contextApi.get()` 走 query；ChatDock「清空对话」接到当前标签页会话）——消除「同会话真并发串逐请求开关 / `llm`」；**后端零改动、不加锁**。过程中**冒烟抓出我方 D 批引入的 P1 回归**：`_apply_persisted_state()` 从导入期移入 lifespan 后**顺序反转**，用持久化值**覆盖**了调用方启动前显式 `set_runtime('code_root', …)`（`verify_scene_canvas.py --serve` / `verify_engine_embed.py` / `verify_regions.py` 都是这个用法）→ 临时 Godot 工程被顶掉 → 场景图空 → 画布无节点 → 冒烟在等 `.vue-flow__node-sceneNode` 超时。**修法**：持久化恢复改「**显式设置优先**」（`"code_root" not in _RUNTIME` 才恢复）+ 回归测试 2 例。**影响面仅校验脚本**——`desktop.py`/`run.py` 不预设 code_root，**用户正常启动不受影响**。验证：单测 **709/709**、`verify_scene_canvas.py` **54/54**、`verify_scene_canvas_ui.mjs` **27/27**、`verify_engine_embed.py` **68/68**（真机 0 跳过 0 未证实）、前端 build、最小 PATH 冻结冒烟 **13/13**；exe **20,536,890 B**、SHA-256 `4934b9c1…`；黄金题门 SKIP |
 
 > 逐次构建的改动/验证/哈希核对明细见 `DocMind_BUILD.md`（20 次完整记录，继续追加不要新建文件）。
 
@@ -189,9 +190,10 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 ### 已知限制与后续项（2026-09-16 设计评审 / 缺陷排查产出）
 
-1. **同会话「真并发」仍可能串开关与 `llm`（已知限制，本轮评估后保留，未加锁）**：`Agent.run()` 的逐请求覆盖是「快照 → 跑 → `finally` 还原」，只保证**串行**语义。`event_stream` 是**同步生成器**、由 Starlette `iterate_in_threadpool` 在**工作线程**消费，而 `asyncio.Lock` 必须在**事件循环线程** acquire/release —— 跨边界释放不安全，且会把同会话请求串行化、改变流式响应行为，故不加锁。
-   **可达性**：前端 `aiApi.askGrounded` **不传 `session_id`** → 各标签页共用 `default` 会话，「同一用户两标签页并发提问」即可命中。
-   【方案】前端为每个标签页生成一个 `session_id`（存 `sessionStorage`）并随 `/api/chat` 传；后端 `_agent_for(sid)` 已按 sid 隔离，各页自然拿到不同 Agent，从根上绕开竞态且不改流式语义。【验收】两标签页并发提问，各自 `web_enabled`/`llm` 互不影响；`/api/context` 按 sid 分别返回。【状态】未做。
+1. **同会话「真并发」串开关/`llm` → 已修复（2026-09-16）**：机制是「后端每个 `session_id` 一个长驻 `Agent`，逐请求开关只保证串行」＋「`event_stream` 是同步生成器、由 Starlette `iterate_in_threadpool` 在**工作线程**消费 ⇒ 同会话两请求**真并行**」＋「前端 `askGrounded` 原不传 `session_id` ⇒ 各标签页共用 `default`」。**修法**：前端改为**每标签页一个 `session_id`**（`sessionStorage` 的 `docmind_session_id`，`getSessionId()`；`askGrounded` 以 **form 字段**带上、`contextApi.get()` 以 **query** 带上），**后端零改动、不加锁**（跨线程加锁不安全且会串行化流式响应）。
+   **残余（已知限制）**：浏览器**「复制标签页」会把 `sessionStorage` 一并复制** ⇒ 副本与原标签页仍同 sid，两者同时提问仍会命中竞态；「新开标签页 / 手输 URL」这条常见路径已修好。彻底覆盖需让 id 参与 `window.name` 或 per-page-load 随机量（各浏览器对"复制标签页"是否继承 `window.name` 行为不一、收益窄），**暂不做**。
+   **语义变更（刻意）**：不同标签页现在是**各自独立**的会话（不共享历史/上下文）；同一标签页刷新仍保留；此前累积在 `default` 会话里的历史**不再被前端使用**（文件仍在磁盘 `STATE_ROOT/.docmind_sessions/`，可 `DELETE /api/sessions/default` 清理）。
+   【验证】`verify_scene_canvas_ui.mjs` **27/27**、`verify_engine_embed.py` **68/68**、独立 QA 复验 **PASS**（含「同 id 负向对照：历史递增=共享」「未用 id → `active:false`」「无参 `/api/context` 向后兼容」）。
 2. **运行时状态根尚未覆盖「项目级」文件**（P2 残留）：`game_workbench` 的 `.docmind_comfy.json` / `.docmind_tasks.jsonl` / `.docmind_engine.*`、`semantic_tags` 的 `<root>/.docmind/semantic_tags.json`、`secrets_store` 的 `.docmind_secrets.json` / `.docmind_secret.key`、`agent_policy` 的 `.docmind_permissions.jsonl` / `.docmind_external_approvals.jsonl`、`mcp_client` 的 `.docmind_mcp.json`、`scene_runtime` 的 `.docmind_runtime.*`、`web_export` 的 `<root>/.docmind/web`、`regions` 的 `.docmind_backups` 仍按 `code_root` / `BASE_DIR` 落盘（本轮按「用户项目内容不搬」原则未动）。当前测试不会污染仓库根（已有断言），若要让测试**完全**隔离需逐个迁移。
 3. **仓库 `.env` 的 `CHROMA_DIR=./.chroma`**（未跟踪的用户文件）：**非隔离**进程仍把该相对路径解析到 cwd；隔离进程（测试）已改为落 `STATE_ROOT`。若想让 dev 也走统一口径，把该键从 `.env` 删掉即可（默认值派生自 `STATE_ROOT`，dev 下等价）。
 4. **`api.py::selection_ai_ep`** 内**嵌套同步生成器**里的 `client = LLMClient()` 未包线程池（D2 范围外，保持原样）：该生成器若将来在事件循环线程被迭代，同样有同步探活阻塞风险。
@@ -400,6 +402,18 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
     是否算失败（进而决定是否触发 Reflection、trace 的 `ok`）。工具返回新的失败文案而没进白名单，就会
     **失败被当成功**（静默）。本轮已补「搜索失败 / 搜索未返回结果 / 网页读取失败 / 读取失败 / 文件不存在 / 拒绝访问」，
     并有表驱动测试 `tests/test_failure_markers.py` 反查漏项——新增失败文案时先跑它。
+31. **把「导入期副作用」改成「lifespan 显式调用」时，必须检查顺序反转**（2026-09-16 真踩）：`_apply_persisted_state()`
+    原本在 `import config` 时执行——那时 `_RUNTIME` 还空，所以调用方（`verify_scene_canvas.py --serve`、
+    `verify_engine_embed.py`、`verify_regions.py`）在其**之后** `set_runtime('code_root', <临时工程>)` 能覆盖；
+    移到 lifespan 后调用方变成「先设」、持久化变成「后设」→ **持久化把临时工程顶掉**，画布/场景图全空
+    （症状是冒烟**超时**而不是报错）。**约定**：启动期的持久化恢复一律「**显式设置优先**」——
+    `if "code_root" not in _RUNTIME: _RUNTIME["code_root"] = root`。`desktop.py`/`run.py` 不预设 code_root，
+    所以用户正常启动不受影响——**别以为"用户没报错"就说明这个顺序没问题**。
+32. **校验脚本的 code_root 语义 × TestClient 是否触发 lifespan**（2026-09-16）：`verify_scene_canvas.py --serve`
+    是「先 `set_runtime('code_root', 临时 Godot 工程)` 再 `uvicorn.run`」，所以它**依赖**上面第 31 条；
+    而 `verify_scene_canvas.py` 的非 `--serve` 路径与 `verify_engine_embed.py` 用 `TestClient(app)` 但**不进 `with`**，
+    因此**不触发 lifespan**、不受影响——这正是「单跑 54/54 全过、`--serve` 路径却已经坏了」的原因。
+    改 lifespan 里任何东西后，**两个路径都要各跑一次**。
 
 ---
 
@@ -742,3 +756,11 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - §8：新增「运行时状态 / 共享对象相关的坑」小节（第 26–30 条）。
 - `DocMind_BUILD.md`：顶部指引行与产物段更新为第二十一次；新增「第二十一次重建」章节（14 项改动 / 验证明细 / 已知限制）。
 - 本轮是**无新功能**的纯修复发布，流程为「评审 → 四批修复 → 独立 QA 复核 → R 批回归修复」；**未验证项**（同会话真并发、需真实硬件/外网的项）已如实列在 §5 与 BUILD.md，未宣称通过。
+
+### 2026-09-16 续：R5 修复 + code_root 顺序回归（第 22 次构建）文档同步
+
+- §4：新增 2026-09-16 第二行（R5「每标签页 session_id」+ 冒烟抓出的 `code_root` 覆盖回归 + 第 22 次构建）。
+- §5「已知限制与后续项」第 1 条：由「未做的并发限制」改写为「**已修复 + 残余（复制标签页会复制 `sessionStorage`）+ 刻意语义变更（各标签页独立会话；旧的 `default` 会话不再被前端使用）**」。
+- §8：新增第 31–32 条（lifespan 化改造的**顺序反转**坑；校验脚本的 code_root 语义与 TestClient 是否触发 lifespan——解释了「54/54 全过但 `--serve` 已坏」）。
+- `DocMind_BUILD.md`：新增「第二十二次重建」章节，顶部指引行与产物段更新为第 22 次；**第二十一次章节保留**（其 exe 20,536,866 B / SHA `f67eac87…` 是当时真实交付值，已被本次取代但不得改写历史）。
+- 本轮**未重跑**：`verify_regions.py`（不在冻结发布流水线内）。`docs/screenshots/*.png` 是校验脚本的副产物、不入库（跑完已 `git checkout --` 还原，避免工作树脏）。

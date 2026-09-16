@@ -1210,9 +1210,51 @@ async function postSse(url: string, init: RequestInit, h: SseStreamHandlers): Pr
   }
 }
 
+// ---------------------------------------------------------------- 会话 id
+// 每个浏览器标签页使用独立的 session_id：后端每个 session_id 对应一个长驻共享 Agent，
+// 逐请求开关（web_enabled / thinking_enabled / tool_mode / plan_mode / llm）由 Agent.run()
+// 在开头快照、finally 还原，只保证「串行」正确；而 /api/chat 的 SSE 由工作线程消费，
+// 同一会话的两个请求会真正并行并互相覆盖这些开关。给每个标签页分配独立 id，
+// 从根上隔离并发请求的逐请求开关（而不是在后端加锁把流式响应串行化）。
+const SESSION_ID_KEY = 'docmind_session_id'
+let cachedSessionId: string | null = null
+
+/** 生成 slug 安全的会话 id（仅含 [A-Za-z0-9_-]），形如 web-<12位十六进制>。
+ *  后端 sessions.py::_slug() 会把 id 用于拼文件名，故必须规避路径分隔符等字符。 */
+function newSessionId(): string {
+  const c = globalThis.crypto as Crypto | undefined
+  const raw = c && typeof c.randomUUID === 'function'
+    ? c.randomUUID().replace(/-/g, '')
+    : Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2)
+  const hex = raw.replace(/[^0-9a-fA-F]/g, '').slice(0, 12).padEnd(12, '0')
+  return `web-${hex}`
+}
+
+/** 当前标签页的会话 id（sessionStorage 持久：刷新保留、标签页间互相隔离）。
+ *  sessionStorage 不可用（隐私模式 / 非浏览器）时 try/catch 退回模块级 id，保证同页一致。 */
+export function getSessionId(): string {
+  if (cachedSessionId) return cachedSessionId
+  try {
+    const existing = sessionStorage.getItem(SESSION_ID_KEY)
+    if (existing) {
+      cachedSessionId = existing
+      return existing
+    }
+    const fresh = newSessionId()
+    sessionStorage.setItem(SESSION_ID_KEY, fresh)
+    cachedSessionId = fresh
+    return fresh
+  } catch {
+    // 非浏览器 / 隐私模式：退回模块级 id（同一页面内保持一致）
+    cachedSessionId = newSessionId()
+    return cachedSessionId
+  }
+}
+
 export const aiApi = {
   /** 解释 / Review / 自由提问：走 ReAct agent（可 search_code/read_file/grep，引用文件行号）。
-   *  web/thinking：逐请求的联网搜索 / 深度思考开关（后端默认均为关/模型默认）。 */
+   *  web/thinking：逐请求的联网搜索 / 深度思考开关（后端默认均为关/模型默认）。
+   *  session_id：当前标签页会话，用于隔离并发请求的逐请求开关。 */
   askGrounded(
     question: string,
     h: SseStreamHandlers,
@@ -1220,6 +1262,7 @@ export const aiApi = {
   ): Promise<void> {
     const fd = new FormData()
     fd.append('question', question)
+    fd.append('session_id', getSessionId())
     fd.append('web_mode', opts.web ? '1' : '0')
     if (opts.thinking === true) fd.append('thinking_mode', '1')
     else if (opts.thinking === false) fd.append('thinking_mode', '0')
@@ -1329,10 +1372,13 @@ export const modelApi = {
   },
 }
 
-/** 上下文窗口用量查询（页面刷新后恢复指示用） */
+/** 上下文窗口用量查询（页面刷新后恢复指示用）。session_id 为 query 参数，
+ *  与 /api/chat 的 form 字段对应，保证读到的是当前标签页会话的用量。 */
 export const contextApi = {
   async get(): Promise<ContextUsage | null> {
-    const r = await request<{ ok: boolean; active?: boolean } & Partial<ContextUsage>>('/api/context')
+    const r = await request<{ ok: boolean; active?: boolean } & Partial<ContextUsage>>(
+      `/api/context?session_id=${encodeURIComponent(getSessionId())}`,
+    )
     if (!r.active) return null
     return {
       used_tokens: r.used_tokens ?? 0,

@@ -460,7 +460,13 @@ def _apply_persisted_state():
     except (OSError, ValueError):
         return
     root = data.get("code_root")
-    if isinstance(root, str) and root and os.path.isdir(root):
+    # 顺序约束：调用方（如 verify_scene_canvas.py / verify_engine_embed.py / verify_regions.py
+    # 的 serve()）若已在启动前 set_runtime('code_root', …) 显式指定代码库，则不得被持久化
+    # 状态覆盖——显式设置优先于持久化恢复。这正是把本函数从 import 期移到 lifespan
+    # （ensure_dirs() 之后）后必须补上的约束：脚本「先设 code_root、再启动应用」，其
+    # set_runtime 早于 lifespan 执行，若无此判断会被这里的无条件赋值冲掉。
+    # 其余键（GPU 偏好 / 自定义窗口）调用方不会预设，行为保持不变。
+    if isinstance(root, str) and root and os.path.isdir(root) and "code_root" not in _RUNTIME:
         _RUNTIME["code_root"] = root
     # GPU 空闲卸载/采样间隔为用户在 GPU 面板设置的本机偏好，跟随状态文件恢复
     for key in ("gpu_idle_unload_seconds", "gpu_poll_interval"):
