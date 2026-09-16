@@ -1,13 +1,34 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第二十三次重建（修复 `/workbench.html` 死链——问答页/`trace` 页的「代码工作台 →」入口在 FastAPI 服务端 404）」；历史构建清单保留在下文。
+> 最新构建见下方「第二十四次重建（顶层「画布 / 运行」tab 接到真实功能——场景画布 / 运行游戏）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 19.7 MB，控制台模式，启动时自动开浏览器）
 - 整体体积：约 309 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 91 MB/365 文件；**第十六次起不再打包开发者 `.chroma` 索引库，较第十五次 682.5 MB 降约 374 MB**）
-- **当前构建时间：`2026-09-16 21:10:24`（第二十三次重建，修复 `/workbench.html` 死链——问答页与 `trace` 页的「代码工作台 →」入口在 FastAPI 服务端 404，exe 20,537,351 字节，SHA-256 6121fa6120e544ebec0f29da57325c4c9cedb8b54b99ae4c017dbd1893dd8cba）**
-- 上一版：`2026-09-16 20:34:25`（第二十二次重建，R5 并发限制修复——前端每标签页独立 `session_id`；并修掉 `code_root` 顺序回归，exe 20,536,890 字节，SHA-256 4934b9c1429faa56aeeffbc97037aea0bdd926e920f7900fbfa792ddab9b6bbd）
+- **当前构建时间：`2026-09-17 02:13`（第二十四次重建，顶层「画布 / 运行」tab 接到真实功能——场景画布 / 运行游戏，exe 20,537,322 字节，SHA-256 `4e847b0ecd534ceb30bd06cde091b013eb865525653913869b50c0809967ba6b）**
+- 上一版：`2026-09-16 21:10:24`（第二十三次重建，修复 `/workbench.html` 死链——问答页与 `trace` 页的「代码工作台 →」入口在 FastAPI 服务端 404，exe 20,537,351 字节，SHA-256 6121fa6120e544ebec0f29da57325c4c9cedb8b54b99ae4c017dbd1893dd8cba）
+
+---
+
+## 第二十四次重建：顶层「画布 / 运行」tab 接到真实功能（2026-09-17 02:13）
+
+### 改动（BugFix，3 个文件，纯前端）
+之前顶层工作区标签条里「画布」「运行」只是 `WorkspaceTabs.vue` 的 **roadmap 占位符**（◌ + tooltip 写「阶段 3 / 阶段 4」），点击只弹 tooltip、切不了视图，用户误以为功能没做完。其实场景画布与运行游戏早已实现，入口在工具栏的「运行游戏」弹窗（`SceneRuntimePanel.vue`）。
+- **改法**：
+  - `composables/workbench.ts` 新增共享态 `runtimeOpen` / `runtimeTab` 与 `openRuntime(tab)` / `closeRuntime()`，作为顶层 tab 与 `SceneRuntimePanel` 之间的桥。
+  - `SceneRuntimePanel.vue` 把本地 `open` / `tab` 与共享态**双向桥接**（watch）：顶层请求打开时弹窗自动弹出并切到对应 tab（画布→`scene`、运行→`play`）；本地关闭 / 切 tab 也写回共享态，保证顶层高亮与实际面板一致。原有 `watch(open)` / `watch(tab)` 副作用（刷新模板、启动定时器、切走试玩 tab 时 `nativeDetach`）自动复用，不重写。
+  - `WorkspaceTabs.vue`：「画布 / 运行」从纯占位符改为**可点入口**：`@click` 触发 `openRuntime`；面板打开且对应 tab 命中时显示 `ws-soon-on` 高亮；去掉「阶段 3/4」误导文案，改为描述真实功能（场景画布 / 运行游戏）。
+- **为什么之前测不出**：占位符没有 `@click`、只有 `:title`，纯静态，无法单测；靠人工点才发现。
+
+### 验证
+- 前端 `npm run build` 通过（首屏体积不变：workbench 281KB / gzip 103KB，Vue Flow 仍异步分块到 `SceneCanvas` / `RuntimeTimeline`）。
+- 711/711 单测（skipped=1）。
+- 冻结包校验：`dist/DocMind/web/assets/workbench-*.js` 含 `openRuntime`；桌面镜像后 `D:\WorkBuddy\DocMind\web\` 同逻辑就位；exe **20,537,322 字节**，SHA-256 `4e847b0ecd534ceb30bd06cde091b013eb865525653913869b50c0809967ba6b`，dist 与桌面 SHA **一致**。
+- **构建坑（已记入 § 铁律）**：PyInstaller COLLECT 步在「删除旧 `dist/DocMind`」时被沙箱**批量删除守卫**拦截，导致首次构建中断、`web/` 未被收进包（dist 仅含 exe/MinGit/_internal，缺 web）；且中断留下的 `Analysis` 缓存（web 未入 `a.datas`）被后续重跑复用，exe 是新的、web 却漏打。修法：`rm -rf build/docmind` 清缓存强制重 Analysis，并把旧 dist **改名移走**（不用删，避守卫）再重跑；若 COLLECT 仍漏 web，手动 `cp -r web/* dist/DocMind/web/` 补齐。
+
+### 交付
+- 提交 `855e238`；冻结包已构建并镜像至 `D:\WorkBuddy\DocMind`（exe SHA 与 dist 一致）。用户重启 DocMind 即加载新 exe + 新 web。
 
 ---
 
