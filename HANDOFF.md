@@ -226,6 +226,12 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 - 新落地的 MCP bridge 与 Web player 的产品级使用文档与边界说明**已补**：`docs/integrations.md`（2026-09-15，覆盖配置模型、API 表面、使用前提、已知边界）。
 - **引擎嵌入的残留**（不影响"已可用"）：本机显示器当前是 **150% 缩放**，100%/125% 未实测——
   `verify_engine_embed.py` 会打印当前 DPI 并按实际坐标断言，改了缩放直接重跑即可补档。
+- **P2-6 编辑即热重载（未做，未开工，2026-09-17 记录方案）**：嵌入态下改 `.tscn/.gd` 应能自动重载引擎、免手动 stop/start 看到效果。
+  - 【现状】当前 UI 嵌入走**运行模式**：`nativeStart` 只传 `engine/embed/rect`、`scene` 为空 ⇒ `engine_start` 拼 `godot --path <root>`（不加 `--editor`）；运行态不 watch 文件，改动不生效。已查 `game_workbench.py` 与 godot-ai 插件，**无可用 reload 通道**（仅 docstring 提及 `GDScript::reload`，无外部可调 RPC）。
+  - 【方案 A · 推荐，侵入最小】给 godot-ai 插件加一个 reload RPC（如 `POST /reload_current_scene` 或 `recompile_scripts`），后端新增 `engine_reload(root)`（与 `engine_focus/embed` 同构）并接 `/api/engine/reload`；保持现有干净运行模式不变，`tools.py` 写 `.tscn/.gd` 成功后自动触发。
+  - 【方案 B · 借 Godot 自带能力】嵌入改走**编辑器模式**：让嵌入路径带 `scene` 使 `engine_start` 拼 `--path --editor`，Godot 的 `EditorFileSystem` 自动监视工程目录并重载资源。代价：嵌入窗口变成整个 IDE（菜单/场景树/检视器/3D 视图，游戏视口只是其中一 pane）、更重、几何更挑剔需重验；且要让**正在跑的游戏实例**也跟着变，仍需在嵌入编辑器内保持 F5 运行态（改 `.gd` 才热重载进运行实例、`.tscn` 才反映）——**并非改文件即自动热重载运行游戏的免费午餐**。
+  - 【验收】嵌入态下保存 `.gd` → 运行实例逻辑更新、保存 `.tscn` → 场景树反映；无需 stop/start；`verify_engine_embed.py` 增一条「保存后重载」真机用例。
+  - 【状态】两条路径均未实现，不得宣称已落地；待定方案 A/B（先确认 godot-ai 插件是否已有 reload 能力再定）。
 - **桌面壳内的 UI 自动化没做成**（不是没做，是做不了）：pywebview 的 `evaluate_js` 在 WebView2 上不稳定
   （实测第二次调用耗 15.7s 且返回 None），拿它当断言基础会得到假失败。目前覆盖方式是
   「浏览器冒烟记 UI 降级 + `verify_engine_embed.py` 记后端契约（含 UI 的实际调用路径）」两段拼起来，
