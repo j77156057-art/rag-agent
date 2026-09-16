@@ -71,16 +71,29 @@ class ContextStatsTests(_Base):
         self.assertEqual(st["level"], "ok")
 
     def test_level_high_and_warn(self):
-        win = 100000
+        # 分级按「可用 prompt 额度」计，与完整窗口无关
+        win, budget = 131072, 100000
         llm = _FakeLLM(
             capability={"context_window": win, "thinking": "none", "cloud": True},
-            token_fn=lambda _t: int(win * 0.75),  # 75% -> high
+            prompt_budget=budget,
+            token_fn=lambda _t: int(budget * 0.75),  # 75% -> high
         )
         self.assertEqual(agent_mod.Agent(llm=llm, session_id="lv").context_stats("q")["level"], "high")
-        llm._token_fn = lambda _t: int(win * 0.95)                    # 95% -> warn
+        llm._token_fn = lambda _t: int(budget * 0.95)                  # 95% -> warn
         self.assertEqual(agent_mod.Agent(llm=llm, session_id="lv").context_stats("q")["level"], "warn")
-        llm._token_fn = lambda _t: 10                                # 极低 -> ok
+        llm._token_fn = lambda _t: 10                                  # 极低 -> ok
         self.assertEqual(agent_mod.Agent(llm=llm, session_id="lv").context_stats("q")["level"], "ok")
+
+    def test_percent_denominator_is_budget_not_full_window(self):
+        # 用量恰好等于「可用额度」时即 100%，即便它只占完整窗口的一部分；
+        # 超过额度也封顶 100%（由每轮 _fit_budget 保证实际不会超发）
+        llm = _FakeLLM(
+            capability={"context_window": 16384, "thinking": "none", "cloud": False},
+            prompt_budget=12000, token_fn=lambda _t: 12000)
+        st = agent_mod.Agent(llm=llm, session_id="dn").context_stats("q")
+        self.assertEqual(st["percent"], 100)
+        llm._token_fn = lambda _t: 6000
+        self.assertEqual(agent_mod.Agent(llm=llm, session_id="dn").context_stats("q")["percent"], 50)
 
 
 class ContextEventTests(_Base):
@@ -132,27 +145,34 @@ class HistoryWindowTests(_Base):
 
 
 class EndToEndCompactionTests(_Base):
-    def test_small_budget_compacts_and_refreshes_usage(self):
-        # 预算压到 100：触发阈值 60、保留目标 35 token，每轮约 200 token
-        llm = _FakeLLM(["Final Answer: ok"] * 6, prompt_budget=100)
+    def test_compaction_drops_usage_gauge(self):
+        # 真实口径：预算 12000（16k 窗口模型），触发线 80%=9600 token；
+        # 每轮问题 8000 字 ≈ 2667 token，累积到第 4 轮必触发压缩
+        llm = _FakeLLM(["Final Answer: ok"] * 8, prompt_budget=12000)
         a = agent_mod.Agent(llm=llm, session_id="e2e")
-        notices, ctx_after_notice = [], []
-        saw_notice = False
-        for _ in range(4):
-            for ev in a.run("问" * 300, stream=True):
-                if ev.get("type") == "notice":
-                    notices.append(ev.get("text", ""))
-                    saw_notice = True
-                if ev.get("type") == "context" and saw_notice:
-                    ctx_after_notice.append(ev)
-        self.assertTrue(notices, "小预算模型多轮后应触发自动压缩")
+        question = "压测内容" + "甲乙丙丁" * 1999  # 8000 字
+        notices = []
+        compacted = None
+        for i in range(4):
+            ctxs, turn_notices = [], []
+            for ev in a.run(question, stream=True):
+                if ev.get("type") == "context":
+                    ctxs.append(ev)
+                elif ev.get("type") == "notice":
+                    turn_notices.append(ev.get("text", ""))
+            self.assertGreaterEqual(len(ctxs), 2)
+            if turn_notices:
+                notices.extend(turn_notices)
+                # 压缩当轮：开工事件在前，notice 后的收尾事件在最后
+                compacted = (ctxs[0], ctxs[-1])
+        self.assertTrue(notices, "累积历史超过 80% 额度后应触发自动压缩")
         self.assertIn("压缩", notices[0])
-        # 压缩后保留的最近原文轮数不低于下限
         self.assertGreaterEqual(len(a.history), sessions.KEEP_TURNS_MIN)
         self.assertTrue(a.summary)
-        # 压缩后那条 context 事件把进度条刷回去（最近窗口体积远小于触发阈值）
-        self.assertTrue(ctx_after_notice)
-        self.assertLess(ctx_after_notice[-1]["percent"], 70)
+        # notice 后的收尾事件必须把进度条刷回去（至少回落一整轮的体积）
+        start_ctx, end_ctx = compacted
+        self.assertLess(end_ctx["used_tokens"], start_ctx["used_tokens"])
+        self.assertLess(end_ctx["percent"], start_ctx["percent"])
 
 
 class ContextApiTests(_Base):

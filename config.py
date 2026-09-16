@@ -149,9 +149,10 @@ TRAIL_ASSISTANT_CHARS = int(os.getenv("TRAIL_ASSISTANT_CHARS", "1000"))  # trail
 # 避免「小窗口塞不下、大窗口浪费 90%」的一刀切。
 PROMPT_TOKEN_BUDGET = int(os.getenv("PROMPT_TOKEN_BUDGET", "11000"))
 # 历史回放/压缩保留占 prompt 预算的比例：留出其余空间给系统提示、当前问题与
-# 本轮工具往返（observation）。触发压缩的历史占用比例。
+# 本轮工具往返（observation）。触发压缩的历史占用比例（80%：大窗口模型尽量
+# 少丢早期原文，到额度八成再压缩；保留 35% 给最近轮次）。
 COMPACT_KEEP_RATIO = float(os.getenv("DOCMIND_COMPACT_KEEP_RATIO", "0.35"))
-COMPACT_TRIGGER_RATIO = float(os.getenv("DOCMIND_COMPACT_TRIGGER_RATIO", "0.6"))
+COMPACT_TRIGGER_RATIO = float(os.getenv("DOCMIND_COMPACT_TRIGGER_RATIO", "0.8"))
 # 单次补全上限（含思考型模型的 reasoning）：防止模型不按格式收尾时无限生成，
 # 到顶后 finish_reason=length，Agent 会自动 nudge 要求直接给简短 Final Answer。
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "3072"))
@@ -209,20 +210,30 @@ _TOGGLE_THINK_RULES = (
 )
 
 
-def model_context_window(provider: str, model: str) -> int:
-    """该模型可用的上下文窗口（token）。保守取厂商公开值，未知模型取 provider 默认。"""
+def model_context_window(provider: str, model: str, live_window: int = None) -> int:
+    """该模型可用的上下文窗口（token）。
+
+    优先级：用户自定义覆盖（模型设置里手填，跨重启持久化）> 实时探测值
+    （如 Ollama /api/show 返回的 context_length）> 内置模型画像 > 厂商默认。
+    """
     p = (provider or "").strip().lower()
     m = (model or "").strip().lower()
+    custom = get_context_window_override(p, m)
+    if custom:
+        return custom
+    if live_window:
+        return int(live_window)
     for (pp, hint), win in _MODEL_CONTEXT_OVERRIDES.items():
         if p == pp and hint in m:
             return win
     return _PROVIDER_CONTEXT_DEFAULT.get(p, 32768)
 
 
-def prompt_token_budget(provider: str, model: str) -> int:
+def prompt_token_budget(provider: str, model: str, context_window: int = None) -> int:
     """单次请求 prompt 可用的 token 预算，按模型真实窗口缩放。
 
     - env PROMPT_TOKEN_BUDGET 显式设置时强制采用（排障/压测用）；
+    - context_window 可传入实时探测/自定义的窗口值（缺省走 model_context_window）；
     - 默认取「窗口的 75%」与「窗口 - 输出上限 - 512 余量」的较小值，
       并保 6144 下限。16k 本地模型 ≈ 12k，131k 云端 ≈ 98k，1M 模型 ≈ 786k。
     """
@@ -232,7 +243,7 @@ def prompt_token_budget(provider: str, model: str) -> int:
             return max(1024, int(env))
         except ValueError:
             pass
-    win = model_context_window(provider, model)
+    win = int(context_window) if context_window else model_context_window(provider, model)
     usable = max(2048, win - LLM_MAX_TOKENS - 512)
     scaled = int(win * 0.75)
     return max(6144, min(usable, scaled))
@@ -250,11 +261,14 @@ def model_thinking_mode(provider: str, model: str) -> str:
     return "none"
 
 
-def model_capability(provider: str, model: str) -> dict:
-    """汇总模型能力：{context_window, thinking, cloud}，供前后端共同决策。"""
+def model_capability(provider: str, model: str, context_window: int = None) -> dict:
+    """汇总模型能力：{context_window, thinking, cloud}，供前后端共同决策。
+
+    context_window 可传入实时探测值（如 Ollama /api/show）；用户自定义覆盖优先。
+    """
     cfg = PROVIDERS.get(provider or "", {})
     return {
-        "context_window": model_context_window(provider, model),
+        "context_window": model_context_window(provider, model, live_window=context_window),
         "thinking": model_thinking_mode(provider, model),
         "cloud": bool(cfg.get("cloud")),
     }
@@ -332,6 +346,41 @@ def load_state(key, default=None):
     return data.get(key, default)
 
 
+# ---- 用户在模型设置里手填的上下文窗口覆盖：{"provider/model": tokens} ----
+# 内置画像不可能覆盖所有模型（尤其自定义 OpenAI 端点），允许用户显式指定；
+# 跨重启持久化在 STATE_FILE，优先级高于实时探测与内置画像。
+_CONTEXT_WINDOW_OVERRIDES = {}
+
+
+def _ctx_override_key(provider: str, model: str) -> str:
+    return f"{(provider or '').strip().lower()}/{(model or '').strip().lower()}"
+
+
+def get_context_window_override(provider: str, model: str):
+    """返回用户自定义窗口（int）；未设置返回 None。"""
+    v = _CONTEXT_WINDOW_OVERRIDES.get(_ctx_override_key(provider, model))
+    return int(v) if isinstance(v, int) and v > 0 else None
+
+
+def set_context_window_override(provider: str, model: str, tokens):
+    """设置/更新自定义窗口（tokens 为正整数）；0 或非法值等同清除。"""
+    key = _ctx_override_key(provider, model)
+    try:
+        tokens = int(tokens)
+    except (TypeError, ValueError):
+        tokens = 0
+    if tokens > 0:
+        _CONTEXT_WINDOW_OVERRIDES[key] = tokens
+    else:
+        _CONTEXT_WINDOW_OVERRIDES.pop(key, None)
+    save_state("context_window_overrides", dict(_CONTEXT_WINDOW_OVERRIDES))
+
+
+def clear_context_window_override(provider: str, model: str):
+    _CONTEXT_WINDOW_OVERRIDES.pop(_ctx_override_key(provider, model), None)
+    save_state("context_window_overrides", dict(_CONTEXT_WINDOW_OVERRIDES))
+
+
 def _apply_persisted_state():
     """进程启动（import config）时恢复上次的本地选择；路径失效自动忽略。"""
     try:
@@ -347,6 +396,12 @@ def _apply_persisted_state():
         val = data.get(key)
         if isinstance(val, (int, float)) and val >= 0:
             _RUNTIME[key] = float(val)
+    # 用户自定义的模型上下文窗口（键 "provider/model" -> 正整数）
+    ov = data.get("context_window_overrides")
+    if isinstance(ov, dict):
+        for k, v in ov.items():
+            if isinstance(k, str) and "/" in k and isinstance(v, int) and v > 0:
+                _CONTEXT_WINDOW_OVERRIDES[k] = v
 
 
 _apply_persisted_state()

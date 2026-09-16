@@ -16,7 +16,7 @@ from openai import OpenAI
 from config import (
     LLM_PROVIDER, PROVIDERS, LLM_MODEL, LLM_API_KEY,
     LLM_MAX_TOKENS, LLM_ENABLE_THINKING, PROMPT_TOKEN_BUDGET, get_runtime,
-    model_capability, prompt_token_budget,
+    model_capability, prompt_token_budget, get_context_window_override,
 )
 
 # 默认单次 LLM 调用超时（秒）与重试策略（可用环境变量覆盖）
@@ -263,6 +263,67 @@ class _OllamaStream:
             if self._on_close: self._on_close()
 
 
+# ---- Ollama 实时上下文窗口探测（/api/show）----
+# 内置画像对未登记的本地模型只能按 16384 保守处理；Ollama 的 /api/show 返回的
+# model_info.<arch>.context_length 才是该模型的真实最大窗口。探测结果进程内缓存，
+# 模型未拉取/服务不可达时静默返回 None，由画像兜底；env DOCMIND_OLLAMA_PROBE=0 可关。
+_OLLAMA_CTX_CACHE = {}
+
+
+def _ollama_native_base(base_url: str = "") -> str:
+    """OpenAI 兼容地址（.../v1）还原成 Ollama 原生地址（去掉末尾 /v1）。"""
+    b = (base_url or "").strip().rstrip("/")
+    if b.endswith("/v1"):
+        b = b[:-3].rstrip("/")
+    return b or os.getenv("OLLAMA_BASE", "http://127.0.0.1:11434")
+
+
+def parse_ollama_show_context(data) -> int:
+    """从 /api/show 响应 JSON 中解析模型最大 context_length；无法识别返回 None。
+
+    新版字段为 model_info.llama.context_length，旧版按架构命名
+    （qwen2.context_length / gemma2.context_length…），取其中最大值。
+    """
+    if not isinstance(data, dict):
+        return None
+    best = None
+    info = data.get("model_info")
+    if isinstance(info, dict):
+        for k, v in info.items():
+            if isinstance(k, str) and k.endswith(".context_length") and isinstance(v, int) and v >= 512:
+                best = v if best is None else max(best, v)
+    if best:
+        return best
+    v = data.get("context_length")
+    return int(v) if isinstance(v, int) and v >= 512 else None
+
+
+def probe_ollama_context(model: str, base_url: str = "", timeout: float = 3.0,
+                         force: bool = False):
+    """实时探测 Ollama 模型的上下文窗口（token）；不可用返回 None。"""
+    name = (model or "").strip()
+    if not name:
+        return None
+    key = (_ollama_native_base(base_url), name.lower())
+    if not force and key in _OLLAMA_CTX_CACHE:
+        return _OLLAMA_CTX_CACHE[key]
+    win = None
+    try:
+        payload = json.dumps({"name": name}).encode("utf-8")
+        req = urllib.request.Request(
+            key[0] + "/api/show", data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        win = parse_ollama_show_context(data)
+    except Exception:  # noqa: BLE001 —— 探测只做锦上添花，任何失败都退回画像
+        win = None
+    _OLLAMA_CTX_CACHE[key] = win
+    return win
+
+
 class LLMClient:
     def __init__(self, provider=None, model=None, api_key=None, base_url=None):
         self.provider = provider or get_runtime("llm_provider") or LLM_PROVIDER
@@ -271,10 +332,6 @@ class LLMClient:
             raise ValueError(f"未知模型服务：{self.provider}")
         cfg = PROVIDERS[self.provider]
         self.model = model or get_runtime("llm_model") or LLM_MODEL or cfg["default_model"]
-        # 模型能力画像：决定 num_ctx 扩充、思考参数能否透传（前端也据此渲染开关）
-        self.capability = model_capability(self.provider, self.model)
-        # 按真实窗口缩放的单轮 prompt token 预算（Agent 裁剪/压缩与 ollama num_ctx 共用）
-        self.prompt_budget = prompt_token_budget(self.provider, self.model)
         # 最近一次调用的 token 用量（由 chat()/流式包装器原地更新），供 trace 账本读取
         self.last_usage = {}
         # 最近一次调用返回的原生 tool_calls（[{id,name,arguments}]），供 agent 的原生通道读取
@@ -292,6 +349,22 @@ class LLMClient:
             or (os.getenv("LLM_BASE_URL", "") if self.provider == "custom" else "")
             or cfg["base_url"]
         )
+
+        # 模型能力画像：决定 num_ctx 扩充、思考参数能否透传（前端也据此渲染开关）。
+        # 窗口来源：custom=用户手填覆盖 > probe=Ollama 实时探测 > profile=内置画像。
+        live_window = None
+        if (self.provider == "ollama"
+                and os.getenv("DOCMIND_OLLAMA_PROBE", "1").strip() not in ("0", "false", "no")
+                and not get_context_window_override(self.provider, self.model)):
+            live_window = probe_ollama_context(self.model, self.base_url)
+        self.context_source = (
+            "custom" if get_context_window_override(self.provider, self.model)
+            else ("probe" if live_window else "profile")
+        )
+        self.capability = model_capability(self.provider, self.model, context_window=live_window)
+        # 按真实窗口缩放的单轮 prompt token 预算（Agent 裁剪/压缩与 ollama num_ctx 共用）
+        self.prompt_budget = prompt_token_budget(
+            self.provider, self.model, context_window=self.capability["context_window"])
 
         if self.provider == "mock":
             # 离线演示模式：不发起任何网络请求

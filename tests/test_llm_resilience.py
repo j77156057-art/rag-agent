@@ -129,7 +129,9 @@ class OllamaPayloadTests(unittest.TestCase):
         from unittest.mock import patch
         from llm import LLMClient
 
-        client = LLMClient(provider="ollama", model=model)
+        # 离线：窗口实时探测打桩为 None，回退内置画像，保证 num_ctx 断言确定
+        with patch("llm.probe_ollama_context", return_value=None):
+            client = LLMClient(provider="ollama", model=model)
         captured = {}
 
         class _Resp:
@@ -177,10 +179,11 @@ class OllamaPayloadTests(unittest.TestCase):
     def test_small_window_model_caps_ctx_and_keeps_min_output(self):
         # 未知 ollama 模型 → 窗口 16384（非小窗口）；构造一个 8k 画像的客户端
         from llm import LLMClient
-        client = LLMClient(provider="ollama", model="tiny:7b")
+        from unittest.mock import patch
+        with patch("llm.probe_ollama_context", return_value=None):
+            client = LLMClient(provider="ollama", model="tiny:7b")
         client.capability = {"context_window": 8192, "thinking": "none", "cloud": False}
         import json as _json
-        from unittest.mock import patch
         captured = {}
 
         class _Resp:
@@ -199,6 +202,127 @@ class OllamaPayloadTests(unittest.TestCase):
                                 stream=False, thinking_on=False)
         self.assertEqual(captured["payload"]["options"]["num_ctx"], 8192)
         self.assertGreaterEqual(captured["payload"]["options"]["num_predict"], 512)
+
+
+class OllamaContextProbeTests(unittest.TestCase):
+    """/api/show 窗口探测：字段解析、进程内缓存、失败静默回退、LLMClient 接入。"""
+
+    def tearDown(self):
+        import llm
+        llm._OLLAMA_CTX_CACHE.clear()
+        from config import clear_context_window_override
+        clear_context_window_override("ollama", "zz-unit-custom:1b")
+
+    def test_parse_show_payload_variants(self):
+        from llm import parse_ollama_show_context as p
+        # 新版字段 model_info.<arch>.context_length
+        self.assertEqual(p({"model_info": {"llama.context_length": 32768}}), 32768)
+        # 多个架构字段取最大值，无关数值（total_params）不干扰
+        self.assertEqual(p({"model_info": {
+            "llama.context_length": 8192,
+            "qwen2.context_length": 32768,
+            "total_params": 8_000_000_000,
+        }}), 32768)
+        # 顶层字段兜底
+        self.assertEqual(p({"context_length": 16384}), 16384)
+        # 无法识别的载荷一律 None
+        self.assertIsNone(p(None))
+        self.assertIsNone(p({}))
+        self.assertIsNone(p({"model_info": {"llama.context_length": 256}}))
+        self.assertIsNone(p({"context_length": "4096"}))
+
+    def test_native_base_strips_v1_suffix(self):
+        from llm import _ollama_native_base
+        self.assertEqual(_ollama_native_base("http://127.0.0.1:11434/v1"),
+                         "http://127.0.0.1:11434")
+        self.assertEqual(_ollama_native_base("http://127.0.0.1:11434"),
+                         "http://127.0.0.1:11434")
+
+    def test_probe_success_uses_native_show_endpoint_and_caches(self):
+        import json as _json
+        from unittest.mock import patch
+        import llm
+        seen = {"urls": [], "n": 0}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return _json.dumps({"model_info": {"llama.context_length": 65536}}).encode()
+
+        class _Opener:
+            def open(self, req, timeout=None):
+                seen["n"] += 1
+                seen["urls"].append(req.full_url)
+                return _Resp()
+
+        with patch("llm.urllib.request.build_opener", return_value=_Opener()):
+            win = llm.probe_ollama_context("unitmodel:1b",
+                                           "http://127.0.0.1:11434/v1", force=True)
+        self.assertEqual(win, 65536)
+        self.assertTrue(seen["urls"][0].endswith("/api/show"))
+        self.assertNotIn("/v1/api", seen["urls"][0])
+        # 第二次不强制：命中缓存，不再发请求
+        with patch("llm.urllib.request.build_opener",
+                   side_effect=AssertionError("缓存命中不应再建 opener")):
+            win2 = llm.probe_ollama_context("unitmodel:1b",
+                                            "http://127.0.0.1:11434/v1")
+        self.assertEqual(win2, 65536)
+        self.assertEqual(seen["n"], 1)
+
+    def test_probe_failure_returns_none_silently(self):
+        from unittest.mock import patch
+        import llm
+
+        class _BadOpener:
+            def open(self, req, timeout=None):
+                raise OSError("connection refused")
+
+        with patch("llm.urllib.request.build_opener", return_value=_BadOpener()):
+            self.assertIsNone(llm.probe_ollama_context("zz-missing:1b", force=True))
+        # 失败结果同样缓存：切模型等路径重复构造客户端时不会反复等待超时
+        with patch("llm.urllib.request.build_opener",
+                   side_effect=AssertionError("失败结果应缓存")):
+            self.assertIsNone(llm.probe_ollama_context("zz-missing:1b"))
+
+    def test_client_adopts_probed_window_and_custom_override_wins(self):
+        import os as _os
+        from unittest.mock import patch
+        from llm import LLMClient
+        from config import set_context_window_override
+
+        env = {"DOCMIND_OLLAMA_PROBE": "1"}
+        with patch.dict(_os.environ, env, clear=False), \
+                patch("llm.probe_ollama_context", return_value=40960) as mk:
+            c = LLMClient(provider="ollama", model="zz-unit-probe:1b")
+        self.assertEqual(mk.call_count, 1)
+        self.assertEqual(c.context_source, "probe")
+        self.assertEqual(c.capability["context_window"], 40960)
+        self.assertEqual(c.prompt_budget, int(40960 * 0.75))
+
+        # 手填覆盖存在时跳过探测，窗口以覆盖为准
+        set_context_window_override("ollama", "zz-unit-custom:1b", 20000)
+        with patch.dict(_os.environ, env, clear=False), \
+                patch("llm.probe_ollama_context",
+                      side_effect=AssertionError("有手填覆盖时不应再探测")):
+            c2 = LLMClient(provider="ollama", model="zz-unit-custom:1b")
+        self.assertEqual(c2.context_source, "custom")
+        self.assertEqual(c2.capability["context_window"], 20000)
+
+    def test_probe_disabled_by_env_falls_back_to_profile(self):
+        import os as _os
+        from unittest.mock import patch
+        from llm import LLMClient
+        with patch.dict(_os.environ, {"DOCMIND_OLLAMA_PROBE": "0"}, clear=False), \
+                patch("llm.probe_ollama_context",
+                      side_effect=AssertionError("env 关闭后不应探测")):
+            c = LLMClient(provider="ollama", model="zz-unit-envoff:1b")
+        self.assertEqual(c.context_source, "profile")
+        self.assertEqual(c.capability["context_window"], 16384)
 
 
 class ReasoningStreamTests(unittest.TestCase):

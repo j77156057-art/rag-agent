@@ -44,10 +44,13 @@ from config import (
     CHAT_IMAGE_MAX_BYTES,
     CHAT_IMAGE_ALLOWED_TYPES,
     model_capability,
+    model_context_window,
+    set_context_window_override,
+    get_context_window_override,
 )
 from ingest import ingest_file, ingest_code_directory, load_project_rules
 from vectorstore import reset_collection, list_sources, count
-from llm import LLMClient
+from llm import LLMClient, probe_ollama_context
 from tools import (
     set_embedding_provider,
     list_pending_edits,
@@ -59,6 +62,7 @@ from tools import (
     dev_capture_bug,
     dev_list_bugs,
     dev_update_bug,
+    web_search,
     _run_region_cmd,
 )
 from regions import (
@@ -1846,6 +1850,8 @@ class ConfigReq(BaseModel):
     base_url: str = ""
     embedding_provider: str = ""
     edit_confirm: Optional[bool] = None
+    # 用户手填的上下文窗口（token）：>0 设置覆盖；=0 清除覆盖回到自动；None=不变
+    context_window: Optional[int] = None
 
 
 def _build_time() -> str:
@@ -1863,12 +1869,33 @@ def _build_time() -> str:
     return "dev"
 
 
+def _live_capability(prov: str, model: str):
+    """当前运行中的 LLMClient 与目标模型一致时返回其实例画像（含实时探测窗口），否则 None。"""
+    cli = agent.llm
+    if (getattr(cli, "provider", "") == prov and getattr(cli, "model", "") == model
+            and isinstance(getattr(cli, "capability", None), dict)):
+        return dict(cli.capability)
+    return None
+
+
+def _context_source(prov: str, model: str) -> str:
+    """当前生效窗口来源：custom 手填 > 运行客户端的 probe/profile > 静态 custom/profile。"""
+    if get_context_window_override(prov, model):
+        return "custom"
+    cli = agent.llm
+    if (getattr(cli, "provider", "") == prov and getattr(cli, "model", "") == model
+            and getattr(cli, "context_source", None)):
+        return cli.context_source
+    return "profile"
+
+
 @app.get("/api/config")
 async def get_config():
     """返回当前生效的模型配置（不回显 key）。"""
     prov = get_runtime("llm_provider") or LLM_PROVIDER
     emb = get_runtime("embedding_provider") or EMBEDDING_PROVIDER
     eff_model = get_runtime("llm_model") or LLM_MODEL or PROVIDERS.get(prov, {}).get("default_model", "")
+    _ctx_override = get_context_window_override(prov, eff_model)
     # 当前厂商专用 env（MOONSHOT/ZHIPU/SILICONFLOW/OPENAI…），并保留对两家旧厂商的兼容检查
     _envk = PROVIDERS.get(prov, {}).get("api_key_env", "")
     has_key = bool(
@@ -1897,8 +1924,13 @@ async def get_config():
         },
         # 自定义端点当前填写的地址（provider=custom 时有值）
         "custom_base_url": get_runtime("llm_base_url") or "",
-        # 当前模型能力：思考支持 native/toggle/none + 上下文窗口 + 是否云端
-        "capability": model_capability(prov, eff_model),
+        # 用户手填的上下文窗口覆盖（0/缺省=自动：实时探测或内置画像）
+        "context_window_override": _ctx_override or 0,
+        # 当前模型能力：当前运行客户端一致时直接取其实例画像（含 Ollama 实时探测结果），
+        # 否则按静态画像渲染（自定义覆盖优先级已在 model_capability 内处理）
+        "capability": _live_capability(prov, eff_model) or model_capability(prov, eff_model),
+        # 当前生效窗口的来源：custom 手填 / probe Ollama 实时探测 / profile 内置画像
+        "context_source": _context_source(prov, eff_model),
         "embedding_options": ["local", "ollama", "qwen"],
         "ingested_files": sorted(_INGESTED),
         "code_root": get_runtime("code_root") or CODE_ROOT,
@@ -1912,6 +1944,101 @@ async def get_config():
 
 
 OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://127.0.0.1:11434")
+
+
+@app.get("/api/ollama/probe")
+async def ollama_probe_ep(model: str = ""):
+    """实时探测已安装 Ollama 模型的上下文窗口（/api/show），强制绕过缓存。
+
+    供模型设置弹窗的「实时探测」按钮使用；服务/模型不可达时 ok=False，
+    不阻塞设置流程（前端可退回手填或内置画像）。
+    """
+    name = (model or "").strip()
+    if not name:
+        return {"ok": False, "error": "缺少模型名称。"}
+    win = await run_in_threadpool(lambda: probe_ollama_context(name, force=True))
+    if not win:
+        return {"ok": False, "error": f"未能从 Ollama 探测到 {name} 的窗口（模型未安装或 Ollama 未启动）。"}
+    return {"ok": True, "model": name, "context_window": int(win)}
+
+
+# 联网识别模型窗口：可接受的 token 范围
+_CTX_MIN, _CTX_MAX = 1024, 2_097_152
+_CTX_KEYWORDS = ("context", "window", "上下文", "窗口", "语境")
+# 数值写法：千分位 / 1,048,576；k/m 后缀；中文「万」；4~7 位裸数字
+_CTX_PATTERNS = (
+    re.compile(r"(?i)(\d{1,3}(?:,\d{3}){1,2})(?!\d)"),
+    re.compile(r"(?i)(\d+(?:\.\d+)?)\s*m(?![a-z0-9])"),
+    re.compile(r"(?i)(\d+(?:\.\d+)?)\s*k(?![a-z0-9])"),
+    re.compile(r"(\d+(?:\.\d+)?)\s*万"),
+    re.compile(r"(\d{4,7})(?!\d)"),
+)
+_CTX_MULT = (1, 1024 * 1024, 1024, 10000, 1)
+
+
+def _extract_context_candidates(text: str, limit: int = 5):
+    """从搜索结果文本里提取候选上下文窗口（token），按置信度排序。
+
+    置信度 = 命中次数 + 邻近上下文关键词加权；裸数字必须邻近
+    context/window/上下文/窗口 等词才采信，避免把无关数字当窗口。
+    """
+    if not text:
+        return []
+    tally = {}  # tokens -> [count, kw_hits, evidence]
+    for rx, mult in zip(_CTX_PATTERNS, _CTX_MULT):
+        for m in rx.finditer(text):
+            raw = m.group(1).replace(",", "")
+            try:
+                val = int(round(float(raw) * mult))
+            except ValueError:
+                continue
+            if not (_CTX_MIN <= val <= _CTX_MAX):
+                continue
+            a, b = max(0, m.start() - 40), min(len(text), m.end() + 40)
+            around = text[a:b].lower()
+            near_kw = any(k in around for k in _CTX_KEYWORDS)
+            # 千分位数字与裸数字（mult=1）无关键词佐证时不可信（页面里大量无关数字）；
+            # k/m/万 后缀本身信息量足够，先收录再靠频次与关键词加权排序。
+            if mult == 1 and not near_kw:
+                continue
+            slot = tally.setdefault(val, [0, 0, ""])
+            slot[0] += 1
+            if near_kw:
+                slot[1] += 1
+            if not slot[2]:
+                ev = re.sub(r"\s+", " ", text[a:b]).strip()
+                slot[2] = ev[:120]
+    ranked = sorted(tally.items(), key=lambda kv: (kv[1][1], kv[1][0]), reverse=True)
+    return [{"tokens": v, "evidence": ev} for v, (_c, _kw, ev) in ranked[:limit]]
+
+
+class ContextLookupReq(BaseModel):
+    provider: str = ""
+    model: str = ""
+
+
+@app.post("/api/model_context_lookup")
+async def model_context_lookup_ep(req: ContextLookupReq):
+    """联网搜索模型公开的上下文窗口（用户在设置里主动触发，不受联网开关约束）。
+
+    搜索后端无需 Key（DuckDuckGo/Bing），结果只做数字提取并给出处，
+    最终采用与否由用户在弹窗里确认——不自动写配置。
+    """
+    name = (req.model or "").strip()
+    if not name:
+        return {"ok": False, "error": "缺少模型名称。"}
+    hint = " ollama" if req.provider == "ollama" else ""
+    query = f'"{name}"{hint} context length 上下文窗口 tokens'
+    try:
+        raw = await run_in_threadpool(web_search, query)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"联网搜索失败：{e}", "query": query}
+    candidates = _extract_context_candidates(raw)
+    if not candidates:
+        return {"ok": False, "error": "搜索结果中未识别到可信的窗口数值，请手动填写。", "query": query}
+    return {"ok": True, "query": query, "best": candidates[0]["tokens"],
+            "candidates": candidates}
+
 
 
 def _check_ollama_model(model: str, timeout: float = 60.0):
@@ -2307,6 +2434,13 @@ async def set_config(req: ConfigReq):
                 status_code=400)
         set_runtime("llm_base_url", custom_base_url)
 
+    # 手填上下文窗口：先做范围校验（1k~2M；0=清除覆盖回到自动），避免无意义探活
+    if req.context_window is not None and req.context_window != 0 and not (
+            1024 <= req.context_window <= 2_097_152):
+        return JSONResponse(
+            {"ok": False, "error": "上下文窗口需在 1024 ~ 2097152 tokens 之间（清空输入框则恢复自动探测/内置画像）。"},
+            status_code=400)
+
     # 切到 Ollama 时先做模型健康检查：避免选了一个加载不起来的模型后页面卡死、显示原始检索内容
     target_model = req.model or PROVIDERS[req.provider]["default_model"]
     if req.provider == "ollama" and target_model:
@@ -2321,6 +2455,10 @@ async def set_config(req: ConfigReq):
                 "embedding_provider": get_runtime("embedding_provider") or EMBEDDING_PROVIDER,
                 "ingested_files": sorted(_INGESTED),
             }
+
+    # 探活/校验全部通过后才落窗口覆盖，紧接着重建客户端即按新窗口算预算
+    if req.context_window is not None:
+        set_context_window_override(req.provider, target_model, req.context_window)
 
     warnings = []
     set_runtime("llm_provider", req.provider)
@@ -2373,7 +2511,10 @@ async def set_config(req: ConfigReq):
         "llm_model": eff_model,
         "embedding_provider": emb,
         "base_url": get_runtime("llm_base_url") or PROVIDERS[prov].get("base_url", ""),
-        "capability": model_capability(prov, eff_model),
+        # 用新建客户端上的画像：含 Ollama 实时探测结果（model_capability 静态调用拿不到）
+        "capability": new_llm.capability,
+        "context_source": getattr(new_llm, "context_source", "profile"),
+        "context_window_override": get_context_window_override(prov, eff_model) or 0,
         "ingested_files": sorted(_INGESTED),
         "warnings": warnings,
     }

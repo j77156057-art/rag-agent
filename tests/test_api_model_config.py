@@ -108,8 +108,121 @@ class GetConfigShapeTests(unittest.TestCase):
         self.assertIn("context_window", resp["capability"])
         self.assertIn("thinking", resp["capability"])
         self.assertIn("custom_base_url", resp)
+        # 窗口覆盖/来源字段存在
+        self.assertIn("context_window_override", resp)
+        self.assertIn("context_source", resp)
         # 密钥字段只回布尔，不回原文
         self.assertNotIn("api_key", resp)
+
+
+class ContextCandidateParseTests(unittest.TestCase):
+    """搜索结果文本中的窗口数值提取（千分位/k/m/万；无关数字不采信）。"""
+
+    def tokens(self, text):
+        return [c["tokens"] for c in api._extract_context_candidates(text)]
+
+    def test_separated_comma_number(self):
+        self.assertIn(131072, self.tokens(
+            "该模型支持 context length of 131,072 tokens，适合长文档。"))
+
+    def test_k_suffix(self):
+        self.assertIn(131072, self.tokens("官方文档：context window 128k tokens。"))
+
+    def test_m_suffix(self):
+        self.assertIn(1048576, self.tokens("Gemini 级别：context length up to 1M tokens。"))
+
+    def test_chinese_wan(self):
+        self.assertIn(128000, self.tokens("该模型上下文窗口为 12.8万 tokens。"))
+
+    def test_unrelated_bare_numbers_ignored(self):
+        # 页面里的下载量/好评率等裸数字附近没有上下文关键词，一律不采信
+        self.assertEqual(api._extract_context_candidates(
+            "下载次数 50000 次，好评率 99%，发布于 2024 年。"), [])
+
+    def test_keyword_proximity_required_and_evidence_returned(self):
+        cs = api._extract_context_candidates(
+            "The model supports a context length of 131,072 tokens.")
+        self.assertTrue(cs)
+        self.assertEqual(cs[0]["tokens"], 131072)
+        self.assertIn("context", cs[0]["evidence"].lower())
+
+
+class ContextWindowEndpointTests(unittest.TestCase):
+    """实时探测 / 联网查询端点 + /api/config 窗口覆盖读写（全部打桩，不触网）。"""
+
+    MODEL = "zz-unit-ctx"
+
+    def setUp(self):
+        self._saved = {k: config.get_runtime(k) for k in _RUNTIME_KEYS}
+        self._old_llm = api.agent.llm
+
+    def tearDown(self):
+        config.clear_context_window_override("mock", self.MODEL)
+        for k, v in self._saved.items():
+            if v is None:
+                config._RUNTIME.pop(k, None)
+            else:
+                config.set_runtime(k, v)
+        api.agent.llm = self._old_llm
+
+    def test_ollama_probe_endpoint(self):
+        from starlette.testclient import TestClient
+        with patch("api.probe_ollama_context", return_value=65536):
+            with TestClient(api.app) as c:
+                r = c.get("/api/ollama/probe", params={"model": "q:7b"})
+        self.assertTrue(r.json()["ok"])
+        self.assertEqual(r.json()["context_window"], 65536)
+        # 探测失败返回 ok=False（非 5xx），前端可降级手填
+        with patch("api.probe_ollama_context", return_value=None):
+            with TestClient(api.app) as c:
+                r2 = c.get("/api/ollama/probe", params={"model": "missing:7b"})
+        self.assertFalse(r2.json()["ok"])
+        self.assertTrue(r2.json()["error"])
+
+    def test_model_context_lookup_endpoint(self):
+        from starlette.testclient import TestClient
+        fake = ("搜索结果：该模型 context length 为 131,072 tokens。\n"
+                "另一篇文章提到 context window 128k tokens。")
+        with patch("api.web_search", return_value=fake):
+            with TestClient(api.app) as c:
+                r = c.post("/api/model_context_lookup",
+                           json={"provider": "qwen", "model": "qwen-long"})
+        data = r.json()
+        self.assertTrue(data["ok"])
+        self.assertIn(131072, [x["tokens"] for x in data["candidates"]])
+        self.assertEqual(data["best"], data["candidates"][0]["tokens"])
+        # 识别不到数字时 ok=False，提示手动填写
+        with patch("api.web_search", return_value="今天天气不错，没有任何模型参数。"):
+            with TestClient(api.app) as c:
+                r2 = c.post("/api/model_context_lookup",
+                            json={"provider": "qwen", "model": "x"})
+        self.assertFalse(r2.json()["ok"])
+
+    def test_config_save_custom_window_and_clear(self):
+        from starlette.testclient import TestClient
+        with patch("api.check_ollama", return_value={"reachable": False}):
+            with TestClient(api.app) as c:
+                # 范围外的值被 400 拒绝
+                bad = c.post("/api/config", json={"provider": "mock", "model": self.MODEL,
+                                                  "context_window": 999})
+                self.assertEqual(bad.status_code, 400)
+                # 正常保存：画像窗口立即变成手填值，来源标记为 custom
+                ok = c.post("/api/config", json={"provider": "mock", "model": self.MODEL,
+                                                 "context_window": 40000}).json()
+                self.assertTrue(ok["ok"])
+                self.assertEqual(ok["context_window_override"], 40000)
+                self.assertEqual(ok["context_source"], "custom")
+                self.assertEqual(ok["capability"]["context_window"], 40000)
+                # GET 同样带回覆盖值与来源
+                got = c.get("/api/config").json()
+                self.assertEqual(got["context_window_override"], 40000)
+                self.assertEqual(got["context_source"], "custom")
+                # 传 0 清除覆盖：回到 mock 厂商默认窗口（32768）
+                cleared = c.post("/api/config", json={"provider": "mock", "model": self.MODEL,
+                                                      "context_window": 0}).json()
+                self.assertEqual(cleared["context_window_override"], 0)
+                self.assertEqual(cleared["capability"]["context_window"], 32768)
+                self.assertIsNone(config.get_context_window_override("mock", self.MODEL))
 
 
 if __name__ == "__main__":

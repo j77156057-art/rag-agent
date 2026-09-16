@@ -101,12 +101,14 @@ function fmtTokens(n: number): string {
 const usageTitle = computed(() => {
   const u = usage.value
   if (!u) return ''
+  // 百分比按「可用 prompt 额度」计（模型窗口扣除输出预留），与压缩触发线同口径
   const tail = u.level === 'warn'
-    ? '（接近窗口上限，早期对话将被自动压缩）'
+    ? '（已接近可用额度上限，早期对话即将自动压缩）'
     : u.level === 'high'
-      ? '（占用偏高，达到阈值后早期对话会自动压缩为摘要）'
-      : '（达到阈值后早期对话会自动压缩为摘要，不影响新问答）'
-  return `上下文已用 ${fmtTokens(u.used_tokens)} / 模型窗口 ${fmtTokens(u.context_window)} tokens${tail}`
+      ? '（占用偏高，达到 80% 后早期对话会自动压缩为摘要）'
+      : '（达到 80% 后早期对话会自动压缩为摘要，不影响新问答）'
+  return `上下文已用 ${fmtTokens(u.used_tokens)} / 可用额度 ${fmtTokens(u.prompt_budget)} tokens`
+    + `（模型窗口 ${fmtTokens(u.context_window)}，已预留输出空间）${tail}`
 })
 
 async function loadModelConfig() {
@@ -725,7 +727,7 @@ function connectorGuide(s: McpServer) {
             <span class="cd-chip-badge">不支持</span>
           </span>
 
-          <!-- 上下文窗口占用：按当前模型真实窗口估算，70% 转黄、90% 转红 -->
+          <!-- 上下文窗口占用：按当前模型真实窗口估算，65% 转黄、80%（压缩触发线）转红 -->
           <span
             v-if="usage"
             class="cd-chip cd-ctx cd-ctx-push"

@@ -16,6 +16,10 @@ from config import (  # noqa: E402
     model_thinking_mode,
     model_capability,
     prompt_token_budget,
+    set_context_window_override,
+    get_context_window_override,
+    clear_context_window_override,
+    load_state,
     LLM_MAX_TOKENS,
 )
 
@@ -104,9 +108,9 @@ class PromptBudgetScalingTests(unittest.TestCase):
         win = 1048576
         budget = max(6144, min(win - LLM_MAX_TOKENS - 512, int(win * 0.75)))
         self.assertEqual(budget, 786432)
-        trigger = int(budget * 0.6)
+        trigger = int(budget * 0.8)
         self.assertLess(5000, trigger)
-        self.assertGreater(trigger, 400_000)
+        self.assertGreater(trigger, 600_000)
 
     def test_tiny_window_keeps_floor(self):
         # 极小窗口也保 6144 下限（由 num_ctx 封顶逻辑再做物理裁剪）
@@ -114,6 +118,64 @@ class PromptBudgetScalingTests(unittest.TestCase):
         win = 4096
         budget = max(6144, min(win - LLM_MAX_TOKENS - 512, int(win * 0.75)))
         self.assertEqual(budget, 6144)
+
+
+class ContextWindowOverrideTests(unittest.TestCase):
+    """用户手填窗口覆盖：优先级 自定义 > 实时探测 > 画像 > 默认；可持久化恢复。"""
+
+    P, M = "custom", "zz-unit-only-model"
+
+    def tearDown(self):
+        clear_context_window_override(self.P, self.M)
+
+    def test_priority_custom_live_profile_default(self):
+        # 无覆盖：实时探测值优先于画像/默认
+        self.assertEqual(model_context_window(self.P, self.M, live_window=99000), 99000)
+        # 无探测：未知模型走默认 32768
+        self.assertEqual(model_context_window(self.P, self.M), 32768)
+        # 手填覆盖后压过探测值
+        set_context_window_override(self.P, self.M, 50000)
+        self.assertEqual(model_context_window(self.P, self.M, live_window=99000), 50000)
+        self.assertEqual(prompt_token_budget(self.P, self.M), int(50000 * 0.75))
+        # 清除覆盖后探测值重新生效
+        clear_context_window_override(self.P, self.M)
+        self.assertEqual(model_context_window(self.P, self.M, live_window=99000), 99000)
+
+    def test_zero_and_garbage_clear_override(self):
+        set_context_window_override(self.P, self.M, 40960)
+        set_context_window_override(self.P, self.M, 0)
+        self.assertIsNone(get_context_window_override(self.P, self.M))
+        set_context_window_override(self.P, self.M, "not-a-number")
+        self.assertIsNone(get_context_window_override(self.P, self.M))
+
+    def test_override_key_case_insensitive_and_scoped(self):
+        set_context_window_override("  Custom ", " ZZ-Unit-Only-MODEL ", 71000)
+        self.assertEqual(get_context_window_override(self.P, self.M), 71000)
+        # 覆盖严格按 provider/model 隔离，不串到别的模型
+        self.assertIsNone(get_context_window_override("ollama", self.M))
+        clear_context_window_override(self.P, self.M)
+
+    def test_persist_and_reapply(self):
+        import tempfile
+        import config
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        tmp.close()
+        old_state = config.STATE_FILE
+        try:
+            config.STATE_FILE = tmp.name
+            set_context_window_override(self.P, self.M, 88000)
+            # 落盘内容可读回
+            self.assertEqual(load_state("context_window_overrides", {})[f"{self.P}/{self.M}"], 88000)
+            # 模拟重启：清空内存字典后重新应用
+            config._CONTEXT_WINDOW_OVERRIDES.pop(f"{self.P}/{self.M}", None)
+            self.assertIsNone(get_context_window_override(self.P, self.M))
+            config._apply_persisted_state()
+            self.assertEqual(get_context_window_override(self.P, self.M), 88000)
+        finally:
+            # 直接摘内存键，绝不在恢复 STATE_FILE 后调用 clear（那会把清空结果写进真实状态文件）
+            config._CONTEXT_WINDOW_OVERRIDES.pop(f"{self.P}/{self.M}", None)
+            config.STATE_FILE = old_state
+            os.unlink(tmp.name)
 
 
 class OllamaBudgetTests(unittest.TestCase):

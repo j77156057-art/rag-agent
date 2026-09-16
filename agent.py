@@ -713,16 +713,22 @@ class Agent:
         return picked
 
     def context_stats(self, question: str = "") -> dict:
-        """当前会话的上下文占用（不含本轮工具往返），供前端「上下文已用 N%」展示。"""
+        """当前会话的上下文占用（不含本轮工具往返），供前端「上下文已用 N%」展示。
+
+        百分比分母用「可用 prompt 额度」（窗口扣除输出预留后的 prompt_budget），
+        而非完整窗口：这样 80% 即对应压缩触发线，65% 转黄、80% 转红贴合真实余量；
+        完整窗口仍随 context_window 字段下发，供悬停提示展示。
+        """
         msgs = self._build_messages(question or "")
         used = self._prompt_tokens(msgs, [])
         win = self.context_window
-        percent = max(0, min(100, round(used * 100 / win))) if win else 0
-        level = "warn" if percent >= 90 else ("high" if percent >= 70 else "ok")
+        budget = self._prompt_budget()
+        percent = max(0, min(100, round(used * 100 / budget))) if budget else 0
+        level = "warn" if percent >= 80 else ("high" if percent >= 65 else "ok")
         return {
             "used_tokens": used,
             "context_window": win,
-            "prompt_budget": self._prompt_budget(),
+            "prompt_budget": budget,
             "percent": percent,
             "level": level,
         }

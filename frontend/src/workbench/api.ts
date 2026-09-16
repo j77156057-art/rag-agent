@@ -1264,6 +1264,10 @@ export interface ModelConfigInfo {
   custom_base_url: string
   capability: ModelCapability
   ollama_status?: OllamaStatus
+  /** 用户手填的窗口覆盖；0/缺省 = 自动（实时探测或内置画像） */
+  context_window_override?: number
+  /** 当前生效窗口来源：custom 手填 / probe Ollama 实时探测 / profile 内置画像 */
+  context_source?: 'custom' | 'probe' | 'profile'
 }
 
 export interface SaveModelReq {
@@ -1271,6 +1275,29 @@ export interface SaveModelReq {
   model?: string
   api_key?: string
   base_url?: string
+  /** >0 设置窗口覆盖；0 清除覆盖回到自动；undefined=不改动 */
+  context_window?: number | null
+}
+
+/** 联网识别出的候选窗口（附带出处片段，由用户判断后采用） */
+export interface ContextCandidate {
+  tokens: number
+  evidence: string
+}
+
+export interface ContextLookupResult {
+  ok: boolean
+  error?: string
+  query?: string
+  best?: number
+  candidates?: ContextCandidate[]
+}
+
+export interface OllamaProbeResult {
+  ok: boolean
+  error?: string
+  model?: string
+  context_window?: number
 }
 
 export const modelApi = {
@@ -1279,6 +1306,14 @@ export const modelApi = {
   },
   save(req: SaveModelReq): Promise<ModelConfigInfo & { warnings?: string[]; model_error?: string }> {
     return postJson('/api/config', req)
+  },
+  /** 实时探测本机已安装 Ollama 模型的真实上下文窗口 */
+  probeOllama(model: string): Promise<OllamaProbeResult> {
+    return request(`/api/ollama/probe?model=${encodeURIComponent(model)}`)
+  },
+  /** 联网搜索模型公开的上下文窗口（返回候选列表，不自动写配置） */
+  lookupModelContext(provider: string, model: string): Promise<ContextLookupResult> {
+    return postJson('/api/model_context_lookup', { provider, model })
   },
 }
 
