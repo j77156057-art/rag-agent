@@ -17,7 +17,7 @@ description: "Golden-question SSE evaluation for the local DocMind agent: run ba
 
 - venv 解释器：`.\.venv\Scripts\python.exe`（工程根 `d:\WorkBuddy\rag-agent`）
 - 所有 shell 调用必须 `dangerouslyDisableSandbox: true`
-- 全量单测需把 MinGit 加 PATH：`$env:Path = "C:\Users\h'h'h\.local\bin\MinGit\cmd;" + $env:Path`
+- 全量单测需把 MinGit 加 PATH：`$env:Path = "C:\Users\<you>\.local\bin\MinGit\cmd;" + $env:Path`
 - dev 服务：`$env:DOCMIND_SERVER_ONLY="1"; .\.venv\Scripts\python.exe desktop.py`（后台运行，:8000，健康检查 `GET /api/health`）
 - **改了 agent.py/tools.py 必须停掉并重启服务**——进程启动时加载模块，热跑的旧进程不会拾取改动
 - 切换 Ollama 模型前确认 `GET /api/ps` 已热载；**不要同时开 ComfyUI**（抢 CUDA 会崩 ollama serve）

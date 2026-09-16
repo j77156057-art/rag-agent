@@ -211,17 +211,6 @@ While the game runs, events are written to `.docmind_runtime.jsonl` (the engine 
 
 ---
 
-## 🎯 Design Points (good interview talk)
-
-1. **Why an Agent, not naive RAG**: simple RAG struggles with "needs calculation" or "cross-document synthesis"; ReAct lets the model plan tool calls itself, generalizes better.
-2. **Provider abstraction**: converge vendors behind one OpenAI-compatible protocol so switching models touches no business code — the same idea is in the author's Android project `MusicLayout` (`AIApiClient`).
-3. **Degradation & robustness**: mock mode guarantees a demonstrable artifact with no network / no key; vector retrieval has clear fallback prompts.
-4. **Service mindset**: FastAPI exposes SSE streaming so the frontend renders "thought / action / observation" step by step — "wrap the Agent as a service" on the resume.
-5. **Subprocess, not in-process execution**: `python_exec` runs via `subprocess` + 12s timeout, so LLM-generated code never pollutes the main process; likewise playtest / build verification run in isolated processes — failure returns text instead of crashing the service.
-6. **Why regions use "per-region independent git repo" instead of single-repo branches / tags**: the goal is "rollback only that region on error", and independent repos have the cleanest semantics; cross-region features then bind multiple regions' commits into one **changeset** for a whole revert, more controllable than a single repo.
-7. **Why the scene canvas uses flat nodes + four edges instead of nested containers**: see the "Scene Canvas" section above. The companion reversible chain is the key — **each write returns an `undo` shaped like the API request body, the frontend returns it as-is to undo**, with no on-disk copy; regression cases pin "byte-for-byte restore after undo". That invariant反过来 constrains the backend (blank lines in `.tscn` belong to the previous block, so any "tidy up blank lines" cleanup breaks reversibility — there's a comment guarding it in code).
-8. **Why two `verify_*` scripts are worth it**: unit tests don't catch "interface field-name drift" or "CSS not loaded". The bug "Vue Flow style not imported + `manualChunks` sliced its CSS into a separate chunk that never loads" was exactly caught by the browser smoke — it doesn't error, nodes just pile in a column, undetectable by counting nodes/edges. So self-check assertions watch **geometric ratio** (landing delta ÷ coordinate delta must be constant), not "element exists".
-
 ## 🎮 Asset filtering tool (`search_assets`)
 
 For "making a game / need art assets": a tool that lets the Agent filter assets on demand.
@@ -287,7 +276,7 @@ Upgrades the Agent from "reads docs only" to "also understands your project code
   - `search_code(query)`: search indexed source/config for relevant functions, classes, config snippets (by symbol name + path) — "where is X implemented / what does function Y do".
   - `read_file(path)`: read a file in the code base (path relative to `code_root`), for full implementation.
   - `grep(pattern)`: regex search text/symbols in the code base, returns `file:line: content`, for locating a variable / an error.
-- **Design points (interview talk)**:
+- **Design points**:
   - **Code-aware chunking**: prose splits by paragraph; code must split by "file + function/class" — otherwise a function is cut in half, two unrelated functions glued — retrieval quality collapses. Python uses `ast` for exact `def/class` (incl. methods) start/end lines and names; other languages use regex heuristics for definition lines. Oversized slices fall back to line-based split.
   - **Separate collection**: code goes to its own Chroma collection (`docmind_code`), not polluting the doc collection; `search_knowledge` handles docs, `search_code` handles code.
   - **Path sandbox**: `read_file` / `grep` only allow access inside `code_root`; out-of-bounds is rejected, never leaking other local files.

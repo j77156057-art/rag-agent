@@ -1,4 +1,4 @@
-"""FastAPI 服务：把 Agent 封装为 HTTP 服务（对应简历中"将 Agent 封装为服务"）。
+"""FastAPI 服务：把 Agent 封装为 HTTP 服务。
 
 接口：
   POST /api/ingest   上传并摄取文档（PDF/MD/TXT）

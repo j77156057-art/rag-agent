@@ -185,7 +185,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 按 `docmind-frozen-release` Skill：py_compile → **全量单测** → `verify_scene_canvas.py`(54) → `verify_scene_canvas_ui.mjs`(27) → `verify_engine_embed.py`(68) → `npm run build` → PyInstaller（项目 .venv）→ 最小 PATH 冷启动冒烟 → 前端产物 SHA-256 核对 → **在 `DocMind_BUILD.md` 追加记录（不新建文件）**；只白名单提交，`agent-golden-eval/` 不提交。
 第 15–21 次均已执行（最新 `DocMind_BUILD.md` 第 21 次章节=2026-09-16 19:22 构建；exe 20,536,866 字节，SHA-256 `f67eac87…`）。
 > 第 21 次的**流程偏离（已在 `DocMind_BUILD.md` 记录理由）**：未重跑 `verify_scene_canvas_ui.mjs`(27) 与 `verify_engine_embed.py`(68)——本轮改动面只有 `agent/api/config/llm/tools/sessions/pricing/agent_trace/gpu_coordinator/hooks/skills/vectorstore` 与前端 `api.ts`/`ChatDock.vue`/`ModelSettingsDialog.vue`，**未触碰** `scene_runtime.py` / `desktop_bridge.py` / `engine_adapters.py` / `game_workbench.py`，这两条验证路径的代码面不变；`verify_scene_canvas.py` 已实跑 **54/54**。
-**第 19 次交付卡点（已解除，2026-09-15 20:43）**：用户确认 8000 实例本就不在（探活 HTTP 000），并清理了残留 python 进程（`C:\Users\h'h'h\.workbuddy\binaries\python\versions\3.13.12\python.exe` 与 `rag-agent\.venv\Scripts\python.exe`）。随后换入完成：源 `D:/Temp/docmind_rel19/DocMind/`（exe 19,814,751、SHA-256 `7c816242…`）→ `dist/DocMind`，**换后 exe SHA-256 与源一致（`7c816242…`）= 完整性校验通过**。注意：未用 `/MIR` 而用 `robocopy /E /XD .docmind`——目标 `dist/DocMind` 含**运行时目录 `.docmind/`**（预算/轨迹/gpu_state/chroma 指针），`/MIR` 会误删，故排除保护；仅镜像构建文件（exe + MinGit + _internal）。交付完成，无需重打包。
+**第 19 次交付卡点（已解除，2026-09-15 20:43）**：用户确认 8000 实例本就不在（探活 HTTP 000），并清理了残留 python 进程（`C:\Users\<you>\.workbuddy\binaries\python\versions\3.13.12\python.exe` 与 `rag-agent\.venv\Scripts\python.exe`）。随后换入完成：源 `D:/Temp/docmind_rel19/DocMind/`（exe 19,814,751、SHA-256 `7c816242…`）→ `dist/DocMind`，**换后 exe SHA-256 与源一致（`7c816242…`）= 完整性校验通过**。注意：未用 `/MIR` 而用 `robocopy /E /XD .docmind`——目标 `dist/DocMind` 含**运行时目录 `.docmind/`**（预算/轨迹/gpu_state/chroma 指针），`/MIR` 会误删，故排除保护；仅镜像构建文件（exe + MinGit + _internal）。交付完成，无需重打包。
 > 第 19 次的**两处流程偏离**（已在 `DocMind_BUILD.md` 记录理由）：① 未重跑 `npm run build`——本轮前端只有手写静态页 `web/trace.html`，`frontend/` 与 `web/assets/*` 零改动；② 未换入 `dist/DocMind`（同上卡点）。
 > **黄金题门**：第 19 / 20 / 21 次均为 **SKIPPED**（本机无法稳定起「已索引本仓库代码库」的可评测服务；离线规则打分由 `tests/test_agent_eval.py` 守在 707 全量里），已如实留痕。
 
@@ -260,7 +260,7 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 
 ## 7. 运行环境与常用命令
 
-- 路径含单引号用户名 `C:\Users\h'h'h\...`：shell 一律**双引号**包裹；服务地址用 `127.0.0.1` 不用 localhost；沙箱内 curl 加 `--noproxy '*'`。
+- 路径含单引号用户名 `C:\Users\<you>\...`：shell 一律**双引号**包裹；服务地址用 `127.0.0.1` 不用 localhost；沙箱内 curl 加 `--noproxy '*'`。
 - venv：`.venv\Scripts\python.exe`（已装全部依赖；打包必须用它，托管 python 缺 webview/chromadb 会出坏 exe）。
 
 ```powershell

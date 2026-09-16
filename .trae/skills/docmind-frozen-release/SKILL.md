@@ -10,7 +10,7 @@ description: "Builds, verifies, smoke-tests and commits a DocMind frozen (PyInst
 ## 环境约定（每个新 Shell 必做）
 
 ```powershell
-$env:PATH = "C:\Users\h'h'h\.local\bin\MinGit\cmd;" + $env:PATH   # 用户名含单引号，必须双引号
+$env:PATH = "C:\Users\<you>\.local\bin\MinGit\cmd;" + $env:PATH   # 用户名含单引号，必须双引号
 ```
 
 - Python：`.\.venv\Scripts\python.exe`（3.13，无 pytest，测试用 unittest）
