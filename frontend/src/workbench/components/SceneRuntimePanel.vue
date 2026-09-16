@@ -93,6 +93,20 @@ function onWindowResize() {
   }, 120)
 }
 
+// DPI 变化（拖到不同缩放的显示器 / WebView 缩放）在窗口尺寸不变时不会触发 resize，
+// 但宿主客户区物理像素会变 → 嵌入比例要重算、引擎视窗要重新 place，否则画面错位。
+// 用 matchMedia(resolution) 精确捕获 DPI 跳变（每次变化需重建监听，因为查询串含当前 DPI）。
+let dpiMq: MediaQueryList | null = null
+function onDpiChange() {
+  void onWindowResize()
+  watchDpi()
+}
+function watchDpi() {
+  dpiMq?.removeEventListener('change', onDpiChange)
+  dpiMq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
+  dpiMq.addEventListener('change', onDpiChange)
+}
+
 async function refreshTemplates() {
   try { tpl.value = await playApi.templates() } catch { /* 忽略 */ }
 }
@@ -341,10 +355,13 @@ watch(tab, v => {
 onMounted(() => {
   window.addEventListener('message', onWindowMessage)
   window.addEventListener('resize', onWindowResize)
+  watchDpi()
 })
 onUnmounted(() => {
   window.removeEventListener('message', onWindowMessage)
   window.removeEventListener('resize', onWindowResize)
+  dpiMq?.removeEventListener('change', onDpiChange)
+  dpiMq = null
   if (resizeTimer) window.clearTimeout(resizeTimer)
   stopTimers()
 })

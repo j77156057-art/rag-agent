@@ -106,7 +106,7 @@ import skills as agent_skills
 import pricing as pricing_mod
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
-from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_apply_parameters, comfy_queue, comfy_free_models, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable
+from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_apply_parameters, comfy_queue, comfy_free_models, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable, start_engine_watchdog
 
 
 @asynccontextmanager
@@ -129,6 +129,9 @@ async def _app_lifespan(app):
     gpu.register_hook("ollama", _gpu_ollama_evict_hook)
     gpu.register_hook("comfyui", _gpu_comfy_evict_hook)
     gpu.start_background()
+    # 引擎崩溃看门狗：进程异常退出（没走 /api/engine/stop）时清理 _EMBED_STATE 残留，
+    # 避免失效 hwnd / 误报嵌入状态；GPU 租约由 gpu_coordinator 进程死亡看门狗统一释放。
+    start_engine_watchdog()
     try:
         yield
     finally:
@@ -650,10 +653,10 @@ async def engine_start_ep(req: EngineReq):
     root=_project_root_or_error()
     host = req.host_hwnd or _DESKTOP_HOST_HWND
     rect = req.rect if (req.rect or {}).get('width') and (req.rect or {}).get('height') else None
-    return engine_start(root,req.executable,req.scene,host,req.embed,rect) if root else {"ok":False,"error":"未配置代码库"}
+    return (await run_in_threadpool(engine_start, root, req.executable, req.scene, host, req.embed, rect)) if root else {"ok":False,"error":"未配置代码库"}
 @app.post("/api/engine/stop")
 async def engine_stop_ep():
-    root=_project_root_or_error(); return engine_stop(root) if root else {"ok":False,"error":"未配置代码库"}
+    root=_project_root_or_error(); return (await run_in_threadpool(engine_stop, root)) if root else {"ok":False,"error":"未配置代码库"}
 @app.post("/api/engine/embed")
 async def engine_embed_ep(req: EngineEmbedReq):
     """把已运行的引擎窗口嵌进桌面宿主（引擎视窗模式优先，否则铺满宿主客户区）。"""
@@ -664,26 +667,26 @@ async def engine_embed_ep(req: EngineEmbedReq):
     rect = None
     if req.width > 0 and req.height > 0:
         rect = {'x': req.x, 'y': req.y, 'width': req.width, 'height': req.height}
-    return engine_embed(root, host, req.width or None, req.height or None,
-                        req.title_hint, offset, rect)
+    return (await run_in_threadpool(engine_embed, root, host, req.width or None, req.height or None,
+                        req.title_hint, offset, rect))
 
 @app.post("/api/engine/place")
 async def engine_place_ep(req: EnginePlaceReq):
     """引擎视窗随前端布局变化重新定位（弹窗移动、窗口缩放时调用）。"""
     root=_project_root_or_error()
     if not root: return {"ok":False,"error":"未配置代码库"}
-    return engine_place(root, req.x, req.y, req.width, req.height)
+    return (await run_in_threadpool(engine_place, root, req.x, req.y, req.width, req.height))
 @app.post("/api/engine/detach")
 async def engine_detach_ep():
-    root=_project_root_or_error(); return engine_detach(root) if root else {"ok":False,"error":"未配置代码库"}
+    root=_project_root_or_error(); return (await run_in_threadpool(engine_detach, root)) if root else {"ok":False,"error":"未配置代码库"}
 @app.post("/api/engine/focus")
 async def engine_focus_ep():
-    root=_project_root_or_error(); return engine_focus(root) if root else {"ok":False,"error":"未配置代码库"}
+    root=_project_root_or_error(); return (await run_in_threadpool(engine_focus, root)) if root else {"ok":False,"error":"未配置代码库"}
 @app.post("/api/engine/resize")
 async def engine_resize_ep(offset_y: int = -1):
     root=_project_root_or_error()
     if not root: return {"ok":False,"error":"未配置代码库"}
-    return engine_resize(root, None if offset_y < 0 else offset_y)
+    return (await run_in_threadpool(engine_resize, root, None if offset_y < 0 else offset_y))
 @app.get("/api/engine/logs")
 async def engine_logs_ep(limit: int = 200):
     root=_project_root_or_error(); return engine_logs(root, limit) if root else {"ok":False,"error":"未配置代码库"}

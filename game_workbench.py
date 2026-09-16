@@ -656,6 +656,53 @@ def engine_resize(root, offset_y=None):
         return {'ok': False, 'error': str(e)}
 
 
+def engine_reap_dead():
+    """清理"引擎异常退出 / 崩溃"（没走 /api/engine/stop）的残留状态。
+
+    * _EMBED_STATE 里指向已死进程 root 的条目：弹出并在 desktop_bridge 注销失效 hwnd，
+      否则 engine_status 会误报嵌入、embedded_children 会列幽灵窗口。
+    * _ENGINE_PROCS 里已退出的进程记录：弹出（实时状态以 poll() 为准，这里只是卫生）。
+    * GPU 租约（engine:<root>）由 gpu_coordinator 的进程死亡看门狗统一 force_release，
+      此处不重复释放，避免双释放。
+    """
+    for root in list(_EMBED_STATE):
+        st = _EMBED_STATE.get(root) or {}
+        p = _ENGINE_PROCS.get(root)
+        if p is not None and p.poll() is None:
+            continue  # 进程还活着
+        hwnd = st.get('child_hwnd')
+        if hwnd:
+            try:
+                from desktop_bridge import forget
+                forget(hwnd)
+            except Exception:  # noqa: BLE001
+                pass
+        _EMBED_STATE.pop(root, None)
+    for root in list(_ENGINE_PROCS):
+        p = _ENGINE_PROCS.get(root)
+        if p is None or p.poll() is not None:
+            _ENGINE_PROCS.pop(root, None)
+    return True
+
+
+_WATCHDOG_THREAD = None
+def start_engine_watchdog(interval=3.0):
+    """起一个 daemon 线程周期调用 engine_reap_dead（与 gpu_coordinator 后台线程同构）。"""
+    global _WATCHDOG_THREAD
+    if _WATCHDOG_THREAD is not None and _WATCHDOG_THREAD.is_alive():
+        return
+    def _loop():
+        while True:
+            try:
+                engine_reap_dead()
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(interval)
+    t = threading.Thread(target=_loop, name="docmind-engine-watchdog", daemon=True)
+    t.start()
+    _WATCHDOG_THREAD = t
+
+
 def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False, rect=None):
     root_abs = _root(root)
     if engine_status(root_abs)["running"]: return engine_status(root_abs)
