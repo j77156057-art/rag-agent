@@ -1106,8 +1106,11 @@ export interface FillExportsResp {
 
 // ---------------------------------------------------------------- P2：选区 AI（SSE 流式）
 export interface SseEvent {
-  type: 'token' | 'thought' | 'action' | 'observation' | 'reflection' | 'final' | 'done' | string
+  type:
+    | 'token' | 'thought' | 'action' | 'observation' | 'reflection'
+    | 'reasoning' | 'notice' | 'plan' | 'route' | 'final' | 'done' | string
   text?: string
+  steps?: string[]
 }
 
 export interface SseStreamHandlers {
@@ -1182,10 +1185,18 @@ async function postSse(url: string, init: RequestInit, h: SseStreamHandlers): Pr
 }
 
 export const aiApi = {
-  /** 解释 / Review / 自由提问：走 ReAct agent（可 search_code/read_file/grep，引用文件行号）。 */
-  askGrounded(question: string, h: SseStreamHandlers): Promise<void> {
+  /** 解释 / Review / 自由提问：走 ReAct agent（可 search_code/read_file/grep，引用文件行号）。
+   *  web/thinking：逐请求的联网搜索 / 深度思考开关（后端默认均为关/模型默认）。 */
+  askGrounded(
+    question: string,
+    h: SseStreamHandlers,
+    opts: { web?: boolean; thinking?: boolean | null } = {},
+  ): Promise<void> {
     const fd = new FormData()
     fd.append('question', question)
+    fd.append('web_mode', opts.web ? '1' : '0')
+    if (opts.thinking === true) fd.append('thinking_mode', '1')
+    else if (opts.thinking === false) fd.append('thinking_mode', '0')
     return postSse('/api/chat', { method: 'POST', body: fd }, h)
   },
   /** 改写：直连 LLM 快通道，强约束只产出可直接替换的纯代码。 */
@@ -1199,6 +1210,59 @@ export const aiApi = {
       },
       h,
     )
+  },
+}
+
+// ---------------------------------------------------------------- 模型设置（/api/config）
+export interface ProviderMeta {
+  label: string
+  base_url: string
+  default_model: string
+  needs_key: boolean
+  cloud: boolean
+}
+
+export interface ModelCapability {
+  context_window: number
+  /** native=模型天生推理（开关恒开） / toggle=可开关（qwen3 家族） / none=不支持 */
+  thinking: 'native' | 'toggle' | 'none' | string
+  cloud: boolean
+}
+
+export interface OllamaStatus {
+  reachable: boolean
+  needed_models?: string[]
+  present_models?: string[]
+  missing_models?: string[]
+  guidance?: string
+}
+
+export interface ModelConfigInfo {
+  ok?: boolean
+  llm_provider: string
+  llm_model: string
+  embedding_provider: string
+  has_key: boolean
+  providers: string[]
+  provider_meta: Record<string, ProviderMeta>
+  custom_base_url: string
+  capability: ModelCapability
+  ollama_status?: OllamaStatus
+}
+
+export interface SaveModelReq {
+  provider: string
+  model?: string
+  api_key?: string
+  base_url?: string
+}
+
+export const modelApi = {
+  get(): Promise<ModelConfigInfo> {
+    return request('/api/config')
+  },
+  save(req: SaveModelReq): Promise<ModelConfigInfo & { warnings?: string[]; model_error?: string }> {
+    return postJson('/api/config', req)
   },
 }
 

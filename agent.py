@@ -285,6 +285,9 @@ _VERBATIM_TOOLS = {"calculate", "python_exec", "gen_video_prompt"}
 # 写工具：只有用户问题明确表达修改/新建意图才允许执行，防止审查类任务越权改代码。
 _WRITE_TOOLS = {"apply_edit", "create_file", "dev_region_edit"}
 
+# 外网工具：只有用户显式打开「联网搜索」开关时才可用（默认关闭，代码问答不外联）。
+_WEB_TOOLS = {"web_search", "web_fetch", "web_research"}
+
 # 输入留空即合法的工具（无参调用 / 可选 path 调用）；
 # 其余工具在 Action Input 为空时一律拦截回填，不消耗工具步数——
 # 弱模型常输出 search_code()/grep() 空参，空跑一步后误判"项目无此实现"。
@@ -587,9 +590,24 @@ class Agent:
         self.plan_mode = bool(plan_mode)
         self.depth = int(depth or 0)
         self.tool_allowlist = list(tool_allowlist) if tool_allowlist else None
+        # 联网开关：默认关闭（代码问答不外联）；由 /api/chat 按请求显式设置。
+        self.web_enabled = False
+        # 深度思考开关：None=沿用模型默认/全局配置；True/False 按模型画像生效。
+        self.thinking_enabled = None
         self._native_queue = []    # 顺序回退用：逐个消化的 tool_calls
         self._pending_batch = []   # 并行批次用：一轮的多个只读 tool_calls
         self.last_turn_record = None   # 最近一回合的 trace 记录（父代理据此回传子代理轨迹）
+
+    def _web_blocked(self, action_name) -> bool:
+        """联网关闭时，外网工具一律拒绝（文本通道与原生通道共用此判定）。"""
+        return action_name in _WEB_TOOLS and not self.web_enabled
+
+    def _effective_tool_names(self):
+        """本轮实际暴露给模型的工具名：子代理白名单 ∩ 联网开关过滤。"""
+        names = self.tool_allowlist if self.tool_allowlist else list(TOOLS.keys())
+        if not self.web_enabled:
+            names = [n for n in names if n not in _WEB_TOOLS]
+        return names
 
     def _native_enabled(self):
         """本轮是否走原生 function-calling。"""
@@ -628,6 +646,19 @@ class Agent:
                 "【计划模式】收到问题后，先用 `Plan:` 开头输出 3-6 步编号计划"
                 "（每步一行、可执行、可验证），然后再开始调用工具或给出 Final Answer。"
                 "计划只输出一次。"
+            )})
+        # 联网开关状态必须显式告知：关闭时模型不应规划任何 web_* 调用
+        # （原生通道已从 schema 里剔除，文本通道再用提示词堵一道）。
+        if self.web_enabled:
+            messages.append({"role": "system", "content": (
+                "【联网已开启】可使用 web_search / web_fetch / web_research 获取最新外部资料；"
+                "回答中引用网页结论时必须附来源 URL。"
+            )})
+        else:
+            messages.append({"role": "system", "content": (
+                "【联网已关闭】本轮禁止使用 web_search / web_fetch / web_research，"
+                "调用也会被拒绝；请仅依据本地代码库、知识库与已知信息回答，"
+                "需要最新外部资料时提示用户打开「联网」开关。"
             )})
         # 更早的会话已被压缩成一段摘要（见 sessions.maybe_compact），作为独立
         # system 消息注入，让模型在滑窗之外仍知道"之前聊过什么"。
@@ -742,6 +773,23 @@ class Agent:
                 elif et == "final":
                     final_text = ev.get("text") or ""
                 yield ev
+            # 正常跑完（非断连）才落盘本轮历史并做压缩：超阈值时把早期轮次
+            # 摘要化，并给前端一条 notice（在 finally 里无法安全 yield）。
+            if self.session_id:
+                try:
+                    before_n = len(self.history)
+                    kept, summary = _sessions.maybe_compact(
+                        self.session_id, self.history, self.llm)
+                    if len(kept) < before_n:
+                        self.history = kept
+                        self.summary = summary
+                        _sessions.save(self.session_id, kept, summary)
+                        yield {"type": "notice",
+                               "text": f"早期 {before_n - len(kept)} 轮对话已自动压缩为摘要，新问答不受影响。"}
+                    else:
+                        _sessions.save(self.session_id, self.history, self.summary)
+                except Exception:  # noqa: BLE001
+                    pass
         except GeneratorExit:
             aborted = True
             raise
@@ -780,14 +828,8 @@ class Agent:
                 _hooks.run_post_turn(rec)
             except Exception:  # noqa: BLE001
                 pass
-            if self.session_id:
-                try:
-                    kept, summary = _sessions.maybe_compact(self.session_id, self.history, self.llm)
-                    self.history = kept
-                    self.summary = summary
-                    _sessions.save(self.session_id, kept, summary)
-                except Exception:  # noqa: BLE001 —— 落盘失败不得影响回答
-                    pass
+            # 历史摘要压缩在正常完成路径执行（需要 yield notice 事件）；
+            # 断连（GeneratorExit）时不落盘本轮，下次问答仍可重试。
 
     def _run(self, question, turn=None, stream=True, images=None, deadline=None):
         """执行一次问答，yield 出流式事件：
@@ -888,7 +930,7 @@ class Agent:
             finish_reason = None
             native_override = None
             use_tools = self._native_enabled()
-            tools_arg = tool_schemas(self.tool_allowlist) if use_tools else None
+            tools_arg = tool_schemas(self._effective_tool_names()) if use_tools else None
             if self._native_queue:
                 # 原生通道：上一轮一次返回了多个 tool_call，逐条顺序执行（不再问模型）
                 _nm, _nin = self._native_queue.pop(0)
@@ -898,13 +940,26 @@ class Agent:
             else:
                 _t_llm = time.monotonic()
                 if stream:
-                    chat_stream = self.llm.chat(messages, stream=True, deadline=deadline, tools=tools_arg)
+                    # 思考流（reasoning_content / thinking）与正文分开收集，
+                    # 每收到正文 token 就把已到达的思考片段作为 reasoning 事件上抛。
+                    reasoning_q = []
+                    chat_stream = self.llm.chat(
+                        messages, stream=True, deadline=deadline, tools=tools_arg,
+                        enable_thinking=self.thinking_enabled, reasoning_sink=reasoning_q,
+                    )
                     for tok in chat_stream:
+                        while reasoning_q:
+                            yield {"type": "reasoning", "text": reasoning_q.pop(0)}
                         acc += tok
                         yield {"type": "token", "text": tok}
+                    while reasoning_q:
+                        yield {"type": "reasoning", "text": reasoning_q.pop(0)}
                     finish_reason = getattr(chat_stream, "finish_reason", None)
                 else:
-                    acc = self.llm.chat(messages, stream=False, deadline=deadline, tools=tools_arg)
+                    acc = self.llm.chat(
+                        messages, stream=False, deadline=deadline, tools=tools_arg,
+                        enable_thinking=self.thinking_enabled,
+                    )
                 if turn is not None:
                     turn.llm_step((time.monotonic() - _t_llm) * 1000, finish_reason)
                     turn.add_usage(getattr(self.llm, "last_usage", None))
@@ -1077,6 +1132,18 @@ class Agent:
                             f"{action_name} 不在白名单内，已拒绝。")
                     trail.append({"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)})
                     trail.append({"role": "user", "content": f"Observation: {_obs}"})
+                    yield {"type": "observation", "text": _obs}
+                    continue
+
+                # 联网开关关闭：web_* 一律不执行（原生通道已在 schema 剔除，
+                # 这里拦文本协议/开关切换瞬间残留的调用），不消耗工具步数。
+                if self._web_blocked(action_name):
+                    _obs = ("[联网未开启] web_search / web_fetch / web_research 已被用户关闭，本次未执行。"
+                            "请改用本地代码库/知识库工具回答；确需最新外部资料时，"
+                            "提示用户在输入框上方打开「联网」开关后重试。")
+                    trail.append({"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)})
+                    trail.append({"role": "user", "content": f"Observation: {_obs}"})
+                    yield {"type": "action", "text": f"{action_name}({action_arg})"}
                     yield {"type": "observation", "text": _obs}
                     continue
 

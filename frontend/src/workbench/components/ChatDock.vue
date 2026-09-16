@@ -3,14 +3,15 @@
 // - 答案中的文件引用渲染为可点击卡片：跳转代码行 + 文件树展开闪烁 + 分区高亮；
 // - 头部「引擎」弹层：MCP 服务器连接状态（godot-ai stdio / unity / unreal HTTP）
 //   与 godot-ai 插件安装引导（安装前必须用户确认）。
-import { nextTick, ref, watch, onMounted, onBeforeUnmount } from 'vue'
+import { nextTick, ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
-import { aiApi, mcpApi } from '../api'
-import type { McpServer } from '../api'
+import { aiApi, mcpApi, modelApi } from '../api'
+import type { McpServer, ModelConfigInfo } from '../api'
 import type { SseEvent } from '../api'
 import { mdToHtml, extractFileRefs } from '../markdown'
 import type { FileRef } from '../markdown'
 import { demoMode } from '../composables/demo'
+import ModelSettingsDialog from './ModelSettingsDialog.vue'
 
 const {
   nodeExists, revealPath, jumpToLine,
@@ -23,6 +24,9 @@ interface ChatMsg {
   text: string
   status: 'streaming' | 'done' | 'error' | 'stopped'
   trace: { type: string; text: string }[]
+  reasoning: string        // 深度思考模型的 reasoning_content 流
+  notices: string[]        // 系统通知（如上下文自动压缩）
+  plan: string[]           // 计划模式步骤
   error?: string
 }
 
@@ -50,13 +54,55 @@ const QUICK_PROMPTS = [
   '帮我梳理这个项目的代码结构',
 ]
 
+// ---------------------------------------------------------------- 模型 / 联网 / 思考
+const modelConfig = ref<ModelConfigInfo | null>(null)
+const settingsOpen = ref(false)
+// 联网默认关（代码问答不外联），选择持久化在本机
+const webOn = ref(window.localStorage.getItem('docmind.chatWeb') === '1')
+// 深度思考：'1'/'0'，仅对支持思考的模型才发送
+const thinkingOn = ref(window.localStorage.getItem('docmind.chatThinking') === '1')
+watch(webOn, (v) => window.localStorage.setItem('docmind.chatWeb', v ? '1' : '0'))
+watch(thinkingOn, (v) => window.localStorage.setItem('docmind.chatThinking', v ? '1' : '0'))
+
+const modelLabel = computed(() => {
+  if (demoMode.value) return '离线演示模型'
+  const c = modelConfig.value
+  if (!c) return '模型加载中…'
+  const name = c.provider_meta?.[c.llm_provider]?.label || c.llm_provider
+  return `${name} · ${c.llm_model || '默认模型'}`
+})
+const thinkingMode = computed(() => modelConfig.value?.capability?.thinking || 'none')
+const thinkingSupported = computed(() => thinkingMode.value !== 'none')
+// native 思考模型（reasoner 类）开关恒开且不可点；toggle 家族才允许用户切
+const thinkingNative = computed(() => thinkingMode.value === 'native')
+const thinkingEffective = computed(() => thinkingNative.value || thinkingOn.value)
+
+async function loadModelConfig() {
+  if (demoMode.value) return
+  try {
+    modelConfig.value = await modelApi.get()
+  } catch {
+    /* 配置加载失败不阻塞聊天，芯片显示兜底文案 */
+  }
+}
+function openSettings() {
+  if (demoMode.value) return
+  void loadModelConfig().then(() => { settingsOpen.value = true })
+}
+function onModelSaved(info: ModelConfigInfo) {
+  modelConfig.value = info
+  // 后端切换模型会清空多轮上下文，前端消息同步清空避免张冠李戴
+  clearMessages()
+  // 是否关闭弹窗由弹窗自身决定（有告警时停留，让用户看到告警内容）
+}
+
 // ---------------------------------------------------------------- 发送 / 停止
 async function send(text?: string) {
   const q = (text ?? input.value).trim()
   if (!q || sending.value) return
   input.value = ''
-  messages.value.push({ id: msgSeq++, role: 'user', text: q, status: 'done', trace: [] })
-  const turn: ChatMsg = { id: msgSeq++, role: 'assistant', text: '', status: 'streaming', trace: [] }
+  messages.value.push({ id: msgSeq++, role: 'user', text: q, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
+  const turn: ChatMsg = { id: msgSeq++, role: 'assistant', text: '', status: 'streaming', trace: [], reasoning: '', notices: [], plan: [] }
   messages.value.push(turn)
   sending.value = true
   if (demoMode.value) {
@@ -76,6 +122,16 @@ async function send(text?: string) {
     if (!t) return
     if (ev.type === 'final' && typeof ev.text === 'string' && ev.text) {
       t.text = ev.text
+    } else if (ev.type === 'reasoning' && typeof ev.text === 'string') {
+      // 深度思考流：实时拼接到独立的思考窗口（与正文分开），流式期间自动展开
+      t.reasoning += ev.text
+      if (!reasonOpen.value.has(t.id)) {
+        reasonOpen.value = new Set([...reasonOpen.value, t.id])
+      }
+    } else if (ev.type === 'notice' && ev.text) {
+      t.notices.push(ev.text)
+    } else if (ev.type === 'plan' && Array.isArray(ev.steps)) {
+      t.plan = ev.steps
     } else if (ev.type === 'thought' || ev.type === 'action' ||
                ev.type === 'observation' || ev.type === 'reflection') {
       if (ev.text) t.trace.push({ type: ev.type, text: ev.text })
@@ -84,7 +140,14 @@ async function send(text?: string) {
   }
 
   try {
-    await aiApi.askGrounded(q, { onEvent, signal: ac.signal })
+    // 不支持思考的模型不传思考参数（null）；native 模型恒开，也无需显式传
+    const thinkingOpt = thinkingSupported.value
+      ? (thinkingNative.value ? null : thinkingOn.value)
+      : null
+    await aiApi.askGrounded(q, { onEvent, signal: ac.signal }, {
+      web: webOn.value,
+      thinking: thinkingOpt,
+    })
     const t = live()
     if (t) t.status = t.text ? 'done' : 'stopped'
   } catch (e) {
@@ -179,7 +242,10 @@ function onFocusChat(ev?: Event) {
     inputEl.value?.focus()
   })
 }
-onMounted(() => window.addEventListener('docmind:focus-chat', onFocusChat as EventListener))
+onMounted(() => {
+  window.addEventListener('docmind:focus-chat', onFocusChat as EventListener)
+  void loadModelConfig()
+})
 onBeforeUnmount(() => window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener))
 
 function scrollToBottom() {
@@ -212,6 +278,29 @@ function toggleTrace(id: number) {
   else next.add(id)
   traceOpen.value = next
 }
+
+// 深度思考面板折叠态（reasoning_content 独立窗口）
+const reasonOpen = ref<Set<number>>(new Set())
+function toggleReason(id: number) {
+  const next = new Set(reasonOpen.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  reasonOpen.value = next
+}
+
+// 思考芯片：仅 toggle 家族可点；native 恒开；none 不渲染可点按钮
+function toggleThinking() {
+  if (!thinkingSupported.value || thinkingNative.value) return
+  thinkingOn.value = !thinkingOn.value
+}
+const thinkingTitle = computed(() => {
+  if (!thinkingSupported.value) return '当前模型不支持深度思考，可点左侧模型芯片切换支持思考的模型'
+  if (thinkingNative.value) return '该模型内置深度思考，始终开启'
+  return thinkingOn.value ? '深度思考已开启：回答前先推理，耗时更长' : '点击开启深度思考'
+})
+const webTitle = computed(() => webOn.value
+  ? '联网搜索已开启：AI 可检索互联网获取最新信息'
+  : '联网搜索已关闭：仅检索当前代码库，点击开启')
 
 // ---------------------------------------------------------------- 引擎 / MCP 弹层
 const enginePopOpen = ref(false)
@@ -483,9 +572,26 @@ function connectorGuide(s: McpServer) {
         <div v-for="m in messages" :key="m.id" class="cd-msg" :class="`cd-msg-${m.role}`">
           <div v-if="m.role === 'user'" class="cd-user-bubble">{{ m.text }}</div>
           <template v-else>
+            <div v-for="(n, i) in m.notices" :key="'n' + i" class="cd-notice">
+              <svg width="11" height="11" viewBox="0 0 11 11"><circle cx="5.5" cy="5.5" r="4.6" fill="none" stroke="currentColor" stroke-width="1"/><path d="M5.5 4.6 V7.6" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><circle cx="5.5" cy="3" r=".75" fill="currentColor"/></svg>
+              <span>{{ n }}</span>
+            </div>
+            <div v-if="m.plan.length" class="cd-plan">
+              <div class="cd-plan-title">执行计划</div>
+              <div v-for="(s, i) in m.plan" :key="'p' + i" class="cd-plan-step">
+                <span class="cd-plan-idx">{{ i + 1 }}</span><span>{{ s }}</span>
+              </div>
+            </div>
+            <div v-if="m.reasoning" class="cd-reason">
+              <button class="cd-reason-head" @click="toggleReason(m.id)">
+                {{ reasonOpen.has(m.id) ? '▾' : '▸' }} 深度思考
+                <span v-if="m.status === 'streaming'" class="cd-dots">…</span>
+              </button>
+              <div v-if="reasonOpen.has(m.id)" class="cd-reason-body">{{ m.reasoning }}</div>
+            </div>
             <div v-if="m.text" class="ai-md cd-answer" v-html="answerHtml(m)" />
             <div v-else-if="m.status === 'streaming'" class="cd-thinking">
-              AI 正在翻代码、组织回答<span class="cd-dots">…</span>
+              {{ m.reasoning ? '正在整理最终回答' : 'AI 正在翻代码、组织回答' }}<span class="cd-dots">…</span>
             </div>
             <div v-if="m.status === 'error'" class="cd-error">⚠ {{ m.error }}</div>
             <div v-if="m.trace.length" class="cd-trace">
@@ -517,18 +623,80 @@ function connectorGuide(s: McpServer) {
       </div>
 
       <footer class="cd-inputbar">
-        <textarea
-          ref="inputEl"
-          v-model="input"
-          class="cd-input"
-          rows="2"
-          placeholder="提问：角色数值在哪 / 解释这段逻辑 / 这个报错怎么改…（Ctrl+Enter 发送）"
-          @keydown="onKeydown"
-        />
-        <button v-if="sending" class="cd-send cd-stop" @click="stop">停止</button>
-        <button v-else class="cd-send" :disabled="!input.trim()" @click="send()">发送</button>
+        <div class="cd-tools">
+          <button
+            class="cd-chip cd-chip-model"
+            :disabled="demoMode"
+            :title="demoMode ? '离线演示模式无需配置模型' : '模型设置：切换云端 / 本地 / 任意 OpenAI 兼容接口'"
+            @click="openSettings"
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12">
+              <rect x="2.6" y="2.6" width="6.8" height="6.8" rx="1" fill="none" stroke="currentColor" stroke-width="1"/>
+              <path d="M4.6 0.9v1.7M7.4 0.9v1.7M4.6 9.4v1.7M7.4 9.4v1.7M0.9 4.6h1.7M0.9 7.4h1.7M9.4 4.6h1.7M9.4 7.4h1.7" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+            </svg>
+            <span class="cd-chip-text">{{ modelLabel }}</span>
+            <svg width="9" height="9" viewBox="0 0 9 9"><path d="M2 3.2 L4.5 5.7 L7 3.2" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+
+          <button
+            class="cd-chip"
+            :class="{ 'cd-chip-on': webOn }"
+            :title="webTitle"
+            @click="webOn = !webOn"
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12">
+              <circle cx="6" cy="6" r="4.7" fill="none" stroke="currentColor" stroke-width="1"/>
+              <path d="M1.3 6h9.4" fill="none" stroke="currentColor" stroke-width="1"/>
+              <path d="M6 1.3c1.5 1.3 2.3 2.9 2.3 4.7S7.5 9.4 6 10.7C4.5 9.4 3.7 7.8 3.7 6S4.5 2.6 6 1.3z" fill="none" stroke="currentColor" stroke-width="1"/>
+            </svg>
+            <span>联网搜索</span>
+            <span class="cd-switch" :class="{ on: webOn }"><i /></span>
+          </button>
+
+          <button
+            v-if="thinkingSupported"
+            class="cd-chip"
+            :class="{ 'cd-chip-on': thinkingEffective, 'cd-chip-native': thinkingNative }"
+            :disabled="thinkingNative"
+            :title="thinkingTitle"
+            @click="toggleThinking"
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12">
+              <path d="M6 1 L7.1 4.9 L11 6 L7.1 7.1 L6 11 L4.9 7.1 L1 6 L4.9 4.9 Z" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>
+            </svg>
+            <span>深度思考</span>
+            <span v-if="thinkingNative" class="cd-chip-badge">内置</span>
+            <span v-else class="cd-switch" :class="{ on: thinkingEffective }"><i /></span>
+          </button>
+          <span v-else class="cd-chip cd-chip-off" :title="thinkingTitle">
+            <svg width="12" height="12" viewBox="0 0 12 12">
+              <path d="M6 1 L7.1 4.9 L11 6 L7.1 7.1 L6 11 L4.9 7.1 L1 6 L4.9 4.9 Z" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>
+            </svg>
+            <span>深度思考</span>
+            <span class="cd-chip-badge">不支持</span>
+          </span>
+        </div>
+        <div class="cd-input-row">
+          <textarea
+            ref="inputEl"
+            v-model="input"
+            class="cd-input"
+            rows="2"
+            placeholder="提问：角色数值在哪 / 解释这段逻辑 / 这个报错怎么改…（Ctrl+Enter 发送）"
+            @keydown="onKeydown"
+          />
+          <button v-if="sending" class="cd-send cd-stop" @click="stop">停止</button>
+          <button v-else class="cd-send" :disabled="!input.trim()" @click="send()">发送</button>
+        </div>
       </footer>
     </template>
+
+    <ModelSettingsDialog
+      :visible="settingsOpen"
+      :config="modelConfig"
+      @close="settingsOpen = false"
+      @saved="onModelSaved"
+    />
   </section>
 </template>
 
@@ -688,7 +856,8 @@ function connectorGuide(s: McpServer) {
 .cd-ref-line { color: var(--amber); }
 
 /* 输入区 */
-.cd-inputbar { display: flex; gap: 8px; align-items: flex-end; padding: 8px 12px 10px; }
+.cd-inputbar { display: flex; flex-direction: column; gap: 6px; padding: 7px 12px 9px; }
+.cd-input-row { display: flex; gap: 8px; align-items: flex-end; }
 .cd-input {
   flex: 1; resize: none;
   background: var(--bg); color: var(--text);
@@ -704,4 +873,88 @@ function connectorGuide(s: McpServer) {
 }
 .cd-send:disabled { opacity: .4; cursor: default; }
 .cd-stop { background: transparent; color: var(--danger); border-color: var(--danger); }
+
+/* 工具行：模型芯片 / 联网开关 / 深度思考开关 */
+.cd-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cd-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  height: 23px; padding: 0 8px;
+  border: 1px solid var(--border); border-radius: 12px;
+  background: transparent; color: var(--text-muted);
+  font-size: 11px; line-height: 1; cursor: pointer;
+  max-width: 60%;
+}
+.cd-chip:hover:not(:disabled):not(.cd-chip-off) { border-color: var(--border-strong); color: var(--text); }
+.cd-chip:disabled { cursor: default; }
+.cd-chip-text {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-mono);
+}
+.cd-chip-model { padding: 0 7px 0 8px; }
+.cd-chip-on {
+  color: var(--accent); border-color: var(--accent);
+  background: rgba(37, 96, 212, .07);
+}
+.cd-chip-native { color: var(--violet, #7c5cd6); border-color: var(--violet, #7c5cd6); background: rgba(124, 92, 214, .08); }
+.cd-chip-off { opacity: .6; cursor: default; }
+.cd-chip-badge { font-size: 10px; color: var(--text-faint); }
+.cd-chip-native .cd-chip-badge { color: var(--violet, #7c5cd6); }
+
+/* 迷你开关 */
+.cd-switch {
+  position: relative; flex: 0 0 auto;
+  width: 22px; height: 12px; border-radius: 7px;
+  background: var(--border-strong); transition: background .15s;
+}
+.cd-switch i {
+  position: absolute; top: 1.5px; left: 2px;
+  width: 9px; height: 9px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25);
+  transition: left .15s;
+}
+.cd-switch.on { background: var(--accent); }
+.cd-chip-native .cd-switch.on { background: var(--violet, #7c5cd6); }
+.cd-switch.on i { left: 11px; }
+
+/* 系统通知（上下文压缩等） */
+.cd-notice {
+  display: flex; align-items: flex-start; gap: 5px;
+  margin: 2px 0 5px; padding: 4px 8px;
+  border-radius: 5px; background: var(--bg-hover);
+  font-size: 10.5px; color: var(--text-dim); line-height: 1.5;
+}
+.cd-notice svg { flex: 0 0 auto; margin-top: 2px; color: var(--text-faint); }
+
+/* 计划步骤 */
+.cd-plan {
+  margin: 2px 0 6px; padding: 7px 9px;
+  border: 1px solid var(--border); border-radius: 7px; background: var(--bg-hover);
+}
+.cd-plan-title { font-size: 11px; font-weight: 600; color: var(--text-muted); margin-bottom: 5px; }
+.cd-plan-step { display: flex; gap: 7px; align-items: flex-start; font-size: 11px; color: var(--text-dim); line-height: 1.55; }
+.cd-plan-step + .cd-plan-step { margin-top: 3px; }
+.cd-plan-idx {
+  flex: 0 0 15px; width: 15px; height: 15px; margin-top: 1px;
+  border-radius: 50%; background: var(--accent); color: #fff;
+  font-size: 9.5px; display: inline-flex; align-items: center; justify-content: center;
+}
+
+/* 深度思考窗口（reasoning_content 流） */
+.cd-reason {
+  margin: 2px 0 6px; border: 1px solid var(--border);
+  border-left: 2px solid var(--violet, #7c5cd6);
+  border-radius: 6px; background: var(--bg-hover); overflow: hidden;
+}
+.cd-reason-head {
+  width: 100%; text-align: left;
+  border: none; background: none; padding: 5px 9px; cursor: pointer;
+  font-size: 11px; color: var(--violet, #7c5cd6);
+}
+.cd-reason-head:hover { color: var(--text); }
+.cd-reason-body {
+  padding: 2px 10px 8px 20px;
+  font-size: 11px; line-height: 1.65; color: var(--text-dim);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 220px; overflow-y: auto;
+}
 </style>

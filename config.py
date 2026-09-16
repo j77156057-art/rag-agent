@@ -27,35 +27,84 @@ PROJECT_DIR = BASE_DIR
 PROJECT_WEB_DIR = os.path.join(PROJECT_DIR, "web")
 
 # ---- LLM Provider ----
-# 可选: qwen(通义千问) / deepseek / ollama / mock(离线演示，无需任何 key)
+# 可选: qwen(通义千问) / deepseek / kimi(月之暗面) / zhipu(智谱) /
+#       siliconflow(硅基流动) / openai / ollama / llamacpp /
+#       custom(任意 OpenAI 兼容端点，base_url 运行时填写) / mock(离线演示)
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mock")
 
 # 各 provider 的 OpenAI 兼容接入点（base_url 统一为 OpenAI 协议，与 Android 端 AIApiClient 思路一致）
+# cloud=True 表示外部云端服务（请求出网、按 token 计费）；本地服务与 mock 为 False。
 PROVIDERS = {
     "qwen": {
+        "label": "通义千问（阿里云百炼）",
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "api_key_env": "DASHSCOPE_API_KEY",
         "default_model": "qwen-plus",
+        "cloud": True,
     },
     "deepseek": {
+        "label": "DeepSeek",
         "base_url": "https://api.deepseek.com/v1",
         "api_key_env": "DEEPSEEK_API_KEY",
         "default_model": "deepseek-chat",
+        "cloud": True,
+    },
+    "kimi": {
+        "label": "Kimi（月之暗面）",
+        "base_url": "https://api.moonshot.cn/v1",
+        "api_key_env": "MOONSHOT_API_KEY",
+        "default_model": "kimi-k2-0905-preview",
+        "cloud": True,
+    },
+    "zhipu": {
+        "label": "智谱 GLM",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "api_key_env": "ZHIPU_API_KEY",
+        "default_model": "glm-4.6",
+        "cloud": True,
+    },
+    "siliconflow": {
+        "label": "硅基流动 SiliconFlow",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "api_key_env": "SILICONFLOW_API_KEY",
+        "default_model": "Qwen/Qwen3-8B",
+        "cloud": True,
+    },
+    "openai": {
+        "label": "OpenAI",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY",
+        "default_model": "gpt-4o-mini",
+        "cloud": True,
     },
     "ollama": {
+        "label": "本地 Ollama",
         "base_url": "http://localhost:11434/v1",
         "api_key_env": "",
         "default_model": "qwen2.5:7b",
+        "cloud": False,
     },
     "llamacpp": {
+        "label": "本地 llama.cpp",
         "base_url": "http://localhost:8080/v1",
         "api_key_env": "",
         "default_model": "qwen3.6-35b-a3b",
+        "cloud": False,
+    },
+    # 任意 OpenAI 兼容服务：base_url / model / key 全部运行时填写
+    "custom": {
+        "label": "自定义 OpenAI 兼容服务",
+        "base_url": "",
+        "api_key_env": "",
+        "default_model": "",
+        "cloud": True,
     },
     "mock": {
+        "label": "离线演示（mock）",
         "base_url": "",
         "api_key_env": "",
         "default_model": "mock",
+        "cloud": False,
     },
 }
 
@@ -102,6 +151,87 @@ LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "3072"))
 # 实测关思考后同类请求 55 token/4s 给出 Action（开思考时偶发烧满 3072 token 不行动）。
 # 仅对本地 OpenAI 兼容服务（llamacpp/ollama）透传 chat_template_kwargs。
 LLM_ENABLE_THINKING = os.getenv("LLM_ENABLE_THINKING", "0") == "1"
+
+# ---- 模型能力画像 ---------------------------------------------------------
+# 不同模型家族差异很大，不能一套参数打天下：
+# · 本地模型需要按自身上下文窗口扩 num_ctx（窗口小的模型不能盲目给 14k prompt）；
+# · 思考分两类：native（reasoner 类模型天生输出 reasoning_content，无需开关）
+#   与 toggle（qwen3 家族靠 enable_thinking / think 参数切换）；
+# · 其余模型不支持思考，传了参数反而可能 400，必须跳过。
+# 画像按 (provider, 模型名子串) 匹配，未命中走 provider 默认值。
+
+# (provider, 模型名小写子串) -> 上下文窗口 token 数
+_MODEL_CONTEXT_OVERRIDES = {
+    ("deepseek", "reasoner"): 65536,
+    ("openai", "gpt-4o"): 128000,
+    ("openai", "gpt-4-"): 65536,
+    ("openai", "gpt-3.5"): 16385,
+    ("openai", "o1"): 200000,
+    ("openai", "o3"): 200000,
+    ("ollama", "qwen2.5:7b"): 32768,
+}
+
+# provider 级默认上下文窗口（模型未命中精确画像时使用）
+_PROVIDER_CONTEXT_DEFAULT = {
+    "qwen": 131072,
+    "deepseek": 131072,
+    "kimi": 131072,
+    "zhipu": 131072,
+    "siliconflow": 65536,
+    "openai": 128000,
+    "ollama": 16384,
+    "llamacpp": 16384,
+    "custom": 32768,
+    "mock": 32768,
+}
+
+# 模型名命中任一子串即视为"原生思考模型"（推理始终开启，思考走 reasoning_content）
+_NATIVE_THINK_HINTS = (
+    "reasoner", "qwq", "-r1", "_r1", "/r1", "think", "o1-", "o3-", "o4-",
+    "gpt-5", "deepseek-r1",
+)
+
+# 支持 enable_thinking 开关的家族：(provider, 模型名前缀/子串)
+_TOGGLE_THINK_RULES = (
+    ("qwen", "qwen3"),       #  DashScope 兼容模式 qwen3 系列支持 extra_body 开关
+    ("ollama", "qwen3"),
+    ("llamacpp", "qwen3"),
+    ("custom", "qwen3"),
+    ("siliconflow", "qwen3"),
+)
+
+
+def model_context_window(provider: str, model: str) -> int:
+    """该模型可用的上下文窗口（token）。保守取厂商公开值，未知模型取 provider 默认。"""
+    p = (provider or "").strip().lower()
+    m = (model or "").strip().lower()
+    for (pp, hint), win in _MODEL_CONTEXT_OVERRIDES.items():
+        if p == pp and hint in m:
+            return win
+    return _PROVIDER_CONTEXT_DEFAULT.get(p, 32768)
+
+
+def model_thinking_mode(provider: str, model: str) -> str:
+    """思考能力画像：'native'（天生推理）/ 'toggle'（可开关）/ 'none'（不支持）。"""
+    p = (provider or "").strip().lower()
+    m = (model or "").strip().lower()
+    if any(h in m for h in _NATIVE_THINK_HINTS):
+        return "native"
+    for pp, hint in _TOGGLE_THINK_RULES:
+        if p == pp and hint in m:
+            return "toggle"
+    return "none"
+
+
+def model_capability(provider: str, model: str) -> dict:
+    """汇总模型能力：{context_window, thinking, cloud}，供前后端共同决策。"""
+    cfg = PROVIDERS.get(provider or "", {})
+    return {
+        "context_window": model_context_window(provider, model),
+        "thinking": model_thinking_mode(provider, model),
+        "cloud": bool(cfg.get("cloud")),
+    }
+
 CODE_ROOT = os.getenv("CODE_ROOT", "")  # 代码问答模式的代码库根目录；为空表示未配置
 CODE_CHUNK = int(os.getenv("CODE_CHUNK", "1200"))  # 单个代码切片的最大字符数
 EDIT_CONFIRM = os.getenv("EDIT_CONFIRM", "0") == "1"  # 写工具是否需要人工确认（改前出 diff）

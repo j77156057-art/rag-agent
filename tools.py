@@ -163,23 +163,35 @@ def calculate(expression):
         return f"计算失败: {e}"
 
 
-def web_search(query):
-    """联网搜索（默认 DuckDuckGo HTML，无需 API Key；可用 env WEB_SEARCH_BACKEND=bing 切换）。
+_SEARCH_EMPTY_MARKERS = ("搜索失败", "搜索未返回结果")
 
-    返回前 5 条结果的标题/摘要/链接；网络不可达时优雅降级并说明原因。
-    注意：依赖运行环境能访问外网。部分网络屏蔽 DuckDuckGo，可设
-    WEB_SEARCH_BACKEND=bing 改用 Bing（同样无需 Key）。
+
+def web_search(query):
+    """联网搜索（无需 API Key）。
+
+    后端策略（可用 env WEB_SEARCH_BACKEND 强制）：
+    - 默认 auto：先 DuckDuckGo HTML，被风控（202 挑战页）或无结果时自动换 Bing；
+    - bing / ddg：只走指定后端。
+    返回前 5 条结果的标题/摘要/链接；全部不可达时优雅降级并说明原因。
     """
     q = (query or "").strip().strip("'\"")
     if not q:
         return "未提供搜索关键词。"
-    backend = (os.getenv("WEB_SEARCH_BACKEND") or "ddg").lower()
-    try:
-        if backend == "bing":
-            return _bing_search(q)
-        return _ddg_search(q)
-    except Exception as e:  # noqa: BLE001
-        return f"搜索失败: {type(e).__name__}: {e}（请确认运行环境能访问外网，或换用带 Key 的搜索引擎）"
+    forced = (os.getenv("WEB_SEARCH_BACKEND") or "auto").strip().lower()
+    order = [forced] if forced in ("ddg", "bing") else ["ddg", "bing"]
+    last = ""
+    for backend in order:
+        try:
+            r = _bing_search(q) if backend == "bing" else _ddg_search(q)
+        except Exception as e:  # noqa: BLE001
+            last = f"{backend}: {type(e).__name__}: {e}"
+            continue
+        if not any(r.startswith(m) for m in _SEARCH_EMPTY_MARKERS):
+            return r
+        last = r
+    return (last or "搜索失败：所有搜索后端均不可用。") + (
+        "" if last.startswith(_SEARCH_EMPTY_MARKERS) else
+        "（DuckDuckGo/Bing 均不可达，请确认运行环境能访问外网，或配置带 Key 的搜索引擎）")
 
 
 def _ddg_search(q):
@@ -218,6 +230,26 @@ def _ddg_search(q):
     return "\n".join(lines)
 
 
+def _bing_real_url(link):
+    """把 Bing 的 ck/a 跳转链接还原成真实目标 URL；非跳转链接原样返回。
+
+    形如 https://www.bing.com/ck/a?...&u=a1aHR0cHM6...&ntb=1，u 参数去掉
+    前缀 a1 后是 URL 的 base64（urlsafe，常缺填充）。
+    """
+    if not link or "bing.com/ck/a" not in link:
+        return link
+    m = re.search(r"[?&]u=a1([A-Za-z0-9_\-]+)", link)
+    if not m:
+        return link
+    import base64 as _b64
+    raw = m.group(1)
+    raw += "=" * (-len(raw) % 4)
+    try:
+        return _b64.urlsafe_b64decode(raw).decode("utf-8", "replace")
+    except Exception:
+        return link
+
+
 def _bing_search(q):
     """Bing HTML 搜索（无需 Key）。用于 DuckDuckGo 被屏蔽的网络环境。"""
     url = "https://www.bing.com/search?q=" + urllib.parse.quote(q)
@@ -243,7 +275,7 @@ def _bing_search(q):
         )
         if not hm:
             continue
-        link = hm.group(1)
+        link = _bing_real_url(hm.group(1))
         title = _clean(hm.group(2))
         sm = re.search(r'<p class="b_lineclamp[^"]*"[^>]*>(.*?)</p>', blk, re.S)
         snippet = _clean(sm.group(1)) if sm else ""

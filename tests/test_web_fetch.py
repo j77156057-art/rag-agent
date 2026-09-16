@@ -1,4 +1,6 @@
+import base64
 import io
+import os
 import unittest
 from unittest.mock import patch
 import tools
@@ -23,5 +25,66 @@ class WebFetchTests(unittest.TestCase):
     def test_network_failure_is_explicit(self):
         with patch('tools.urllib.request.urlopen', side_effect=TimeoutError('late')):
             self.assertIn('网页读取失败', tools.web_fetch('https://example.test'))
+
+
+class WebSearchFailoverTests(unittest.TestCase):
+    """auto 模式：DuckDuckGo 被风控/无结果时必须自动转 Bing（实测 DDG 常返 202 挑战页）。"""
+
+    def test_ddg_empty_falls_back_to_bing(self):
+        bing_result = "· 真实标题\n  摘要\n  https://example.test/real"
+        env = {**os.environ, "WEB_SEARCH_BACKEND": "auto"}
+        with patch.dict(tools.os.environ, env, clear=True), \
+                patch("tools._ddg_search", return_value="搜索未返回结果，可能是网络受限或该关键词无结果。"), \
+                patch("tools._bing_search", return_value=bing_result) as mb:
+            out = tools.web_search("今天新闻")
+        self.assertEqual(out, bing_result)
+        mb.assert_called_once_with("今天新闻")
+
+    def test_ddg_success_skips_bing(self):
+        ddg_result = "· DDG 标题\n  摘要\n  https://ddg.test/x"
+        env = {**os.environ, "WEB_SEARCH_BACKEND": "auto"}
+        with patch.dict(tools.os.environ, env, clear=True), \
+                patch("tools._ddg_search", return_value=ddg_result), \
+                patch("tools._bing_search") as mb:
+            self.assertEqual(tools.web_search("q"), ddg_result)
+        mb.assert_not_called()
+
+    def test_ddg_exception_falls_back_to_bing(self):
+        env = {**os.environ, "WEB_SEARCH_BACKEND": "auto"}
+        with patch.dict(tools.os.environ, env, clear=True), \
+                patch("tools._ddg_search", side_effect=TimeoutError("202 challenge")), \
+                patch("tools._bing_search", return_value="· B\n  s\n  https://b.test"):
+            out = tools.web_search("q")
+        self.assertIn("https://b.test", out)
+
+    def test_forced_ddg_does_not_fail_over(self):
+        env = {**os.environ, "WEB_SEARCH_BACKEND": "ddg"}
+        with patch.dict(tools.os.environ, env, clear=True), \
+                patch("tools._ddg_search", return_value="搜索未返回结果，可能是网络受限或该关键词无结果。"), \
+                patch("tools._bing_search") as mb:
+            out = tools.web_search("q")
+        self.assertIn("搜索未返回结果", out)
+        mb.assert_not_called()
+
+    def test_empty_query_short_circuits(self):
+        self.assertIn("未提供搜索关键词", tools.web_search("  "))
+
+
+class BingRealUrlTests(unittest.TestCase):
+    def test_decodes_ck_a_redirect(self):
+        target = "https://example.com/page?x=1&y=2"
+        enc = base64.urlsafe_b64encode(target.encode("utf-8")).decode("ascii").rstrip("=")
+        link = f"https://www.bing.com/ck/a?!&&p=abc&u=a1{enc}&ntb=1"
+        self.assertEqual(tools._bing_real_url(link), target)
+
+    def test_plain_link_passes_through(self):
+        self.assertEqual(tools._bing_real_url("https://example.com/a"), "https://example.com/a")
+        self.assertEqual(tools._bing_real_url(""), "")
+
+    def test_malformed_ck_a_returns_original(self):
+        link = "https://www.bing.com/ck/a?!&&p=abc&u=notbase64!!"
+        # 正则不匹配时原样返回，不能抛异常
+        self.assertEqual(tools._bing_real_url(link), link)
+
 
 if __name__ == '__main__': unittest.main()

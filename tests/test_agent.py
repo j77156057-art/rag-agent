@@ -309,5 +309,75 @@ class AgentGuardTests(unittest.TestCase):
         self.assertEqual(p["action_input"], "ApiProvider")
 
 
+class WebGateTests(unittest.TestCase):
+    """联网开关：默认关闭时 web_* 工具文本通道拒绝执行、原生 schema 剔除。"""
+
+    def setUp(self):
+        self._old_tools = agent_mod.TOOLS
+
+    def tearDown(self):
+        agent_mod.TOOLS = self._old_tools
+
+    def test_web_tool_blocked_in_text_channel_when_off(self):
+        calls = []
+
+        def fake_web(arg):
+            calls.append(arg)
+            return "不应被调用"
+
+        def fake_local(arg):
+            return "本地结果"
+
+        agent_mod.TOOLS = {
+            "web_search": {"func": fake_web},
+            "search_code": {"func": fake_local},
+        }
+        a = agent_mod.Agent(llm=_ScriptedLLM([
+            _act("web_search", "今天的新闻"),
+            _FINAL_OK,
+        ]))
+        self.assertFalse(a.web_enabled, "新 Agent 的联网必须默认关闭")
+        events = _run(a)
+        self.assertEqual(calls, [], "联网关闭时 web_search 绝不能执行")
+        obs = [e["text"] for e in events if e["type"] == "observation"]
+        self.assertTrue(any("联网未开启" in t for t in obs))
+
+    def test_web_tool_runs_when_enabled(self):
+        calls = []
+
+        def fake_web(arg):
+            calls.append(arg)
+            return "· 标题\n  https://example.test/a"
+
+        agent_mod.TOOLS = {"web_search": {"func": fake_web}}
+        a = agent_mod.Agent(llm=_ScriptedLLM([
+            _act("web_search", "今天的新闻"),
+            _FINAL_OK,
+        ]))
+        a.web_enabled = True
+        _run(a)
+        self.assertEqual(calls, ["今天的新闻"])
+
+    def test_effective_tool_schemas_filter_web_tools(self):
+        a = agent_mod.Agent(llm=_ScriptedLLM([_FINAL_OK]))
+        names_off = set(a._effective_tool_names())
+        for name in agent_mod._WEB_TOOLS:
+            self.assertNotIn(name, names_off, f"联网关闭时 {name} 不应暴露给模型")
+        self.assertIn("search_code", names_off)
+
+        a.web_enabled = True
+        names_on = set(a._effective_tool_names())
+        for name in agent_mod._WEB_TOOLS:
+            self.assertIn(name, names_on, f"联网开启后 {name} 应出现在 schema 中")
+
+    def test_system_prompt_declares_web_status(self):
+        a = agent_mod.Agent(llm=_ScriptedLLM([_FINAL_OK]))
+        joined_off = " ".join(str(m.get("content", "")) for m in a._build_messages("q"))
+        self.assertIn("联网已关闭", joined_off)
+        a.web_enabled = True
+        joined_on = " ".join(str(m.get("content", "")) for m in a._build_messages("q"))
+        self.assertIn("联网已开启", joined_on)
+
+
 if __name__ == "__main__":
     unittest.main()

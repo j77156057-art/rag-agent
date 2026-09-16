@@ -16,6 +16,7 @@ from openai import OpenAI
 from config import (
     LLM_PROVIDER, PROVIDERS, LLM_MODEL, LLM_API_KEY,
     LLM_MAX_TOKENS, LLM_ENABLE_THINKING, PROMPT_TOKEN_BUDGET, get_runtime,
+    model_capability,
 )
 
 # 默认单次 LLM 调用超时（秒）与重试策略（可用环境变量覆盖）
@@ -136,10 +137,11 @@ class StreamChat:
     长度到 reasoning_chars，供上层判断"只有思考、没有正文"的情况。
     """
 
-    def __init__(self, stream, usage_sink=None, tool_sink=None):
+    def __init__(self, stream, usage_sink=None, tool_sink=None, reasoning_sink=None):
         self._stream = stream
         self._usage = usage_sink if usage_sink is not None else {}
         self._tool_sink = tool_sink if tool_sink is not None else []
+        self._reasoning_sink = reasoning_sink
         self._partial = {}          # index -> {"id":.., "name":.., "arguments":..}
         self.finish_reason = None
         self.reasoning_chars = 0
@@ -196,6 +198,8 @@ class StreamChat:
                 reasoning = getattr(delta, "reasoning_content", None)
                 if reasoning:
                     self.reasoning_chars += len(reasoning)
+                    if self._reasoning_sink is not None:
+                        self._reasoning_sink.append(reasoning)
                 content = getattr(delta, "content", None)
                 if content:
                     yield content
@@ -211,11 +215,13 @@ class _OllamaStream:
     末行 done=true 带 done_reason（"stop" / "length"），映射到 finish_reason。
     """
 
-    def __init__(self, resp, on_close=None, usage_sink=None, tool_sink=None):
+    def __init__(self, resp, on_close=None, usage_sink=None, tool_sink=None,
+                 reasoning_sink=None):
         self._resp = resp
         self._on_close = on_close
         self._usage = usage_sink if usage_sink is not None else {}
         self._tool_sink = tool_sink if tool_sink is not None else []
+        self._reasoning_sink = reasoning_sink
         self._seen_tools = set()
         self.finish_reason = None
         self.reasoning_chars = 0
@@ -234,6 +240,8 @@ class _OllamaStream:
             thinking = msg.get("thinking")
             if thinking:
                 self.reasoning_chars += len(thinking)
+                if self._reasoning_sink is not None:
+                    self._reasoning_sink.append(thinking)
             # ollama 的 tool_calls 是"完整"对象（非分片），去重后并入 sink
             for call in normalize_tool_calls(msg.get("tool_calls")):
                 sig = (call["name"], call["arguments"])
@@ -256,10 +264,15 @@ class _OllamaStream:
 
 
 class LLMClient:
-    def __init__(self, provider=None, model=None, api_key=None):
+    def __init__(self, provider=None, model=None, api_key=None, base_url=None):
         self.provider = provider or get_runtime("llm_provider") or LLM_PROVIDER
+        if self.provider not in PROVIDERS:
+            # 未知 provider 不静默回退：明确报错，避免把请求发到意料之外的服务
+            raise ValueError(f"未知模型服务：{self.provider}")
         cfg = PROVIDERS[self.provider]
         self.model = model or get_runtime("llm_model") or LLM_MODEL or cfg["default_model"]
+        # 模型能力画像：决定 num_ctx 扩充、思考参数能否透传（前端也据此渲染开关）
+        self.capability = model_capability(self.provider, self.model)
         # 最近一次调用的 token 用量（由 chat()/流式包装器原地更新），供 trace 账本读取
         self.last_usage = {}
         # 最近一次调用返回的原生 tool_calls（[{id,name,arguments}]），供 agent 的原生通道读取
@@ -270,34 +283,72 @@ class LLMClient:
         # 解析出来的 key 留档：子代理需要用它新建**独立**的 LLMClient（避免共享实例的
         # last_usage / last_tool_calls 在并发下互相覆盖）
         self.api_key = ""
+        # 自定义 OpenAI 兼容端点：显式传入 > 运行时覆盖 > LLM_BASE_URL 环境变量
+        self.base_url = (
+            base_url
+            or (get_runtime("llm_base_url") if self.provider == "custom" else "")
+            or (os.getenv("LLM_BASE_URL", "") if self.provider == "custom" else "")
+            or cfg["base_url"]
+        )
 
         if self.provider == "mock":
             # 离线演示模式：不发起任何网络请求
             self.client = None
             return
 
+        if self.provider == "custom" and not self.base_url:
+            raise ValueError("自定义 OpenAI 兼容服务缺少 base_url，请在模型设置中填写接口地址。")
+
         # 解析 API Key：优先显式传入 -> 运行时覆盖 -> 环境变量 LLM_API_KEY -> provider 专用变量
         key = api_key or get_runtime("llm_api_key") or LLM_API_KEY
         if cfg["api_key_env"]:
             key = key or os.getenv(cfg["api_key_env"], "")
         self.api_key = key or ""
-        self.client = OpenAI(base_url=cfg["base_url"], api_key=key or "EMPTY", timeout=self.timeout)
+        self.client = OpenAI(base_url=self.base_url, api_key=key or "EMPTY", timeout=self.timeout)
 
     def clone(self):
         """复制一份**独立**的客户端（同 provider/model/key），供并发子代理使用。"""
-        return LLMClient(provider=self.provider, model=self.model, api_key=self.api_key)
+        return LLMClient(provider=self.provider, model=self.model, api_key=self.api_key,
+                         base_url=self.base_url or None)
 
-    def chat(self, messages, stream=False, temperature=0.3, timeout=None, deadline=None, tools=None):
+    def _resolve_thinking(self, enable_thinking):
+        """本次调用是否开启思考：显式参数 > 运行时开关 > 全局环境变量。
+
+        返回 (enabled, reason)：
+        - native 思考模型（reasoner/qwq…）始终为 True，开关只控制前端是否展示思考流；
+        - toggle 家族（qwen3）按开关透传 enable_thinking；
+        - 不支持思考的模型恒 False（不能给服务端发陌生参数）。
+        """
+        rt = get_runtime("llm_enable_thinking")
+        if enable_thinking is None:
+            enable_thinking = (str(rt) in ("1", "true", "yes", "on")) if rt is not None \
+                else LLM_ENABLE_THINKING
+        mode = self.capability.get("thinking", "none")
+        if mode == "native":
+            return True
+        if mode == "toggle":
+            return bool(enable_thinking)
+        return False
+
+    def chat(self, messages, stream=False, temperature=0.3, timeout=None, deadline=None, tools=None,
+             enable_thinking=None, reasoning_sink=None):
         """统一的对话入口。stream=True 时返回一个 token 生成器。
 
         timeout：单次调用超时（秒），默认 self.timeout。
         deadline：time.monotonic() 基准的绝对截止时刻；到达即不再重试并抛 TimeoutError。
         tools：OpenAI 风格函数 schema 列表；给出则走原生 function-calling 通道。
+        enable_thinking：思考开关（None=按运行时/全局配置）；仅对画像为 toggle/native
+                         的模型生效。
+        reasoning_sink：可选 list，流式思考片段（reasoning_content / thinking）实时追加，
+                        供 Agent 转成 SSE 事件给前端"深度思考"窗口。
         每次调用都重置 self.last_usage / self.last_tool_calls；成功后由 agent 读取。
         可重试错误（429/5xx/网络/超时）按指数退避自动重试。
         """
         self.last_usage = {}
         self.last_tool_calls = []
+        if reasoning_sink is not None:
+            reasoning_sink.clear()
+        thinking_on = self._resolve_thinking(enable_thinking)
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("本轮已超出截止时间")
 
@@ -314,6 +365,7 @@ class LLMClient:
                     messages, stream=stream, temperature=temperature,
                     timeout=timeout, usage_sink=self.last_usage,
                     tool_sink=self.last_tool_calls, tools=tools,
+                    thinking_on=thinking_on, reasoning_sink=reasoning_sink,
                 ),
                 deadline=deadline, attempts=self.max_retries, base=self.retry_base,
             )
@@ -325,9 +377,10 @@ class LLMClient:
         # max_tokens 兜底：思考型模型偶发不按格式收尾而无限生成，到顶后由
         # finish_reason=length 触发 Agent 的续写纠偏，避免单轮烧几分钟/上万 token。
         kwargs = {"max_tokens": LLM_MAX_TOKENS}
-        # 本地 qwen3 系思考模型：显式关闭 reasoning，避免预算被思考吃光而不行动。
-        if not LLM_ENABLE_THINKING and self.provider in ("llamacpp", "ollama"):
-            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        # qwen3 toggle 家族（含 DashScope 兼容模式/自建端点）：按开关透传 enable_thinking。
+        # 不支持思考的模型绝不带这个参数，避免 400；native 模型本身始终推理，无需传。
+        if self.capability.get("thinking") == "toggle":
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": thinking_on}}
         call_timeout = self.timeout if timeout is None else timeout
         if tools:
             kwargs["tools"] = tools
@@ -339,7 +392,9 @@ class LLMClient:
                     model=self.model, messages=oai_messages, stream=True,
                     temperature=temperature, timeout=call_timeout, **kwargs, **extra
                 )
-                return StreamChat(resp, usage_sink=self.last_usage, tool_sink=self.last_tool_calls)
+                return StreamChat(resp, usage_sink=self.last_usage,
+                                  tool_sink=self.last_tool_calls,
+                                  reasoning_sink=reasoning_sink)
             try:
                 return retry_call(lambda: _open(True), deadline=deadline,
                                   attempts=self.max_retries, base=self.retry_base)
@@ -415,28 +470,41 @@ class LLMClient:
         return root + path
 
     def _ollama_chat(self, messages, stream=False, temperature=0.3, timeout=None,
-                     usage_sink=None, tool_sink=None, tools=None):
+                     usage_sink=None, tool_sink=None, tools=None,
+                     thinking_on=False, reasoning_sink=None):
         if not _gpu_acquire("ollama", 2): raise RuntimeError("GPU 正忙：ComfyUI 正在使用中，请稍后重试。")
         # 打点：空闲卸载计时器以"真正发起 Ollama 推理"为活动依据，
         # 仅持有租约（排队等待）不算活动，避免把等待误判成模型在用。
         _gpu_note_activity("ollama")
+        # num_ctx 按模型画像的上下文窗口封顶：小窗口模型不能盲目给 14k（会被服务端
+        # 拒绝或挤爆显存）；窗口充足时维持"prompt 预算 + 补全上限 + 余量"的扩充值。
+        want_ctx = PROMPT_TOKEN_BUDGET + LLM_MAX_TOKENS + 512
+        win = int(self.capability.get("context_window") or 16384)
+        num_ctx = min(want_ctx, win)
+        # 窗口放得下完整预算时输出给满 LLM_MAX_TOKENS；放不下（小窗口模型）时
+        # 至少保 512 输出，其余额度让给 prompt。
+        if num_ctx >= want_ctx:
+            num_predict = LLM_MAX_TOKENS
+        else:
+            num_predict = min(LLM_MAX_TOKENS, max(512, win - num_ctx + 512))
         payload = {
             "model": self.model,
             "messages": messages,
             "stream": bool(stream),
             # ollama 默认 num_ctx=4096，会把 ~11000 token 的 prompt 静默截断
             "options": {
-                "num_ctx": PROMPT_TOKEN_BUDGET + LLM_MAX_TOKENS + 512,
-                "num_predict": LLM_MAX_TOKENS,
+                "num_ctx": num_ctx,
+                "num_predict": num_predict,
                 "temperature": temperature,
                 # qwen3.6 模型 Modelfile 自带 presence_penalty=1.5，实测会诱发
                 # 空 Action Input / JSON 参数等格式退化；显式归零贴近 OpenAI 默认
                 "presence_penalty": 0.0,
                 "frequency_penalty": 0.0,
             },
+            # 显式 think：qwen3 toggle 家族按用户开关；原生思考模型 ollama 自行决定；
+            # 不支持的模型给 false 也安全（实测 ollama 对无思考模板的模型忽略该字段）。
+            "think": bool(thinking_on),
         }
-        if not LLM_ENABLE_THINKING:
-            payload["think"] = False
         if tools:
             # ollama 原生 /api/chat 的 tools 直接收 function 对象列表（不含 type 包装）
             payload["tools"] = [t.get("function", t) for t in tools]
@@ -457,7 +525,8 @@ class LLMClient:
                 # 流式收尾再打一次点：长回答结束时间作为"最后活动"更准确
                 _gpu_note_activity("ollama")
                 _gpu_release("ollama")
-            return _OllamaStream(resp, _stream_done, usage_sink=usage_sink, tool_sink=tool_sink)
+            return _OllamaStream(resp, _stream_done, usage_sink=usage_sink,
+                                 tool_sink=tool_sink, reasoning_sink=reasoning_sink)
         body = json.loads(resp.read().decode("utf-8"))
         _gpu_note_activity("ollama")
         _gpu_release("ollama")

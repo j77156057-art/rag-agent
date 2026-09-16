@@ -43,6 +43,7 @@ from config import (
     CHAT_IMAGE_MAX_FILES,
     CHAT_IMAGE_MAX_BYTES,
     CHAT_IMAGE_ALLOWED_TYPES,
+    model_capability,
 )
 from ingest import ingest_file, ingest_code_directory, load_project_rules
 from vectorstore import reset_collection, list_sources, count
@@ -1376,6 +1377,8 @@ async def chat(
     session_id: str = Form("default"),
     tool_mode: str = Form(""),
     plan_mode: str = Form(""),
+    web_mode: str = Form(""),
+    thinking_mode: str = Form(""),
     images: list[UploadFile] = File(default=None),
 ):
     question = (question or "").strip()
@@ -1435,6 +1438,11 @@ async def chat(
             else:
                 routing = {**routing, 'route': 'local', 'reason': '云端未配置 API Key，已回退本地'}
     hints.append(f"模型路由建议：{routing['route']}（复杂度 {routing['complexity']}，{routing['reason']}）。若需云端模型，必须使用已配置且可审计的 provider。")
+    # 逐请求开关：联网（默认关，空串也按关处理，避免漏传时误外联）；
+    # 深度思考空串=沿用模型画像/全局默认，显式 1/0 才覆盖。
+    selected_agent.web_enabled = web_mode.strip().lower() in ("1", "true", "yes", "on")
+    if thinking_mode.strip():
+        selected_agent.thinking_enabled = thinking_mode.strip().lower() in ("1", "true", "yes", "on")
     if hints:
         grounded = "【系统提示】" + " ".join(hints) + f"\n\n用户问题：{question}"
     else:
@@ -1818,6 +1826,7 @@ class ConfigReq(BaseModel):
     provider: str = "mock"
     api_key: str = ""
     model: str = ""
+    base_url: str = ""
     embedding_provider: str = ""
     edit_confirm: Optional[bool] = None
 
@@ -1843,11 +1852,14 @@ async def get_config():
     prov = get_runtime("llm_provider") or LLM_PROVIDER
     emb = get_runtime("embedding_provider") or EMBEDDING_PROVIDER
     eff_model = get_runtime("llm_model") or LLM_MODEL or PROVIDERS.get(prov, {}).get("default_model", "")
+    # 当前厂商专用 env（MOONSHOT/ZHIPU/SILICONFLOW/OPENAI…），并保留对两家旧厂商的兼容检查
+    _envk = PROVIDERS.get(prov, {}).get("api_key_env", "")
     has_key = bool(
         get_runtime("llm_api_key")
         or LLM_API_KEY
         or os.getenv("DASHSCOPE_API_KEY", "")
         or os.getenv("DEEPSEEK_API_KEY", "")
+        or (_envk and os.getenv(_envk, ""))
     )
     return {
         "llm_provider": prov,
@@ -1855,6 +1867,21 @@ async def get_config():
         "embedding_provider": emb,
         "has_key": has_key,
         "providers": list(PROVIDERS.keys()),
+        # 前端模型设置弹窗渲染所需的厂商元信息（不含任何密钥）
+        "provider_meta": {
+            k: {
+                "label": v.get("label") or k,
+                "base_url": v.get("base_url", ""),
+                "default_model": v.get("default_model", ""),
+                "needs_key": bool(v.get("api_key_env")),
+                "cloud": bool(v.get("cloud")),
+            }
+            for k, v in PROVIDERS.items()
+        },
+        # 自定义端点当前填写的地址（provider=custom 时有值）
+        "custom_base_url": get_runtime("llm_base_url") or "",
+        # 当前模型能力：思考支持 native/toggle/none + 上下文窗口 + 是否云端
+        "capability": model_capability(prov, eff_model),
         "embedding_options": ["local", "ollama", "qwen"],
         "ingested_files": sorted(_INGESTED),
         "code_root": get_runtime("code_root") or CODE_ROOT,
@@ -2249,6 +2276,20 @@ async def set_config(req: ConfigReq):
     if req.provider not in PROVIDERS:
         return JSONResponse({"ok": False, "error": f"未知 provider: {req.provider}"}, status_code=400)
 
+    # 自定义 OpenAI 兼容端点：base_url / model 必填，且只允许 http(s)
+    custom_base_url = ""
+    if req.provider == "custom":
+        custom_base_url = (req.base_url or get_runtime("llm_base_url") or "").strip().rstrip("/")
+        if not custom_base_url.startswith(("http://", "https://")):
+            return JSONResponse(
+                {"ok": False, "error": "自定义服务需要填写 http(s) 开头的接口地址（到 /v1 一级）。"},
+                status_code=400)
+        if not (req.model or "").strip():
+            return JSONResponse(
+                {"ok": False, "error": "自定义服务需要填写模型名称（如 gpt-4o-mini / qwen-plus）。"},
+                status_code=400)
+        set_runtime("llm_base_url", custom_base_url)
+
     # 切到 Ollama 时先做模型健康检查：避免选了一个加载不起来的模型后页面卡死、显示原始检索内容
     target_model = req.model or PROVIDERS[req.provider]["default_model"]
     if req.provider == "ollama" and target_model:
@@ -2275,11 +2316,16 @@ async def set_config(req: ConfigReq):
             secrets_store.save(root_for_secret, req.provider, req.api_key)
 
     # 重建 Agent 的 LLM 客户端（即时生效），并清空多轮上下文避免旧回答混淆
-    agent.llm = LLMClient(
-        provider=req.provider,
-        model=req.model or None,
-        api_key=req.api_key or None,
-    )
+    try:
+        new_llm = LLMClient(
+            provider=req.provider,
+            model=req.model or None,
+            api_key=req.api_key or None,
+            base_url=custom_base_url or None,
+        )
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    agent.llm = new_llm
     agent.history = []
 
     # 切换 embedding provider：清空向量缓存 + 重建集合（维度可能变化）
@@ -2294,11 +2340,10 @@ async def set_config(req: ConfigReq):
     if req.edit_confirm is not None:
         set_runtime("edit_confirm", bool(req.edit_confirm))
 
-    # 需要 key 但未提供
-    if req.provider in ("qwen", "deepseek"):
-        envk = PROVIDERS[req.provider]["api_key_env"]
-        if not (get_runtime("llm_api_key") or LLM_API_KEY or os.getenv(envk, "")):
-            warnings.append(f"{req.provider} 需要 API Key，请在设置中填写后保存。")
+    # 云端厂商需要 key 但未提供（custom 可能是免 key 的内网代理，不警告）
+    envk = PROVIDERS[req.provider].get("api_key_env", "")
+    if envk and not (get_runtime("llm_api_key") or LLM_API_KEY or os.getenv(envk, "")):
+        warnings.append(f"{PROVIDERS[req.provider].get('label', req.provider)} 需要 API Key，请在设置中填写后保存。")
 
     prov = get_runtime("llm_provider") or LLM_PROVIDER
     emb = get_runtime("embedding_provider") or EMBEDDING_PROVIDER
@@ -2308,6 +2353,8 @@ async def set_config(req: ConfigReq):
         "llm_provider": prov,
         "llm_model": eff_model,
         "embedding_provider": emb,
+        "base_url": get_runtime("llm_base_url") or PROVIDERS[prov].get("base_url", ""),
+        "capability": model_capability(prov, eff_model),
         "ingested_files": sorted(_INGESTED),
         "warnings": warnings,
     }
