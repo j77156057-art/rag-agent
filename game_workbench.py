@@ -1235,7 +1235,7 @@ def comfy_apply_parameters(workflow, params):
     return {'ok':True,'workflow':wf}
 
 
-def comfy_queue(workflow, url="http://127.0.0.1:8188"):
+def comfy_queue(workflow, url="http://127.0.0.1:8188", min_free_mb=None):
     # ComfyUI exposes two JSON formats: the editor's UI graph (`nodes`/`links`)
     # and the API prompt graph (`{id: {class_type, inputs}}`).  The latter is
     # required by /prompt; fail early with an actionable message instead of
@@ -1255,9 +1255,12 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188"):
     # 环境写入 CUDA_VISIBLE_DEVICES=<lease["gpu"]>（进程初始化后改无效）。
     # 验收口径见 HANDOFF.md 第 5 节 P2-1 待验收项 B。
     submit_owner = f"comfyui:submit:{uuid.uuid4().hex[:12]}"
+    # min_free_mb=None：沿用 DOCMIND_COMFY_MIN_FREE_MB（默认 1024MB）；
+    # 视频大模型靠逐层 offload 运行，空闲几百 MB 也能跑，调用方可显式放宽。
+    threshold = COMFY_MIN_FREE_MB if min_free_mb is None else float(min_free_mb)
     lease = _gpu.acquire_lease(submit_owner, timeout=2, purpose="comfyui",
                                ttl=COMFY_JOB_TTL,
-                               min_free_mb=COMFY_MIN_FREE_MB or None,
+                               min_free_mb=threshold or None,
                                evict=("ollama",))
     if not lease.get("ok"):
         return {"ok": False, "error": _gpu_busy_error(lease)}

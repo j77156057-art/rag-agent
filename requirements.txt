@@ -8,3 +8,6 @@ httpx
 markdown
 python-multipart
 pywebview
+pillow
+imageio
+imageio-ffmpeg

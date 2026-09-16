@@ -86,6 +86,7 @@ _DESKTOP_HOST_HWND = None
 
 import workbench_fs
 import asset_sources
+import asset_gen
 import mcp_client
 import web_export
 import unity_graph
@@ -1059,6 +1060,140 @@ async def asset_proxy_ep(url: str):
         return Response(content=data, media_type=ctype)
     except asset_sources.AssetError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+# ============================ 本地 AI 生成（阶段 5） ============================
+COMFY_URL_DEFAULT = "http://127.0.0.1:8188"
+FRAME_UPLOAD_MAX = 10 * 1024 * 1024
+_FRAME_IMG_EXTS = ('.png', '.jpg', '.jpeg', '.webp')
+
+
+def _gen_guard(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except asset_gen.GenError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/assets/generate/status")
+async def gen_status_ep(url: str = COMFY_URL_DEFAULT):
+    return await run_in_threadpool(_gen_guard, asset_gen.generation_status, url)
+
+
+class GenImageReq(BaseModel):
+    prompt: str
+    negative_prompt: str = "blurry, low quality"
+    width: int = 512
+    height: int = 512
+    steps: int = 8
+    seed: int = 42
+    batch_size: int = 1
+    url: str = COMFY_URL_DEFAULT
+
+
+@app.post("/api/assets/generate/image")
+async def gen_image_ep(req: GenImageReq):
+    root = _project_root_or_error()
+    if not root:
+        return {"ok": False, "error": "未配置代码库"}
+    prompt = (req.prompt or "").strip()
+    if not prompt:
+        return {"ok": False, "error": "请填写画面描述（提示词）。"}
+    if not (256 <= req.width <= 1536 and 256 <= req.height <= 1536):
+        return {"ok": False, "error": "宽高需在 256–1536 之间。"}
+    if not (1 <= req.steps <= 30 and 1 <= req.batch_size <= 4):
+        return {"ok": False, "error": "步数需 1–30，数量需 1–4。"}
+    def _submit():
+        jid = asset_gen.jobs.submit_image(
+            root, url=req.url, prompt=prompt, negative_prompt=req.negative_prompt,
+            width=req.width, height=req.height, steps=req.steps, seed=req.seed,
+            batch_size=req.batch_size)
+        return {"ok": True, "job_id": jid}
+    return await run_in_threadpool(_submit)
+
+
+class GenAnimReq(BaseModel):
+    prompt: str
+    duration: float = 5.0
+    seed: int = 1
+    fps: int = 12
+    max_frames: int = 64
+    turbo: bool = True
+    first_frame_path: str = ""
+    first_frame_name: str = ""
+    url: str = COMFY_URL_DEFAULT
+
+
+@app.post("/api/assets/generate/animation")
+async def gen_animation_ep(req: GenAnimReq):
+    root = _project_root_or_error()
+    if not root:
+        return {"ok": False, "error": "未配置代码库"}
+    prompt = (req.prompt or "").strip()
+    if not prompt:
+        return {"ok": False, "error": "请填写动作描述（提示词）。"}
+    if not (1.0 <= req.duration <= 15.0):
+        return {"ok": False, "error": "时长需在 1–15 秒之间。"}
+    if not (1 <= req.fps <= 30 and 1 <= req.max_frames <= 128):
+        return {"ok": False, "error": "帧率需 1–30，帧数上限需 1–128。"}
+
+    frame_bytes, frame_name = None, req.first_frame_name.strip()
+    rp = (req.first_frame_path or "").strip()
+    if rp:
+        try:
+            if os.path.splitext(rp)[1].lower() not in _FRAME_IMG_EXTS:
+                return {"ok": False, "error": "首帧只支持 PNG/JPG/WebP。"}
+            full, _ = asset_sources.raw_file(root, rp)
+            frame_bytes = open(full, "rb").read()
+            if len(frame_bytes) > FRAME_UPLOAD_MAX:
+                return {"ok": False, "error": "首帧图片超过 10MB。"}
+        except asset_sources.AssetError as e:
+            return {"ok": False, "error": str(e)}
+        if not frame_name:
+            frame_name = asset_sources.safe_name(os.path.basename(rp), default='firstframe.png')
+
+    def _submit():
+        jid = asset_gen.jobs.submit_animation(
+            root, url=req.url, prompt=prompt, duration=req.duration, seed=req.seed,
+            fps=req.fps, max_frames=req.max_frames, turbo=req.turbo,
+            first_frame_bytes=frame_bytes, first_frame_name=frame_name)
+        return {"ok": True, "job_id": jid}
+    return await run_in_threadpool(_submit)
+
+
+@app.post("/api/assets/generate/upload-frame")
+async def gen_upload_frame_ep(file: UploadFile = File(...), url: str = COMFY_URL_DEFAULT):
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _FRAME_IMG_EXTS:
+        return JSONResponse({"ok": False, "error": "首帧只支持 PNG/JPG/WebP。"}, status_code=400)
+    data = await file.read(FRAME_UPLOAD_MAX + 1)
+    if len(data) > FRAME_UPLOAD_MAX:
+        return JSONResponse({"ok": False, "error": "首帧图片超过 10MB。"}, status_code=400)
+    name = asset_sources.safe_name(file.filename or "firstframe.png", default="firstframe.png")
+    return await run_in_threadpool(
+        _gen_guard, lambda: {"ok": True, "name": asset_gen.upload_image(url, data, name)})
+
+
+@app.get("/api/assets/generate/jobs")
+async def gen_jobs_ep():
+    return {"ok": True, "jobs": asset_gen.jobs.list_jobs()}
+
+
+@app.get("/api/assets/generate/jobs/{job_id}")
+async def gen_job_ep(job_id: str):
+    j = asset_gen.jobs.status(job_id)
+    if not j:
+        return JSONResponse({"ok": False, "error": "任务不存在。"}, status_code=404)
+    return {"ok": True, "job": j}
+
+
+class GenCancelReq(BaseModel):
+    url: str = COMFY_URL_DEFAULT
+
+
+@app.post("/api/assets/generate/jobs/{job_id}/cancel")
+async def gen_job_cancel_ep(job_id: str, req: GenCancelReq):
+    return await run_in_threadpool(_gen_guard, asset_gen.jobs.cancel, job_id, req.url)
+
 @app.get("/api/fs/scene-tree")
 async def scene_tree_ep(path: str):
     root=_project_root_or_error(); return scene_tree(root,path) if root else {"ok":False,"error":"未配置代码库"}

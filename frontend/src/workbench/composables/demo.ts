@@ -242,6 +242,43 @@ export const demoPackFiles = [
   { path: 'License.txt', show_path: 'License.txt', ext: '.txt', kind: 'other', size: 1200, dep: false },
 ]
 
+/** AI 生成面板演示：生图结果占位 */
+export const demoGenImages = [thumbSunset, thumbCube, thumbTree]
+
+/** AI 生成面板演示：4×4 跳跃循环精灵图（小球按帧跳起，可真实循环播放） */
+function demoSpriteSheetDataUri(): string {
+  const C = 4, FW = 64, S = C * FW
+  const cells: string[] = []
+  for (let k = 0; k < C * C; k++) {
+    const ox = (k % C) * FW
+    const oy = Math.floor(k / C) * FW
+    const t = k / (C * C - 1)
+    const bx = FW / 2
+    const by = FW - 14 - Math.abs(Math.sin(t * Math.PI)) * 32
+    cells.push(
+      `<g transform="translate(${ox},${oy})">`,
+      `<rect width="${FW}" height="${FW}" fill="#dfe7f2"/>`,
+      `<ellipse cx="${bx}" cy="${FW - 10}" rx="16" ry="3.5" fill="#9fb0c6"/>`,
+      `<circle cx="${bx}" cy="${by.toFixed(1)}" r="11" fill="#2f6fed"/>`,
+      `<circle cx="${(bx - 3).toFixed(1)}" cy="${(by - 3).toFixed(1)}" r="3" fill="#fff"/>`,
+      `<text x="4" y="12" font-size="9" fill="#6b7280">${String(k).padStart(2, '0')}</text>`,
+      '</g>',
+    )
+  }
+  const lines: string[] = []
+  for (let i = 1; i < C; i++) {
+    lines.push(`<line x1="${i * FW}" y1="0" x2="${i * FW}" y2="${S}" stroke="#c2cdda" stroke-width="1"/>`)
+    lines.push(`<line x1="0" y1="${i * FW}" x2="${S}" y2="${i * FW}" stroke="#c2cdda" stroke-width="1"/>`)
+  }
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${S}" height="${S}" viewBox="0 0 ${S} ${S}">`
+    + cells.join('') + lines.join('') + '</svg>'
+  return 'data:image/svg+xml,' + encodeURIComponent(svg)
+}
+export const demoGenSheet = {
+  src: demoSpriteSheetDataUri(),
+  cols: 4, rows: 4, fw: 64, fh: 64, fps: 12, frames: 16,
+}
+
 export const demoAssetLibrary = [
   { path: 'assets/models/vintage_armchair.glb', name: 'vintage_armchair.glb', kind: 'model', size: 248320,
     mtime: Date.now() / 1000 - 3600, source: 'polyhaven', author: 'Kirill Sannikov',
@@ -258,6 +295,15 @@ export const demoAssetLibrary = [
   { path: 'assets/interface-sounds/Audio/click_01.wav', name: 'click_01.wav', kind: 'audio', size: 18420,
     mtime: Date.now() / 1000 - 259200, source: 'kenney', author: 'Kenney',
     license: 'CC0', imported_at: '', duplicate: false, thumb: thumbAudio },
+  { path: 'assets/generated/animations/slime_jump/slime_jump_sheet.png',
+    name: 'slime_jump.anim.json', kind: 'animation', size: 245760,
+    mtime: Date.now() / 1000 - 5400, source: 'comfyui-h3', author: '',
+    license: '', imported_at: '', duplicate: false, thumb: demoGenSheet.src,
+    fps: 12, frame_count: 16, cols: 4, rows: 4, frame_width: 64, frame_height: 64,
+    frames_dir: 'assets/generated/animations/slime_jump/frames',
+    first_frame: 'assets/generated/animations/slime_jump/frames/frame_0001.png',
+    prompt: 'slime monster jumping in place, seamless loop',
+    manifest: 'assets/generated/animations/slime_jump/slime_jump.anim.json' },
 ]
 
 export const demoRegionCards = [

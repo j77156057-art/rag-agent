@@ -37,6 +37,8 @@ PACK_CACHE_KEEP = 3                     # LRU 保留最近解压的包数
 
 LEDGER_REL = os.path.join('.docmind', 'assets.json')
 GENERATED_DIR = os.path.join('assets', 'generated')
+# 帧动画清单（阶段 5）：与散帧/图集同目录，素材库据此把一个动画聚合成单个条目。
+ANIM_SUFFIX = '.anim.json'
 
 # 出站白名单（host 后缀匹配）
 HOST_ALLOWLIST = ('api.polyhaven.com', 'cdn.polyhaven.com', 'dl.polyhaven.org', 'kenney.nl')
@@ -757,6 +759,83 @@ def _read_sidecar(path: str) -> dict | None:
         return None
 
 
+def _collect_generated(base: str, gen_root: str) -> list[dict]:
+    """扫描 assets/generated：动画清单聚合成单个 animation 条目。
+
+    一个 ``<名称>.anim.json`` 代表一个帧动画：素材库只展示一个卡片
+    （缩略图用 SpriteSheet），其散帧目录与源视频被屏蔽，不单独刷屏。
+    其余媒体文件沿用“同名 .json sidecar”规则。
+    """
+    media: list[tuple[str, str, str]] = []
+    anim_manifests: list[tuple[str, str]] = []
+    for dp, _, names in os.walk(gen_root):
+        for fn in names:
+            full = os.path.join(dp, fn)
+            rel = os.path.relpath(full, base).replace('\\', '/')
+            if fn.endswith(ANIM_SUFFIX):
+                anim_manifests.append((rel, full))
+            elif os.path.splitext(fn)[1].lower() in MEDIA_EXTS:
+                media.append((rel, full, fn))
+
+    items: list[dict] = []
+    shield_files: set[str] = set()
+    shield_dirs: set[str] = set()
+    for rel, full in anim_manifests:
+        meta = _read_sidecar(full) or {}
+        if not isinstance(meta, dict):
+            continue
+        dir_rel = os.path.dirname(rel)
+        sheet = str(meta.get('sheet') or '')
+        if not sheet:
+            continue
+        sheet_rel = f'{dir_rel}/{sheet}' if dir_rel else sheet
+        sheet_full = os.path.join(base, *sheet_rel.split('/'))
+        if not os.path.isfile(sheet_full):
+            continue  # 清单存在但图集丢失，按损坏处理，不展示半截动画
+        frames_dir = str(meta.get('frames_dir') or 'frames')
+        fd_rel = f'{dir_rel}/{frames_dir}'.strip('/') if dir_rel else frames_dir
+        shield_dirs.add(fd_rel)
+        shield_files.add(sheet_rel)
+        video = str(meta.get('video') or '')
+        if video:
+            shield_files.add(f'{dir_rel}/{video}' if dir_rel else video)
+        prefix = str(meta.get('frame_prefix') or 'frame_')
+        ext = str(meta.get('frame_ext') or '.png')
+        first = f'{fd_rel}/{prefix}0001{ext}'
+        items.append({
+            'path': sheet_rel,
+            'name': str(meta.get('name') or os.path.basename(dir_rel)),
+            'kind': 'animation',
+            'size': os.path.getsize(sheet_full),
+            'mtime': int(os.path.getmtime(sheet_full)),
+            'source': meta.get('source') or 'comfyui-h3',
+            'author': meta.get('author') or '',
+            'license': meta.get('license') or '',
+            'imported_at': meta.get('imported_at') or meta.get('created_at') or '',
+            # 前端播放动画所需的元数据
+            'fps': meta.get('fps'), 'frame_count': meta.get('frame_count'),
+            'cols': meta.get('cols'), 'rows': meta.get('rows'),
+            'frame_width': meta.get('frame_width'), 'frame_height': meta.get('frame_height'),
+            'frames_dir': fd_rel, 'first_frame': first,
+            'prompt': meta.get('prompt') or '', 'manifest': os.path.basename(rel),
+        })
+
+    for rel, full, fn in media:
+        if rel in shield_files:
+            continue
+        if any(rel == d or rel.startswith(d + '/') for d in shield_dirs):
+            continue
+        meta = _read_sidecar(full + '.json') or {}
+        items.append({
+            'path': rel, 'name': fn, 'kind': meta.get('asset_kind') or kind_of(fn),
+            'size': os.path.getsize(full), 'mtime': int(os.path.getmtime(full)),
+            'source': meta.get('source') or 'comfyui',
+            'author': meta.get('author') or '', 'license': meta.get('license') or '',
+            'imported_at': (meta.get('imported_at') or '') if isinstance(meta, dict) else '',
+        })
+    return items
+
+
 def library(root: str) -> dict:
     base = root_path(root)
     ledger = _Ledger.load(root)
@@ -781,26 +860,14 @@ def library(root: str) -> dict:
             'imported_at': rec.get('imported_at') or '',
         })
 
-    # 2) assets/generated 下的 ComfyUI 产物（sidecar 元数据；无 sidecar 标 local）
+    # 2) assets/generated 下的 ComfyUI 产物（动画清单聚合；其余按 sidecar 元数据）
     gen_root = os.path.join(base, *GENERATED_DIR.split('/'))
     if os.path.isdir(gen_root):
-        for dp, _, names in os.walk(gen_root):
-            for fn in names:
-                if fn.endswith('.json'):
-                    continue
-                full = os.path.join(dp, fn)
-                rel = os.path.relpath(full, base).replace('\\', '/')
-                if rel in seen_paths or os.path.splitext(fn)[1].lower() not in MEDIA_EXTS:
-                    continue
-                seen_paths.add(rel)
-                meta = _read_sidecar(full + '.json') or {}
-                items.append({
-                    'path': rel, 'name': fn, 'kind': meta.get('asset_kind') or kind_of(fn),
-                    'size': os.path.getsize(full), 'mtime': int(os.path.getmtime(full)),
-                    'source': meta.get('source') or 'comfyui',
-                    'author': meta.get('author') or '', 'license': meta.get('license') or '',
-                    'imported_at': (meta.get('imported_at') or '') if isinstance(meta, dict) else '',
-                })
+        for it in _collect_generated(base, gen_root):
+            if it['path'] in seen_paths:
+                continue
+            seen_paths.add(it['path'])
+            items.append(it)
 
     # 3) 重复内容分组（素材库通常文件不多；大文件跳过，避免卡顿）
     sha_map: dict[str, list[str]] = {}

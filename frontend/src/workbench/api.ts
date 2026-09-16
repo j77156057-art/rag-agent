@@ -800,7 +800,7 @@ export const comfyApi = {
 }
 
 /** 素材中心（asset_sources.py / /api/assets/*，阶段 2） */
-export type AssetKind = 'model' | 'texture' | 'hdri' | 'image' | 'audio' | '2d' | 'other'
+export type AssetKind = 'model' | 'texture' | 'hdri' | 'image' | 'audio' | '2d' | 'animation' | 'other'
 export interface AssetSourceInfo {
   key: string; name: string; mode: 'remote' | 'pack'
   kinds: string[]; license: string; home: string
@@ -837,6 +837,10 @@ export interface LibraryItem {
   source: string; author: string; license: string; imported_at: string; duplicate: boolean
   /** 仅离线演示数据使用：内联占位缩略图（真实接口不返回） */
   thumb?: string
+  /** kind === 'animation' 时的精灵播放元数据 */
+  fps?: number; frame_count?: number; cols?: number; rows?: number
+  frame_width?: number; frame_height?: number
+  frames_dir?: string; first_frame?: string; prompt?: string; manifest?: string
 }
 export interface LibraryResp {
   ok: boolean; total: number
@@ -881,6 +885,66 @@ export const assetsApi = {
   },
   proxyUrl(url: string) {
     return `/api/assets/proxy?url=${encodeURIComponent(url)}`
+  },
+}
+
+/** 本地 AI 生成（asset_gen.py / /api/assets/generate/*，阶段 5） */
+export interface GenStatus {
+  ok: boolean
+  online: boolean
+  online_error: string
+  comfy_root: string
+  models_dir: string
+  image: { ready: boolean; missing: string[] }
+  video: { ready: boolean; missing: string[] }
+  workflows: { i2v: string; t2v: string }
+}
+export interface GenJob {
+  id: string
+  type: 'image' | 'animation'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'canceling'
+  phase: string
+  progress: number
+  prompt_id: string
+  prompt: string
+  result: Record<string, unknown> | null
+  error: string
+  created_at: string
+  cancel_requested?: boolean
+}
+export interface GenSubmitResp { ok: boolean; job_id?: string; error?: string }
+
+export const genApi = {
+  status() {
+    return request<GenStatus>('/api/assets/generate/status')
+  },
+  image(p: { prompt: string; negative_prompt: string; width: number; height: number;
+             steps: number; seed: number; batch_size: number }) {
+    return postJson<GenSubmitResp>('/api/assets/generate/image', p)
+  },
+  animation(p: { prompt: string; duration: number; seed: number; fps: number;
+                 max_frames: number; turbo: boolean;
+                 first_frame_path?: string; first_frame_name?: string }) {
+    return postJson<GenSubmitResp>('/api/assets/generate/animation', p)
+  },
+  async uploadFrame(file: File) {
+    const fd = new FormData()
+    fd.append('file', file)
+    const r = await fetch('/api/assets/generate/upload-frame', { method: 'POST', body: fd })
+    const body = await r.json().catch(() => ({})) as { ok?: boolean; name?: string; error?: string }
+    if (!r.ok || !body.ok) throw new FsApiError(r.status, body.error || '首帧上传失败')
+    return body.name as string
+  },
+  jobs() {
+    return request<{ ok: boolean; jobs: GenJob[] }>('/api/assets/generate/jobs')
+  },
+  job(id: string) {
+    return request<{ ok: boolean; job: GenJob; error?: string }>(
+      `/api/assets/generate/jobs/${encodeURIComponent(id)}`)
+  },
+  cancel(id: string) {
+    return postJson<{ ok: boolean; error?: string }>(
+      `/api/assets/generate/jobs/${encodeURIComponent(id)}/cancel`, {})
   },
 }
 

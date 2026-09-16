@@ -11,10 +11,12 @@ import {
   demoMode, demoAssetResults, demoKenneyPacks, demoPackFiles, demoAssetLibrary,
 } from '../composables/demo'
 import ModelPreview from './ModelPreview.vue'
+import AssetGeneratePanel from './AssetGeneratePanel.vue'
+import SpritePlayer from './SpritePlayer.vue'
 
 const { revealPath, loadTree } = useWorkbench()
 
-type WebTab = 'web' | 'library'
+type WebTab = 'web' | 'library' | 'generate'
 type SourceKey = 'polyhaven' | 'kenney'
 const tab = ref<WebTab>('web')
 const source = ref<SourceKey>('polyhaven')
@@ -35,13 +37,13 @@ function showToast(msg: string) {
   toastTimer = window.setTimeout(() => { toast.value = '' }, 3200)
 }
 function kindLabel(k: string): string {
-  return ({ model: '3D 模型', texture: '贴图', hdri: 'HDRI', image: '图片', '2d': '2D 素材', audio: '音效' } as Record<string, string>)[k] || '文件'
+  return ({ model: '3D 模型', texture: '贴图', hdri: 'HDRI', image: '图片', '2d': '2D 素材', audio: '音效', animation: '帧动画' } as Record<string, string>)[k] || '文件'
 }
 function kindBadgeClass(k: string): string {
   return 'ac-kind-' + k
 }
 const KIND_BADGE: Record<string, string> = {
-  model: '3D', texture: '贴图', hdri: 'HDR', image: '图', '2d': '2D', audio: '音', other: '',
+  model: '3D', texture: '贴图', hdri: 'HDR', image: '图', '2d': '2D', audio: '音', animation: '动画', other: '',
 }
 
 // ---------------------------------------------------------------- Poly Haven
@@ -350,6 +352,11 @@ function libThumb(it: LibraryItem): string {
   return assetsApi.rawUrl(it.path)
 }
 function isImageKind(k: string): boolean { return k === 'image' || k === 'texture' }
+/** 卡片可直接显示缩略图的类型（帧动画用 SpriteSheet 当封面） */
+function hasThumb(it: LibraryItem): boolean { return isImageKind(it.kind) || it.kind === 'animation' }
+function sourceLabel(s: string): string {
+  return ({ polyhaven: 'Poly Haven', kenney: 'Kenney', comfyui: 'ComfyUI', 'comfyui-h3': 'ComfyUI H3' } as Record<string, string>)[s] || '本地'
+}
 function locateInTree(it: LibraryItem) {
   revealPath(it.path)
   showToast(`已在左侧文件树定位：${it.path}`)
@@ -358,6 +365,12 @@ async function switchTab(t: WebTab) {
   tab.value = t
   moreOpen.value = false
   if (t === 'library') await loadLibrary()
+}
+/** AI 生成面板完成新图/新动画后，让素材库下次展示最新内容 */
+function onGenDone() {
+  libLoaded.value = false
+  void loadTree()
+  if (tab.value === 'library') void loadLibrary()
 }
 
 function openExternal(e: ExternalSource) {
@@ -401,6 +414,9 @@ onMounted(() => {
         <button type="button" class="ac-sub" :class="{ on: tab === 'web' }" @click="switchTab('web')">网络素材</button>
         <button type="button" class="ac-sub" :class="{ on: tab === 'library' }" @click="switchTab('library')">
           我的素材库<span v-if="libTotal" class="ac-sub-count">{{ libTotal }}</span>
+        </button>
+        <button type="button" class="ac-sub" :class="{ on: tab === 'generate' }" @click="switchTab('generate')">
+          AI 生成
         </button>
       </div>
     </div>
@@ -486,6 +502,9 @@ onMounted(() => {
       </div>
     </template>
 
+    <!-- ============================ AI 生成（本地 ComfyUI） ============================ -->
+    <AssetGeneratePanel v-else-if="tab === 'generate'" @done="onGenDone" />
+
     <!-- ============================ 我的素材库 ============================ -->
     <div v-else class="ac-scroll">
       <div class="ac-lib-head">
@@ -504,7 +523,7 @@ onMounted(() => {
         <div class="ac-grid">
           <div v-for="it in g.items" :key="it.path" class="ac-card ac-lib-card">
             <div class="ac-thumb">
-              <template v-if="isImageKind(it.kind)">
+              <template v-if="hasThumb(it)">
                 <img :src="libThumb(it)" :alt="it.name" loading="lazy">
               </template>
               <span v-else class="ac-thumb-ph ac-thumb-type">{{ KIND_BADGE[it.kind] || '·' }}</span>
@@ -514,10 +533,13 @@ onMounted(() => {
             <div class="ac-card-body">
               <p class="ac-card-name" :title="it.path">{{ it.name }}</p>
               <p class="ac-card-meta">
-                {{ fmtSize(it.size) }} · {{ it.source === 'polyhaven' ? 'Poly Haven' : it.source === 'kenney' ? 'Kenney' : it.source === 'comfyui' ? 'ComfyUI' : '本地' }}
+                <template v-if="it.kind === 'animation'">
+                  {{ it.fps }}fps · {{ it.frame_count }}帧 · {{ sourceLabel(it.source) }}
+                </template>
+                <template v-else>{{ fmtSize(it.size) }} · {{ sourceLabel(it.source) }}</template>
               </p>
               <div class="ac-lib-actions">
-                <button v-if="it.kind === 'model' || it.kind === 'audio'" type="button" class="ac-mini-btn" @click="libPreview = it">预览</button>
+                <button v-if="it.kind === 'model' || it.kind === 'audio' || it.kind === 'animation'" type="button" class="ac-mini-btn" @click="libPreview = it">预览</button>
                 <button type="button" class="ac-mini-btn" @click="locateInTree(it)">文件树定位</button>
               </div>
             </div>
@@ -677,11 +699,24 @@ onMounted(() => {
           <div class="ac-drawer-preview ac-lib-preview-box">
             <ModelPreview v-if="libPreview.kind === 'model'" :src="assetsApi.rawUrl(libPreview.path)" />
             <audio v-else-if="libPreview.kind === 'audio'" controls class="ac-audio-full" :src="assetsApi.rawUrl(libPreview.path)" />
+            <SpritePlayer
+              v-else-if="libPreview.kind === 'animation' && libPreview.cols && libPreview.rows"
+              :src="libThumb(libPreview)" :cols="libPreview.cols" :rows="libPreview.rows"
+              :frame-w="libPreview.frame_width || 0" :frame-h="libPreview.frame_height || 0"
+              :fps="libPreview.fps || 12" :frames="libPreview.frame_count || 0"
+            />
           </div>
           <dl class="ac-meta-grid">
             <div><dt>路径</dt><dd>{{ libPreview.path }}</dd></div>
             <div><dt>大小</dt><dd>{{ fmtSize(libPreview.size) }}</dd></div>
-            <div><dt>来源</dt><dd>{{ libPreview.source }}</dd></div>
+            <div><dt>来源</dt><dd>{{ sourceLabel(libPreview.source) }}</dd></div>
+            <template v-if="libPreview.kind === 'animation'">
+              <div><dt>帧率</dt><dd>{{ libPreview.fps }} fps</dd></div>
+              <div><dt>帧数</dt><dd>{{ libPreview.frame_count }}（{{ libPreview.cols }}×{{ libPreview.rows }} 图集）</dd></div>
+              <div><dt>单帧</dt><dd>{{ libPreview.frame_width }}×{{ libPreview.frame_height }} px</dd></div>
+              <div v-if="libPreview.frames_dir"><dt>序列帧</dt><dd>{{ libPreview.frames_dir }}（frame_NNNN.png）</dd></div>
+              <div v-if="libPreview.prompt"><dt>动作提示</dt><dd>{{ libPreview.prompt }}</dd></div>
+            </template>
             <div v-if="libPreview.license"><dt>许可</dt><dd class="ac-cc0">{{ libPreview.license }}</dd></div>
           </dl>
         </div>
@@ -831,6 +866,7 @@ button.ac-card { font: inherit; color: inherit; }
 .ac-kind-hdri { color: #6d4bbf; }
 .ac-kind-audio { color: #2b9a6a; }
 .ac-kind-2d { color: #c0467a; }
+.ac-kind-animation { color: #0f8f8f; }
 .ac-dup-badge {
   position: absolute; right: 6px; bottom: 6px;
   font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px;
