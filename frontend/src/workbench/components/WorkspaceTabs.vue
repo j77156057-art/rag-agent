@@ -10,14 +10,16 @@ const { workspace, setWorkspace, tabs } = useWorkbench()
 const real: { key: WorkspaceView; name: string; icon: string }[] = [
   { key: 'overview', name: '概览', icon: 'home' },
   { key: 'code', name: '代码', icon: 'code' },
+  { key: 'assets', name: '素材', icon: 'assets' },
 ]
 
 // 路线图：◌ + 悬浮说明来自哪个阶段
 const soon = [
-  { key: 'assets', name: '素材', tip: '阶段 2：CC0/CC-BY 网络素材与本地 ComfyUI 生图' },
   { key: 'canvas', name: '画布', tip: '阶段 3：AI 工具流画布，把多步操作连成流水线' },
   { key: 'runtime', name: '运行', tip: '阶段 4：内置 Godot，边玩边让 AI 改' },
 ] as const
+
+const HOTKEY: Record<string, number> = { overview: 1, code: 2, assets: 3 }
 
 function pick(key: WorkspaceView) {
   if (key === 'code' && !tabs.value.length) return
@@ -37,12 +39,17 @@ function pick(key: WorkspaceView) {
         'ws-disabled': item.key === 'code' && !tabs.length,
       }"
       :disabled="item.key === 'code' && !tabs.length"
-      :title="item.key === 'code' && !tabs.length ? '先从左侧文件树打开一个文件（Alt+2 切回代码）' : `${item.name}（Alt+${item.key === 'overview' ? 1 : 2}）`"
+      :title="item.key === 'code' && !tabs.length ? '先从左侧文件树打开一个文件（Alt+2 切回代码）' : `${item.name}（Alt+${HOTKEY[item.key]}）`"
       @click="pick(item.key)"
     >
       <svg v-if="item.icon === 'home'" width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
         <path d="M2 6 L6.5 2.2 L11 6 V10.6 Q11 11 10.6 11 H2.4 Q2 11 2 10.6 Z" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
         <path d="M5.2 11 V7.4 H7.8 V11" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
+      </svg>
+      <svg v-else-if="item.icon === 'assets'" width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
+        <rect x="1.6" y="2.4" width="9.8" height="8.2" rx="1" fill="none" stroke="currentColor" stroke-width="1.05"/>
+        <circle cx="4.3" cy="4.9" r="0.95" fill="none" stroke="currentColor" stroke-width="1.05"/>
+        <path d="M2.6 9.6 L5.2 7 L7.2 8.8 L8.8 7.4 L10.4 9" fill="none" stroke="currentColor" stroke-width="1.05" stroke-linejoin="round"/>
       </svg>
       <svg v-else width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
         <path d="M4.6 4.4 L2.2 6.5 L4.6 8.6 M8.4 4.4 L10.8 6.5 L8.4 8.6" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>

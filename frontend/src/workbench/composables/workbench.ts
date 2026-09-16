@@ -217,8 +217,8 @@ function seedDemoRegionCards(cards: RegionCard[]) {
 }
 
 // ================================================================ 工作区视图
-// Godot 式工作区切换：概览驾驶舱 / 代码编辑。素材、画布、运行为后续阶段预留标签。
-export type WorkspaceView = 'overview' | 'code'
+// Godot 式工作区切换：概览驾驶舱 / 代码编辑 / 素材中心。画布、运行为后续阶段预留标签。
+export type WorkspaceView = 'overview' | 'code' | 'assets'
 const workspace = ref<WorkspaceView>('overview')
 
 function setWorkspace(v: WorkspaceView) {

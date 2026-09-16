@@ -23,6 +23,7 @@ import GpuPanel from './components/GpuPanel.vue'
 import HarnessPanel from './components/HarnessPanel.vue'
 import SemanticLocateBar from './components/SemanticLocateBar.vue'
 import WorkspaceTabs from './components/WorkspaceTabs.vue'
+import AssetCenterView from './components/AssetCenterView.vue'
 import { useWorkbench } from './composables/workbench'
 import { probeBackend, demoMode, demoTagMap, demoRegionCards } from './composables/demo'
 import { regionColor } from './theme'
@@ -63,6 +64,7 @@ function onWorkspaceHotkey(e: KeyboardEvent) {
   if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement | null)?.isContentEditable) return
   if (e.key === '1') { e.preventDefault(); setWorkspace('overview') }
   else if (e.key === '2' && tabs.value.length) { e.preventDefault(); setWorkspace('code') }
+  else if (e.key === '3') { e.preventDefault(); setWorkspace('assets') }
 }
 
 onMounted(() => {
@@ -226,24 +228,27 @@ onBeforeUnmount(() => {
 
         <main class="wb-main">
           <WorkspaceTabs />
-          <EditorTabs v-if="workspace === 'code'" />
-          <div class="wb-editor-row">
-            <CodeView :tab="workspace === 'code' ? activeTab : null" />
-            <SelectionAiPanel v-if="aiPanelOpen && workspace === 'code'" />
-            <SymbolOutline v-if="workspace === 'code'" />
-          </div>
-          <ChatDock />
-          <footer class="wb-statusbar">
-            <span v-if="selectedPath" class="wb-status-path">{{ selectedPath }}</span>
-            <span v-else class="wb-status-faint">未选择文件</span>
-            <span v-if="dirtyCount" class="wb-status-dirty">● {{ dirtyCount}} 个文件未保存</span>
-            <span class="wb-status-spacer" />
-            <span v-if="tree.regions_enabled" class="wb-status-legend">
-              <i v-for="r in tree.regions" :key="r.key">
-                <b :style="{ background: regionColor(r.key) }" />{{ r.name }}
-              </i>
-            </span>
-          </footer>
+          <AssetCenterView v-if="workspace === 'assets'" />
+          <template v-else>
+            <EditorTabs v-if="workspace === 'code'" />
+            <div class="wb-editor-row">
+              <CodeView :tab="workspace === 'code' ? activeTab : null" />
+              <SelectionAiPanel v-if="aiPanelOpen && workspace === 'code'" />
+              <SymbolOutline v-if="workspace === 'code'" />
+            </div>
+            <ChatDock />
+            <footer class="wb-statusbar">
+              <span v-if="selectedPath" class="wb-status-path">{{ selectedPath }}</span>
+              <span v-else class="wb-status-faint">未选择文件</span>
+              <span v-if="dirtyCount" class="wb-status-dirty">● {{ dirtyCount}} 个文件未保存</span>
+              <span class="wb-status-spacer" />
+              <span v-if="tree.regions_enabled" class="wb-status-legend">
+                <i v-for="r in tree.regions" :key="r.key">
+                  <b :style="{ background: regionColor(r.key) }" />{{ r.name }}
+                </i>
+              </span>
+            </footer>
+          </template>
         </main>
       </template>
 
@@ -281,14 +286,17 @@ onBeforeUnmount(() => {
 
         <main class="wb-main">
           <WorkspaceTabs />
-          <EditorTabs />
-          <div class="wb-editor-row">
-            <CodeView :tab="null" />
-          </div>
-          <ChatDock />
-          <footer class="wb-statusbar">
-            <span class="wb-status-faint">示例演示模式 · 未连接本地项目</span>
-          </footer>
+          <AssetCenterView v-if="workspace === 'assets'" />
+          <template v-else>
+            <EditorTabs />
+            <div class="wb-editor-row">
+              <CodeView :tab="null" />
+            </div>
+            <ChatDock />
+            <footer class="wb-statusbar">
+              <span class="wb-status-faint">示例演示模式 · 未连接本地项目</span>
+            </footer>
+          </template>
         </main>
       </template>
 

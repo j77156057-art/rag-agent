@@ -26,7 +26,10 @@ function cleanAssets(): Plugin {
 // - 产物直接写入后端静态目录 ../web（PyInstaller 的 ("web","web") 会原样带走）
 // - emptyOutDir 必须为 false：../web 里有问答页 index.html，构建时绝不能清空
 export default defineConfig({
-  plugins: [vue(), cleanAssets()],
+  plugins: [
+    vue({ template: { compilerOptions: { isCustomElement: (tag: string) => tag === 'model-viewer' } } }),
+    cleanAssets(),
+  ],
   build: {
     outDir: resolve(__dirname, '../web'),
     emptyOutDir: false,
@@ -47,6 +50,9 @@ export default defineConfig({
           // vendor-vue（@vue-flow 的路径里也含 "@vue"）。这里返回 undefined = 不做切分，
           // 让它跟画布一起留在 SceneCanvas 异步 chunk：JS 与 CSS 同批加载，且首屏不受影响。
           if (id.includes('@vue-flow')) return
+          // model-viewer + three 体积大且只有素材中心 3D 预览用到，保持动态 import 的独立懒 chunk
+          const norm = id.replaceAll('\\', '/')
+          if (id.includes('@google/model-viewer') || norm.includes('node_modules/three/')) return
           if (id.includes('@vue') || id.includes('vue') || id.includes('@vitejs')) {
             return 'vendor-vue'
           }

@@ -799,6 +799,91 @@ export const comfyApi = {
   validateProvenance(meta: Record<string, unknown>) { return postJson<{ok:boolean;errors:string[];review_required:boolean}>('/api/comfy/provenance/validate', meta) },
 }
 
+/** 素材中心（asset_sources.py / /api/assets/*，阶段 2） */
+export type AssetKind = 'model' | 'texture' | 'hdri' | 'image' | 'audio' | '2d' | 'other'
+export interface AssetSourceInfo {
+  key: string; name: string; mode: 'remote' | 'pack'
+  kinds: string[]; license: string; home: string
+}
+export interface ExternalSource { key: string; name: string; url: string }
+export interface AssetItem {
+  id: string; source: string; kind: AssetKind; name: string
+  author: string; license: string; page_url: string; thumb_url: string
+  tags: string[]; summary: string
+}
+export interface AssetOption { label: string; ext: string; size: number; url: string; md5: string }
+export interface KenneyPack {
+  slug: string; name: string; kinds: string[]; summary: string
+  source: string; license: string; page_url: string; thumb_url: string
+}
+export interface PackFile {
+  path: string; show_path: string; ext: string; kind: AssetKind
+  size: number; dep: boolean
+}
+export interface PackPeek {
+  ok: boolean; token: string; name: string; thumb: string; page_url: string
+  files: PackFile[]; prefix: string; cached: boolean; error?: string
+}
+export interface ImportResult {
+  ok: boolean; path?: string; kind?: string; size?: number; sha256?: string
+  license?: string; author?: string; error?: string
+}
+export interface PackImportResp {
+  ok: boolean; imported: ImportResult[]; skipped: ImportResult[]
+  imported_count: number; skipped_count: number; error?: string
+}
+export interface LibraryItem {
+  path: string; name: string; kind: AssetKind; size: number; mtime: number
+  source: string; author: string; license: string; imported_at: string; duplicate: boolean
+  /** 仅离线演示数据使用：内联占位缩略图（真实接口不返回） */
+  thumb?: string
+}
+export interface LibraryResp {
+  ok: boolean; total: number
+  dirs: { dir: string; items: LibraryItem[] }[]; error?: string
+}
+
+export const assetsApi = {
+  sources() {
+    return request<{ ok: boolean; sources: AssetSourceInfo[]; external: ExternalSource[] }>('/api/assets/sources')
+  },
+  polySearch(q: string, kind: string, page: number) {
+    return request<{ ok: boolean; page: number; has_more: boolean; items: AssetItem[]; error?: string }>(
+      `/api/assets/search?source=polyhaven&kind=${encodeURIComponent(kind)}&page=${page}&q=${encodeURIComponent(q)}`)
+  },
+  resolve(id: string, kind: string) {
+    return request<{ ok: boolean; options: AssetOption[]; error?: string }>(
+      `/api/assets/resolve?id=${encodeURIComponent(id)}&kind=${encodeURIComponent(kind)}`)
+  },
+  importItem(payload: { source: string; item_id: string; option: AssetOption; kind: string;
+                        dest_dir: string; author: string; source_url: string }) {
+    return postJson<ImportResult>('/api/assets/import', payload)
+  },
+  packs(q = '', kinds = '') {
+    return request<{ ok: boolean; items: KenneyPack[] }>(
+      `/api/assets/packs?q=${encodeURIComponent(q)}&kinds=${encodeURIComponent(kinds)}`)
+  },
+  packPeek(slug: string) {
+    return postJson<PackPeek>('/api/assets/packs/peek', { slug })
+  },
+  packImport(token: string, selected: string[], destRoot: string) {
+    return postJson<PackImportResp>('/api/assets/packs/import',
+      { token, selected, dest_root: destRoot })
+  },
+  packPreviewUrl(token: string, file: string) {
+    return `/api/assets/packs/preview?token=${encodeURIComponent(token)}&file=${encodeURIComponent(file)}`
+  },
+  library() {
+    return request<LibraryResp>('/api/assets/library')
+  },
+  rawUrl(path: string) {
+    return `/api/assets/raw?path=${encodeURIComponent(path)}`
+  },
+  proxyUrl(url: string) {
+    return `/api/assets/proxy?url=${encodeURIComponent(url)}`
+  },
+}
+
 /** GPU 协调器（gpu_coordinator.py / /api/gpu/*） */
 export interface GpuHolder {
   owner: string

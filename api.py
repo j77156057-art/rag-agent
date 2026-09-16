@@ -85,6 +85,7 @@ import secrets_store
 _DESKTOP_HOST_HWND = None
 
 import workbench_fs
+import asset_sources
 import mcp_client
 import web_export
 import unity_graph
@@ -965,6 +966,99 @@ async def comfy_duplicates_ep(directory: str = "assets/generated"):
 async def comfy_unused_ep(directory: str = "assets/generated"):
     root = _project_root_or_error()
     return comfy_unused_resources(root, directory) if root else {"ok":False,"error":"未配置代码库"}
+
+# ============================ 素材中心（阶段 2） ============================
+def _asset_guard(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except asset_sources.AssetError as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/assets/sources")
+async def asset_sources_ep():
+    return asset_sources.sources_list()
+
+@app.get("/api/assets/search")
+async def asset_search_ep(q: str = "", kind: str = "model", page: int = 1, source: str = "polyhaven"):
+    if source == "kenney":
+        return await run_in_threadpool(_asset_guard, asset_sources.kenney_list, q, kind)
+    return await run_in_threadpool(_asset_guard, asset_sources.poly_search, q, kind, page)
+
+@app.get("/api/assets/resolve")
+async def asset_resolve_ep(id: str, kind: str = "model"):
+    return await run_in_threadpool(_asset_guard, asset_sources.poly_resolve, id, kind)
+
+class AssetImportReq(BaseModel):
+    source: str = "polyhaven"
+    item_id: str
+    option: dict
+    kind: str
+    dest_dir: str = "assets"
+    author: str = ""
+    source_url: str = ""
+
+@app.post("/api/assets/import")
+async def asset_import_ep(req: AssetImportReq):
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    return await run_in_threadpool(_asset_guard, lambda: asset_sources.import_item(
+        root, source=req.source, item_id=req.item_id, option=req.option, kind=req.kind,
+        dest_dir=req.dest_dir, author=req.author, source_url=req.source_url))
+
+@app.get("/api/assets/packs")
+async def asset_packs_ep(q: str = "", kinds: str = ""):
+    return asset_sources.kenney_list(q, kinds)
+
+class PackPeekReq(BaseModel):
+    slug: str
+
+@app.post("/api/assets/packs/peek")
+async def asset_pack_peek_ep(req: PackPeekReq):
+    return await run_in_threadpool(_asset_guard, asset_sources.kenney_peek, req.slug)
+
+class PackImportReq(BaseModel):
+    token: str
+    selected: list[str]
+    dest_root: str = "assets"
+
+@app.post("/api/assets/packs/import")
+async def asset_pack_import_ep(req: PackImportReq):
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    return await run_in_threadpool(_asset_guard, asset_sources.kenney_import,
+                                   root, req.token, req.selected, req.dest_root)
+
+@app.get("/api/assets/packs/preview")
+async def asset_pack_preview_ep(token: str, file: str):
+    try:
+        path, ctype = asset_sources.kenney_preview_file(token, file)
+        return FileResponse(path, media_type=ctype)
+    except asset_sources.AssetError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+@app.get("/api/assets/library")
+async def asset_library_ep():
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    return await run_in_threadpool(_asset_guard, asset_sources.library, root)
+
+@app.get("/api/assets/raw")
+async def asset_raw_ep(path: str):
+    root = _project_root_or_error()
+    if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
+    try:
+        p, ctype = asset_sources.raw_file(root, path)
+        return FileResponse(p, media_type=ctype)
+    except asset_sources.AssetError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+@app.get("/api/assets/proxy")
+async def asset_proxy_ep(url: str):
+    try:
+        data, ctype = await run_in_threadpool(asset_sources.proxy_fetch, url)
+        return Response(content=data, media_type=ctype)
+    except asset_sources.AssetError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 @app.get("/api/fs/scene-tree")
 async def scene_tree_ep(path: str):
     root=_project_root_or_error(); return scene_tree(root,path) if root else {"ok":False,"error":"未配置代码库"}

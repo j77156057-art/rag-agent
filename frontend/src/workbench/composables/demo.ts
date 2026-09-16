@@ -160,6 +160,106 @@ export const demoTagMap = {
   symbols: string[]; origin: string;
 }>
 
+// ---------------------------------------------------------------- 阶段 2：素材中心演示数据
+/** 生成内联 SVG 缩略图（离线演示无网络，占位图也要能直接显示）。 */
+function svgThumb(inner: string, bg = '#eef2f8'): string {
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="336" height="220" viewBox="0 0 336 220">` +
+    `<rect width="336" height="220" fill="${bg}"/>${inner}</svg>`
+  return 'data:image/svg+xml,' + encodeURIComponent(svg)
+}
+
+const thumbCube = svgThumb(
+  '<path d="M168 52 L238 88 L238 158 L168 194 L98 158 L98 88 Z M168 52 L168 122 M98 88 L168 122 L238 88 M168 122 L168 194" '
+  + 'fill="none" stroke="#2f6fed" stroke-width="3" stroke-linejoin="round"/>')
+const thumbTree = svgThumb(
+  '<path d="M168 40 L214 118 H122 Z M168 84 L226 168 H110 Z" fill="rgba(47,111,237,.18)" stroke="#2f6fed" stroke-width="3" stroke-linejoin="round"/>'
+  + '<rect x="160" y="166" width="16" height="26" fill="#8a6d4b"/>')
+const thumbWood = svgThumb(
+  '<g stroke="#b98a57" stroke-width="3">' + [58, 88, 118, 148, 178].map((y) =>
+    `<path d="M40 ${y} Q120 ${y - 12} 200 ${y + 4} T296 ${y - 2}" fill="none"/>`).join('') + '</g>', '#f3ead9')
+const thumbGrid = svgThumb(
+  '<g stroke="rgba(47,111,237,.55)" stroke-width="2">' +
+  [108, 168, 228].map((x) => `<line x1="${x}" y1="40" x2="${x}" y2="180"/>`).join('') +
+  [70, 110, 150].map((y) => `<line x1="78" y1="${y}" x2="258" y2="${y}"/>`).join('') + '</g>')
+const thumbHdri = svgThumb(
+  '<circle cx="168" cy="110" r="62" fill="none" stroke="#2f6fed" stroke-width="3"/>'
+  + '<circle cx="168" cy="110" r="20" fill="rgba(47,111,237,.25)"/>'
+  + '<g stroke="#2f6fed" stroke-width="2"><line x1="168" y1="30" x2="168" y2="48"/><line x1="168" y1="172" x2="168" y2="190"/>'
+  + '<line x1="88" y1="110" x2="106" y2="110"/><line x1="230" y1="110" x2="248" y2="110"/></g>')
+const thumbSunset = svgThumb(
+  '<circle cx="168" cy="128" r="40" fill="rgba(214,137,52,.55)" stroke="#c97a2b" stroke-width="3"/>'
+  + '<line x1="40" y1="150" x2="296" y2="150" stroke="#8a6d4b" stroke-width="3"/>',
+  '#f6e7d3')
+const thumbUi = svgThumb(
+  '<rect x="78" y="78" width="180" height="64" rx="8" fill="#fff" stroke="#2f6fed" stroke-width="3"/>'
+  + '<rect x="96" y="98" width="80" height="10" rx="5" fill="rgba(47,111,237,.45)"/>'
+  + '<rect x="96" y="118" width="50" height="10" rx="5" fill="rgba(47,111,237,.25)"/>'
+  + '<rect x="196" y="106" width="46" height="22" rx="6" fill="#2f6fed"/>')
+const thumbAudio = svgThumb(
+  '<g stroke="#2f6fed" stroke-width="4" stroke-linecap="round">' +
+  [86, 110, 134, 158, 182, 206, 230].map((x, i) =>
+    `<line x1="${x}" y1="${110 - 28 - (i % 3) * 12}" x2="${x}" y2="${110 + 28 + ((i + 1) % 3) * 12}"/>`).join('') + '</g>')
+
+export const demoAssetResults = [
+  { id: 'vintage_armchair', source: 'polyhaven', kind: 'model', name: '复古扶手椅',
+    author: 'Kirill Sannikov', license: 'CC0', page_url: 'https://polyhaven.com/',
+    thumb_url: thumbCube, tags: ['家具', '室内'], summary: '带布艺坐垫的木质扶手椅，室内场景道具' },
+  { id: 'lowpoly_oak', source: 'polyhaven', kind: 'model', name: '低多边形橡树',
+    author: 'Dairon Sanchez', license: 'CC0', page_url: 'https://polyhaven.com/',
+    thumb_url: thumbTree, tags: ['自然', '植物'], summary: '风格化低多边形树木，可直接放进关卡' },
+  { id: 'wood_planks_01', source: 'polyhaven', kind: 'texture', name: '旧木板纹理',
+    author: 'Poly Haven', license: 'CC0', page_url: 'https://polyhaven.com/',
+    thumb_url: thumbWood, tags: ['木材', 'PBR'], summary: '无缝拼接旧木板 PBR 贴图（颜色/法线/粗糙度）' },
+  { id: 'prototype_grid', source: 'polyhaven', kind: 'texture', name: '原型网格贴图',
+    author: 'Poly Haven', license: 'CC0', page_url: 'https://polyhaven.com/',
+    thumb_url: thumbGrid, tags: ['原型', '网格'], summary: '灰盒阶段用的网格贴图，便于判断比例' },
+  { id: 'studio_softbox', source: 'polyhaven', kind: 'hdri', name: '摄影棚柔光',
+    author: 'Poly Haven', license: 'CC0', page_url: 'https://polyhaven.com/',
+    thumb_url: thumbHdri, tags: ['室内', '布光'], summary: '中性柔光摄影棚环境，展示模型默认灯光' },
+  { id: 'sunset_field', source: 'polyhaven', kind: 'hdri', name: '黄昏旷野',
+    author: 'Poly Haven', license: 'CC0', page_url: 'https://polyhaven.com/',
+    thumb_url: thumbSunset, tags: ['户外', '黄昏'], summary: '暖色调黄昏户外环境光' },
+]
+
+export const demoKenneyPacks = [
+  { slug: 'prototype-kit', name: '原型套件', kinds: ['model'], summary: '灰盒原型用几何体模块，搭关卡最快的一套',
+    source: 'kenney', license: 'CC0', page_url: 'https://kenney.nl/assets/prototype-kit', thumb_url: thumbCube },
+  { slug: 'nature-kit', name: '自然套件', kinds: ['model'], summary: '树木、岩石、灌木等自然道具',
+    source: 'kenney', license: 'CC0', page_url: 'https://kenney.nl/assets/nature-kit', thumb_url: thumbTree },
+  { slug: 'prototype-textures', name: '原型纹理集', kinds: ['texture'], summary: '网格/棋盘格原型贴图，快速拼出灰盒关卡',
+    source: 'kenney', license: 'CC0', page_url: 'https://kenney.nl/assets/prototype-textures', thumb_url: thumbGrid },
+  { slug: 'ui-pack', name: 'UI 套件', kinds: ['2d'], summary: '按钮、面板、图标等通用界面素材',
+    source: 'kenney', license: 'CC0', page_url: 'https://kenney.nl/assets/ui-pack', thumb_url: thumbUi },
+]
+
+export const demoPackFiles = [
+  { path: 'Models/primitive_cube.glb', show_path: 'Models/primitive_cube.glb', ext: '.glb', kind: 'model', size: 1820, dep: false },
+  { path: 'Models/primitive_cylinder.glb', show_path: 'Models/primitive_cylinder.glb', ext: '.glb', kind: 'model', size: 2140, dep: false },
+  { path: 'Models/primitive_plane.glb', show_path: 'Models/primitive_plane.glb', ext: '.glb', kind: 'model', size: 980, dep: false },
+  { path: 'Models/ramp_01.glb', show_path: 'Models/ramp_01.glb', ext: '.glb', kind: 'model', size: 1560, dep: false },
+  { path: 'Textures/grid_01.png', show_path: 'Textures/grid_01.png', ext: '.png', kind: 'image', size: 3400, dep: false },
+  { path: 'License.txt', show_path: 'License.txt', ext: '.txt', kind: 'other', size: 1200, dep: false },
+]
+
+export const demoAssetLibrary = [
+  { path: 'assets/models/vintage_armchair.glb', name: 'vintage_armchair.glb', kind: 'model', size: 248320,
+    mtime: Date.now() / 1000 - 3600, source: 'polyhaven', author: 'Kirill Sannikov',
+    license: 'CC0', imported_at: '', duplicate: false, thumb: thumbCube },
+  { path: 'assets/models/lowpoly_oak.glb', name: 'lowpoly_oak.glb', kind: 'model', size: 184200,
+    mtime: Date.now() / 1000 - 7200, source: 'polyhaven', author: 'Dairon Sanchez',
+    license: 'CC0', imported_at: '', duplicate: false, thumb: thumbTree },
+  { path: 'assets/textures/wood_planks_01.jpg', name: 'wood_planks_01.jpg', kind: 'texture', size: 924532,
+    mtime: Date.now() / 1000 - 86400, source: 'polyhaven', author: 'Poly Haven',
+    license: 'CC0', imported_at: '', duplicate: false, thumb: thumbWood },
+  { path: 'assets/generated/hero_bg.png', name: 'hero_bg.png', kind: 'image', size: 512004,
+    mtime: Date.now() / 1000 - 172800, source: 'comfyui', author: '',
+    license: '', imported_at: '', duplicate: false, thumb: thumbSunset },
+  { path: 'assets/interface-sounds/Audio/click_01.wav', name: 'click_01.wav', kind: 'audio', size: 18420,
+    mtime: Date.now() / 1000 - 259200, source: 'kenney', author: 'Kenney',
+    license: 'CC0', imported_at: '', duplicate: false, thumb: thumbAudio },
+]
+
 export const demoRegionCards = [
   {
     key: 'values', name: '数值区', dir: 'values', desc: '玩家与敌人的数值配置',
