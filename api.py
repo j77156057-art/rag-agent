@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, UploadFile, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -1646,6 +1646,12 @@ async def trace_page():
     return FileResponse(page, media_type="text/html")
 
 
+@app.get("/trace.html")
+async def trace_html():
+    """`/trace.html` 别名 → 307 到 `/trace`（与 `/workbench.html` 同理）。"""
+    return RedirectResponse(url="/trace", status_code=307)
+
+
 class EnhancePromptReq(BaseModel):
     prompt: str
 
@@ -1871,6 +1877,18 @@ async def workbench():
             status_code=404,
         )
     return FileResponse(page)
+
+
+@app.get("/workbench.html")
+async def workbench_html():
+    """`/workbench.html` 别名 → 307 到 `/workbench`。
+
+    手写页（web/index.html、web/trace.html）的「代码工作台 →」入口链接用的是
+    `/workbench.html`：在纯静态托管（如 IGA Pages）下该文件真实存在、链 `.html`
+    才有效；而 FastAPI 服务端只有无后缀路由 `/workbench`。此别名让同一份链接在
+    两种托管方式下都能打开，不必改链接、也不破坏静态发布。
+    """
+    return RedirectResponse(url="/workbench", status_code=307)
 
 
 class ConfigReq(BaseModel):

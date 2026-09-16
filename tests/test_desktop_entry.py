@@ -12,9 +12,16 @@
 """
 import importlib
 import os
+import re
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _parse_first_href(html: str):
+    """取页面里第一个指向工作台的 href（`/workbench` 或 `/workbench.html`）。"""
+    m = re.search(r'href="(/workbench(?:\.html)?)"', html)
+    return m.group(1) if m else None
 
 
 class DesktopEntryTests(unittest.TestCase):
@@ -51,10 +58,39 @@ class DesktopEntryTests(unittest.TestCase):
         path = os.path.join(ROOT, 'web', 'index.html')
         with open(path, encoding='utf-8') as f:
             html = f.read()
-        # /workbench.html 在 FastAPI 静态挂载与 IGA Pages 纯静态托管下都能打开，
-        # /workbench 仅 FastAPI 路由可解析；两者都算有效入口。
-        self.assertTrue('href="/workbench"' in html or 'href="/workbench.html"' in html,
-                        'RAG 问答页（默认首页）里没有通往开发工作台的链接，用户找不到工作台')
+        href = _parse_first_href(html)
+        self.assertIsNotNone(href,
+                             'RAG 问答页（默认首页）里没有通往开发工作台的链接，用户找不到工作台')
+        self._assert_link_opens(href, '问答页「代码工作台 →」链接指向的路径必须能被后端打开（曾把 /workbench.html 写成死链导致 404）')
+
+    def test_trace_page_links_to_workbench(self):
+        path = os.path.join(ROOT, 'web', 'trace.html')
+        with open(path, encoding='utf-8') as f:
+            html = f.read()
+        href = _parse_first_href(html)
+        self.assertIsNotNone(href, 'trace 页里没有通往开发工作台的链接')
+        self._assert_link_opens(href, 'trace 页指向工作台的链接必须能被后端打开')
+
+    def _assert_link_opens(self, href: str, msg: str):
+        from fastapi.testclient import TestClient
+        import api
+        # 不进 with：不触发 lifespan（HANDOFF §8 第 32 条——校验脚本靠这条区别工作）。
+        client = TestClient(api.app)
+        resp = client.get(href, follow_redirects=True)
+        self.assertEqual(resp.status_code, 200, f'{msg}（实际 {href} → HTTP {resp.status_code}）')
+
+    def test_workbench_html_alias_redirects(self):
+        """两个 .html 别名都应 307 到无后缀路由，最终 200。"""
+        from fastapi.testclient import TestClient
+        import api
+        client = TestClient(api.app)
+        for alias, target in (('/workbench.html', '/workbench'), ('/trace.html', '/trace')):
+            r = client.get(alias, follow_redirects=False)
+            self.assertEqual(r.status_code, 307, f'{alias} 应 307')
+            self.assertEqual(r.headers.get('location'), target, f'{alias} 的 Location 应指向 {target}')
+        for path in ('/workbench', '/workbench.html', '/trace', '/trace.html'):
+            self.assertEqual(client.get(path, follow_redirects=True).status_code, 200,
+                             f'{path} 应最终 200')
 
     def test_workbench_links_back_to_question_page(self):
         path = os.path.join(ROOT, 'frontend', 'src', 'workbench', 'App.vue')

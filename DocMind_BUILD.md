@@ -1,13 +1,33 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第二十二次重建（R5 并发限制修复——每标签页独立 session_id；并修掉 `code_root` 顺序回归）」；历史构建清单保留在下文。
+> 最新构建见下方「第二十三次重建（修复 `/workbench.html` 死链——问答页/`trace` 页的「代码工作台 →」入口在 FastAPI 服务端 404）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 19.7 MB，控制台模式，启动时自动开浏览器）
 - 整体体积：约 309 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 91 MB/365 文件；**第十六次起不再打包开发者 `.chroma` 索引库，较第十五次 682.5 MB 降约 374 MB**）
-- **当前构建时间：`2026-09-16 20:34:25`（第二十二次重建，R5 并发限制修复——前端每标签页独立 `session_id`；并修掉 `code_root` 顺序回归，exe 20,536,890 字节，SHA-256 4934b9c1429faa56aeeffbc97037aea0bdd926e920f7900fbfa792ddab9b6bbd）**
-- 上一版：`2026-09-16 19:22:21`（第二十一次重建，设计评审驱动的缺陷修复——导入期副作用 / 运行时状态隔离 / 前后端契约一致性 / 加固，exe 20,536,866 字节，SHA-256 f67eac87acb0c447061b791c05a2ac643faa3ddcfae058f123c5e47ee8e9681a）
+- **当前构建时间：`2026-09-16 21:10:24`（第二十三次重建，修复 `/workbench.html` 死链——问答页与 `trace` 页的「代码工作台 →」入口在 FastAPI 服务端 404，exe 20,537,351 字节，SHA-256 6121fa6120e544ebec0f29da57325c4c9cedb8b54b99ae4c017dbd1893dd8cba）**
+- 上一版：`2026-09-16 20:34:25`（第二十二次重建，R5 并发限制修复——前端每标签页独立 `session_id`；并修掉 `code_root` 顺序回归，exe 20,536,890 字节，SHA-256 4934b9c1429faa56aeeffbc97037aea0bdd926e920f7900fbfa792ddab9b6bbd）
+
+---
+
+## 第二十三次重建：修复 `/workbench.html` 死链（2026-09-16 21:10）
+
+### 改动（BugFix，2 个文件）
+用户实测：在 DocMind 桌面窗口（标题「DocMind 开发工作台」）里点顶栏「代码工作台 →」，页面变成裸 JSON `{"detail":"Not Found"}`。
+- **根因**：手写页的入口链接写的是 `.html` —— `web/index.html:486` 与 `web/trace.html:70` 均为 `href="/workbench.html"`；而 FastAPI 服务端只有无后缀路由 `@app.get("/workbench")`（`api.py:1861`）与 `@app.get("/trace")`（`:1640`），`workbench.html` 只作为文件存在于 `web/`（经 `/static` 挂载才可取），故 `/workbench.html` 在 API 服务端是 **404**。`/workbench.html` 只在**纯静态托管**（如 IGA Pages，`.html` 是真实文件）下有效。
+- **修法**（两种托管方式都对，不改链接、不破坏静态发布）：`api.py` 新增两个 `.html` **别名路由**，`307` 重定向到无后缀路由：
+  - `GET /workbench.html` → 307 `/workbench`
+  - `GET /trace.html` → 307 `/trace`（同坑顺手收掉）
+- **为什么测试没拦住**：`tests/test_desktop_entry.py::test_question_page_links_to_workbench` 原断言是「`href="/workbench"` **或** `href="/workbench.html"` 二者之一即可」——太宽松，「链接指向 404 路径」永远测不出。已把它升级为**真的能打开**：从 HTML 正则**解析出实际 href**，再用 `TestClient`（**不进 `with`，不触发 lifespan**）请求、断言最终 200；并新增 `test_trace_page_links_to_workbench`（trace 页同理）+ `test_workbench_html_alias_redirects`（四个路径最终 200 + 两个别名 307 且 Location 正确）。
+
+### 验证
+- 单测：全量 **711/711 通过**（skipped=1；709 + 新增 2 例）。`test_api_routes.py`（查重复路由 + 顶层重名）9 项全绿 —— 确认 `/workbench`/`/trace` 各只注册一次。
+- 端到端（源码起服务 8023）：`/` `/workbench` `/workbench.html` `/workbench/` `/trace` `/trace.html` **六个全部最终 200**；`curl -i /workbench.html` → `307 Temporary Redirect` + `location: /workbench`。
+- 冻结态（最小 PATH 仅 `System32`、`DOCMIND_SERVER_ONLY=1`、端口 8000，PyInstaller 退出码 0）：冷启动 2.1s；`build_time=2026-09-16 21:10:24`；exe **20,537,351 字节**，SHA-256 `6121fa6120e544ebec0f29da57325c4c9cedb8b54b99ae4c017dbd1893dd8cba`；`/` 200、`/workbench/` 200（跟随 307）、`/api/health` 200；三处新端点干净 `ok:false`；**前端 14 个产物「HTTP 返回体 vs `web/` 源」SHA-256 全 match**；清理后包内卫生 → **13/13 ALL PASS**。
+- 黄金题门：**SKIPPED**（环境限制，如实留痕）。
+
+> **交付说明**：:8000 无用户实例，直接构建进 `rag-agent/dist/DocMind/`；桌面安装 `D:\WorkBuddy\DocMind` 已镜像（`DocMind.lnk` 指向它）。
 
 ---
 
