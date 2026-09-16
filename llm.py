@@ -16,7 +16,7 @@ from openai import OpenAI
 from config import (
     LLM_PROVIDER, PROVIDERS, LLM_MODEL, LLM_API_KEY,
     LLM_MAX_TOKENS, LLM_ENABLE_THINKING, PROMPT_TOKEN_BUDGET, get_runtime,
-    model_capability,
+    model_capability, prompt_token_budget,
 )
 
 # 默认单次 LLM 调用超时（秒）与重试策略（可用环境变量覆盖）
@@ -273,6 +273,8 @@ class LLMClient:
         self.model = model or get_runtime("llm_model") or LLM_MODEL or cfg["default_model"]
         # 模型能力画像：决定 num_ctx 扩充、思考参数能否透传（前端也据此渲染开关）
         self.capability = model_capability(self.provider, self.model)
+        # 按真实窗口缩放的单轮 prompt token 预算（Agent 裁剪/压缩与 ollama num_ctx 共用）
+        self.prompt_budget = prompt_token_budget(self.provider, self.model)
         # 最近一次调用的 token 用量（由 chat()/流式包装器原地更新），供 trace 账本读取
         self.last_usage = {}
         # 最近一次调用返回的原生 tool_calls（[{id,name,arguments}]），供 agent 的原生通道读取
@@ -476,9 +478,10 @@ class LLMClient:
         # 打点：空闲卸载计时器以"真正发起 Ollama 推理"为活动依据，
         # 仅持有租约（排队等待）不算活动，避免把等待误判成模型在用。
         _gpu_note_activity("ollama")
-        # num_ctx 按模型画像的上下文窗口封顶：小窗口模型不能盲目给 14k（会被服务端
-        # 拒绝或挤爆显存）；窗口充足时维持"prompt 预算 + 补全上限 + 余量"的扩充值。
-        want_ctx = PROMPT_TOKEN_BUDGET + LLM_MAX_TOKENS + 512
+        # num_ctx 按模型画像的真实窗口缩放：大窗口模型不再被 14.5k 限死，
+        # 小窗口模型也不会盲目塞爆（被服务端拒绝或挤爆显存）。
+        budget = int(getattr(self, "prompt_budget", 0) or PROMPT_TOKEN_BUDGET)
+        want_ctx = budget + LLM_MAX_TOKENS + 512
         win = int(self.capability.get("context_window") or 16384)
         num_ctx = min(want_ctx, win)
         # 窗口放得下完整预算时输出给满 LLM_MAX_TOKENS；放不下（小窗口模型）时

@@ -1503,6 +1503,23 @@ async def sessions_ep(limit: int = 50):
     return {"ok": True, "items": session_store.list_sessions(limit)}
 
 
+@app.get("/api/context")
+async def context_usage_ep(session_id: str = ""):
+    """当前会话的上下文窗口占用（供刷新页面后恢复「上下文已用 N%」指示）。
+
+    优先返回该会话 Agent 最近一次问答上报的快照；无快照时实时估算一次
+    （ollama/llamacpp 会触发一次 tokenize，故仅在必要时调用）。
+    """
+    ag = _SESSION_AGENTS.get(str(session_id or "").strip() or "default")
+    if ag is None:
+        return {"ok": True, "active": False}
+    try:
+        stats = getattr(ag, "last_context", None) or ag.context_stats("")
+    except Exception:  # noqa: BLE001
+        return {"ok": True, "active": False}
+    return {"ok": True, "active": True, **stats}
+
+
 @app.delete("/api/sessions/{session_id}")
 async def session_delete_ep(session_id: str):
     # 同时丢弃常驻 Agent，避免删除后旧历史仍在内存里续用
@@ -2327,6 +2344,8 @@ async def set_config(req: ConfigReq):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     agent.llm = new_llm
     agent.history = []
+    # 窗口随模型变化，旧的上下文用量快照作废（前端下一轮问答会收到新事件）
+    agent.last_context = None
 
     # 切换 embedding provider：清空向量缓存 + 重建集合（维度可能变化）
     if req.embedding_provider:

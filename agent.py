@@ -16,6 +16,8 @@ from config import (
     HISTORY_ANSWER_CHARS,
     TRAIL_ASSISTANT_CHARS,
     PROMPT_TOKEN_BUDGET,
+    COMPACT_KEEP_RATIO,
+    COMPACT_TRIGGER_RATIO,
     get_runtime,
 )
 from llm import LLMClient, args_to_input
@@ -600,6 +602,7 @@ class Agent:
         self._native_queue = []    # 顺序回退用：逐个消化的 tool_calls
         self._pending_batch = []   # 并行批次用：一轮的多个只读 tool_calls
         self.last_turn_record = None   # 最近一回合的 trace 记录（父代理据此回传子代理轨迹）
+        self.last_context = None       # 最近一次上下文用量快照（context 事件 / 查询接口共用）
 
     def _web_blocked(self, action_name) -> bool:
         """联网关闭时，外网工具一律拒绝（文本通道与原生通道共用此判定）。"""
@@ -669,9 +672,9 @@ class Agent:
             messages.append(
                 {"role": "system", "content": "【早期对话摘要（更早的轮次已压缩）】\n" + self.summary}
             )
-        # 历史只回放最近 AGENT_HISTORY_TURNS 轮（滑窗），长回答截断后回放，
-        # 避免多轮对话把本就紧张的上下文预算吃光。
-        for turn in self.history[-AGENT_HISTORY_TURNS:]:
+        # 历史回放按模型真实预算开 token 窗口（见 _history_window）：大窗口模型
+        # 能带几十轮原文，小窗口模型只带最近几轮；AGENT_HISTORY_TURNS 是硬上限。
+        for turn in self._history_window():
             messages.append({"role": "user", "content": turn["user"]})
             messages.append(
                 {"role": "assistant", "content": _clip(turn["assistant"], HISTORY_ANSWER_CHARS)}
@@ -682,19 +685,62 @@ class Agent:
         messages.append(current)
         return messages
 
+    def _prompt_budget(self) -> int:
+        """本模型单轮 prompt 的 token 预算（按真实窗口缩放；测试假客户端退回常量）。"""
+        return int(getattr(self.llm, "prompt_budget", 0) or PROMPT_TOKEN_BUDGET)
+
+    @property
+    def context_window(self) -> int:
+        """当前模型的上下文窗口（token），无画像时保守按 32768。"""
+        cap = getattr(self.llm, "capability", None) or {}
+        return int(cap.get("context_window") or 32768)
+
+    def _history_window(self):
+        """按 token 预算从近到远挑选回放的历史问答对。
+
+        目标体积 = prompt 预算 × COMPACT_KEEP_RATIO（与落盘压缩的保留口径一致，
+        保证刚压缩完的历史能完整回放），轮数不超过 AGENT_HISTORY_TURNS 硬上限。
+        """
+        limit = max(256, int(self._prompt_budget() * COMPACT_KEEP_RATIO))
+        picked, used = [], 0
+        for turn in reversed(self.history[-AGENT_HISTORY_TURNS:]):
+            clip_ans = _clip(turn.get("assistant", ""), HISTORY_ANSWER_CHARS)
+            t = self.llm.count_tokens((turn.get("user", "") or "") + "\n" + clip_ans)
+            if picked and used + t > limit:
+                break
+            picked.insert(0, {"user": turn.get("user", ""), "assistant": clip_ans})
+            used += t
+        return picked
+
+    def context_stats(self, question: str = "") -> dict:
+        """当前会话的上下文占用（不含本轮工具往返），供前端「上下文已用 N%」展示。"""
+        msgs = self._build_messages(question or "")
+        used = self._prompt_tokens(msgs, [])
+        win = self.context_window
+        percent = max(0, min(100, round(used * 100 / win))) if win else 0
+        level = "warn" if percent >= 90 else ("high" if percent >= 70 else "ok")
+        return {
+            "used_tokens": used,
+            "context_window": win,
+            "prompt_budget": self._prompt_budget(),
+            "percent": percent,
+            "level": level,
+        }
+
     def _prompt_tokens(self, head, trail):
         """整段待发送消息的 token 数（llamacpp 走 /tokenize 精算，失败走保守估算）。"""
         text = "\n".join((m.get("content") or "") for m in head + trail)
         return self.llm.count_tokens(text)
 
     def _fit_budget(self, head, trail):
-        """把整段 prompt 压到 PROMPT_TOKEN_BUDGET 以内，返回最终消息列表。
+        """把整段 prompt 压到本模型的 prompt 预算以内，返回最终消息列表。
         裁剪顺序（保住最相关上下文）：
         1) trail 最早的工具/反思/续写往返（至少保留最近 1 轮）；
         2) head 中最早的历史问答对（system 规则与当前问题永不动）。
         """
+        budget = self._prompt_budget()
         guard = 0
-        while self._prompt_tokens(head, trail) > PROMPT_TOKEN_BUDGET and guard < 40:
+        while self._prompt_tokens(head, trail) > budget and guard < 40:
             guard += 1
             found = _find_prunable_trail(trail)
             if found is not None:
@@ -781,16 +827,27 @@ class Agent:
             if self.session_id:
                 try:
                     before_n = len(self.history)
+                    # 压缩阈值按当前模型真实窗口换算：1M 模型与 16k 本地模型各用各的
+                    # token 阈值，不再用固定 8000 字符 / 12 轮一刀切。
+                    _budget = self._prompt_budget()
                     kept, summary = _sessions.maybe_compact(
-                        self.session_id, self.history, self.llm)
+                        self.session_id, self.history, self.llm,
+                        trigger_tokens=int(_budget * COMPACT_TRIGGER_RATIO),
+                        keep_tokens=int(_budget * COMPACT_KEEP_RATIO))
                     if len(kept) < before_n:
                         self.history = kept
                         self.summary = summary
                         _sessions.save(self.session_id, kept, summary)
                         yield {"type": "notice",
                                "text": f"早期 {before_n - len(kept)} 轮对话已自动压缩为摘要，新问答不受影响。"}
+                        # 压缩后刷新一次用量指示，让进度条立即回落
+                        self.last_context = self.context_stats("")
+                        yield {"type": "context", **self.last_context}
                     else:
                         _sessions.save(self.session_id, self.history, self.summary)
+                        # 本轮问答已入历史，用量随之上浮，刷新指示
+                        self.last_context = self.context_stats("")
+                        yield {"type": "context", **self.last_context}
                 except Exception:  # noqa: BLE001
                     pass
         except GeneratorExit:
@@ -844,6 +901,14 @@ class Agent:
         """
         head = self._build_messages(question, images=images)
         trail = []
+        # 本轮开工前上报一次上下文用量（仅顶层会话代理；子代理不刷 UI 指示）。
+        # 此时尚未产生工具往返，用量 = 系统提示 + 历史摘要/回放 + 当前问题。
+        if self.session_id and self.depth == 0:
+            try:
+                self.last_context = self.context_stats(question)
+                yield {"type": "context", **self.last_context}
+            except Exception:  # noqa: BLE001 —— 用量统计失败绝不影响问答
+                pass
 
         failures = 0
         nudges = 0

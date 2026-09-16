@@ -1108,9 +1108,25 @@ export interface FillExportsResp {
 export interface SseEvent {
   type:
     | 'token' | 'thought' | 'action' | 'observation' | 'reflection'
-    | 'reasoning' | 'notice' | 'plan' | 'route' | 'final' | 'done' | string
+    | 'reasoning' | 'notice' | 'plan' | 'route' | 'final' | 'done'
+    | 'context' | string
   text?: string
   steps?: string[]
+  /** type=context 时的上下文窗口用量 */
+  used_tokens?: number
+  context_window?: number
+  prompt_budget?: number
+  percent?: number
+  level?: 'ok' | 'high' | 'warn' | string
+}
+
+/** 上下文窗口占用（GET /api/context 与 SSE context 事件同构） */
+export interface ContextUsage {
+  used_tokens: number
+  context_window: number
+  prompt_budget: number
+  percent: number
+  level: 'ok' | 'high' | 'warn'
 }
 
 export interface SseStreamHandlers {
@@ -1263,6 +1279,21 @@ export const modelApi = {
   },
   save(req: SaveModelReq): Promise<ModelConfigInfo & { warnings?: string[]; model_error?: string }> {
     return postJson('/api/config', req)
+  },
+}
+
+/** 上下文窗口用量查询（页面刷新后恢复指示用） */
+export const contextApi = {
+  async get(): Promise<ContextUsage | null> {
+    const r = await request<{ ok: boolean; active?: boolean } & Partial<ContextUsage>>('/api/context')
+    if (!r.active) return null
+    return {
+      used_tokens: r.used_tokens ?? 0,
+      context_window: r.context_window ?? 0,
+      prompt_budget: r.prompt_budget ?? 0,
+      percent: r.percent ?? 0,
+      level: (r.level as ContextUsage['level']) ?? 'ok',
+    }
   },
 }
 

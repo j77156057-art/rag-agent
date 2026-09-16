@@ -101,7 +101,9 @@ class AgentTraceIntegrationTests(_IsoBase):
     def test_agent_run_records_one_trace(self):
         a = agent_mod.Agent(llm=_FakeLLM(["Final Answer: 你好"]), session_id="s-trace")
         events = list(a.run("hi", stream=True))
-        self.assertEqual(events[-1]["type"], "final")
+        # 收尾会补发 context 用量事件，final 不再是流里最后一个事件
+        final_ev = next(e for e in events if e["type"] == "final")
+        self.assertEqual(final_ev["type"], "final")
         rows = agent_trace.recent(10)
         self.assertEqual(len(rows), 1)
         r = rows[0]
@@ -126,8 +128,8 @@ class AgentTraceIntegrationTests(_IsoBase):
     def test_deadline_aborts_turn(self):
         a = agent_mod.Agent(llm=_FakeLLM(["Final Answer: 不该到达"]), session_id="s-dl")
         events = list(a.run("q", stream=True, deadline=time.monotonic() - 1))
-        self.assertEqual(events[-1]["type"], "final")
-        self.assertIn("时间上限", events[-1]["text"])
+        final_ev = next(e for e in events if e["type"] == "final")
+        self.assertIn("时间上限", final_ev["text"])
         self.assertEqual(agent_trace.recent(1)[0]["outcome"], "deadline_exceeded")
 
     def test_client_disconnect_marks_aborted(self):
@@ -161,11 +163,31 @@ class SessionIsolationTests(_IsoBase):
                          "无 session_id 时不应写入任何会话文件")
 
     def test_compaction_folds_old_turns_into_summary(self):
-        turns = [{"user": f"q{i}", "assistant": f"a{i}"} for i in range(20)]
-        kept, summary = sessions.maybe_compact("long", turns, None)
-        self.assertEqual(len(kept), sessions.KEEP_TURNS)
+        # 每轮 60 字符 -> _FakeLLM 口径约 20 token/轮；阈值按 token 传入
+        turns = [{"user": f"问{i}" + "甲" * 28, "assistant": "乙" * 30} for i in range(20)]
+        kept, summary = sessions.maybe_compact(
+            "long", turns, _FakeLLM([]), trigger_tokens=100, keep_tokens=70)
+        # 每轮约 20 token：保留目标 70 token -> 恰好 3 轮（高于 KEEP_TURNS_MIN 下限）
+        self.assertEqual(len(kept), 3)
+        self.assertGreaterEqual(len(kept), sessions.KEEP_TURNS_MIN)
         self.assertIn("摘要", summary)
-        self.assertEqual(kept[-1]["user"], "q19")
+        self.assertTrue(kept[-1]["user"].startswith("问19"))
+
+    def test_large_window_threshold_does_not_trigger_on_moderate_history(self):
+        # 1M 窗口模型：8000 字历史远未到其压缩阈值，绝不能按旧的固定 8000 字符压缩
+        turns = [{"user": "字" * 200, "assistant": "答" * 200} for _ in range(20)]
+        kept, summary = sessions.maybe_compact(
+            "bigwin", turns, None, trigger_tokens=700_000, keep_tokens=350_000)
+        self.assertEqual(len(kept), 20)
+        self.assertEqual(summary, "")
+
+    def test_turn_hard_cap_still_compacts(self):
+        # token 没超但轮数超过硬上限：也必须收敛（防失控保险）
+        turns = [{"user": f"q{i}", "assistant": f"a{i}"} for i in range(sessions.MAX_TURNS + 5)]
+        kept, _ = sessions.maybe_compact(
+            "cap", turns, None, trigger_tokens=10 ** 9, keep_tokens=10 ** 9)
+        self.assertLessEqual(len(kept), sessions.MAX_TURNS)
+        self.assertEqual(kept[-1]["user"], f"q{sessions.MAX_TURNS + 4}")
 
     def test_slug_blocks_path_traversal(self):
         self.assertNotIn("/", sessions._slug("../../evil"))

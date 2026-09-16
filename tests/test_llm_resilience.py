@@ -150,21 +150,28 @@ class OllamaPayloadTests(unittest.TestCase):
         return captured["payload"], out
 
     def test_payload_always_carries_think_flag(self):
+        from config import prompt_token_budget, LLM_MAX_TOKENS
         payload_on, out = self._capture("qwen3:8b", True)
         self.assertEqual(out, "ok")
         self.assertIs(payload_on["think"], True)
-        # 16k 窗口：完整预算 14584 放得下，num_predict 必须给满 3072
-        self.assertEqual(payload_on["options"]["num_ctx"], 14584)
+        # 16k 窗口：预算按窗口 75% 缩放到 12288，want_ctx=15872 仍放得下，
+        # num_predict 必须给满 3072（旧的一刀切 14584 已废弃）
+        want = prompt_token_budget("ollama", "qwen3:8b") + LLM_MAX_TOKENS + 512
+        self.assertEqual(payload_on["options"]["num_ctx"], min(want, 16384))
+        self.assertEqual(payload_on["options"]["num_ctx"], 15872)
         self.assertEqual(payload_on["options"]["num_predict"], 3072)
 
         payload_off, _ = self._capture("qwen3:8b", False)
         self.assertIs(payload_off["think"], False)
 
     def test_plain_model_payload_think_false_ctx_by_window(self):
-        # qwen2.5:7b 画像窗口 32768，同样放得下完整预算
+        from config import prompt_token_budget, LLM_MAX_TOKENS
+        # qwen2.5:7b 画像窗口 32768：大窗口不再被 14.5k 限死，num_ctx 扩到 28160
         payload, _ = self._capture("qwen2.5:7b", False)
         self.assertIs(payload["think"], False)
-        self.assertEqual(payload["options"]["num_ctx"], 14584)
+        want = prompt_token_budget("ollama", "qwen2.5:7b") + LLM_MAX_TOKENS + 512
+        self.assertEqual(payload["options"]["num_ctx"], min(want, 32768))
+        self.assertEqual(payload["options"]["num_ctx"], 28160)
         self.assertEqual(payload["options"]["num_predict"], 3072)
 
     def test_small_window_model_caps_ctx_and_keeps_min_output(self):

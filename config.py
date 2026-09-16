@@ -137,13 +137,21 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "80"))
 TOP_K = int(os.getenv("TOP_K", "4"))
 MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "8"))
 # ---- Agent 上下文预算（防止长系统提示 + 多轮观察 + 思考模型 reasoning 撑爆 n_ctx）----
-AGENT_HISTORY_TURNS = int(os.getenv("AGENT_HISTORY_TURNS", "3"))  # 多轮记忆最多回放的问答对数
+# 多轮记忆回放的问答对【硬上限】：实际回放多少轮先按 token 窗口动态决定
+# （Agent._history_window，占 prompt 预算 COMPACT_KEEP_RATIO），此值只兜底防失控。
+AGENT_HISTORY_TURNS = int(os.getenv("AGENT_HISTORY_TURNS", "40"))
 OBS_MAX_CHARS = int(os.getenv("OBS_MAX_CHARS", "1200"))  # 单条工具观察回填给模型前的截断长度
 HISTORY_ANSWER_CHARS = int(os.getenv("HISTORY_ANSWER_CHARS", "700"))  # 回放历史回答时的单条截断长度
 TRAIL_ASSISTANT_CHARS = int(os.getenv("TRAIL_ASSISTANT_CHARS", "1000"))  # trail 中保留的模型单轮决策上限
-# 每轮送模型前，整段 prompt 的 token 预算（llamacpp 走 /tokenize 精算；
-# 16384 n_ctx 下 11000 给 prompt、约 5000 留给思考+回答）
+# 每轮送模型前，整段 prompt 的 token 预算（llamacpp 走 /tokenize 精算）。
+# 仅作为 env 显式覆盖值与无画像客户端的兜底；实际默认值按模型真实窗口缩放
+# （见 prompt_token_budget）：16k 本地模型约 12k，131k 云端模型可放到 ~98k，
+# 避免「小窗口塞不下、大窗口浪费 90%」的一刀切。
 PROMPT_TOKEN_BUDGET = int(os.getenv("PROMPT_TOKEN_BUDGET", "11000"))
+# 历史回放/压缩保留占 prompt 预算的比例：留出其余空间给系统提示、当前问题与
+# 本轮工具往返（observation）。触发压缩的历史占用比例。
+COMPACT_KEEP_RATIO = float(os.getenv("DOCMIND_COMPACT_KEEP_RATIO", "0.35"))
+COMPACT_TRIGGER_RATIO = float(os.getenv("DOCMIND_COMPACT_TRIGGER_RATIO", "0.6"))
 # 单次补全上限（含思考型模型的 reasoning）：防止模型不按格式收尾时无限生成，
 # 到顶后 finish_reason=length，Agent 会自动 nudge 要求直接给简短 Final Answer。
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "3072"))
@@ -209,6 +217,25 @@ def model_context_window(provider: str, model: str) -> int:
         if p == pp and hint in m:
             return win
     return _PROVIDER_CONTEXT_DEFAULT.get(p, 32768)
+
+
+def prompt_token_budget(provider: str, model: str) -> int:
+    """单次请求 prompt 可用的 token 预算，按模型真实窗口缩放。
+
+    - env PROMPT_TOKEN_BUDGET 显式设置时强制采用（排障/压测用）；
+    - 默认取「窗口的 75%」与「窗口 - 输出上限 - 512 余量」的较小值，
+      并保 6144 下限。16k 本地模型 ≈ 12k，131k 云端 ≈ 98k，1M 模型 ≈ 786k。
+    """
+    env = os.getenv("PROMPT_TOKEN_BUDGET", "").strip()
+    if env:
+        try:
+            return max(1024, int(env))
+        except ValueError:
+            pass
+    win = model_context_window(provider, model)
+    usable = max(2048, win - LLM_MAX_TOKENS - 512)
+    scaled = int(win * 0.75)
+    return max(6144, min(usable, scaled))
 
 
 def model_thinking_mode(provider: str, model: str) -> str:

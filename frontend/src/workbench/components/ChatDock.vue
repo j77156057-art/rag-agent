@@ -5,8 +5,8 @@
 //   与 godot-ai 插件安装引导（安装前必须用户确认）。
 import { nextTick, ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
-import { aiApi, mcpApi, modelApi } from '../api'
-import type { McpServer, ModelConfigInfo } from '../api'
+import { aiApi, mcpApi, modelApi, contextApi } from '../api'
+import type { McpServer, ModelConfigInfo, ContextUsage } from '../api'
 import type { SseEvent } from '../api'
 import { mdToHtml, extractFileRefs } from '../markdown'
 import type { FileRef } from '../markdown'
@@ -77,6 +77,38 @@ const thinkingSupported = computed(() => thinkingMode.value !== 'none')
 const thinkingNative = computed(() => thinkingMode.value === 'native')
 const thinkingEffective = computed(() => thinkingNative.value || thinkingOn.value)
 
+// ---------------------------------------------------------------- 上下文窗口用量
+// 后端按当前模型真实窗口估算（含系统提示/历史摘要/历史回放/当前问题），
+// 每轮问答开工与收尾各推一次 SSE context 事件；刷新页面走 GET /api/context 恢复。
+const usage = ref<ContextUsage | null>(null)
+function applyUsage(ev: SseEvent) {
+  if (typeof ev.percent !== 'number' || typeof ev.context_window !== 'number') return
+  usage.value = {
+    used_tokens: ev.used_tokens ?? 0,
+    context_window: ev.context_window,
+    prompt_budget: ev.prompt_budget ?? 0,
+    percent: Math.max(0, Math.min(100, ev.percent)),
+    level: (ev.level as ContextUsage['level']) || 'ok',
+  }
+}
+function fmtTokens(n: number): string {
+  if (n >= 1000) {
+    const k = n / 1000
+    return `${k >= 100 ? Math.round(k) : k.toFixed(k >= 10 ? 0 : 1)}k`
+  }
+  return String(n)
+}
+const usageTitle = computed(() => {
+  const u = usage.value
+  if (!u) return ''
+  const tail = u.level === 'warn'
+    ? '（接近窗口上限，早期对话将被自动压缩）'
+    : u.level === 'high'
+      ? '（占用偏高，达到阈值后早期对话会自动压缩为摘要）'
+      : '（达到阈值后早期对话会自动压缩为摘要，不影响新问答）'
+  return `上下文已用 ${fmtTokens(u.used_tokens)} / 模型窗口 ${fmtTokens(u.context_window)} tokens${tail}`
+})
+
 async function loadModelConfig() {
   if (demoMode.value) return
   try {
@@ -118,6 +150,11 @@ async function send(text?: string) {
 
   const live = () => messages.value.find((m) => m.id === turn.id)
   const onEvent = (ev: SseEvent) => {
+    // 上下文用量是全局指示，不挂在某条消息上
+    if (ev.type === 'context') {
+      applyUsage(ev)
+      return
+    }
     const t = live()
     if (!t) return
     if (ev.type === 'final' && typeof ev.text === 'string' && ev.text) {
@@ -182,6 +219,17 @@ function onKeydown(ev: KeyboardEvent) {
 function clearMessages() {
   if (sending.value) stop()
   messages.value = []
+  usage.value = null
+}
+
+async function loadContextUsage() {
+  if (demoMode.value) return
+  try {
+    const u = await contextApi.get()
+    if (u) usage.value = u
+  } catch {
+    /* 未启动/无会话时不显示指示即可 */
+  }
 }
 
 // ---------------------------------------------------------------- 离线演示问答
@@ -245,6 +293,7 @@ function onFocusChat(ev?: Event) {
 onMounted(() => {
   window.addEventListener('docmind:focus-chat', onFocusChat as EventListener)
   void loadModelConfig()
+  void loadContextUsage()
 })
 onBeforeUnmount(() => window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener))
 
@@ -675,6 +724,22 @@ function connectorGuide(s: McpServer) {
             <span>深度思考</span>
             <span class="cd-chip-badge">不支持</span>
           </span>
+
+          <!-- 上下文窗口占用：按当前模型真实窗口估算，70% 转黄、90% 转红 -->
+          <span
+            v-if="usage"
+            class="cd-chip cd-ctx cd-ctx-push"
+            :class="'cd-ctx-' + usage.level"
+            :title="usageTitle"
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12">
+              <path d="M1.5 9.5a4.5 4.5 0 0 1 9 0" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+              <path d="M3.3 9.5a2.7 2.7 0 0 1 5.4 0" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+              <circle cx="6" cy="9.5" r=".7" fill="currentColor"/>
+            </svg>
+            <span>上下文 {{ usage.percent }}%</span>
+            <span class="cd-ctx-bar"><i :style="{ width: usage.percent + '%' }" /></span>
+          </span>
         </div>
         <div class="cd-input-row">
           <textarea
@@ -915,6 +980,29 @@ function connectorGuide(s: McpServer) {
 .cd-switch.on { background: var(--accent); }
 .cd-chip-native .cd-switch.on { background: var(--violet, #7c5cd6); }
 .cd-switch.on i { left: 11px; }
+
+/* 上下文窗口用量指示 */
+.cd-ctx-push { margin-left: auto; cursor: default; max-width: none; }
+.cd-ctx:hover { border-color: var(--border); color: var(--text-muted); }
+.cd-ctx-bar {
+  position: relative; flex: 0 0 auto;
+  width: 34px; height: 4px; border-radius: 2px;
+  background: var(--border-strong); overflow: hidden;
+}
+.cd-ctx-bar i {
+  position: absolute; inset: 0 auto 0 0;
+  border-radius: 2px; background: currentColor;
+  transition: width .25s ease;
+}
+.cd-ctx-ok { color: var(--text-faint); }
+.cd-ctx-high {
+  color: #b47a1e; border-color: rgba(180, 122, 30, .45);
+  background: rgba(180, 122, 30, .08);
+}
+.cd-ctx-warn {
+  color: #cc5347; border-color: rgba(204, 83, 71, .5);
+  background: rgba(204, 83, 71, .09);
+}
 
 /* 系统通知（上下文压缩等） */
 .cd-notice {
