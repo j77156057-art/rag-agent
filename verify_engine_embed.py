@@ -346,6 +346,18 @@ def process_alive(pid):
     return bool(ok) and code.value == STILL_ACTIVE
 
 
+def terminate_pid(pid):
+    """强制结束进程（模拟引擎崩溃 / 被任务管理器结束），不走优雅的 engine_stop。"""
+    k32 = ctypes.windll.kernel32
+    PROCESS_TERMINATE = 0x0001
+    handle = k32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+    if not handle:
+        return False
+    ok = bool(k32.TerminateProcess(handle, 0))
+    k32.CloseHandle(handle)
+    return ok
+
+
 # ---------------------------------------------------------------------------
 # 窗口截图（GDI → PNG）
 # ---------------------------------------------------------------------------
@@ -914,6 +926,69 @@ def main():
               % (rect_ui['x'] - origin_ui['x'], rect_ui['y'] - origin_ui['y'],
                  rect_ui['width'], rect_ui['height']))
         hwnd_child = new_child          # 后续断言沿用这个新窗口
+
+        print('\n[12] 崩溃后清理：引擎进程异常退出（没走 /api/engine/stop）时看门狗兜底')
+        # 看门狗在 API lifespan 里启动（每 3s 跑 engine_reap_dead）；本脚本直调 gw.* 不走 API，
+        # 所以这里手动起一次（幂等）。引擎自己崩掉时，_EMBED_STATE 会残留失效 hwnd、engine_status
+        # 误报嵌入、embedded_children 列幽灵窗口——看门狗必须自动弹出。
+        gw.start_engine_watchdog()
+        started_c = gw.engine_start(project, godot, '', host.hwnd, False)
+        check('崩溃用例：引擎独立启动', started_c.get('running') is True, started_c.get('error', ''))
+        emb_c = gw.engine_embed(project, host.hwnd)
+        check('崩溃用例：嵌入成功', emb_c.get('ok') is True, emb_c.get('error', ''))
+        pid_c = started_c['pid']
+        check('崩溃用例：嵌入登记存在（崩溃前）',
+              bool(db.embedded_children()) and gw.engine_status(project).get('embedded') is True,
+              'children=%s' % db.embedded_children())
+        killed = terminate_pid(pid_c)
+        check('崩溃用例：已强制结束引擎进程（模拟崩溃）', killed and not process_alive(pid_c),
+              'pid=%s alive=%s' % (pid_c, process_alive(pid_c)))
+        # 看门狗每 3s 跑一次 engine_reap_dead；等它自动弹出 _EMBED_STATE 残留
+        t0 = time.time()
+        reaped = False
+        while time.time() - t0 < 9:
+            if not gw.engine_status(project).get('embedded'):
+                reaped = True
+                break
+            time.sleep(0.3)
+        check('崩溃用例：看门狗自动弹出 _EMBED_STATE（修复误报嵌入）', reaped,
+              'embedded=%s 9s 内未清' % gw.engine_status(project).get('embedded'))
+        check('崩溃用例：desktop_bridge 注册表不再列幽灵窗口',
+              not db.embedded_children(), db.embedded_children())
+        check('崩溃用例：engine_status.running 也变为 False',
+              gw.engine_status(project).get('running') is False)
+        gw.engine_stop(project)   # 对死进程是安全 no-op，但会释放 GPU 租约（本脚本无 gpu 看门狗）
+
+        print('\n[13] DPI 变化后重新定位（跨屏/WebView 缩放：窗口尺寸不变但 DPI 变）')
+        # 前端 matchMedia(resolution) 监听在 DPI 变化时重算"引擎视窗"物理矩形并重 place——
+        # 这里验证后端 engine_place 这条链路能精确落点（父子同坐标空间、不被 DPI 带偏）。
+        started_d = gw.engine_start(project, godot, '', host.hwnd, False)
+        check('DPI 用例：引擎独立启动', started_d.get('running') is True, started_d.get('error', ''))
+        base = {'x': 60, 'y': 70, 'width': 480, 'height': 260}
+        emb_d = gw.engine_embed(project, host.hwnd, base['width'], base['height'], '', 0, base)
+        check('DPI 用例：rect 模式嵌入成功', emb_d.get('ok') is True, emb_d.get('error', ''))
+        child_d = gw.engine_status(project).get('child_hwnd')
+        # 模拟"DPI 变化后前端重算出的新矩形"（缩放 1.5x），验证 place 精确落点
+        scaled = {'x': int(base['x'] * 1.5), 'y': int(base['y'] * 1.5),
+                  'width': int(base['width'] * 1.5), 'height': int(base['height'] * 1.5)}
+        moved_d = gw.engine_place(project, scaled['x'], scaled['y'], scaled['width'], scaled['height'])
+        placed_d = db.window_rect(child_d)
+        origin_d = db.client_origin(host.hwnd)
+        check('DPI 用例：engine_place 按重算矩形精确落点（左/上对齐）',
+              moved_d.get('ok') and abs(placed_d['x'] - (origin_d['x'] + scaled['x'])) <= 2
+              and abs(placed_d['y'] - (origin_d['y'] + scaled['y'])) <= 2,
+              'child=(%s,%s) expect=(%s,%s)'
+              % (placed_d['x'], placed_d['y'], origin_d['x'] + scaled['x'], origin_d['y'] + scaled['y']))
+        check('DPI 用例：尺寸按重算矩形（缩放后）',
+              abs(placed_d['width'] - scaled['width']) <= 2
+              and abs(placed_d['height'] - scaled['height']) <= 2,
+              '%sx%s' % (placed_d['width'], placed_d['height']))
+        check('DPI 用例：重定位后仍保持宿主子窗口（不变成孤儿）',
+              db.parent_of(child_d) == host.hwnd, 'parent=%s' % db.parent_of(child_d))
+        check('DPI 用例：状态仍记 rect 模式',
+              gw.engine_status(project).get('embed_mode') == 'rect',
+              gw.engine_status(project).get('embed_mode'))
+        gw.engine_stop(project)
 
     except Exception as exc:  # noqa: BLE001
         check('自检过程中未抛异常', False, str(exc))

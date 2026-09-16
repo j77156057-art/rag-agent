@@ -627,7 +627,7 @@ def engine_detach(root):
         return {'ok': False, 'was_embedded': True, 'error': str(e)}
 
 
-def engine_focus(root):
+def engine_focus(root, keep_attached=False):
     """把键盘焦点交给嵌入的引擎窗口（用户点工作台后要把焦点还给游戏）。"""
     root_abs = _root(root)
     state = _EMBED_STATE.get(root_abs)
@@ -635,7 +635,7 @@ def engine_focus(root):
         return {'ok': False, 'error': '引擎未嵌入，无需聚焦。'}
     try:
         from desktop_bridge import focus
-        return focus(state['child_hwnd'], state.get('host_hwnd'))
+        return focus(state['child_hwnd'], state.get('host_hwnd'), keep_attached=keep_attached)
     except Exception as e:  # noqa: BLE001
         return {'ok': False, 'error': str(e)}
 

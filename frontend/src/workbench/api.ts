@@ -565,7 +565,7 @@ export const engineApi = {
   /** 引擎视窗随前端布局变化重新定位（弹窗移动、窗口缩放时调用）。 */
   place(rect: EmbedRect) { return postJson<{ ok: boolean; error?: string }>('/api/engine/place', rect) },
   detach() { return postJson<{ ok: boolean; was_embedded?: boolean; error?: string }>('/api/engine/detach', {}) },
-  focusEngine() { return postJson<{ ok: boolean; focused?: number; error?: string }>('/api/engine/focus', {}) },
+  focusEngine(keepAttached = false) { return postJson<{ ok: boolean; focused?: number; error?: string }>('/api/engine/focus', { keep_attached: !!keepAttached }) },
   /** 按宿主当前客户区重排"铺满模式"的嵌入窗口 */
   resizeEngine() { return postJson<{ ok: boolean; error?: string }>('/api/engine/resize', {}) },
   stop() { return postJson<{ ok: boolean; stopped: boolean }>('/api/engine/stop', {}) },

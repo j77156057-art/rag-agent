@@ -188,7 +188,7 @@ async function nativeStart() {
       lastRect = `${rect.x},${rect.y},${rect.width},${rect.height}`
       const size = r.embed?.width && r.embed?.height ? `${r.embed.width}×${r.embed.height}` : '按视窗'
       embedMsg.value = `已嵌入工作台（${size}，宿主 ${r.embed?.host_dpi || hostDpi.value} DPI）`
-      await engineApi.focusEngine().catch(() => {})
+      await engineApi.focusEngine(true).catch(() => {})
     } else if (rect) {
       embedState.value = 'failed'
       embedMsg.value = '引擎已启动但嵌入失败：' + (r.embed_error || '未知原因') + '（已退化为独立窗口）'
@@ -217,6 +217,30 @@ async function nativeDetach() {
     embedMsg.value = ''
     exportMsg.value = r.was_embedded ? '已解除嵌入，引擎回到独立窗口（进程仍在运行）' : '引擎当前未嵌入'
   } catch (e) { embedMsg.value = (e as Error).message }
+}
+
+async function nativeEmbed() {
+  // 仅把已运行的引擎重新嵌进工作台（不重启进程）：切走 play tab 被 detach 后回来用。
+  if (!desktopReady.value) return
+  const rect = autoEmbed.value ? viewportRect() : null
+  if (!rect) return
+  try {
+    const r = await engineApi.embed(rect)
+    if (r.ok && r.embedded) {
+      embedState.value = 'embedded'
+      await syncEngineRect(true)
+      embedMsg.value = `已嵌入工作台（${r.width || '?'}×${r.height || '?'}）`
+      await engineApi.focusEngine(true).catch(() => {})
+    } else {
+      embedState.value = 'off'
+      embedMsg.value = (r as { error?: string }).error || '重新嵌入未完成'
+    }
+  } catch (e) { embedMsg.value = (e as Error).message }
+}
+
+function onViewportFocus() {
+  // 点引擎视窗区主动把键盘焦点交还游戏（最佳努力；引擎子窗口在顶层时系统点击也会自动聚焦）。
+  if (embedState.value === 'embedded') void engineApi.focusEngine().catch(() => {})
 }
 
 async function nativeFocus() {
@@ -347,9 +371,13 @@ watch(open, v => {
   }
 })
 
-// 切走试玩 tab 同理：视窗元素被 v-if 摘掉，必须解除
+// 切走试玩 tab 同理：视窗元素被 v-if 摘掉，必须解除；切回来若引擎还在跑且开着自动嵌入，自动重新嵌回
 watch(tab, v => {
-  if (v !== 'play' && embedState.value === 'embedded') void nativeDetach()
+  if (v !== 'play') {
+    if (embedState.value === 'embedded') void nativeDetach()
+  } else if (nativeRunning.value && autoEmbed.value && embedState.value !== 'embedded' && desktopReady.value) {
+    void nativeEmbed()
+  }
 })
 
 onMounted(() => {
@@ -442,7 +470,7 @@ onUnmounted(() => {
             </div>
 
             <!-- 原生引擎嵌入时，Window 子窗口会盖在这一块矩形上（ref 用于算它的坐标） -->
-            <div ref="engineViewport" class="pb-framewrap">
+            <div ref="engineViewport" class="pb-framewrap" @mousedown="onViewportFocus">
               <iframe
                 v-if="iframeUrl"
                 ref="iframeEl"

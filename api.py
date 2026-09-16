@@ -265,14 +265,18 @@ class EngineEmbedReq(BaseModel):
     offset_y: int = -1
     title_hint: str = ""
 
+
+class EngineFocusReq(BaseModel):
+    """聚焦请求。keep_attached=True 时把引擎线程的输入队列长挂到宿主，
+    使键盘事件持续送到嵌入的引擎（适合"嵌进去后一直在游戏里操作"的场景）；
+    默认 False：取焦一次即解除挂接，避免引擎长期霸占输入队列。"""
+    keep_attached: bool = False
+
 class EnginePlaceReq(BaseModel):
     x: int
     y: int
     width: int
     height: int
-
-class EngineFocusReq(BaseModel):
-    pass
 
 @app.post('/api/desktop/host')
 async def desktop_host_ep(req: DesktopHostReq):
@@ -680,8 +684,8 @@ async def engine_place_ep(req: EnginePlaceReq):
 async def engine_detach_ep():
     root=_project_root_or_error(); return (await run_in_threadpool(engine_detach, root)) if root else {"ok":False,"error":"未配置代码库"}
 @app.post("/api/engine/focus")
-async def engine_focus_ep():
-    root=_project_root_or_error(); return (await run_in_threadpool(engine_focus, root)) if root else {"ok":False,"error":"未配置代码库"}
+async def engine_focus_ep(req: EngineFocusReq):
+    root=_project_root_or_error(); return (await run_in_threadpool(engine_focus, root, req.keep_attached)) if root else {"ok":False,"error":"未配置代码库"}
 @app.post("/api/engine/resize")
 async def engine_resize_ep(offset_y: int = -1):
     root=_project_root_or_error()
