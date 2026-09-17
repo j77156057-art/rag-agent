@@ -18,7 +18,12 @@ import ctypes.wintypes
 import os
 import threading
 
-_HOST_HWND = None
+# 宿主窗口表：project_id -> 宿主 hwnd。键 ``None`` 表示「无项目 / 全局默认宿主」，
+# 等价于改造前的单一 `_HOST_HWND`（生命线：无项目键时行为与今天完全一致）。
+# 桌面壳可为每个已打开的项目各注册一个宿主；未登记项目的查询回落到 ``None`` 键的默认宿主。
+_HOST_STATE = {}
+# 保护 _HOST_STATE 的并发读写（桌面壳注册线程 / API 线程池 / resize 回调并发）。
+_HOST_LOCK = threading.RLock()
 # child hwnd -> {'parent': 原始父窗口, 'style': 原始样式, 'orig_rect': 原始屏幕矩形,
 #               'host': 宿主 hwnd, 'mode': 'rect'|'fill', 'offset_y', 'placed': 当前矩形,
 #               'attached': [伙伴线程id], 'attached_by': 本进程调用线程id}
@@ -118,14 +123,54 @@ def _user32():
     return u
 
 
-def set_host(hwnd):
-    global _HOST_HWND
-    _HOST_HWND = int(hwnd) if hwnd else None
-    return _HOST_HWND
+def set_host(hwnd, project_id=None):
+    """登记（或清除）宿主窗口。返回写入的 hwnd（清除时为 None）。
+
+    兼容两种调用形式（“按项目分桶”是 P5 新增，旧调用方语法完全不变）：
+
+    * ``set_host(12345)`` / ``set_host(None)``：旧形式，登记/清除**默认（无项目）宿主**；
+    * ``set_host(12345, 'prjA')`` 或 ``set_host('prjA', 12345)``：登记**指定项目**的宿主
+      （首参为 ``str`` 时按“project_id 在前”解读，兼容团队约定的参数顺序）。
+
+    ``hwnd`` 为空（None / 0）时**清除**该项目的登记。
+    """
+    # 首参是字符串 → 它是 project_id（团队约定 set_host(project_id, hwnd)）；
+    # 否则首参是 hwnd（旧形式 set_host(hwnd) 或 set_host(hwnd, project_id)）。
+    if isinstance(hwnd, str):
+        hwnd, project_id = project_id, hwnd
+    key = project_id or None
+    value = int(hwnd) if hwnd else None
+    with _HOST_LOCK:
+        if value is None:
+            _HOST_STATE.pop(key, None)
+        else:
+            _HOST_STATE[key] = value
+    return value
+
+
+def host_hwnd(project_id=None):
+    """取某项目的宿主 hwnd。
+
+    未登记的项目、或 ``project_id`` 为空 → **回落默认（None 键）宿主**，保持与改造前
+    `get_host()` 一致（生命线）。因此单宿主场景（桌面壳只注册默认宿主）行为不变。
+    """
+    key = project_id or None
+    with _HOST_LOCK:
+        if key in _HOST_STATE:
+            return _HOST_STATE.get(key)
+        return _HOST_STATE.get(None)
 
 
 def get_host():
-    return _HOST_HWND
+    """默认（无项目）宿主 hwnd；等价旧 `get_host()`。"""
+    with _HOST_LOCK:
+        return _HOST_STATE.get(None)
+
+
+def hosts_snapshot():
+    """全部宿主登记快照 ``{project_id(或 None): hwnd}``（供状态查询）。"""
+    with _HOST_LOCK:
+        return dict(_HOST_STATE)
 
 
 # ---------------------------------------------------------------------------
@@ -578,10 +623,18 @@ def fill_host(hwnd_child: int, offset_y=None):
         return {'ok': False, 'error': str(e)}
 
 
-def fill_all(offset_y=None):
-    """把所有"铺满模式"的嵌入窗口按当前宿主客户区重排（桌面壳 resize 事件用）。"""
+def fill_all(offset_y=None, project_id=None):
+    """把所有"铺满模式"的嵌入窗口按当前宿主客户区重排（桌面壳 resize 事件用）。
+
+    ``project_id`` 为 ``None`` 时**行为与改造前完全一致**（重排全部嵌入窗口）；给出项目 id
+    时只重排嵌进**该项目宿主**的窗口——多宿主（每项目一个窗口）场景下，某个宿主的 resize
+    只应影响挂在它下面的那批窗口，不能去动别的项目的引擎画面。
+    """
     with _STATE_LOCK:
         hwnds = list(_CHILD_STATE)
+    if project_id is not None:
+        target = host_hwnd(project_id)
+        hwnds = [h for h in hwnds if (_CHILD_STATE.get(h) or {}).get('host') == target]
     # fill_host 内部也会取 _STATE_LOCK；用 RLock 重入安全
     return [fill_host(hwnd, offset_y) for hwnd in hwnds]
 

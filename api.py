@@ -108,7 +108,34 @@ import gpu_coordinator as gpu
 from gpu_coordinator import status as gpu_status, process_environment
 from agent_policy import route_for, permission_check, record_permission, approval_allows, apply_approved_external, routing_status, redact_for_cloud, create_external_approval, list_approvals, decide_approval
 import secrets_store
-_DESKTOP_HOST_HWND = None
+# 桌面宿主表：project_id -> hwnd。键 None = 无项目 / 全局默认宿主（等价旧单一变量，生命线）。
+# 桌面壳可为每个已打开项目各注册一个宿主；引擎端点取「本请求项目」的宿主，未登记则回落默认。
+_DESKTOP_HOSTS: dict = {}
+
+
+def _desktop_host_for(project_id):
+    """取某项目的桌面宿主 hwnd；``project_id`` 为空 / 未登记 → 回落默认（None 键）宿主。
+
+    与 ``desktop_bridge.host_hwnd`` 语义一致：单宿主场景（只注册了默认宿主）行为不变。
+    """
+    key = project_id or None
+    if key in _DESKTOP_HOSTS:
+        return _DESKTOP_HOSTS.get(key)
+    return _DESKTOP_HOSTS.get(None)
+
+
+def _desktop_host_source(project_id) -> str:
+    """标注宿主分辨率来自哪个桶（调试用）：``'project'`` / ``'global'`` / ``'none'``。
+
+    与 ``_desktop_host_for`` 的回落顺序一致：项目桶命中记 ``'project'``，否则若全局桶已登记
+    记 ``'global'``，都没有则 ``'none'``。
+    """
+    key = project_id or None
+    if key is not None and key in _DESKTOP_HOSTS:
+        return 'project'
+    if _DESKTOP_HOSTS.get(None) is not None:
+        return 'global'
+    return 'none'
 
 import workbench_fs
 import asset_sources
@@ -335,7 +362,11 @@ async def agent_connector_route_ep(hint: str = ''):
         return {'ok': False, 'error': str(e), 'matches': []}
 
 class DesktopHostReq(BaseModel):
+    """桌面宿主登记。``project_id`` 可选：给了就登记到该项目（每项目一个宿主）；
+    **不给则落到全局默认键（None）**——旧桌面壳只传 hwnd 时稳定登记到全局桶，
+    行为与改造前一致（不随当前项目漂移）。"""
     hwnd: int
+    project_id: str = ""
 
 class DesktopResizeReq(BaseModel):
     child_hwnd: int
@@ -372,22 +403,37 @@ class EnginePlaceReq(BaseModel):
 
 @app.post('/api/desktop/host')
 async def desktop_host_ep(req: DesktopHostReq):
-    global _DESKTOP_HOST_HWND
-    _DESKTOP_HOST_HWND = int(req.hwnd)
-    return {'ok': True, 'host_hwnd': _DESKTOP_HOST_HWND}
+    # 登记桶**只认显式 project_id**：显式给了就登记到该项目（每项目一个宿主），
+    # 否则落到全局默认键（None）。**绝不**用 _request_project_id() 兜底——旧桌面壳只传
+    # {hwnd}（无 body project_id），必须稳定登记到全局桶，否则会绑到「登记当刻的当前项目」，
+    # 一旦用户切项目，读取路径找不到该宿主 → 生命线（无头 ≡ 旧行为）被破坏。
+    # 新桌面壳 / 多窗口模式下由调用方在 body 里显式传 project_id 来登记项目宿主。
+    pid = req.project_id or None
+    host = int(req.hwnd)
+    _DESKTOP_HOSTS[pid] = host
+    return {'ok': True, 'host_hwnd': host, 'project_id': pid}
 
 @app.get('/api/desktop/host')
-async def desktop_host_get_ep():
-    """桌面宿主信息。浏览器模式下 host_hwnd 为 null，前端据此降级（不显示"自动嵌入"）。"""
-    info = {'ok': True, 'host_hwnd': _DESKTOP_HOST_HWND}
+async def desktop_host_get_ep(project_id: str = ''):
+    """桌面宿主信息。浏览器模式下 host_hwnd 为 null，前端据此降级（不显示"自动嵌入"）。
+
+    ``?project_id=`` 可选：查该项目宿主；**项目桶查不到则回落全局桶**（``_desktop_host_for``），
+    因此单窗口模式下桌面壳只登记了一次全局宿主，用户切项目后本接口仍返回同一宿主——
+    与改造前「查询全局宿主」行为一致（生命线）。不传 ``project_id`` 时按全局桶处理。
+    响应附 ``source``（``'project'`` / ``'global'`` / ``'none'``）便于排查宿主来源。
+    """
+    pid = project_id or None
+    host = _desktop_host_for(pid)
+    info = {'ok': True, 'host_hwnd': host, 'project_id': pid, 'source': _desktop_host_source(pid),
+            'hosts': dict(_DESKTOP_HOSTS)}
     try:
         from desktop_bridge import (client_rect, dpi_awareness, dpi_of, embedded_children,
                                     is_window)
-        info['desktop'] = bool(_DESKTOP_HOST_HWND) and is_window(_DESKTOP_HOST_HWND)
+        info['desktop'] = bool(host) and is_window(host)
         info['dpi_awareness'] = dpi_awareness()
         if info['desktop']:
-            info['client'] = client_rect(_DESKTOP_HOST_HWND)
-            info['dpi'] = dpi_of(_DESKTOP_HOST_HWND)
+            info['client'] = client_rect(host)
+            info['dpi'] = dpi_of(host)
         info['embedded'] = embedded_children()
     except Exception as e:  # noqa: BLE001  桥接层不可用时保持最小响应
         info['desktop'] = False
@@ -780,7 +826,7 @@ async def engine_config_post_ep(req: EngineReq):
 async def engine_start_ep(req: EngineReq):
     root=_project_root_or_error()
     if not root: return {"ok":False,"error":"未配置代码库"}
-    host = req.host_hwnd or _DESKTOP_HOST_HWND
+    host = req.host_hwnd or _desktop_host_for(_request_project_id())
     rect = req.rect if (req.rect or {}).get('width') and (req.rect or {}).get('height') else None
     # P1 单实例策略：启动新引擎前，先停掉「其它项目」的引擎，避免切了项目、旧引擎仍在后台
     # 跑却找不到它（孤儿进程占 GPU、UI 无入口）。同一 root 重复启动由 engine_start 内部
@@ -788,14 +834,21 @@ async def engine_start_ep(req: EngineReq):
     # 失败不应阻断本次启动（_stop_other_engines 内部已容错）。
     stopped, warnings = await _stop_other_engines(root)
     result = await run_in_threadpool(engine_start, root, req.executable, req.scene, host, req.embed, rect)
-    if isinstance(result, dict) and (stopped or warnings):
+    if isinstance(result, dict):
         parts = []
         if stopped:
             parts.append("已自动停止其它项目的引擎：" + "、".join(stopped))
         parts.extend(warnings)
-        note = "；".join(parts)
-        result = {**result, "auto_stopped_roots": stopped, "notice": note}
-        print("[engine] " + note, flush=True)
+        # engine_start 返回的 notice（如软租约的显存不足警告）也要并进来，不能被覆盖。
+        if result.get("notice"):
+            parts.append(result["notice"])
+        if parts:
+            note = "；".join(parts)
+            merged = {**result, "notice": note}
+            if stopped or warnings:
+                merged["auto_stopped_roots"] = stopped
+            result = merged
+            print("[engine] " + note, flush=True)
     return result
 @app.post("/api/engine/stop")
 async def engine_stop_ep():
@@ -805,7 +858,7 @@ async def engine_embed_ep(req: EngineEmbedReq):
     """把已运行的引擎窗口嵌进桌面宿主（引擎视窗模式优先，否则铺满宿主客户区）。"""
     root=_project_root_or_error()
     if not root: return {"ok":False,"error":"未配置代码库"}
-    host = req.host_hwnd or _DESKTOP_HOST_HWND
+    host = req.host_hwnd or _desktop_host_for(_request_project_id())
     offset = EMBED_TOP_STRIP if req.offset_y < 0 else req.offset_y
     rect = None
     if req.width > 0 and req.height > 0:

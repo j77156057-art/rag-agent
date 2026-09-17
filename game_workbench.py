@@ -735,10 +735,13 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
     elif selected == 'unreal': args=[executable, os.path.join(root_abs, scene)] if scene else [executable, root_abs]
     else: args=[executable, '--path', root_abs]
     if scene and selected == 'godot': args += ['--editor']
-    # 引擎是长生命周期 GPU 占用方：启动前先拿租约（ttl=0 不限期，由 engine_stop 释放），
-    # 并在 Popen 前把租约卡号注入 CUDA_VISIBLE_DEVICES——这是物理设备隔离的接线点。
+    # 引擎是长生命周期 GPU 占用方：启动前先拿**软租约**（exclusive=False）——
+    # 引擎需要多开（每个项目一个引擎），硬租约会让第二个引擎被"GPU 正忙"挡住。
+    # 软租约仍登记（供 gpu_status 展示、进程死亡回收），但不参与互斥；ttl=0 不限期，
+    # 由 engine_stop / 进程死亡看门狗 force_release 释放。Popen 前把租约卡号注入
+    # CUDA_VISIBLE_DEVICES——这是物理设备隔离的接线点。
     lease_owner = 'engine:' + root_abs
-    lease = _gpu.acquire_lease(lease_owner, timeout=2, purpose=selected, ttl=0)
+    lease = _gpu.acquire_lease(lease_owner, timeout=2, purpose=selected, ttl=0, exclusive=False)
     if not lease.get("ok"):
         return {'ok': False, 'error': 'GPU 资源正忙，无法启动引擎。', 'reason': lease.get('reason')}
     child_env = os.environ.copy()
@@ -751,6 +754,10 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
         _gpu.register_process(p.pid, lease_owner, lease.get('gpu'), selected)
         _ENGINE_LOGS[root_abs] = log
         result = {"ok": True, "running": True, "pid": p.pid, "gpu": lease.get("gpu")}
+        # 软租约下显存门槛只出警告、不阻断（单卡让用户自行判断）；透传给前端展示。
+        if lease.get("warning"):
+            result["notice"] = lease["warning"]
+            result["gpu_warning"] = lease["warning"]
         if embed and host_hwnd:
             # 引擎建窗口是异步的：轮询直到找到窗口并嵌入成功，或超时。
             # rect 给了就嵌到前端口算的"引擎视窗"，否则按宿主客户区铺满。

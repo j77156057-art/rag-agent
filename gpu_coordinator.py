@@ -53,8 +53,13 @@ PROBE_CACHE_TTL = float(os.getenv("DOCMIND_GPU_PROBE_CACHE_TTL", "0.5") or 0.5)
 _lock = threading.Lock()
 _cv = threading.Condition(_lock)
 
-# gpu_key -> {"owner","purpose","since","ttl"}；serial 只有一个键 0
+# gpu_key -> {"owner","purpose","since","ttl","exclusive"}；serial 只有一个键 0。
+# exclusive=True（默认）为**硬租约**，互相独占；exclusive=False 为软租约，见 _soft_leases。
 _leases: dict = {}
+# 软租约登记：owner -> {"owner","purpose","since","ttl","gpu","exclusive":False}。
+# 软租约**只登记、不占 _leases 槽位**：不参与互斥判定、不被任何人阻挡，也不阻挡任何人，
+# 仅供 status() 展示与 TTL / 显式 release 回收（引擎“多开”所需）。
+_soft_leases: dict = {}
 _waiters = collections.deque()  # token: {owner,purpose,event,gpu,min_free,granted,canceled}
 _activities = {}                # owner -> 最近活动时间戳（Ollama 空闲判定）
 _hooks = {}                     # 名字 -> 无参可调用（驱逐钩子，在锁外执行）
@@ -303,11 +308,15 @@ def _mem_of(mem, key):
 
 
 def _drop_expired_locked(now):
-    """TTL 到期租约清空（只清不转交，转交统一走 _pump_locked）。"""
+    """TTL 到期租约清空（只清不转交，转交统一走 _pump_locked）。硬 / 软租约都清理。"""
     for key, lease in list(_leases.items()):
         ttl = lease.get("ttl") or 0
         if ttl and lease["since"] and now - lease["since"] > ttl:
             del _leases[key]
+    for owner, lease in list(_soft_leases.items()):
+        ttl = lease.get("ttl") or 0
+        if ttl and lease["since"] and now - lease["since"] > ttl:
+            del _soft_leases[owner]
 
 
 def _pump_locked(now, mem):
@@ -345,7 +354,7 @@ def _pump_locked(now, mem):
             break  # 队首要的卡忙/显存不足，后面一律不许插队
         _waiters.popleft()
         _leases[chosen] = {"owner": tok["owner"], "purpose": tok["purpose"],
-                           "since": now, "ttl": tok["ttl"]}
+                           "since": now, "ttl": tok["ttl"], "exclusive": True}
         _persist_runtime_locked()
         tok["granted"] = True
         tok["gpu"] = chosen
@@ -385,7 +394,8 @@ def _try_grant_locked(owner, purpose, ttl, gpu, min_free, now, mem):
     free_keys = [k for k in keys if k not in _leases]
     if free_keys:
         key = free_keys[0]
-        _leases[key] = {"owner": owner, "purpose": purpose, "since": now, "ttl": ttl}
+        _leases[key] = {"owner": owner, "purpose": purpose, "since": now, "ttl": ttl,
+                        "exclusive": True}
         _persist_runtime_locked()
         return ("granted", key, False)
     return ("wait", busy_keys[0] if busy_keys else None, False)
@@ -393,8 +403,43 @@ def _try_grant_locked(owner, purpose, ttl, gpu, min_free, now, mem):
 
 # --------------------------------------------------------------------------- 租约 API
 
+def _acquire_soft_lease(owner, purpose, ttl, want_gpu, threshold):
+    """登记一条**软租约**（``exclusive=False``）并立即成功。
+
+    软租约语义（明确写入此处，供 P5 收口核对）：
+    - **登记**在 ``_soft_leases``（键 = owner），供 ``status()`` 展示与 TTL / ``release`` 回收；
+      它**不进入** ``_leases`` 互斥槽位，因此**不参与互斥判定**；
+    - **不阻挡**任何硬租约（硬租约只看 ``_leases`` 是否空闲），也**不被**任何硬租约阻挡；
+    - 多个 ``exclusive=False`` 请求可**同时成功**（各自登记）；
+    - 同一 owner 重复申请会覆盖旧登记（幂等重入）；
+    - 不写入持久化文件（重启即丢，避免被当作 recovered 事件）；
+    - 显存门槛（``min_free_mb``）只产出**软警告**，绝不拒绝——单卡上让用户自己判断。
+    """
+    now = time.time()
+    gpu_key = want_gpu if want_gpu is not None else _env_index()
+    warning = None
+    if threshold:
+        try:
+            mem = memory_info()
+        except Exception:  # noqa: BLE001
+            mem = None
+        g = _mem_of(mem, gpu_key)
+        if g and (g["total_mb"] - g["used_mb"]) < threshold:
+            free = max(0, int(g["total_mb"] - g["used_mb"]))
+            warning = (f"显存不足：当前剩余 {free}MB < 门槛 {threshold}MB"
+                       f"（软租约不阻断启动，请自行确认）")
+    with _cv:
+        _drop_expired_locked(now)
+        _soft_leases[owner] = {"owner": owner, "purpose": purpose, "since": now,
+                               "ttl": ttl, "gpu": gpu_key, "exclusive": False}
+    out = {"ok": True, "gpu": gpu_key, "mode": GPU_MODE, "exclusive": False, "soft": True}
+    if warning:
+        out["warning"] = warning
+    return out
+
+
 def acquire_lease(owner, timeout=2.0, purpose="", ttl=None, gpu=None,
-                  min_free_mb=None, evict=()):
+                  min_free_mb=None, evict=(), exclusive=True):
     """申请租约，返回结果字典。
 
     - ``gpu``：multi 模式指定卡号，None=自动挑最空的卡；
@@ -402,7 +447,10 @@ def acquire_lease(owner, timeout=2.0, purpose="", ttl=None, gpu=None,
     - ``evict``：仅当因显存门槛被拒绝（无租约挡路、显存被外部驻留占用）时，
       按名调用已注册的驱逐钩子（锁外执行，例如卸载 Ollama 驻留模型），
       重新探测后只重试一次；有活跃持有者导致的排队等待不触发驱逐；
-    - ``ttl``：秒，0/None 取 DEFAULT_TTL。
+    - ``ttl``：秒，0/None 取 DEFAULT_TTL；
+    - ``exclusive``：**默认 True（保持所有既有调用方语义不变）**——硬租约，互相独占。
+      传 ``False`` 得到**软租约**：只登记、不参与互斥、不阻挡也不被阻挡（见
+      ``_acquire_soft_lease``），供引擎“多开”；显存门槛对软租约只产出 ``warning`` 不拒绝。
 
     返回的 ``gpu`` 只是协调层选出的物理卡号，**本身不产生任何设备隔离**：
     消费方若自行 ``Popen`` GPU 子进程，必须在启动前往其环境写入
@@ -420,6 +468,10 @@ def acquire_lease(owner, timeout=2.0, purpose="", ttl=None, gpu=None,
 
     if GPU_MODE == "parallel":
         return {"ok": True, "gpu": None, "mode": GPU_MODE, "reentrant": False}
+
+    # 软租约（exclusive=False）：只登记、不互斥、不排队、不因显存门槛被拒（只给警告）。
+    if not exclusive:
+        return _acquire_soft_lease(owner, purpose, lease_ttl, want_gpu, threshold)
 
     mem = memory_info()
     now = time.time()
@@ -495,12 +547,16 @@ def acquire(owner, timeout=2, purpose="", ttl=None):
 
 
 def release(owner):
-    """归还租约并触发队首转交；owner 不匹配（含已 TTL 转交）时静默忽略。"""
+    """归还（硬或软）租约并触发队首转交；owner 不匹配时静默忽略。
+
+    硬租约释放后转交等待者；软租约只从登记表移除（不涉及队列）。
+    """
     if GPU_MODE == "parallel":
         return
     owner = str(owner)
     mem_now = memory_info()
     with _cv:
+        _soft_leases.pop(owner, None)   # 软租约：直接注销，无需转交
         key = next((k for k, v in _leases.items() if v["owner"] == owner), None)
         if key is None:
             return
@@ -530,25 +586,32 @@ def reown(old_owner, new_owner, purpose=None, ttl=None):
 
 
 def force_release(owner=None):
-    """强制回收：指定 owner 只收它；不指定回收全部并转交等待者。
+    """强制回收（硬 + 软租约）：指定 owner 只收它；不指定回收全部并转交等待者。
 
     返回被回收的 owner 字符串（多个用逗号连接），没有租约时返回 None。
+    进程死亡看门狗 `_recover_processes` 走这里回收引擎的软租约。
     """
     if GPU_MODE == "parallel":
         return None
     mem_now = memory_info()
     with _cv:
         if owner is not None:
-            key = next((k for k, v in _leases.items() if v["owner"] == str(owner)), None)
-            if key is None:
+            owner = str(owner)
+            key = next((k for k, v in _leases.items() if v["owner"] == owner), None)
+            if key is not None:
+                prev = _leases.pop(key)["owner"]
+                _persist_runtime_locked()
+            elif owner in _soft_leases:
+                prev = _soft_leases.pop(owner)["owner"]
+            else:
                 return None
-            prev = _leases.pop(key)["owner"]
-            _persist_runtime_locked()
         else:
-            if not _leases:
+            owners = [v["owner"] for v in _leases.values()] + list(_soft_leases)
+            if not owners:
                 return None
-            prev = ",".join(v["owner"] for v in _leases.values())
+            prev = ",".join(owners)
             _leases.clear()
+            _soft_leases.clear()
             _persist_runtime_locked()
         _pump_locked(time.time(), mem_now)
         _cv.notify_all()
@@ -620,6 +683,8 @@ def _holder_view(key, lease, now):
         "purpose": lease["purpose"],
         "held_for_seconds": round(now - lease["since"], 1) if lease["since"] else None,
         "lease_ttl": lease.get("ttl") or 0,
+        # 硬租约 True（默认）、软租约 False；前端据此区分"独占持有"与"软登记"。
+        "exclusive": lease.get("exclusive", True),
     }
 
 
@@ -630,6 +695,7 @@ def status():
         _drop_expired_locked(now)
         _pump_locked(now, mem)
         leases_snapshot = {k: dict(v) for k, v in _leases.items()}
+        soft_snapshot = [dict(v) for v in _soft_leases.values()]
         queue_snapshot = [{"owner": t["owner"], "purpose": t["purpose"],
                            "gpu": t["gpu"], "waiting_gpu": t["gpu"] is None}
                           for t in _waiters if not t["canceled"]]
@@ -656,6 +722,12 @@ def status():
             "queue": queue_snapshot,
         })
 
+    # 软租约也计入 holders（供前端/gpu_status 展示）；附 soft=True 与 exclusive=False 便于区分。
+    soft_holders = [{"gpu": v.get("gpu"), "soft": True, **_holder_view(v.get("gpu"), v, now)}
+                    for v in soft_snapshot]
+    hard_holders = [{"gpu": k, **_holder_view(k, v, now)}
+                    for k, v in sorted(leases_snapshot.items(), key=lambda x: str(x[0]))]
+
     primary = leases_snapshot.get(0) or (next(iter(leases_snapshot.values()), None))
     ps = process_status()
     return {
@@ -667,7 +739,8 @@ def status():
         "device_index": next(iter(leases_snapshot), _env_index()),
         "held_for_seconds": round(now - primary["since"], 1) if primary and primary["since"] else None,
         "lease_ttl": (primary.get("ttl") if primary else 0) or 0,
-        "holders": [{"gpu": k, **_holder_view(k, v, now)} for k, v in sorted(leases_snapshot.items(), key=lambda x: str(x[0]))],
+        "holders": hard_holders + soft_holders,
+        "soft_holders": soft_holders,
         "queue": queue_snapshot,
         "queue_length": len(queue_snapshot),
         "memory": mem,

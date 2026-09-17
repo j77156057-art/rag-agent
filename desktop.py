@@ -101,12 +101,40 @@ def _open_browser() -> bool:
     except Exception:  # noqa: BLE001
         return False
 
+def probe_multi_window_support():
+    """静态探测 pywebview 是否具备"每项目一个宿主窗口"的能力。
+
+    ⚠️ 只做**静态**能力探测（包版本 + API 存在性），返回值仅表示"允许尝试多窗口"，
+    **不代表真机同时开两个 edgechromium 窗口并各自嵌入引擎已被验证**——本机无法证实
+    多窗口同时嵌入（见 desktop_bridge 宿主表已就绪，默认仍走单窗口）。
+    返回 ``(ok, reason)``。
+    """
+    try:
+        import webview
+        try:
+            from importlib.metadata import version as _pkg_version
+            ver = _pkg_version("pywebview")
+        except Exception:  # noqa: BLE001
+            ver = getattr(webview, "__version__", "") or ""
+        major = 0
+        head = str(ver).split(".")[0] if ver else ""
+        major = int("".join(ch for ch in head if ch.isdigit()) or 0)
+        multi_api = hasattr(webview, "windows") and hasattr(webview, "create_window")
+        ok = bool(multi_api and major >= 4)
+        return ok, f"pywebview {ver or '?'} (multi_api={multi_api}, major={major})"
+    except Exception as e:  # noqa: BLE001
+        return False, "pywebview 不可用：" + str(e)
+
+
 def build_host_window(api_base: str = "", title: str = "DocMind 开发工作台",
-                      width: int = 1440, height: int = 920):
+                      width: int = 1440, height: int = 920, project_id: str = ""):
     """创建 pywebview 原生宿主窗口并绑定事件，返回 window 对象（**不启动事件循环**）。
 
     抽成独立函数是为了让自动化测试能驱动同一套宿主逻辑（标题、最小尺寸、宿主 HWND 注册、
     resized/shown/closing 事件接线），而不是在测试里各写一份——两份实现必然漂移。
+
+    ``project_id``：非空时把宿主登记到**该项目**（多窗口/多项目场景）；为空则登记到全局
+    默认键，行为与改造前一致（生命线）。
     """
     import webview
     class _DesktopApi:
@@ -116,11 +144,14 @@ def build_host_window(api_base: str = "", title: str = "DocMind 开发工作台"
 
     base = (api_base or API_BASE).rstrip('/')
     page = base + HOME_PATH
+    # 带项目后缀的标题：多窗口时靠它把每个窗口区分开（find_host 按标题子串枚举）。
+    # project_id 为空 → 标题不变，单窗口行为与改造前完全一致。
+    win_title = title if not project_id else f"{title} · {project_id}"
 
     def _host_hwnd():
         """通过标题枚举拿到 pywebview 的宿主 HWND（必须在窗口创建之后）。"""
         from desktop_bridge import find_host
-        host = find_host("DocMind")
+        host = find_host(win_title) or find_host("DocMind")
         return host[0] if host else None
 
     def _register_host():
@@ -130,9 +161,13 @@ def build_host_window(api_base: str = "", title: str = "DocMind 开发工作台"
             return None
         _log("已找到 DocMind 宿主 HWND: %s" % hwnd)
         import desktop_bridge
-        desktop_bridge.set_host(hwnd)
+        desktop_bridge.set_host(hwnd, project_id)
         try:
-            body = ('{"hwnd": %d}' % hwnd).encode()
+            import json as _json
+            payload = {"hwnd": hwnd}
+            if project_id:
+                payload["project_id"] = project_id
+            body = _json.dumps(payload).encode()
             req = urllib.request.Request(base + "/api/desktop/host", data=body,
                                         headers={'Content-Type': 'application/json'},
                                         method='POST')
@@ -156,7 +191,8 @@ def build_host_window(api_base: str = "", title: str = "DocMind 开发工作台"
         """
         try:
             from desktop_bridge import fill_all
-            results = fill_all()
+            # project_id 为空 → fill_all(project_id=None) 行为与改造前完全一致。
+            results = fill_all(project_id=project_id or None)
             if results:
                 _log("%s：已同步 %d 个嵌入窗口" % (reason, len(results)))
         except Exception as e:
@@ -182,7 +218,7 @@ def build_host_window(api_base: str = "", title: str = "DocMind 开发工作台"
         except Exception as e:
             _log("关窗前停止引擎失败：" + str(e))
 
-    win = webview.create_window(title, page, width=width, height=height,
+    win = webview.create_window(win_title, page, width=width, height=height,
                                 min_size=(1024, 680), text_select=True, js_api=_DesktopApi())
     try:
         # pywebview 事件属于具体窗口对象；绑定全局 webview.events 在部分版本不会触发。
