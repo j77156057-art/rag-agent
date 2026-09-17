@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // AI 运行台：把 harness 后端能力（成本预算 / 会话 / 逐轮轨迹 / 技能与钩子）
 // 做成普通人看得懂的面板。静态预览（无后端）时自动使用演示数据。
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   harnessApi, setSessionId, getSessionId, startNewSession,
   type BudgetStatus, type BudgetCheck, type SessionInfo,
@@ -120,6 +120,14 @@ async function loadAll() {
 watch(open, (v) => {
   if (v) void loadAll()
 })
+
+// 项目切换：会话按项目隔离，面板开着时必须重拉（否则仍显示旧项目的会话列表）。
+function onProjectChanged() {
+  currentId.value = getSessionId()
+  if (open.value) void loadAll()
+}
+onMounted(() => window.addEventListener('docmind:project-changed', onProjectChanged))
+onBeforeUnmount(() => window.removeEventListener('docmind:project-changed', onProjectChanged))
 
 function switchTab(k: typeof tab.value) {
   tab.value = k

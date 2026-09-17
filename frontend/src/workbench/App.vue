@@ -25,9 +25,10 @@ import SettingsView from './components/SettingsView.vue'
 import SemanticLocateBar from './components/SemanticLocateBar.vue'
 import WorkspaceTabs from './components/WorkspaceTabs.vue'
 import AssetCenterView from './components/AssetCenterView.vue'
-import { useWorkbench } from './composables/workbench'
+import { useWorkbench, askConfirm } from './composables/workbench'
 import { probeBackend, demoMode, demoTagMap, demoRegionCards } from './composables/demo'
 import { regionColor } from './theme'
+import { projectApi, getProjectId, setProjectId, type ProjectInfo } from './api'
 
 // 演示侧栏的文件 → 业务标签（key 取文件名，与静态示例树对齐）
 const demoBadgeOf = (name: string) => {
@@ -44,6 +45,7 @@ const {
   openRegionMap,
   aiPanelOpen,
   workspace, setWorkspace, seedDemoRegionCards,
+  closeAllTabs, closeRuntime,
 } = useWorkbench()
 
 const dirtyCount = computed(() => tabs.value.filter((t) => t.dirty).length)
@@ -55,6 +57,190 @@ const canRevertActive = computed(() => {
   return !!t && t.writable && t.tracked === true && (t.gitDirty === true || t.dirty)
 })
 const canHistoryActive = computed(() => activeTab.value?.tracked === true)
+
+// ---------------------------------------------------------------- P4 项目选择器
+const projects = ref<ProjectInfo[]>([])
+/** 当前项目 id（与 localStorage 同步，供请求头注入与下拉高亮）。 */
+const currentProjectId = ref(getProjectId())
+const projectMenuOpen = ref(false)
+const projectBusy = ref(false)
+const projectError = ref('')
+const openFormVisible = ref(false)
+const newRoot = ref('')
+/** 取消切换等场景的中性轻提示（非错误，自动消散）。 */
+const projectNotice = ref('')
+let noticeTimer: number | null = null
+
+const currentProject = computed<ProjectInfo | null>(
+  () => projects.value.find((p) => p.project_id === currentProjectId.value) ?? null,
+)
+/** 顶栏展示：项目名 > 根目录 basename > '未选择项目'。 */
+const currentProjectLabel = computed(() => {
+  if (currentProject.value?.name) return currentProject.value.name
+  const root = currentProject.value?.root || tree.value?.code_root || ''
+  return baseName(root) || '未选择项目'
+})
+
+function baseName(p: string): string {
+  const s = (p || '').replace(/[\\/]+$/, '')
+  return s.split(/[\\/]/).pop() || ''
+}
+
+/** 中性轻提示（非错误）：短暂显示后自动消散。 */
+function flashNotice(msg: string) {
+  projectNotice.value = msg
+  if (noticeTimer !== null) window.clearTimeout(noticeTimer)
+  noticeTimer = window.setTimeout(() => { projectNotice.value = ''; noticeTimer = null }, 2600)
+}
+
+/**
+ * 若无未保存标签 → 直接放行（不加摩擦）；否则弹确认。
+ * 返回 true = 继续（无脏标签，或用户确认放弃）；false = 用户取消，调用方必须**完全不切换**。
+ */
+async function confirmDiscardDirty(action: string): Promise<boolean> {
+  const n = dirtyCount.value
+  if (n <= 0) return true
+  const names = tabs.value.filter((t) => t.dirty).map((t) => t.name)
+  const shown = names.slice(0, 8)
+  const more = names.length > shown.length ? `\n…等共 ${n} 个文件` : ''
+  return await askConfirm({
+    title: action,
+    message: `${action}将关闭当前项目的 ${n} 个未保存文件，未保存的改动会丢失。继续${action}？`,
+    detail: shown.join('\n') + more,
+    confirmText: '放弃改动并继续',
+    danger: true,
+  })
+}
+
+/** 拉取项目列表（供切换后刷新；不写 current，避免与切换流程互相覆盖）。 */
+async function refreshProjects() {
+  const r = await projectApi.list()
+  projects.value = r.projects || []
+  return r
+}
+
+/** 启动时与后端 current 对齐（本地为空或与后端不一致 → 以后端为准并回写）。 */
+async function initProjects() {
+  projectError.value = ''
+  try {
+    const r = await refreshProjects()
+    const backendCurrent = r.current || ''
+    if (backendCurrent !== getProjectId()) setProjectId(backendCurrent)
+    currentProjectId.value = backendCurrent
+  } catch (e) {
+    projectError.value = (e as Error).message || '加载项目列表失败'
+  }
+}
+
+/** 桌面壳原生选目录（有则用；浏览器/无桥则返回空串，仅保留文本框）。 */
+async function pickDirectory(): Promise<string> {
+  const w = window as unknown as {
+    pywebview?: { api?: { select_directory?: () => Promise<string> | string } }
+  }
+  const fn = w.pywebview?.api?.select_directory
+  if (typeof fn !== 'function') return ''
+  try {
+    const r = await fn()
+    return typeof r === 'string' ? r : ''
+  } catch {
+    return ''
+  }
+}
+async function browseDirectory() {
+  const dir = await pickDirectory()
+  if (dir) newRoot.value = dir
+}
+
+/** 切换成功后的统一清理：文件树 / 编辑器标签 / 运行面板 / 对话 / 运行台。 */
+async function applyProjectSwitch() {
+  closeAllTabs()   // 关闭旧项目的编辑器标签
+  closeRuntime()   // 关闭运行面板 → SceneRuntimePanel 自动 detach（引擎/画布归位）
+  await loadTree() // 用新项目头重新拉文件树
+  window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
+  window.dispatchEvent(new CustomEvent('docmind:project-changed'))
+}
+
+async function switchProject(pid: string) {
+  projectMenuOpen.value = false
+  if (projectBusy.value || !pid || pid === currentProjectId.value) return
+  projectError.value = ''
+  // 切项目会关闭当前项目全部编辑器标签：有未保存改动时先确认；取消则**完全不切换**
+  // （不调 activate、不改 getProjectId()、不清理标签、UI 选中态保持不变），只给中性轻提示。
+  if (!(await confirmDiscardDirty('切换项目'))) {
+    flashNotice('已取消切换项目')
+    return
+  }
+  const prev = currentProjectId.value
+  projectBusy.value = true
+  try {
+    setProjectId(pid)                       // 先让后续请求带上新项目头
+    const r = await projectApi.activate(pid)
+    if (!r.ok) throw new Error(r.error || '切换项目失败')
+    currentProjectId.value = pid
+    await applyProjectSwitch()
+    await refreshProjects()
+  } catch (e) {
+    setProjectId(prev)                      // 失败回滚，绝不留在「已切其实没切」
+    currentProjectId.value = prev
+    projectError.value = (e as Error).message || '切换项目失败'
+  } finally {
+    projectBusy.value = false
+  }
+}
+
+async function openProject() {
+  if (projectBusy.value) return
+  const root = newRoot.value.trim()
+  if (!root) { projectError.value = '请填写项目目录'; return }
+  projectError.value = ''
+  // 「打开项目」后端会 ensure + activate，同样会关掉当前项目标签 → 走同一道确认；取消则不切换。
+  if (!(await confirmDiscardDirty('打开项目'))) {
+    flashNotice('已取消打开项目')
+    return
+  }
+  const prev = currentProjectId.value
+  projectBusy.value = true
+  try {
+    const r = await projectApi.create(root)  // 后端 ensure + activate
+    if (!r.ok) throw new Error(r.error || '打开项目失败')
+    const pid = r.project_id || ''
+    setProjectId(pid)
+    currentProjectId.value = pid
+    newRoot.value = ''
+    openFormVisible.value = false
+    await applyProjectSwitch()
+    await refreshProjects()
+  } catch (e) {
+    setProjectId(prev)
+    currentProjectId.value = prev
+    projectError.value = (e as Error).message || '打开项目失败'
+  } finally {
+    projectBusy.value = false
+  }
+}
+
+// 下拉菜单用 position:fixed（逃离 .wb-topbar-meta 的 overflow:hidden 裁剪），
+// 位置由按钮实时量取，右边缘做夹取避免溢出视口。
+const projBtn = ref<HTMLElement | null>(null)
+const projMenuStyle = ref<Record<string, string>>({})
+
+function toggleProjectMenu() {
+  const willOpen = !projectMenuOpen.value
+  if (willOpen) {
+    const r = projBtn.value?.getBoundingClientRect()
+    const width = 300
+    let left = r ? Math.round(r.left) : 12
+    const top = r ? Math.round(r.bottom + 6) : 54
+    const maxLeft = Math.max(8, window.innerWidth - width - 8)
+    if (left > maxLeft) left = maxLeft
+    projMenuStyle.value = { top: `${top}px`, left: `${left}px`, width: `${width}px` }
+    projectError.value = ''
+  }
+  projectMenuOpen.value = willOpen
+}
+function closeProjectMenu() {
+  projectMenuOpen.value = false
+}
 
 function beforeUnload(e: BeforeUnloadEvent) {
   if (dirtyCount.value > 0) e.preventDefault()
@@ -74,6 +260,7 @@ onMounted(() => {
   // 先探测同源后端：静态预览（无 FastAPI）进演示模式，不发会失败的树请求。
   void probeBackend().then((online) => {
     if (online) {
+      void initProjects()
       void loadTree()
     } else {
       seedDemoRegionCards(demoRegionCards)
@@ -86,6 +273,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', beforeUnload)
   window.removeEventListener('keydown', onWorkspaceHotkey)
+  if (noticeTimer !== null) { window.clearTimeout(noticeTimer); noticeTimer = null }
 })
 </script>
 
@@ -101,12 +289,58 @@ onBeforeUnmount(() => {
         </span>
         <span class="wb-brand-name">DocMind <em>代码工作台</em></span>
       </div>
-      <div v-if="tree" class="wb-topbar-meta">
-        <span class="wb-rootpath" :title="tree.code_root">
-          <svg width="12" height="12" viewBox="0 0 12 12" class="wb-root-icon"><path d="M1 3 Q1 2.2 1.8 2.2 H4.6 L5.6 3.2 H10.2 Q11 3.2 11 4 V9 Q11 9.8 10.2 9.8 H1.8 Q1 9.8 1 9 Z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
-          {{ tree.code_root }}
-        </span>
+      <div v-if="!demoMode" class="wb-topbar-meta">
+        <div class="wb-proj">
+          <button
+            ref="projBtn"
+            class="wb-proj-btn"
+            :class="{ busy: projectBusy }"
+            :disabled="projectBusy"
+            :title="currentProject ? currentProject.root : '选择或打开一个项目作为工作目录'"
+            @click="toggleProjectMenu"
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" class="wb-proj-icon"><path d="M1 3 Q1 2.2 1.8 2.2 H4.6 L5.6 3.2 H10.2 Q11 3.2 11 4 V9 Q11 9.8 10.2 9.8 H1.8 Q1 9.8 1 9 Z" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+            <span class="wb-proj-name">{{ currentProjectLabel }}</span>
+            <svg class="wb-proj-caret" width="9" height="9" viewBox="0 0 9 9"><path d="M1.5 3.2 L4.5 6.2 L7.5 3.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div v-if="projectMenuOpen" class="wb-proj-backdrop" @click="closeProjectMenu" />
+          <div v-if="projectMenuOpen" class="wb-proj-menu" :style="projMenuStyle" @click.stop>
+            <div v-if="projectError" class="wb-proj-err">{{ projectError }}</div>
+            <div v-if="projects.length" class="wb-proj-list">
+              <button
+                v-for="p in projects"
+                :key="p.project_id"
+                class="wb-proj-item"
+                :class="{ active: p.project_id === currentProjectId }"
+                :title="p.root"
+                :disabled="projectBusy"
+                @click="switchProject(p.project_id)"
+              >
+                <span class="wb-proj-item-name">{{ p.name }}</span>
+                <span v-if="p.project_id === currentProjectId" class="wb-proj-item-check">✓</span>
+              </button>
+            </div>
+            <div v-else class="wb-proj-empty">暂无项目，先「打开项目」</div>
+            <div class="wb-proj-sep" />
+            <button class="wb-proj-open-toggle" @click="openFormVisible = !openFormVisible">＋ 打开项目…</button>
+            <div v-if="openFormVisible" class="wb-proj-form">
+              <input
+                v-model="newRoot"
+                class="wb-proj-input"
+                type="text"
+                placeholder="项目根目录，例如 D:\MyGame"
+                @keydown.enter="openProject"
+              />
+              <div class="wb-proj-form-actions">
+                <button class="wb-proj-browse" title="从本机选择目录" @click="browseDirectory">浏览…</button>
+                <button class="wb-proj-go" :disabled="projectBusy" @click="openProject">打开</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <span v-if="projectNotice" class="wb-proj-notice" role="status">{{ projectNotice }}</span>
         <button
+          v-if="tree"
           class="wb-region-pill"
           :class="{ off: !tree.regions_enabled }"
           :title="tree.regions_enabled ? '查看分区依赖图与各区状态' : '查看分区状态'"

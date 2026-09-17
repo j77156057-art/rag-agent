@@ -122,6 +122,70 @@ button { font-family: inherit; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ---------- P4 项目选择器 ---------- */
+.wb-proj { position: relative; display: flex; min-width: 0; }
+/* 中性轻提示（如「已取消切换项目」），非错误态；短暂出现后自动消散 */
+.wb-proj-notice {
+  font-size: 12px; color: var(--text-muted); background: var(--bg-hover);
+  border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px;
+  white-space: nowrap; animation: wb-proj-notice-in .18s ease-out;
+}
+@keyframes wb-proj-notice-in { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
+.wb-proj-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  max-width: 240px; padding: 3px 9px;
+  background: #f4f7fb; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font-size: 12px; cursor: pointer; font-family: inherit;
+}
+.wb-proj-btn:hover { background: #eaf1fd; border-color: #b9d0f5; }
+.wb-proj-btn:disabled { opacity: .6; cursor: default; }
+.wb-proj-btn.busy { opacity: .75; }
+.wb-proj-icon { flex: 0 0 auto; color: #2f6fed; }
+.wb-proj-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-proj-caret { flex: 0 0 auto; color: var(--text-faint); }
+.wb-proj-backdrop { position: fixed; inset: 0; z-index: 60; }
+.wb-proj-menu {
+  position: fixed; z-index: 61;
+  background: var(--bg-raised); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: var(--shadow-pop); padding: 6px;
+  max-height: 70vh; overflow: auto;
+}
+.wb-proj-err { color: var(--danger); font-size: 12px; padding: 6px 8px; }
+.wb-proj-list { display: flex; flex-direction: column; }
+.wb-proj-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 7px 9px; border: 0; background: transparent; border-radius: 7px;
+  text-align: left; cursor: pointer; color: var(--text); font-size: 12.5px; font-family: inherit;
+}
+.wb-proj-item:hover { background: var(--bg-hover); }
+.wb-proj-item.active { background: var(--bg-selected); color: var(--accent); }
+.wb-proj-item:disabled { opacity: .6; cursor: default; }
+.wb-proj-item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-proj-item-check { color: var(--accent); flex: 0 0 auto; }
+.wb-proj-empty { color: var(--text-faint); font-size: 12px; padding: 8px; }
+.wb-proj-sep { height: 1px; background: var(--border); margin: 6px 2px; }
+.wb-proj-open-toggle {
+  width: 100%; text-align: left; padding: 7px 9px; border: 0; background: transparent;
+  border-radius: 7px; cursor: pointer; color: #2f6fed; font-size: 12.5px; font-family: inherit;
+}
+.wb-proj-open-toggle:hover { background: var(--bg-hover); }
+.wb-proj-form { display: flex; flex-direction: column; gap: 6px; padding: 4px 2px 2px; }
+.wb-proj-input {
+  width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 7px;
+  font-family: var(--font-mono); font-size: 12px; color: var(--text); background: #fff;
+}
+.wb-proj-input:focus { outline: none; border-color: #b9d0f5; box-shadow: 0 0 0 3px #2f6fed1a; }
+.wb-proj-form-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.wb-proj-browse, .wb-proj-go {
+  padding: 5px 12px; border-radius: 7px; font-size: 12px; cursor: pointer; font-family: inherit;
+  border: 1px solid var(--border); background: #fff; color: var(--text);
+}
+.wb-proj-browse:hover { background: var(--bg-hover); }
+.wb-proj-go { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+.wb-proj-go:hover { background: #2a63d4; }
+.wb-proj-go:disabled { opacity: .6; cursor: default; }
+
 .wb-region-pill {
   display: inline-flex;
   align-items: center;
@@ -520,10 +584,13 @@ button { font-family: inherit; }
 /* ---------- 顶栏窄屏分级降级 ---------- */
 /* ≤1450：先收起引擎任务/GPU 两个偏引擎运维的面板 */
 @media (max-width: 1450px) { .wb-tool-te, .wb-tool-gp { display: none; } }
-/* ≤1200：项目路径与分区 pill 让位（分区入口在概览驾驶舱仍可到达）；地图组收掉 */
+/* ≤1200：分区 pill 与地图组让位（分区入口在概览驾驶舱仍可到达）。
+   项目选择器**保留**（切换项目是核心操作），只收窄显示，避免窄屏下无法切项目。 */
 @media (max-width: 1200px) {
-  .wb-topbar-meta { display: none; }
+  .wb-topbar-meta .wb-region-pill { display: none; }
   .wb-topbar-maps { display: none; }
+  .wb-proj-btn { max-width: 150px; }
+  .wb-proj-name { max-width: 104px; }
   .wb-rootpath { max-width: 160px; }
 }
 /* ≤1024：再收 AI 运行台与运行游戏（功能仍可从 AI 助手侧进入） */

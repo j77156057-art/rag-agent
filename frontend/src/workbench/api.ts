@@ -309,10 +309,52 @@ export class FsApiError extends Error {
   }
 }
 
+// ---------------------------------------------------------------- P3/P4 项目上下文
+// 全请求出口统一注入 `X-DocMind-Project`，把每个请求绑定到「当前项目」。
+// 空串 = 未选择项目 → **不注入**（后端缺省回落当前项目，保持生命线）。持久化到
+// localStorage 以便刷新后保持选中；后端切换项目后由 UI 回写对齐。
+const PROJECT_ID_KEY = 'docmind_project_id'
+
+/** 当前项目 id（持久化于 localStorage）；空串表示未选择。 */
+export function getProjectId(): string {
+  try {
+    return localStorage.getItem(PROJECT_ID_KEY) || ''
+  } catch {
+    return '' // 隐私模式 / 无 localStorage：视作未选择
+  }
+}
+
+/** 设置当前项目 id（空串 = 清除选择）；持久化以便刷新后保持。 */
+export function setProjectId(pid: string): void {
+  try {
+    if (pid) localStorage.setItem(PROJECT_ID_KEY, pid)
+    else localStorage.removeItem(PROJECT_ID_KEY)
+  } catch {
+    /* 写入失败（隐私模式等）不影响主流程 */
+  }
+}
+
+/**
+ * 在 init.headers 基础上**合并** `X-DocMind-Project`。
+ *
+ * - 不改动既有头（尤其 `Content-Type`：FormData 场景必须由浏览器自带 multipart boundary）；
+ * - `getProjectId()` 为空时**不注入**，原样返回（生命线：后端回落当前项目）；
+ * - 用 `new Headers(...)` 统一处理 headers 为 `undefined` / 普通对象 / `Headers` 实例三种形态。
+ */
+export function withProject(init?: RequestInit): RequestInit {
+  const base: RequestInit = init ? { ...init } : {}
+  const pid = getProjectId()
+  if (!pid) return base
+  const merged = new Headers(base.headers as HeadersInit | undefined)
+  merged.set('X-DocMind-Project', pid)
+  base.headers = merged
+  return base
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   let res: Response
   try {
-    res = await fetch(url, init)
+    res = await fetch(url, withProject(init))
   } catch {
     throw new FsApiError(0, '无法连接本地服务（127.0.0.1:8000），请确认 DocMind 已启动。')
   }
@@ -351,9 +393,9 @@ async function postJson<T>(url: string, payload: unknown): Promise<T> {
 async function rawJson<T>(url: string, payload?: unknown): Promise<T> {
   let res: Response
   try {
-    res = await fetch(url, payload === undefined
+    res = await fetch(url, withProject(payload === undefined
       ? { method: 'GET' }
-      : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }))
   } catch {
     throw new FsApiError(0, '无法连接本地服务（127.0.0.1:8000），请确认 DocMind 已启动。')
   }
@@ -362,6 +404,83 @@ async function rawJson<T>(url: string, payload?: unknown): Promise<T> {
   } catch {
     throw new FsApiError(res.status, `响应不是合法 JSON（HTTP ${res.status}）`)
   }
+}
+
+// ---------------------------------------------------------------- 项目 API（P3 端点）
+export interface ProjectInfo {
+  project_id: string
+  root: string
+  name: string
+  created_at?: string
+  last_opened?: string
+}
+
+export interface ProjectListResp {
+  ok: boolean
+  current: string
+  projects: ProjectInfo[]
+}
+
+export interface ProjectMutationResp {
+  ok: boolean
+  project_id?: string
+  project?: ProjectInfo
+  code_root?: string
+  current?: string
+  notice?: string
+  error?: string
+}
+
+/**
+ * 项目 CRUD 的原始通道：**不**把 `ok:false` 抛错，便于 UI 读失败体里的 `error`
+ * （例如「目录不存在」「项目名称不能为空」）；只有网络不可达或响应非 JSON 才抛错。
+ * 全部经 `withProject` 注入项目头。
+ */
+async function projectRequest<T>(url: string, init?: RequestInit): Promise<T> {
+  let res: Response
+  try {
+    res = await fetch(url, withProject(init))
+  } catch {
+    throw new FsApiError(0, '无法连接本地服务（127.0.0.1:8000），请确认 DocMind 已启动。')
+  }
+  try {
+    return (await res.json()) as T
+  } catch {
+    throw new FsApiError(res.status, `响应不是合法 JSON（HTTP ${res.status}）`)
+  }
+}
+
+export const projectApi = {
+  /** 项目列表 + 当前项目。返回字段：ok / current / projects[]。 */
+  list(): Promise<ProjectListResp> {
+    return projectRequest<ProjectListResp>('/api/projects')
+  },
+  /** 登记并激活一个代码库（后端 ensure+activate）。root 必须是已存在目录。 */
+  create(root: string, name?: string): Promise<ProjectMutationResp> {
+    return projectRequest<ProjectMutationResp>('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root, name: name || '' }),
+    })
+  },
+  /** 把某项目切为「当前项目」。 */
+  activate(pid: string): Promise<ProjectMutationResp> {
+    return projectRequest<ProjectMutationResp>(
+      `/api/projects/${encodeURIComponent(pid)}/activate`, { method: 'POST' })
+  },
+  /** 重命名项目（仅登记信息，不动磁盘）。 */
+  rename(pid: string, name: string): Promise<ProjectMutationResp> {
+    return projectRequest<ProjectMutationResp>(`/api/projects/${encodeURIComponent(pid)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    })
+  },
+  /** 注销项目登记（不删磁盘上的索引/会话）。 */
+  remove(pid: string): Promise<ProjectMutationResp> {
+    return projectRequest<ProjectMutationResp>(
+      `/api/projects/${encodeURIComponent(pid)}`, { method: 'DELETE' })
+  },
 }
 
 export const fsApi = {
@@ -930,7 +1049,7 @@ export const genApi = {
   async uploadFrame(file: File) {
     const fd = new FormData()
     fd.append('file', file)
-    const r = await fetch('/api/assets/generate/upload-frame', { method: 'POST', body: fd })
+    const r = await fetch('/api/assets/generate/upload-frame', withProject({ method: 'POST', body: fd }))
     const body = await r.json().catch(() => ({})) as { ok?: boolean; name?: string; error?: string }
     if (!r.ok || !body.ok) throw new FsApiError(r.status, body.error || '首帧上传失败')
     return body.name as string
@@ -1053,7 +1172,7 @@ export const regionsApi = {
   async contracts(): Promise<ContractsResp> {
     let res: Response
     try {
-      res = await fetch('/api/verify_contracts')
+      res = await fetch('/api/verify_contracts', withProject())
     } catch {
       throw new FsApiError(0, '无法连接本地服务（127.0.0.1:8000），请确认 DocMind 已启动。')
     }
@@ -1167,7 +1286,7 @@ export interface SelectionAiRequest {
 async function postSse(url: string, init: RequestInit, h: SseStreamHandlers): Promise<void> {
   let res: Response
   try {
-    res = await fetch(url, { ...init, signal: h.signal })
+    res = await fetch(url, withProject({ ...init, signal: h.signal }))
   } catch (e) {
     if ((e as Error).name === 'AbortError') throw e
     throw new FsApiError(0, '无法连接本地服务（127.0.0.1:8000），请确认 DocMind 已启动。')
@@ -1807,7 +1926,7 @@ export const harnessApi = {
     return request(`/api/sessions/${encodeURIComponent(id)}`)
   },
   deleteSession(id: string): Promise<{ ok: boolean }> {
-    return fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }).then((r) => r.json())
+    return fetch(`/api/sessions/${encodeURIComponent(id)}`, withProject({ method: 'DELETE' })).then((r) => r.json())
   },
   trace(limit = 30): Promise<{ ok: boolean; items: TraceItem[]; summary: TraceSummary }> {
     return request(`/api/trace?limit=${limit}`)
@@ -1826,6 +1945,45 @@ export const harnessApi = {
   },
   reloadHooks(): Promise<{ ok: boolean; errors?: string[] }> {
     return postJson('/api/hooks/reload', {})
+  },
+}
+
+// ---------------------------------------------------------------- Agent 策略 / 审批（P4 收口）
+// 对应后端 /api/agent/*。这些是**项目作用域**请求（审批/授权针对当前项目的外部文件），
+// 必须带上 X-DocMind-Project（经 withProject）。统一走 rawJson 通道：不把 ok:false 抛错，
+// 与原组件「读失败体字段（reason/recorded/approval）」的语义一致。
+export interface AgentRoutingResp { ok?: boolean; auto_cloud_enabled?: boolean }
+export interface AgentConnectorInfo { key: string; label: string; enabled: boolean }
+export interface AgentConnectorsResp { ok?: boolean; connectors?: AgentConnectorInfo[] }
+export interface AgentApproval { id: string; status: string; summary?: string; diff?: string }
+export interface AgentApprovalsResp { ok?: boolean; approvals?: AgentApproval[] }
+export interface AgentPermissionResp { ok?: boolean; recorded?: boolean; reason?: string }
+export interface AgentApprovalCreateResp { ok?: boolean; approval?: AgentApproval; error?: string }
+
+export const agentApi = {
+  /** Agent 路由策略（本地/云端、自动转云开关）。 */
+  routing(): Promise<AgentRoutingResp> {
+    return rawJson<AgentRoutingResp>('/api/agent/routing')
+  },
+  /** 已接入的外部工具（连接器）列表。 */
+  connectors(): Promise<AgentConnectorsResp> {
+    return rawJson<AgentConnectorsResp>('/api/agent/connectors')
+  },
+  /** 外部文件改动审批列表。 */
+  approvals(): Promise<AgentApprovalsResp> {
+    return rawJson<AgentApprovalsResp>('/api/agent/approvals')
+  },
+  /** 为「项目外文件」发起改动审批请求。 */
+  requestApproval(paths: string[], summary: string): Promise<AgentApprovalCreateResp> {
+    return rawJson<AgentApprovalCreateResp>('/api/agent/approvals', { paths, summary })
+  },
+  /** 记录/查询「允许修改项目外文件」的授权。 */
+  permission(payload: { path: string; allow_external: boolean; approved: boolean }): Promise<AgentPermissionResp> {
+    return rawJson<AgentPermissionResp>('/api/agent/permission', payload)
+  },
+  /** 审批决定：approved / rejected。 */
+  decide(id: string, status: string): Promise<{ ok?: boolean }> {
+    return rawJson<{ ok?: boolean }>('/api/agent/approvals/decide', { id, status })
   },
 }
 

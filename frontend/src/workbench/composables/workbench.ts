@@ -555,6 +555,22 @@ export function registerContentGetter(id: number, fn: () => string) {
   contentGetters.set(id, fn)
 }
 
+/**
+ * 切换项目时调用：关闭全部旧项目的编辑器标签，清空选中并回到概览。
+ * 静默丢弃未保存改动——项目切换是显式动作，前端已在切换前给出「会关闭当前打开的文件」提示语义；
+ * 这里不再逐文件弹确认，避免卡在一堆弹窗里无法完成切换。
+ */
+function closeAllTabs() {
+  for (const t of tabs.value) {
+    contentGetters.delete(t.id)
+    docReplacers.delete(t.id)
+  }
+  tabs.value = []
+  activeId.value = null
+  selectedPath.value = null
+  workspace.value = 'overview'
+}
+
 // ---------------------------------------------------------------- 保存
 async function saveTab(id: number, overwrite = false): Promise<boolean> {
   const tab = tabs.value.find((t) => t.id === id)
@@ -1423,6 +1439,7 @@ export function useWorkbench() {
     unityGraphOpen, openUnityGraph, closeUnityGraph,
     // tabs
     activateTab, closeTab, saveTab, saveActive, registerContentGetter, registerDocReplacer,
+    closeAllTabs,
     // P3 git 回滚 / 历史版本
     revertPath, history, openHistory, closeHistory, selectHistoryVersion, restoreSelectedVersion,
     // fs ops

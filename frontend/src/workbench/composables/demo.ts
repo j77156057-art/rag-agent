@@ -2,6 +2,9 @@
 // 静态预览（如 IGA Pages）没有 FastAPI 后端，探测失败后切换为演示数据，
 // 让第一次打开的人也能看懂界面，而不是对着无限转圈的加载态发懵。
 import { ref } from 'vue'
+// P4 收口：开发台内所有 /api/* 请求统一带上当前项目头（withProject）。健康探测本身与项目
+// 无关（后端 /api/health 不读项目上下文），但为一致性也走同一注入；未选项目时不带头（生命线）。
+import { withProject } from '../api'
 
 export const demoMode = ref(false)
 export const demoProbed = ref(false)
@@ -13,7 +16,7 @@ export function probeBackend(timeoutMs = 2500): Promise<boolean> {
     const controller = new AbortController()
     const timer = window.setTimeout(() => controller.abort(), timeoutMs)
     try {
-      const res = await fetch('/api/health', { signal: controller.signal })
+      const res = await fetch('/api/health', withProject({ signal: controller.signal }))
       demoMode.value = !res.ok
     } catch {
       demoMode.value = true
