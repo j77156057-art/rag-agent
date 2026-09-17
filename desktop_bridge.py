@@ -16,11 +16,16 @@
 import ctypes
 import ctypes.wintypes
 import os
+import threading
 
 _HOST_HWND = None
 # child hwnd -> {'parent': 原始父窗口, 'style': 原始样式, 'orig_rect': 原始屏幕矩形,
-#               'host': 宿主 hwnd, 'mode': 'rect'|'fill', 'offset_y', 'placed': 当前矩形}
+#               'host': 宿主 hwnd, 'mode': 'rect'|'fill', 'offset_y', 'placed': 当前矩形,
+#               'attached': [伙伴线程id], 'attached_by': 本进程调用线程id}
 _CHILD_STATE = {}
+# 保护 _CHILD_STATE 的并发读写：看门狗 daemon 线程(start_engine_watchdog)会并发 pop，
+# API 线程池与桌面壳 resize 回调也会并发读写，避免复合操作（如 embed 的 if not in: 赋值）竞态。
+_STATE_LOCK = threading.RLock()
 
 # x64 下必须显式声明指针宽度的签名，否则 Python int 会被按 c_int 截断 HWND。
 _WNDPROCTYPE = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
@@ -418,24 +423,28 @@ def embed(hwnd_child: int, hwnd_host: int, width=None, height=None,
                 return {'ok': False, 'error': host_rect}
 
         if hwnd_child not in _CHILD_STATE:
-            _CHILD_STATE[hwnd_child] = {
-                'parent': int(user32.GetParent(hwnd_child) or 0) or None,
-                'style': style_of(hwnd_child),
-                # 原始屏幕矩形：解除嵌入时用它把窗口放回原处
-                'orig_rect': window_rect(hwnd_child),
-                'host': hwnd_host,
-            }
+            with _STATE_LOCK:
+                if hwnd_child not in _CHILD_STATE:
+                    _CHILD_STATE[hwnd_child] = {
+                        'parent': int(user32.GetParent(hwnd_child) or 0) or None,
+                        'style': style_of(hwnd_child),
+                        # 原始屏幕矩形：解除嵌入时用它把窗口放回原处
+                        'orig_rect': window_rect(hwnd_child),
+                        'host': hwnd_host,
+                    }
         style = style_of(hwnd_child)
         user32.SetWindowLongPtrW(hwnd_child, GWL_STYLE,
                                  (style | WS_CHILD | WS_VISIBLE) & ~_TOPLEVEL_STYLES)
         user32.SetParent(hwnd_child, hwnd_host)
         # 不带动 SWP_NOZORDER：要把它抬到宿主子窗口的顶层，否则会被 WebView2 盖住。
+        # 不带 SWP_NOACTIVATE：嵌入是用户主动操作，焦点交给游戏是预期行为。
         user32.SetWindowPos(hwnd_child, ctypes.c_void_p(0), pos_x, pos_y, size_w, size_h,
                             SWP_FRAMECHANGED | SWP_SHOWWINDOW)
-        state = _CHILD_STATE[hwnd_child]
-        state['mode'] = mode
-        state['offset_y'] = int(offset_y)
-        state['placed'] = {'x': pos_x, 'y': pos_y, 'width': size_w, 'height': size_h}
+        with _STATE_LOCK:
+            state = _CHILD_STATE[hwnd_child]
+            state['mode'] = mode
+            state['offset_y'] = int(offset_y)
+            state['placed'] = {'x': pos_x, 'y': pos_y, 'width': size_w, 'height': size_h}
         return {'ok': True, 'hwnd': hwnd_child, 'host_hwnd': hwnd_host, 'title': title,
                 'mode': mode, 'x': pos_x, 'y': pos_y, 'offset_y': int(offset_y),
                 'width': size_w, 'height': size_h,
@@ -446,7 +455,12 @@ def embed(hwnd_child: int, hwnd_host: int, width=None, height=None,
 
 
 def place(hwnd_child: int, x: int, y: int, width: int, height: int):
-    """把已嵌入的子窗口移到新的矩形（前端布局变化时同步）。"""
+    """把已嵌入的子窗口移到新的矩形（前端布局变化时同步）。
+
+    ⚠️ 必须带 SWP_NOACTIVATE：这是**非用户主动**的重定位（resize / DPI 变化 / 布局变动触发），
+    绝不能把键盘焦点从工作台抢到游戏——否则用户正在工作台打字，窗口一缩放焦点就飞走。
+    （embed 是用户主动点"嵌入"，才不带 NOACTIVATE。）
+    """
     user32 = _user32()
     if user32 is None:
         return {'ok': False, 'error': '仅 Windows 支持'}
@@ -456,10 +470,11 @@ def place(hwnd_child: int, x: int, y: int, width: int, height: int):
             return {'ok': False, 'error': '引擎窗口已失效'}
         x, y, width, height = int(x), int(y), max(1, int(width)), max(1, int(height))
         user32.SetWindowPos(hwnd_child, ctypes.c_void_p(0), x, y, width, height,
-                            SWP_FRAMECHANGED | SWP_SHOWWINDOW)
-        state = _CHILD_STATE.get(hwnd_child)
-        if state is not None:
-            state['placed'] = {'x': x, 'y': y, 'width': width, 'height': height}
+                            SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE)
+        with _STATE_LOCK:
+            state = _CHILD_STATE.get(hwnd_child)
+            if state is not None:
+                state['placed'] = {'x': x, 'y': y, 'width': width, 'height': height}
         return {'ok': True, 'hwnd': hwnd_child, 'x': x, 'y': y,
                 'width': width, 'height': height}
     except Exception as e:  # noqa: BLE001
@@ -489,7 +504,8 @@ def fill_host(hwnd_child: int, offset_y=None):
         if not size_w:
             return {'ok': False, 'error': rect}
         user32.MoveWindow(hwnd_child, 0, int(top), size_w, size_h, True)
-        state['placed'] = {'x': 0, 'y': int(top), 'width': size_w, 'height': size_h}
+        with _STATE_LOCK:
+            state['placed'] = {'x': 0, 'y': int(top), 'width': size_w, 'height': size_h}
         return {'ok': True, 'hwnd': hwnd_child, 'host_hwnd': hwnd_host,
                 'width': size_w, 'height': size_h, 'offset_y': int(top),
                 'host_client': rect}
@@ -499,7 +515,32 @@ def fill_host(hwnd_child: int, offset_y=None):
 
 def fill_all(offset_y=None):
     """把所有"铺满模式"的嵌入窗口按当前宿主客户区重排（桌面壳 resize 事件用）。"""
-    return [fill_host(hwnd, offset_y) for hwnd in list(_CHILD_STATE)]
+    with _STATE_LOCK:
+        hwnds = list(_CHILD_STATE)
+    # fill_host 内部也会取 _STATE_LOCK；用 RLock 重入安全
+    return [fill_host(hwnd, offset_y) for hwnd in hwnds]
+
+
+def _detach_input_queues(state):
+    """撤销 focus(keep_attached=True) 留下的跨线程输入队列挂接（尽力而为）。
+
+    挂接是 AttachThreadInput(调用线程, 引擎线程, True)；引擎进程退出后该挂接由系统自动释放，
+    这里用记录的 (attached_by, 伙伴线程) 对再调一次 False，避免线程池复用线程上残留挂接。
+    目标线程已死时 AttachThreadInput 会失败，捕获后忽略即可。
+    """
+    attached = state.get('attached')
+    by = state.get('attached_by')
+    if not attached or not by:
+        return
+    user32 = _user32()
+    if user32 is None:
+        return
+    for t in attached:
+        if t and t != by:
+            try:
+                user32.AttachThreadInput(ctypes.c_ulong(by), ctypes.c_ulong(t), False)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def detach(hwnd_child: int):
@@ -509,12 +550,13 @@ def detach(hwnd_child: int):
         return {'ok': False, 'error': '仅 Windows 支持'}
     try:
         hwnd_child = int(hwnd_child)
+        with _STATE_LOCK:
+            state = _CHILD_STATE.pop(hwnd_child, None)
         if not is_window(hwnd_child):
-            _CHILD_STATE.pop(hwnd_child, None)
             return {'ok': True, 'already_gone': True}
-        state = _CHILD_STATE.pop(hwnd_child, None)
         if state is None:
             return {'ok': True, 'was_embedded': False}
+        _detach_input_queues(state)   # 清掉 keep_attached 留下的跨线程输入挂接
         parent = state.get('parent') or None
         style = state.get('style')
         if style is not None:
@@ -538,8 +580,10 @@ def detach(hwnd_child: int):
 def embedded_children():
     """当前处于嵌入状态的子窗口列表（供状态查询与"防孤儿"检查）。"""
     user32 = _user32()
+    with _STATE_LOCK:
+        items = list(_CHILD_STATE.items())
     out = []
-    for hwnd, state in list(_CHILD_STATE.items()):
+    for hwnd, state in items:
         out.append({'hwnd': hwnd, 'host': state.get('host'), 'mode': state.get('mode'),
                     'placed': state.get('placed'),
                     'alive': is_window(hwnd) if user32 else False})
@@ -548,7 +592,11 @@ def embedded_children():
 
 def forget(hwnd_child):
     """引擎进程已退出时清理登记（窗口随进程销毁，没有可解除的东西）。"""
-    return _CHILD_STATE.pop(int(hwnd_child), None) is not None
+    with _STATE_LOCK:
+        state = _CHILD_STATE.pop(int(hwnd_child), None)
+    if state:
+        _detach_input_queues(state)   # 进程已死，挂接多已自动释放，这里尽力清理
+    return state is not None
 
 
 # ---------------------------------------------------------------------------
@@ -585,8 +633,8 @@ def focus(hwnd_child: int, hwnd_host=None, keep_attached: bool = False):
         foreground_thread = (user32.GetWindowThreadProcessId(foreground, None)
                              if foreground else 0)
         current_thread = k32.GetCurrentThreadId()
-        target_state = _CHILD_STATE.get(int(hwnd_child)) or {}
-        _CHILD_STATE.setdefault(int(hwnd_child), target_state)
+        with _STATE_LOCK:
+            target_state = _CHILD_STATE.setdefault(int(hwnd_child), {})
         via = []
         attached = []
         try:
@@ -610,7 +658,9 @@ def focus(hwnd_child: int, hwnd_host=None, keep_attached: bool = False):
                 got = int(user32.GetFocus() or 0)
             now_foreground = int(user32.GetForegroundWindow() or 0)
             if keep_attached:
-                target_state['attached'] = attached
+                with _STATE_LOCK:
+                    target_state['attached'] = attached
+                    target_state['attached_by'] = current_thread
         finally:
             if not keep_attached:
                 for thread in attached:

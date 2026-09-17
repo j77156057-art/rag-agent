@@ -672,6 +672,10 @@ def main():
         check('engine_status 反映 rect 模式与当前尺寸',
               gw.engine_status(project).get('embed_mode') == 'rect',
               gw.engine_status(project).get('embed_mode'))
+        # P3-A：engine_place 是"非用户主动"重定位（resize/DPI/布局触发），绝不能抢焦点到引擎
+        fg_after_place = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+        check('engine_place 未把键盘焦点抢到引擎窗口（SWP_NOACTIVATE）',
+              fg_after_place != hwnd_child, 'fg=%s child=%s' % (fg_after_place, hwnd_child))
 
         print('\n[5] 键鼠输入（合成真事件 → 真焦点链路 → 引擎回显）')
         focus_result = gw.engine_focus(project)
