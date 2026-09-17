@@ -1576,6 +1576,23 @@ async def context_usage_ep(session_id: str = ""):
     return {"ok": True, "active": True, **stats}
 
 
+@app.get("/api/sessions/{session_id}")
+async def session_detail_ep(session_id: str):
+    """取回某会话的完整问答历史（供前端刷新页面 / 重开工作台后回灌对话）。
+
+    会话不存在或为空时返回空洞（ok=True + 空 turns，不 404），前端据此静默处理。
+    与同路径的 DELETE 是不同 HTTP 方法，FastAPI 允许二者共存。
+    """
+    data = session_store.load(session_id)
+    return {
+        "ok": True,
+        "session_id": data.get("session_id") or str(session_id or ""),
+        "turns": data.get("turns") or [],
+        "summary": data.get("summary") or "",
+        "updated_at": data.get("updated_at") or "",
+    }
+
+
 @app.delete("/api/sessions/{session_id}")
 async def session_delete_ep(session_id: str):
     # 同时丢弃常驻 Agent，避免删除后旧历史仍在内存里续用

@@ -1230,18 +1230,23 @@ function newSessionId(): string {
   return `web-${hex}`
 }
 
-/** 当前标签页的会话 id（sessionStorage 持久：刷新保留、标签页间互相隔离）。
- *  sessionStorage 不可用（隐私模式 / 非浏览器）时 try/catch 退回模块级 id，保证同页一致。 */
+/** 当前会话 id（优先 localStorage 持久化：窗口/标签关闭、桌面壳重开后仍存活；
+ *  取不到再退回 sessionStorage；两处都写入以兼容旧数据）。
+ *  存储不可用（隐私模式 / 非浏览器）时 try/catch 退回模块级 id，保证同页一致。 */
 export function getSessionId(): string {
   if (cachedSessionId) return cachedSessionId
   try {
-    const existing = sessionStorage.getItem(SESSION_ID_KEY)
+    const existing = localStorage.getItem(SESSION_ID_KEY) || sessionStorage.getItem(SESSION_ID_KEY)
     if (existing) {
       cachedSessionId = existing
+      // 兼容并回填两处存储：旧会话可能只在 sessionStorage 里，新会话写 localStorage
+      try { localStorage.setItem(SESSION_ID_KEY, existing) } catch { /* 存储不可写：仅内存 */ }
+      try { sessionStorage.setItem(SESSION_ID_KEY, existing) } catch { /* 同上 */ }
       return existing
     }
     const fresh = newSessionId()
-    sessionStorage.setItem(SESSION_ID_KEY, fresh)
+    try { localStorage.setItem(SESSION_ID_KEY, fresh) } catch { /* 存储不可写：仅内存 */ }
+    try { sessionStorage.setItem(SESSION_ID_KEY, fresh) } catch { /* 同上 */ }
     cachedSessionId = fresh
     return fresh
   } catch {
@@ -1249,6 +1254,19 @@ export function getSessionId(): string {
     cachedSessionId = newSessionId()
     return cachedSessionId
   }
+}
+
+/** 显式切换当前会话 id（如「继续某段历史对话」）：写入持久存储并刷新模块级缓存。
+ *  返回是否切换成功（空 id 视为无效）。存储不可用时仍更新内存缓存。 */
+export function setSessionId(id: string): boolean {
+  const v = (id || '').trim()
+  if (!v) return false
+  try {
+    try { localStorage.setItem(SESSION_ID_KEY, v) } catch { /* 忽略：仍更新内存 */ }
+    try { sessionStorage.setItem(SESSION_ID_KEY, v) } catch { /* 同上 */ }
+  } catch { /* 存储整体不可用：忽略 */ }
+  cachedSessionId = v
+  return true
 }
 
 export const aiApi = {
@@ -1558,6 +1576,16 @@ export const harnessApi = {
   },
   sessions(): Promise<{ ok: boolean; items: SessionInfo[] }> {
     return request('/api/sessions')
+  },
+  /** 取回某会话的完整问答历史（供刷新/重开后回灌对话）。会话不存在时返回空 turns。 */
+  sessionDetail(id: string): Promise<{
+    ok: boolean
+    session_id: string
+    turns: { user: string; assistant: string; ts?: string }[]
+    summary?: string
+    updated_at?: string
+  }> {
+    return request(`/api/sessions/${encodeURIComponent(id)}`)
   },
   deleteSession(id: string): Promise<{ ok: boolean }> {
     return fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }).then((r) => r.json())

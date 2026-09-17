@@ -3,7 +3,7 @@
 // 做成普通人看得懂的面板。静态预览（无后端）时自动使用演示数据。
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
-  harnessApi,
+  harnessApi, setSessionId,
   type BudgetStatus, type BudgetCheck, type SessionInfo,
   type TraceItem, type TraceSummary, type SkillInfo,
 } from '../api'
@@ -149,6 +149,13 @@ async function removeSession(id: string) {
   const r = await harnessApi.deleteSession(id)
   if (r.ok) sessions.value = sessions.value.filter((x) => x.session_id !== id)
 }
+/** 继续某段历史对话：把该 session_id 切为当前会话并让 AI 助手回灌其历史。 */
+function continueSession(id: string) {
+  if (demoMode.value) { actionMsg.value = '演示模式不能续聊'; return }
+  if (!setSessionId(id)) return
+  open.value = false
+  window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
+}
 async function clearTraces() {
   if (demoMode.value) { traces.value = []; actionMsg.value = '演示记录已清空（刷新后恢复）'; return }
   if (!window.confirm('清空全部操作记录（trace 账本）？')) return
@@ -247,6 +254,7 @@ onBeforeUnmount(() => { open.value = false })
                 <span>{{ s.turns }} 轮问答<template v-if="s.has_summary"> · 已生成早期摘要</template></span>
                 <em>{{ ago(s.updated_at) }}（{{ fmtTime(s.updated_at) }}）</em>
               </div>
+              <button class="hp-btn sm" title="切到这段对话并载入其历史" @click="continueSession(s.session_id)">继续</button>
               <button class="hp-btn danger sm" title="删除这段对话" @click="removeSession(s.session_id)">删除</button>
             </div>
           </div>

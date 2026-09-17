@@ -5,7 +5,7 @@
 //   与 godot-ai 插件安装引导（安装前必须用户确认）。
 import { nextTick, ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
-import { aiApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId } from '../api'
+import { aiApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, setSessionId } from '../api'
 import type { McpServer, ModelConfigInfo, ContextUsage } from '../api'
 import type { SseEvent } from '../api'
 import { mdToHtml, extractFileRefs } from '../markdown'
@@ -260,6 +260,61 @@ async function loadContextUsage() {
   }
 }
 
+// ---------------------------------------------------------------- 历史回灌
+/** 把服务端 turns 按「用户→助手」交替重建成消息列表（历史消息均为已完成态）。 */
+function rebuildFromTurns(turns: { user: string; assistant: string }[]) {
+  const rebuilt: ChatMsg[] = []
+  for (const t of turns) {
+    if (!t) continue
+    if (t.user) {
+      rebuilt.push({ id: msgSeq++, role: 'user', text: t.user, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
+    }
+    if (t.assistant) {
+      rebuilt.push({ id: msgSeq++, role: 'assistant', text: t.assistant, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
+    }
+  }
+  // msgSeq 已随分配递增，天然大于历史消息最大 id，后续新消息 id 不会冲突。
+  messages.value = rebuilt
+  return rebuilt.length
+}
+
+/** 回灌历史：优先当前会话 id；查不到（浏览器存储被清 → 桌面壳重开生成了全新 id）
+ *  则退回最近一段会话续上，并把该 id 写回存储。仅在没有正在发送的消息时执行，
+ *  除非 force（如「继续这段对话」显式切换会话）。 */
+async function restoreHistory(force = false) {
+  if (demoMode.value) return
+  if (sending.value) return
+  if (!force && messages.value.length) return
+  // 记住进入时的消息数：await 期间用户可能已发送新消息（SSE 正在流），
+  // 重建会整体覆盖 messages 并让 live() 匹配不到、静默丢流，故 await 后需复检。
+  const before = messages.value.length
+  try {
+    let detail = await harnessApi.sessionDetail(getSessionId())
+    let turns = detail.turns || []
+    if (!turns.length) {
+      // 当前 id 无历史：取最近一段有内容的会话续上（桌面壳往往不持久浏览器存储）
+      const list = await harnessApi.sessions()
+      const items = list.items || []
+      const recent = items.find((x) => (x.turns || 0) > 0) || items[0]
+      if (recent && recent.session_id && recent.session_id !== getSessionId()) {
+        setSessionId(recent.session_id)
+        detail = await harnessApi.sessionDetail(recent.session_id)
+        turns = detail.turns || []
+      }
+    }
+    if (turns.length) {
+      // 竞态兜底：await 窗口内若有新消息涌入（或正在发送），放弃本次回灌，
+      // 绝不覆盖用户正在进行的对话；force 切换只受 sending 拦截。
+      if (sending.value || (!force && messages.value.length !== before)) return
+      rebuildFromTurns(turns)
+      stickToBottom.value = true
+      await nextTick(scrollToBottom)
+    }
+  } catch {
+    /* 服务未启动 / 无历史：保持空态，不打扰用户 */
+  }
+}
+
 // ---------------------------------------------------------------- 离线演示问答
 function demoAnswer(turnId: number, q: string): Promise<void> {
   return new Promise((resolve) => {
@@ -310,9 +365,15 @@ function demoReply(q: string): string {
 }
 
 // 概览页「去问问 / 试试问 AI」：展开对话台、（可选）预填问题、定位输入框
+// 运行台「继续这段对话」：detail.reload=true 时按当前存储的会话 id 重新回灌历史
 function onFocusChat(ev?: Event) {
-  const q = (ev as CustomEvent<{ q?: string }> | undefined)?.detail?.q
+  const detail = (ev as CustomEvent<{ q?: string; reload?: boolean }> | undefined)?.detail
+  const q = detail?.q
   collapsed.value = false
+  if (detail?.reload) {
+    void restoreHistory(true).then(() => nextTick(() => inputEl.value?.focus()))
+    return
+  }
   nextTick(() => {
     if (q) input.value = q
     inputEl.value?.focus()
@@ -322,6 +383,7 @@ onMounted(() => {
   window.addEventListener('docmind:focus-chat', onFocusChat as EventListener)
   void loadModelConfig()
   void loadContextUsage()
+  void restoreHistory()
 })
 onBeforeUnmount(() => window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener))
 
