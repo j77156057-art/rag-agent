@@ -219,14 +219,16 @@ def _llm_summary(turns, llm) -> str:
         return _naive_summary(turns)
 
 
-def maybe_compact(session_id, turns, llm=None, trigger_tokens=None, keep_tokens=None):
+def maybe_compact(session_id, turns, llm=None, trigger_tokens=None, keep_tokens=None,
+                  project_id=None):
     """历史 token 占用超过模型预算阈值时，把最早的若干轮压缩进 summary。
 
     - trigger_tokens：历史总 token 达到该值即压缩（由 Agent 按模型真实窗口 ×
       COMPACT_TRIGGER_RATIO 换算；1M 窗口模型与 16k 本地模型用各自的阈值）；
     - keep_tokens：压缩后最近原文轮次的 token 目标体积（× COMPACT_KEEP_RATIO），
       至少保留 KEEP_TURNS_MIN 轮；
-    - 轮数超过 MAX_TURNS 硬上限也必压缩（与 token 阈值是「或」关系）。
+    - 轮数超过 MAX_TURNS 硬上限也必压缩（与 token 阈值是「或」关系）；
+    - project_id：摘要读写的项目桶（P3）；缺省 None = 「当前项目」，行为与改动前一致。
     返回 (turns, summary)；未触发压缩时原样返回。
     """
     turns = list(turns or [])
@@ -237,7 +239,7 @@ def maybe_compact(session_id, turns, llm=None, trigger_tokens=None, keep_tokens=
     over_tokens = _turns_tokens(turns, counter) > trigger
     over_turns = len(turns) > MAX_TURNS
     if not over_tokens and not over_turns:
-        return turns, summary_text(session_id)
+        return turns, summary_text(session_id, project_id)
 
     # 从最旧轮次开始弹出，直到最近轮次装进 keep_tokens（轮数硬上限同时收敛），
     # 但给最近 KEEP_TURNS_MIN 轮免死金牌——再超也由每轮 _fit_budget 裁剪兜底。
@@ -248,10 +250,10 @@ def maybe_compact(session_id, turns, llm=None, trigger_tokens=None, keep_tokens=
     ):
         kept.pop(0)
     if len(kept) >= len(turns):
-        return turns, summary_text(session_id)
+        return turns, summary_text(session_id, project_id)
 
     old = turns[: len(turns) - len(kept)]
-    prev = summary_text(session_id)
+    prev = summary_text(session_id, project_id)
     new_sum = _llm_summary(old, llm)
     summary = (prev + "\n" + new_sum).strip() if prev else new_sum
     return kept, summary

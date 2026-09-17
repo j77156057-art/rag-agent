@@ -1,5 +1,6 @@
 """DocMind 配置中心：从 .env 读取，集中管理模型 / 路径 / 参数。"""
 import json
+import contextvars
 import os
 import sys
 import tempfile
@@ -393,12 +394,42 @@ CHAT_IMAGE_ALLOWED_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"
 # 模型类切换仅存于内存（重启恢复 .env）；code_root 例外，经 STATE_FILE 跨重启恢复。
 _RUNTIME = {}
 
+# ---- 请求级项目上下文（P3 端点项目化）----
+# 让 get_runtime('code_root') 变成「请求上下文感知」：api.py 的 project_context_middleware
+# 按 X-DocMind-Project（或 ?project_id=）解析出项目 root 后 set_context_code_root(root)，
+# 于是 tools / regions / workbench_fs / agent 等几十处既有 get_runtime('code_root') 调用
+# 零改动即自动项目化。
+# 关键正确性前提（已用 tests/test_project_routing.py 固化）：FastAPI 的 run_in_threadpool
+# （anyio.to_thread.run_sync）会复制当前 context，故异步端点内核里 await run_in_threadpool(…)
+# 内部仍读到正确 root；而独立 daemon 线程（GPU/引擎看门狗）不继承请求上下文——这是**正确**
+# 行为（它们本就非请求作用域）。
+_CTX_CODE_ROOT: contextvars.ContextVar = contextvars.ContextVar("docmind_ctx_code_root", default=None)
+
+
+def set_context_code_root(value):
+    """把当前执行上下文绑定到某个项目 root；返回用于 reset 的 Token。"""
+    return _CTX_CODE_ROOT.set(value)
+
+
+def reset_context_code_root(token) -> None:
+    """按 Token 还原上下文（必须与 set_context_code_root 配对，严格 try/finally）。"""
+    try:
+        _CTX_CODE_ROOT.reset(token)
+    except (ValueError, LookupError, RuntimeError):
+        pass
+
 
 def set_runtime(key, value):
     _RUNTIME[key] = value
 
 
 def get_runtime(key, default=None):
+    # code_root 走请求上下文优先：项目化请求返回该项目 root，无上下文时回落全局
+    # （行为与改动前完全一致）。
+    if key == "code_root":
+        ctx_root = _CTX_CODE_ROOT.get()
+        if ctx_root:
+            return ctx_root
     return _RUNTIME.get(key, default)
 
 

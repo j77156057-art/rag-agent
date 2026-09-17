@@ -595,14 +595,16 @@ def _extract_plan(text):
 
 class Agent:
     def __init__(self, llm=None, session_id=None, tool_mode=None, plan_mode=False,
-                 depth=0, tool_allowlist=None):
+                 depth=0, tool_allowlist=None, project_id=None):
         self.llm = llm or LLMClient()
         # session_id 为空 = 纯内存会话（测试/临时，行为与旧版一致）；
         # 非空则按会话落盘、跨重启恢复，并启用超阈值摘要压缩。
         self.session_id = session_id
+        # P3：会话按项目隔离；project_id=None = 当前项目（向后兼容）。
+        self.project_id = project_id
         if session_id:
-            self.history = _sessions.history(session_id)
-            self.summary = _sessions.summary_text(session_id)
+            self.history = _sessions.history(session_id, self.project_id)
+            self.summary = _sessions.summary_text(session_id, self.project_id)
         else:
             self.history = []
             self.summary = ""
@@ -952,18 +954,19 @@ class Agent:
                     kept, summary = _sessions.maybe_compact(
                         self.session_id, self.history, self.llm,
                         trigger_tokens=int(_budget * COMPACT_TRIGGER_RATIO),
-                        keep_tokens=int(_budget * COMPACT_KEEP_RATIO))
+                        keep_tokens=int(_budget * COMPACT_KEEP_RATIO),
+                        project_id=self.project_id)
                     if len(kept) < before_n:
                         self.history = kept
                         self.summary = summary
-                        _sessions.save(self.session_id, kept, summary)
+                        _sessions.save(self.session_id, kept, summary, self.project_id)
                         yield {"type": "notice",
                                "text": f"早期 {before_n - len(kept)} 轮对话已自动压缩为摘要，新问答不受影响。"}
                         # 压缩后刷新一次用量指示，让进度条立即回落
                         self.last_context = self.context_stats("")
                         yield {"type": "context", **self.last_context}
                     else:
-                        _sessions.save(self.session_id, self.history, self.summary)
+                        _sessions.save(self.session_id, self.history, self.summary, self.project_id)
                         # 本轮问答已入历史，用量随之上浮，刷新指示
                         self.last_context = self.context_stats("")
                         yield {"type": "context", **self.last_context}

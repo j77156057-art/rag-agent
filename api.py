@@ -13,6 +13,7 @@ import time
 import urllib.request
 import urllib.error
 import uuid
+import contextvars
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -65,6 +66,8 @@ from config import (
     get_context_window_override,
     ensure_dirs,
     _apply_persisted_state,
+    set_context_code_root,
+    reset_context_code_root,
 )
 from ingest import ingest_file, ingest_code_directory, load_project_rules
 from vectorstore import reset_collection, list_sources, count
@@ -115,6 +118,7 @@ import web_export
 import unity_graph
 import agent_trace
 import sessions as session_store
+import projects
 import hooks as agent_hooks
 import skills as agent_skills
 import pricing as pricing_mod
@@ -154,21 +158,95 @@ async def _app_lifespan(app):
 
 app = FastAPI(title="DocMind RAG Agent", lifespan=_app_lifespan)
 
-# 会话隔离：按 session_id 维护各自的 Agent（各持独立历史，跨重启从会话文件恢复）。
-# 不再共用一个模块级单例 —— 那会让不同用户/不同会话的历史串台。
+# 会话隔离：按「项目 + 会话」维护各自的 Agent（各持独立历史，跨重启从会话文件恢复）。
+# 无项目上下文时键退化为纯 session_id（等价改动前）；有项目时为 "pid::session_id"（内存隔离）。
+# 不再共用一个模块级单例 —— 那会让不同用户/不同会话/不同项目的历史串台。
 _SESSION_AGENTS: dict = {}
 
+# P3：本请求绑定的项目 pid（由 project_context_middleware 设置；未设置则回落当前项目）。
+_CTX_PROJECT_ID: contextvars.ContextVar = contextvars.ContextVar("docmind_ctx_project_id", default=None)
 
-def _agent_for(session_id):
+
+def _ctx_project_id() -> str:
+    """本请求上下文里的项目 pid；未设置返回 ""（**不读盘**，可安全用于导入期）。"""
+    return _CTX_PROJECT_ID.get() or ""
+
+
+def _request_project_id() -> str:
+    """本请求的项目 pid：上下文优先，否则回落「当前项目」（会读 STATE_FILE）。"""
+    return _ctx_project_id() or projects.current_project_id()
+
+
+def _agent_key(session_id, project_id=None) -> str:
+    """会话 Agent 的注册键。
+
+    - 无项目上下文（未启用项目 / 无当前项目 / 非请求场景）→ 纯 session_id，
+      与改动前逐字节一致（DOCMIND_PROJECTS=0 时完全回退今日行为）；
+    - 有项目上下文 → "pid::session_id"，避免不同项目的同名会话在内存里串台。
+
+    注意这里的 pid 取**请求上下文**（`_ctx_project_id`），不回落到「当前项目」：
+    否则在非请求场景（测试 / 直调）下会凭空给 Agent 打上项目标签，与今日语义不符。
+    """
     sid = (str(session_id or "").strip() or "default")
-    a = _SESSION_AGENTS.get(sid)
+    pid = (project_id if project_id is not None else _ctx_project_id()) or ""
+    return sid if not pid else f"{pid}::{sid}"
+
+
+def _agent_for(session_id, project_id=None):
+    """取/建会话 Agent；project_id 缺省用请求上下文的项目（见 `_agent_key`）。"""
+    sid = (str(session_id or "").strip() or "default")
+    pid = (project_id if project_id is not None else _ctx_project_id()) or ""
+    key = _agent_key(sid, pid)
+    a = _SESSION_AGENTS.get(key)
     if a is None:
-        a = Agent(session_id=sid)
-        _SESSION_AGENTS[sid] = a
+        a = Agent(session_id=sid, project_id=(pid or None))
+        _SESSION_AGENTS[key] = a
     return a
 
 
+# 模块级默认 Agent（兼容既有引用）。端点内部一律通过 _agent_for("default") 取用，
+# 以便在请求上下文中命中「当前项目」的默认会话 Agent（见 P3 注释）。
 agent = _agent_for("default")
+
+
+def _resolve_request_project(request):
+    """解析请求要绑定的项目：header `X-DocMind-Project` > 查询参数 `?project_id=`。
+
+    解析到的 pid 必须是**已登记项目**；非法/未登记 → 忽略并回落「当前项目」（不返回 400，
+    避免打断旧前端）。无法确定时返回 (None, None)（= 不设上下文，沿用全局 code_root）。
+    """
+    if not projects.enabled():
+        return None, None
+    raw = request.headers.get("x-docmind-project") or request.query_params.get("project_id") or ""
+    pid = (raw or "").strip()
+    if pid:
+        rec = projects.get_project(pid)
+        if rec and rec.get("root"):
+            return pid, rec["root"]
+    cur = projects.current_project_id()
+    if cur and cur != projects.LEGACY_ID:
+        rec = projects.get_project(cur)
+        if rec and rec.get("root"):
+            return cur, rec["root"]
+    return None, None
+
+
+async def _stop_other_engines(target_root):
+    """停掉「非 target_root」的在跑引擎（P1 单实例策略）；返回 (stopped, warnings)。
+
+    停引擎失败只记 warning、绝不中断调用方（启动新引擎 / 切项目 / 激活项目）。
+    """
+    stopped, warnings = [], []
+    target = os.path.abspath(target_root or "")
+    for other in engine_running_roots():
+        if os.path.abspath(other) == target:
+            continue
+        try:
+            await run_in_threadpool(engine_stop, other)
+            stopped.append(other)
+        except Exception as e:  # noqa: BLE001
+            warnings.append(f"未能停止 {other} 的引擎：{e}")
+    return stopped, warnings
 
 class AgentRouteReq(BaseModel):
     prompt: str = ''
@@ -337,6 +415,38 @@ async def optional_api_auth(request: Request, call_next):
         if supplied != API_TOKEN and auth != f"Bearer {API_TOKEN}":
             return JSONResponse({"ok": False, "error": "需要有效的 DocMind API Token。"}, status_code=401)
     return await call_next(request)
+
+
+@app.middleware("http")
+async def project_context_middleware(request: Request, call_next):
+    """P3：把 /api/* 请求绑定到某个项目（header `X-DocMind-Project`，或 `?project_id=` 调试用）。
+
+    - header 优先级高于 query；解析到的 pid 必须是已登记项目，非法/未登记则忽略并回落
+      「当前项目」（不返回 400，避免打断旧前端）；
+    - 无该头且无当前项目 → 不设上下文（沿用全局 code_root，行为与改动前完全一致）；
+    - 用 Token 严格 reset（try/finally），绝不把上下文泄漏到后续请求。
+
+    运行时中间件栈（外→内）：CORS → 本中间件 → optional_api_auth → 路由。
+    CORS 最先注册却最外层（Starlette 用 insert(0)+reversed 组装，最后注册者最外），
+    故本中间件在其内、在鉴权之外：即使鉴权 401，上下文也会在 finally 中复位。
+    """
+    if not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    try:
+        pid, root = _resolve_request_project(request)
+    except Exception:  # noqa: BLE001  解析失败 → 走全局，不打断请求
+        pid, root = None, None
+    if not root:
+        return await call_next(request)
+    token = set_context_code_root(root)
+    ptoken = _CTX_PROJECT_ID.set(pid)
+    try:
+        return await call_next(request)
+    finally:
+        try:
+            _CTX_PROJECT_ID.reset(ptoken)
+        finally:
+            reset_context_code_root(token)
 
 
 # 外部接入：允许浏览器/前端跨域调用本服务（来源由 DOCMIND_CORS_ORIGINS 控制，默认 *）。
@@ -674,19 +784,9 @@ async def engine_start_ep(req: EngineReq):
     rect = req.rect if (req.rect or {}).get('width') and (req.rect or {}).get('height') else None
     # P1 单实例策略：启动新引擎前，先停掉「其它项目」的引擎，避免切了项目、旧引擎仍在后台
     # 跑却找不到它（孤儿进程占 GPU、UI 无入口）。同一 root 重复启动由 engine_start 内部
-    # engine_status()["running"] 逻辑处理，这里只挑非目标 root。
-    # 停引擎是"尽量清理"，失败不应阻断本次启动（engine_stop 可能因桥接/权限抛异常）。
-    target = os.path.abspath(root)
-    stopped = []
-    warnings = []
-    for other in engine_running_roots():
-        if os.path.abspath(other) == target:
-            continue
-        try:
-            await run_in_threadpool(engine_stop, other)
-            stopped.append(other)
-        except Exception as e:  # noqa: BLE001  停不掉旧引擎不该阻断新引擎启动
-            warnings.append(f"未能停止 {other} 的引擎：{e}")
+    # engine_status()["running"] 逻辑处理，这里只挑非目标 root。停引擎是"尽量清理"，
+    # 失败不应阻断本次启动（_stop_other_engines 内部已容错）。
+    stopped, warnings = await _stop_other_engines(root)
     result = await run_in_threadpool(engine_start, root, req.executable, req.scene, host, req.embed, rect)
     if isinstance(result, dict) and (stopped or warnings):
         parts = []
@@ -1345,7 +1445,8 @@ async def ingest(file: UploadFile = File(...)):
     try:
         n = ingest_file(path)
         # 上传新文档 = 新话题开始，清空多轮上下文避免旧问答污染当前问题
-        agent.history = []
+        # P3：清的是「本请求上下文所属项目」的默认会话 Agent（无上下文等价改动前）
+        _agent_for("default").history = []
         _INGESTED.add(file.filename)  # 用原始文件名（无 uuid），配合 pretty_source 保证一致
         return {"ok": True, "chunks": n, "file": file.filename, "ingested_files": sorted(_INGESTED)}
     except Exception as e:  # noqa: BLE001
@@ -1358,41 +1459,47 @@ async def ingest_code(root: str = Form(...)):
     if not os.path.isdir(root):
         return JSONResponse({"ok": False, "error": f"目录不存在: {root}"}, status_code=400)
     # P1 单实例策略：切换项目前，先停掉「非新项目」的引擎，避免切了项目、旧引擎仍在后台跑
-    # 却找不到它（孤儿进程占 GPU、UI 无入口）。与 /api/engine/start 同构，非目标 root 才停；
-    # 停引擎失败只记警告、绝不阻断切换（否则旧引擎异常会让新项目根本切不了）。
-    new_root = os.path.abspath(root)
-    stopped = []
-    warnings = []
-    for other in engine_running_roots():
-        if os.path.abspath(other) == new_root:
-            continue
-        try:
-            await run_in_threadpool(engine_stop, other)
-            stopped.append(other)
-        except Exception as e:  # noqa: BLE001  停不掉旧引擎不该阻断切项目
-            warnings.append(f"未能停止 {other} 的引擎：{e}")
+    # 却找不到它（孤儿进程占 GPU、UI 无入口）。停引擎失败只记警告、绝不阻断切换。
+    stopped, warnings = await _stop_other_engines(root)
+    # P3：本请求所属项目的代码集合（无项目 → legacy 名，等价改动前）。
+    pid = _request_project_id()
+    coll = projects.code_collection(pid)
+    # D1：全局/持久化 code_root 的语义是「**当前项目指针**」，只允许「当前项目」的请求改写它。
+    # 带「非当前项目」头的请求只在项目作用域内建索引，绝不动全局指针与持久化文件
+    # （否则 daemon 线程 / 启动期 / 脚本等跨请求场景会读到错误项目）。
+    affects_current = (not pid) or (pid == projects.current_project_id())
     try:
         # 重新索引前先清空代码集合：本端点语义是"把该目录完整重建索引"，
         # 不 reset 会导致同一切片被重复写入（实测 117 → 234 翻倍）。
-        reset_collection(CODE_COLLECTION_NAME)
-        n = ingest_code_directory(root)
+        reset_collection(coll)
+        n = ingest_code_directory(root, collection=coll)
         abs_root = os.path.abspath(root)
-        set_runtime("code_root", abs_root)
-        save_state("code_root", abs_root)  # 跨重启记住上次选择，启动时由 config 恢复
+        # 保证注册表里「该项目」的 root 正确（非当前项目也登记，但不改当前指针）
+        try:
+            if pid and projects.enabled():
+                projects.ensure_project(abs_root)
+        except Exception:  # noqa: BLE001 —— 登记失败不影响索引结果
+            pass
         # 读项目规则文件（若有），注入 Agent 系统消息，让分区约定随项目生效
         rules = load_project_rules(abs_root)
-        set_runtime("project_rules", rules)
+        if affects_current:
+            set_runtime("code_root", abs_root)
+            save_state("code_root", abs_root)  # 跨重启记住上次选择，启动时由 config 恢复
+            set_runtime("project_rules", rules)
         # 索引代码 = 新话题，清空多轮上下文避免旧问答污染
-        agent.history = []
+        # P3：清的是「本请求上下文所属项目」的默认会话 Agent（无上下文等价改动前）
+        _agent_for("default").history = []
         parts = []
         if stopped:
             parts.append("已自动停止其它项目的引擎：" + "、".join(stopped))
         parts.extend(warnings)
+        if not affects_current:
+            parts.append(f"已为项目 {pid} 建立索引；当前项目未切换")
         return {
             "ok": True,
             "chunks": n,
             "code_root": abs_root,
-            "code_sources": count(CODE_COLLECTION_NAME),
+            "code_sources": count(coll),
             "project_rules_loaded": bool(rules),
             "auto_stopped_roots": stopped,
             "notice": "；".join(parts),
@@ -1503,6 +1610,7 @@ async def chat(
             f"请用 search_code / read_file / grep 工具。"
         )
     routing = route_for(question)
+    # P3：会话 Agent 按「请求上下文里的项目」隔离（无上下文 → 纯 session_id，等价改动前）。
     selected_agent = _agent_for(session_id)
     # 本次请求的逐请求开关改为传给 Agent.run(...)：不再写入共享单例属性，
     # 避免把某次请求的临时开关（工具通道/计划模式）泄漏给同会话的并发请求
@@ -1600,8 +1708,8 @@ async def trace_clear_ep():
 
 @app.get("/api/sessions")
 async def sessions_ep(limit: int = 50):
-    """会话概览：每个 session_id 的轮数、是否有摘要、最后更新时间。"""
-    return {"ok": True, "items": session_store.list_sessions(limit)}
+    """会话概览：每个 session_id 的轮数、是否有摘要、最后更新时间（限本请求项目）。"""
+    return {"ok": True, "items": session_store.list_sessions(limit, project_id=_request_project_id() or None)}
 
 
 @app.get("/api/context")
@@ -1611,7 +1719,8 @@ async def context_usage_ep(session_id: str = ""):
     优先返回该会话 Agent 最近一次问答上报的快照；无快照时实时估算一次
     （ollama/llamacpp 会触发一次 tokenize，故仅在必要时调用）。
     """
-    ag = _SESSION_AGENTS.get(str(session_id or "").strip() or "default")
+    # P3：按「请求上下文里的项目」定位会话 Agent 的注册键（无上下文 → 纯 session_id）。
+    ag = _SESSION_AGENTS.get(_agent_key(session_id))
     if ag is None:
         return {"ok": True, "active": False}
     try:
@@ -1628,7 +1737,7 @@ async def session_detail_ep(session_id: str):
     会话不存在或为空时返回空洞（ok=True + 空 turns，不 404），前端据此静默处理。
     与同路径的 DELETE 是不同 HTTP 方法，FastAPI 允许二者共存。
     """
-    data = session_store.load(session_id)
+    data = session_store.load(session_id, project_id=_request_project_id() or None)
     return {
         "ok": True,
         "session_id": data.get("session_id") or str(session_id or ""),
@@ -1640,9 +1749,90 @@ async def session_detail_ep(session_id: str):
 
 @app.delete("/api/sessions/{session_id}")
 async def session_delete_ep(session_id: str):
-    # 同时丢弃常驻 Agent，避免删除后旧历史仍在内存里续用
-    _SESSION_AGENTS.pop(str(session_id or "").strip() or "default", None)
-    return {"ok": session_store.delete(session_id)}
+    # 同时丢弃常驻 Agent，避免删除后旧历史仍在内存里续用（键与 _agent_for 一致）
+    _SESSION_AGENTS.pop(_agent_key(session_id), None)
+    return {"ok": session_store.delete(session_id, project_id=_request_project_id() or None)}
+
+
+# ---------------------------------------------------------------- 项目 CRUD（P3）
+class ProjectCreateReq(BaseModel):
+    root: str = ""
+    name: str = ""
+
+
+class ProjectRenameReq(BaseModel):
+    name: str = ""
+
+
+async def _activate_project(pid):
+    """激活项目：同步全局 code_root 与 project_rules，并停掉其它项目的引擎。
+
+    返回同步信息 dict（含 code_root 与中文 notice）。停引擎失败只记 warning、不中断。
+    """
+    rec = projects.get_project(pid) or {}
+    root = rec.get("root") or ""
+    stopped, warnings = [], []
+    if root and os.path.isdir(root):
+        set_runtime("code_root", root)
+        try:
+            set_runtime("project_rules", load_project_rules(root))
+        except Exception:  # noqa: BLE001
+            pass
+        stopped, warnings = await _stop_other_engines(root)
+    parts = []
+    if stopped:
+        parts.append("已自动停止其它项目的引擎：" + "、".join(stopped))
+    parts.extend(warnings)
+    return {"code_root": root, "notice": "；".join(parts)}
+
+
+@app.get("/api/projects")
+async def projects_list_ep():
+    """项目列表与当前项目（每项含 pid/root/name/last_opened）。"""
+    return {"ok": True, "current": projects.current_project_id(), "projects": projects.list_projects()}
+
+
+@app.post("/api/projects")
+async def projects_create_ep(req: ProjectCreateReq):
+    """登记一个代码库为项目并激活它（root 必须是已存在目录）。"""
+    root = (req.root or "").strip()
+    if not root or not os.path.isdir(root):
+        return JSONResponse({"ok": False, "error": f"目录不存在：{root}"}, status_code=400)
+    pid = projects.ensure_project(root, req.name or None)
+    projects.set_current(pid)
+    info = await _activate_project(pid)
+    return {"ok": True, "project_id": pid, "project": projects.get_project(pid), **info}
+
+
+@app.post("/api/projects/{pid}/activate")
+async def projects_activate_ep(pid: str):
+    """把某个已登记项目切为当前项目，并同步 code_root / project_rules / 引擎单实例。"""
+    if not projects.get_project(pid):
+        return JSONResponse({"ok": False, "error": f"项目不存在：{pid}"}, status_code=404)
+    projects.set_current(pid)
+    info = await _activate_project(pid)
+    return {"ok": True, "project_id": pid, **info}
+
+
+@app.patch("/api/projects/{pid}")
+async def projects_rename_ep(pid: str, req: ProjectRenameReq):
+    """重命名项目（仅登记信息，不动磁盘）。"""
+    rec = projects.get_project(pid)
+    if not rec:
+        return JSONResponse({"ok": False, "error": f"项目不存在：{pid}"}, status_code=404)
+    name = (req.name or "").strip()
+    if not name:
+        return JSONResponse({"ok": False, "error": "项目名称不能为空。"}, status_code=400)
+    projects.ensure_project(rec["root"], name)
+    return {"ok": True, "project_id": pid, "project": projects.get_project(pid)}
+
+
+@app.delete("/api/projects/{pid}")
+async def projects_delete_ep(pid: str):
+    """注销项目登记（**只注销，绝不删磁盘上的索引/会话**）。"""
+    if not projects.remove_project(pid):
+        return JSONResponse({"ok": False, "error": f"项目不存在：{pid}"}, status_code=404)
+    return {"ok": True, "project_id": pid, "current": projects.current_project_id()}
 
 
 @app.get("/api/budget")
@@ -2014,7 +2204,7 @@ def _build_time() -> str:
 
 def _live_capability(prov: str, model: str):
     """当前运行中的 LLMClient 与目标模型一致时返回其实例画像（含实时探测窗口），否则 None。"""
-    cli = agent.llm
+    cli = _agent_for("default").llm
     if (getattr(cli, "provider", "") == prov and getattr(cli, "model", "") == model
             and isinstance(getattr(cli, "capability", None), dict)):
         return dict(cli.capability)
@@ -2025,7 +2215,7 @@ def _context_source(prov: str, model: str) -> str:
     """当前生效窗口来源：custom 手填 > 运行客户端的 probe/profile > 静态 custom/profile。"""
     if get_context_window_override(prov, model):
         return "custom"
-    cli = agent.llm
+    cli = _agent_for("default").llm
     if (getattr(cli, "provider", "") == prov and getattr(cli, "model", "") == model
             and getattr(cli, "context_source", None)):
         return cli.context_source
@@ -2077,7 +2267,7 @@ async def get_config():
         "embedding_options": ["local", "ollama", "qwen"],
         "ingested_files": sorted(_INGESTED),
         "code_root": get_runtime("code_root") or CODE_ROOT,
-        "code_sources": count(CODE_COLLECTION_NAME),
+        "code_sources": count(projects.code_collection(_request_project_id())),
         "project_rules_loaded": bool(get_runtime("project_rules")),
         "edit_confirm": edit_confirm_enabled(),
         "build_time": _build_time(),
@@ -2634,10 +2824,12 @@ async def set_config(req: ConfigReq):
         ))
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-    agent.llm = new_llm
-    agent.history = []
+    # P3：即时生效于「本请求上下文所属项目」的默认会话 Agent（无上下文等价改动前）
+    _cur_agent = _agent_for("default")
+    _cur_agent.llm = new_llm
+    _cur_agent.history = []
     # 窗口随模型变化，旧的上下文用量快照作废（前端下一轮问答会收到新事件）
-    agent.last_context = None
+    _cur_agent.last_context = None
 
     # 切换 embedding provider：清空向量缓存 + 重建集合（维度可能变化）
     if req.embedding_provider:
@@ -2716,13 +2908,19 @@ async def set_config(req: ConfigReq):
 @app.post("/api/reset_code")
 async def reset_code():
     """清空代码集合并解除代码库配置（重新索引前调用，避免旧切片累积）。"""
-    reset_collection(CODE_COLLECTION_NAME)
-    set_runtime("code_root", "")
-    save_state("code_root", "")  # 同步清除持久化选择，避免重启后又恢复
-    set_runtime("project_rules", "")
+    pid = _request_project_id()
+    coll = projects.code_collection(pid)
+    reset_collection(coll)
+    # D1：全局/持久化 code_root 是「当前项目指针」，只有「当前项目（或无项目）」的请求
+    # 才能清它；带「非当前项目」头时只清该项目的代码集合，不动全局指针与持久化文件。
+    if (not pid) or (pid == projects.current_project_id()):
+        set_runtime("code_root", "")
+        save_state("code_root", "")  # 同步清除持久化选择，避免重启后又恢复
+        set_runtime("project_rules", "")
     clear_read_files()
-    agent.history = []
-    return {"ok": True, "code_sources": count(CODE_COLLECTION_NAME)}
+    # P3：清的是「本请求上下文所属项目」的默认会话 Agent（无上下文等价改动前）
+    _agent_for("default").history = []
+    return {"ok": True, "code_sources": count(coll)}
 
 
 @app.get("/api/pending_edits")
