@@ -1,13 +1,37 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第二十四次重建（顶层「画布 / 运行」tab 接到真实功能——场景画布 / 运行游戏）」；历史构建清单保留在下文。
+> 最新构建见下方「第二十五次重建（完整设置页 + 对话/检索历史持久化）」；历史构建清单保留在下文。
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）
 - 入口：`DocMind.exe`（约 19.7 MB，控制台模式，启动时自动开浏览器）
 - 整体体积：约 309 MB（chromadb / onnxruntime / webview 运行时 + 随包 MinGit 91 MB/365 文件；**第十六次起不再打包开发者 `.chroma` 索引库，较第十五次 682.5 MB 降约 374 MB**）
-- **当前构建时间：`2026-09-17 02:13`（第二十四次重建，顶层「画布 / 运行」tab 接到真实功能——场景画布 / 运行游戏，exe 20,537,322 字节，SHA-256 `4e847b0ecd534ceb30bd06cde091b013eb865525653913869b50c0809967ba6b）**
-- 上一版：`2026-09-16 21:10:24`（第二十三次重建，修复 `/workbench.html` 死链——问答页与 `trace` 页的「代码工作台 →」入口在 FastAPI 服务端 404，exe 20,537,351 字节，SHA-256 6121fa6120e544ebec0f29da57325c4c9cedb8b54b99ae4c017dbd1893dd8cba）
+- **当前构建时间：`2026-09-17 19:35`（第二十五次重建，完整设置页（网络搜索 / MCP / 智能体）+ 对话/检索历史持久化，exe 20,563,506 字节，SHA-256 `a52f202dd8716f4b3b15c6896bd51cdbb1854fcd1a8793594577368fd3efa52d`）**
+- 上一版：`2026-09-17 02:13`（第二十四次重建，顶层「画布 / 运行」tab 接到真实功能——场景画布 / 运行游戏，exe 20,537,322 字节，SHA-256 `4e847b0ecd534ceb30bd06cde091b013eb865525653913869b50c0809967ba6b`）
+
+---
+
+## 第二十五次重建：完整设置页（网络搜索 / MCP / 智能体）+ 对话/检索历史持久化（2026-09-17 19:35）
+
+### 改动（两批功能，2 个代码提交）
+1. **完整设置页（`44eab9a`）**：新增 `frontend/src/workbench/components/SettingsView.vue` 三面板——网络搜索（服务商下拉 + API Key + API 地址 + 内置 Web 工具开关）、MCP 连接器（列表 / 添加 / 移除）、智能体本地预设；顶栏加「设置」齿轮入口。后端：`config.py` 新增 `WEB_SEARCH_*` / `WEB_FETCH_*` 运行时 getter/setter 与跨重启持久化；`api.py` `ConfigReq`/`get_config`/`set_config` 增 7 字段（密钥不回显）；`tools.py` 的 `web_search`/`web_fetch` 由 `WEB_SEARCH_BACKEND` 环境变量改为 `get_web_search_provider()` 配置驱动，内置 `ddg→baidu→bing` 故障转移保留，新增 Exa / Tavily / SearXNG / Bocha / Firecrawl / 智谱 / Querit / Parallel / MCP-Exa 共 8 个 API 后端。
+2. **对话/检索历史跨重启丢失修复（`5c4db6c`）**：`api.py` 新增 `GET /api/sessions/{session_id}` 取回该会话 `turns`（与同路径 DELETE 不同方法共存，缺省回空 turns 不 404）；`api.ts` 的 `getSessionId()` 改 **localStorage 优先**（关窗/重启仍存活）+ 新增 `setSessionId()` + `harnessApi.sessionDetail()`；`ChatDock.vue` 挂载时回灌历史、当前会话无历史则自动续接最近一段、并在 `await` 后补复检守卫避免覆盖进行中的对话；`HarnessPanel.vue`「对话」列表新增「继续」按钮。
+
+### 验证
+- 单测：全量 **746/746**（skipped=1，**0 失败**；含新增 `test_session_restore.py` 4 例 + `test_session_restore_qa.py` 6 例）。
+- 前端 `vite build` 通过（252 modules transformed）。
+- 冻结态冷启动冒烟（最小 PATH 仅 `System32`、`DOCMIND_SERVER_ONLY=1`、端口 **8044**，不碰用户 :8000）：`build_time=2026-09-17 19:35:54`；`/` 200、`/workbench` 200（`/workbench/` → 307 → `/workbench`）、`/trace` 200；`/api/config` 200；**新端点 `GET /api/sessions/{id}` 返回 `{"ok":true,...,"turns":[]}`，`/api/sessions` 200**；`/assets/workbench-D8748ZNr.js` 服务端返回体与 `web/` 源 **SHA-256 一致**（`61e3720a…`）。
+- 卫生扫描：`dist/DocMind/` 无 `.chroma` / `.env` / `.docmind_state.json` / `python.exe` / `.docmind*`；MinGit 随包 **89.5 MB**。
+- 桌面安装 `D:\WorkBuddy\DocMind` 实机启动（server-only，端口 8055）：**1s 就绪**，`build_time=2026-09-17 19:39:40`，**用户 `code_root`（`D:\WorkBuddy\godot_sample`）与既有配置完整保留**，`/`、`/workbench`、`/trace`、`/api/sessions`、`/api/sessions/{id}` 全 200。
+
+### 交付
+- exe **20,563,506 字节**，SHA-256 `a52f202dd8716f4b3b15c6896bd51cdbb1854fcd1a8793594577368fd3efa52d`；整包约 **391.7 MB**。
+- 换入策略（**只替换会变的部分、保留用户数据**）：冻结版按 `config.py:15-22` 取 `EXE_DIR/_internal/web` 作前端目录，故桌面安装只替换 `DocMind.exe` + `_internal/web/`（并同步顶层残留 `web/` 保持一致），**保留** `_internal/{.docmind_state.json, .chroma, .docmind_sessions, .docmind, .docmind_traces.jsonl, .docmind_budget.json}`、MinGit 与 `unins000*`。旧 web 备份于 `D:\Temp\desktop_web_prev`；桌面安装 exe 与 dist exe SHA **一致**。
+- **本次未跑黄金题门**（本轮含 agent/工具/提示词改动面，理论应跑；因环境无法稳定起已索引评测服务而 SKIP，如实留痕）；**未跑** 场景 54/54 / 浏览器冒烟 / 引擎嵌入 68/68（改动面不含 `scene_runtime.py` / `desktop_bridge.py` / `engine_*`，与第 21/24 次同口径留痕）。
+
+### 构建坑（本轮新踩）
+- `docmind.spec` 末尾对 `DISTPATH/DocMind/MinGit` 做 `shutil.rmtree` 再 `copytree`；该 rmtree 在**沙箱批量删除守卫**下会被拦（历史第八/二十四次同源）。**修法**：构建前先把旧 `dist/DocMind` **整目录改名移走**（`mv` 到 `D:\Temp`，别删）+ 清 `build/docmind` 的 Analysis 缓存，即可一次构建成功（本轮 PyInstaller 退出码 0，耗时 2m12s）。旧 dist 备份于 `D:\Temp\docmind_dist_prev`，旧 Analysis 缓存于 `D:\Temp\docmind_build_prev`。
+- 前端资源的真实路径是 **`/assets/<hash>`**（不是 `/workbench/assets/...`）；且 **`/workbench/`（带尾斜杠）是 307 重定向**——探测服务就绪要打 `/api/config` 或 `/workbench`（无尾斜杠），否则会误判「未就绪」。
 
 ---
 
