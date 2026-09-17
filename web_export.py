@@ -148,6 +148,39 @@ def play_token(root):
     return hashlib.sha1(os.path.normcase(os.path.abspath(root)).encode("utf-8")).hexdigest()[:16]
 
 
+# token -> root，供 /play/<token> 反查（浏览器 GET 不带 X-DocMind-Project 头，
+# 不能依赖当前项目上下文）。导出时写入；若服务重启，会从项目注册表 + code_root 回扫兜底。
+_PLAY_TOKEN_ROOTS = {}
+
+
+def root_for_token(token):
+    """按 token 反查工程根目录。找不到返回 None。"""
+    if not token:
+        return None
+    root = _PLAY_TOKEN_ROOTS.get(token)
+    if root and os.path.isdir(root):
+        return root
+    # Fallback：扫描注册项目与全局 code_root，匹配 token。
+    candidates = []
+    try:
+        import projects as _projects
+        candidates.extend([p['root'] for p in _projects.list_projects() if p.get('root')])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import config as _config
+        code_root = _config.get_runtime('code_root') or _config.CODE_ROOT
+        if code_root and code_root not in candidates:
+            candidates.append(code_root)
+    except Exception:  # noqa: BLE001
+        pass
+    for cand in candidates:
+        if cand and os.path.isdir(cand) and play_token(cand) == token:
+            _PLAY_TOKEN_ROOTS[token] = cand
+            return cand
+    return None
+
+
 def web_dir(root):
     return os.path.join(os.path.abspath(root), WEB_DIR_NAME)
 
@@ -412,7 +445,9 @@ def export_web(root, executable, timeout=300):
         fp = os.path.join(out_dir, name)
         if os.path.isfile(fp):
             files[name] = os.path.getsize(fp)
-    return {"ok": True, "token": play_token(root), "url": f"/play/{play_token(root)}/index.html",
+    token = play_token(root)
+    _PLAY_TOKEN_ROOTS[token] = root
+    return {"ok": True, "token": token, "url": f"/play/{token}/index.html",
             "elapsed": round(time.time() - started, 1), "files": files,
             "html_injected": injected, "bridge_changed": changed_bridge,
             "preset_added": preset_added, "output": out[-2000:]}

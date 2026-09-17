@@ -144,7 +144,7 @@ class ApiRouteTests(unittest.TestCase):
             with patch.object(
                     api, 'check_ollama', return_value={'reachable': True, 'guidance': ''}), \
                  patch.object(
-                    api.agent, 'run', return_value=iter([
+                    api.Agent, 'run', return_value=iter([
                         {'type': 'token', 'text': '正常回答'},
                         {'type': 'final', 'text': '正常回答'},
                     ])):

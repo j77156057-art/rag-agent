@@ -598,9 +598,26 @@ def main():
         check('嵌入前带标题栏样式（后面要断言被摘掉）', bool(before_style & 0x00CF0000),
               hex(before_style & 0x00CF0000))
 
-        embedded = gw.engine_embed(project, host.hwnd)
+        # 硬化验证：rect 缺失且未显式 fill 时，必须退化为"安全有界框"（绝不铺满全屏，
+        # 那是"引擎打开直接黑屏、git 按钮被盖住"的根因）。这是 API/集成方"想嵌但没给矩形"
+        # 时的防御性默认。
+        safe = gw.engine_embed(project, host.hwnd)
+        check('rect 缺失且未显式 fill：embed 仍成功（有界框降级而非失败）',
+              safe.get('ok') is True, safe.get('error', ''))
+        check('默认（无 rect）为安全有界框模式，而非铺满',
+              safe.get('mode') == 'rect', safe.get('mode'))
+        hc_safe = db.client_rect(host.hwnd)
+        check('有界框宽度明显小于宿主客户区宽度（未铺满全屏）',
+              int(safe.get('width', 0)) < int(hc_safe['width']) - 10,
+              'box_w=%s host_w=%s' % (safe.get('width'), hc_safe['width']))
+        check('有界框高度明显小于宿主客户区高度（未铺满全屏）',
+              int(safe.get('height', 0)) < int(hc_safe['height']) - 10,
+              'box_h=%s host_h=%s' % (safe.get('height'), hc_safe['height']))
+
+        # 显式 fill=True 才进入铺满模式（保留历史行为，供 [3] 几何校验）
+        embedded = gw.engine_embed(project, host.hwnd, fill=True)
         check('engine_embed 返回 ok', embedded.get('ok') is True, embedded.get('error', ''))
-        check('embed 返回 mode=fill（未指定引擎视窗时为铺满模式）',
+        check('embed 返回 mode=fill（仅显式请求时铺满）',
               embedded.get('mode') == 'fill', embedded.get('mode'))
         status = gw.engine_status(project)
         check('engine_status 报告 embedded:true', status.get('embedded') is True)

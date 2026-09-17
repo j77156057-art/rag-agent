@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -61,6 +62,25 @@ class WebExportHelpersTest(unittest.TestCase):
         t2 = we.play_token(os.path.abspath(self.tmp) + os.sep + "." + os.sep)
         self.assertEqual(t1, t2)
         self.assertEqual(len(t1), 16)
+
+    def test_root_for_token_cache_and_fallback(self):
+        token = we.play_token(self.tmp)
+        we._PLAY_TOKEN_ROOTS.pop(token, None)
+        self.addCleanup(lambda: we._PLAY_TOKEN_ROOTS.pop(token, None))
+
+        # 浏览器 GET /play/<token> 不带项目头，必须能从 token 反查 root。
+        # Fallback：扫描项目注册表 + code_root。
+        fake_projects = type(sys)('fake_projects')
+        fake_projects.list_projects = lambda: [{'root': self.tmp}]
+        fake_config = type(sys)('fake_config')
+        fake_config.get_runtime = lambda key: None
+        fake_config.CODE_ROOT = ''
+        with patch.dict(sys.modules, {'projects': fake_projects, 'config': fake_config}):
+            self.assertEqual(we.root_for_token(token), self.tmp)
+
+        # 命中缓存后，不再依赖 sys.modules 也能返回。
+        self.assertEqual(we.root_for_token(token), self.tmp)
+        self.assertIsNone(we.root_for_token('not_a_token'))
 
     def test_resolve_play_file_and_traversal(self):
         web_dir = os.path.join(self.tmp, ".docmind", "web")

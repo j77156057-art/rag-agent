@@ -846,6 +846,8 @@ export interface SceneOpResult {
 export const sceneApi = {
   graph(path: string) { return rawJson<SceneGraph>(`/api/scene/graph?path=${encodeURIComponent(path)}`) },
   op(payload: Record<string, unknown>) { return rawJson<SceneOpResult>('/api/scene/op', payload) },
+  /** 项目主场景（project.godot 的 run/main_scene）——场景画布打开时自动加载用 */
+  main() { return rawJson<{ ok: boolean; scene?: string; exists?: boolean; error?: string; note?: string }>('/api/scene/main') },
 }
 
 /** P1：Web 导出 / iframe 试玩 */

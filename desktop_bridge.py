@@ -493,15 +493,19 @@ def _target_size(hwnd_host, width, height, offset_y, cached=None):
 
 
 def embed(hwnd_child: int, hwnd_host: int, width=None, height=None,
-          offset_y: int = 0, title: str = '', rect=None):
+          offset_y: int = 0, title: str = '', rect=None, fill: bool = False):
     """把引擎窗口嵌进宿主客户区，并记录原始状态以便 `detach` 还原。
 
-    尺寸有两种模式：
+    三种尺寸模式：
 
     * **rect 模式（推荐）**：`rect={'x','y','width','height'}`，由前端给出工作台里那块
-      "引擎视窗"的屏幕/客户坐标。引擎只占这一块，工作台 UI 照常可用——否则引擎铺满
-      整个窗口，用户连"停止引擎"的按钮都点不到。
-    * **fill 模式**：不给 rect 时按宿主客户区铺满（`offset_y` 是顶部留白）。
+      "引擎视窗"的屏幕/客户坐标。引擎只占这一块，工作台 UI 照常可用。
+    * **fill 模式**：`fill=True` 显式请求时，按宿主客户区铺满（`offset_y` 是顶部留白）。
+      这会盖住整个工作台界面——包括"停止引擎"按钮——所以**只能由调用方显式声明**，
+      绝不作为"没给 rect"的默默兜底（那正是"引擎打开直接黑屏"的根因）。
+    * **有界框模式（默认安全降级）**：`rect` 缺失且未显式 `fill` 时，在宿主客户区内嵌一个
+      居中、四周留边的小窗。既不铺满全屏（不会黑屏盖住 git 按钮等），也不强制退化成独立窗口
+      ——引擎仍嵌在工作台里，只是占一小块。这是"rect 拿不到"时的防御性默认。
     """
     user32 = _user32()
     if user32 is None:
@@ -517,7 +521,8 @@ def embed(hwnd_child: int, hwnd_host: int, width=None, height=None,
         if rect and int(rect.get('width') or 0) > 0 and int(rect.get('height') or 0) > 0:
             pos_x, pos_y = int(rect.get('x') or 0), int(rect.get('y') or 0)
             size_w, size_h, host_rect = int(rect['width']), int(rect['height']), None
-        else:
+        elif fill:
+            # 显式铺满：调用方明确要全屏嵌入（会盖住工作台界面），仅此情形才允许。
             mode = 'fill'
             pos_x, pos_y = 0, int(offset_y)
             with _STATE_LOCK:
@@ -525,6 +530,22 @@ def embed(hwnd_child: int, hwnd_host: int, width=None, height=None,
             size_w, size_h, host_rect = _target_size(hwnd_host, width, height, offset_y, cached)
             if not size_w:
                 return {'ok': False, 'error': host_rect}
+        else:
+            # 硬化：rect 缺失也不许铺满全屏。退化为"宿主客户区内的安全有界框"，
+            # 既不黑屏盖住工作台，也不强制退化成独立窗口（引擎仍嵌着）。
+            mode = 'rect'
+            with _STATE_LOCK:
+                cached = (_CHILD_STATE.get(hwnd_child) or {}).get('last_host_client')
+            host_w, host_h, host_rect = _target_size(hwnd_host, width, height, 0, cached)
+            if not host_w:
+                # 连宿主客户区都读不到（窗口最小化 / 尚未布局）：放弃嵌入，让引擎当独立窗口跑。
+                return {'ok': False,
+                        'error': '引擎视窗矩形无效且无法读取宿主客户区，已退化为独立窗口运行（' + str(host_rect) + '）'}
+            margin = max(32, int(min(host_w, host_h) * 0.10))
+            size_w = max(80, host_w - 2 * margin)
+            size_h = max(80, host_h - 2 * margin)
+            pos_x = max(0, (host_w - size_w) // 2)
+            pos_y = max(0, (host_h - size_h) // 2)
 
         if hwnd_child not in _CHILD_STATE:
             with _STATE_LOCK:

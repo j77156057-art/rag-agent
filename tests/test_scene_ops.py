@@ -483,5 +483,30 @@ class RuntimeEventTests(SceneFixture):
             sr.runtime_clear(self.root, "nope")
 
 
+class MainSceneTests(SceneFixture):
+    """场景画布"自动加载主场景"依赖的 project.godot 解析。"""
+
+    def test_reads_main_scene_relative_path(self):
+        self._write("scenes/Main.tscn", "[gd_scene format=3]\n")
+        self._write("project.godot",
+                    'config_version=5\n\n[application]\n\n'
+                    'run/main_scene="res://scenes/Main.tscn"\n')
+        res = sr.main_scene(self.root)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["scene"], "scenes/Main.tscn")
+        self.assertTrue(res["exists"])
+
+    def test_missing_main_scene_config(self):
+        self._write("project.godot", 'config_version=5\n\n[application]\nconfig/name="T"\n')
+        res = sr.main_scene(self.root)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["scene"], "")
+        self.assertFalse(res["exists"])
+
+    def test_not_a_godot_project(self):
+        res = sr.main_scene(os.path.join(self.root, "nope"))
+        self.assertFalse(res["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

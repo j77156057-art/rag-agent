@@ -314,6 +314,12 @@ function exportJson() {
 
     <div v-if="message" class="rt-msg">{{ message }}</div>
 
+    <div class="rt-legend">
+      <b>怎么读：</b>左边每一行是一个<b>事件类型</b>（方块数量 = 该类事件条数）；方块的位置 = 事件发生的<b>时间点</b>（横轴是时间）；
+      点任意方块，右侧「事件详情」显示它的完整字段。<b>来源</b>指事件由谁上报：<code>api</code> = 前端/接口上报，<code>godot</code> = 引擎日志抓取。
+      想只看某几类，点上面的类型/来源胶囊筛选；「指标曲线」可把某个数值字段（如 hp）画成折线。
+    </div>
+
     <div class="rt-body">
       <div class="rt-timeline" ref="wrapEl">
         <div class="rt-inner" :style="{ width: `${trackWidth}px` }">
@@ -415,6 +421,9 @@ function exportJson() {
 .rt-pill.good.on { background: #e6f7ee; border-color: #8fd4b3; color: #146c48; }
 .rt-pill.bad.on { background: #fdecec; border-color: #eeb7ba; color: #c23a40; }
 .rt-msg { font-size: 11px; color: var(--amber); padding-bottom: 7px; }
+.rt-legend { font-size: 10.5px; color: var(--text-faint); line-height: 1.7; padding-bottom: 7px; }
+.rt-legend b { color: var(--text-muted); }
+.rt-legend code { font-family: var(--font-mono); color: var(--text-muted); background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 3px; }
 .rt-dim { color: var(--text-faint); font-size: 11px; }
 .rt-dim.pad { padding: 12px 4px; line-height: 1.7; }
 

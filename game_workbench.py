@@ -551,11 +551,12 @@ def engine_status(root):
 
 
 def engine_embed(root, host_hwnd, width=None, height=None, title_hint='',
-                 offset_y=EMBED_TOP_STRIP, rect=None):
+                 offset_y=EMBED_TOP_STRIP, rect=None, fill=False):
     """把已运行的引擎窗口嵌进宿主窗口。
 
     `rect` = 前端口算出的"引擎视窗"（宿主客户区坐标，物理像素）；给了它引擎就只占那一块，
-    工作台界面照常可用。不给则退化为按宿主客户区铺满（顶部留 `offset_y`）。
+    工作台界面照常可用。`rect` 缺失时默认**有界框降级**（在宿主客户区里嵌一块居中留边的小窗），
+    绝不悄悄铺满全屏——`fill=True` 才显式请求铺满（会盖住工作台界面，仅限明确意图）。
     """
     root_abs = _root(root)
     st = engine_status(root_abs)
@@ -576,7 +577,7 @@ def engine_embed(root, host_hwnd, width=None, height=None, title_hint='',
             child = find_window(st['pid'], title_hint)
         if not child:
             return {'ok': False, 'error': '尚未找到引擎窗口，请稍后重试。'}
-        r = embed(child[0], int(host_hwnd), width, height, offset_y, title=child[1], rect=rect)
+        r = embed(child[0], int(host_hwnd), width, height, offset_y, title=child[1], rect=rect, fill=fill)
         if not r.get('ok'):
             return r
         _EMBED_STATE[root_abs] = {'child_hwnd': r['hwnd'], 'host_hwnd': int(host_hwnd),
@@ -721,7 +722,7 @@ def start_engine_watchdog(interval=3.0):
     _WATCHDOG_THREAD = t
 
 
-def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False, rect=None):
+def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False, rect=None, fill=False):
     root_abs = _root(root)
     if engine_status(root_abs)["running"]: return engine_status(root_abs)
     cfg=engine_config(root); selected=cfg.get('engine','godot'); executable=cfg.get('executable','godot') if not executable or (executable == 'godot' and selected != 'godot') else executable; executable=_resolve_engine_executable(selected, executable)
@@ -760,11 +761,12 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
             result["gpu_warning"] = lease["warning"]
         if embed and host_hwnd:
             # 引擎建窗口是异步的：轮询直到找到窗口并嵌入成功，或超时。
-            # rect 给了就嵌到前端口算的"引擎视窗"，否则按宿主客户区铺满。
+            # rect 给了就嵌到前端口算的"引擎视窗"；都不给也不许铺满——退化为安全有界框
+            #（fill=True 才显式铺满）。引擎仍会正常启动，只是嵌入方式不同。
             last = ''
             for _ in range(30):
                 time.sleep(0.2)
-                er = engine_embed(root_abs, host_hwnd, rect=rect)
+                er = engine_embed(root_abs, host_hwnd, rect=rect, fill=fill)
                 if er.get('ok'):
                     result['embedded'] = True
                     result['hwnd'] = er.get('hwnd')

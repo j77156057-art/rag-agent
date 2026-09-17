@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
-import { runtimeApi, engineApi, playApi } from '../api'
+import { runtimeApi, engineApi, playApi, sceneApi } from '../api'
 import type { WebTemplates, WebExportResult, DesktopHost, EmbedRect } from '../api'
 import { useWorkbench } from '../composables/workbench'
 // 画布与时间线都引了重依赖（@vue-flow 约 243KB / gzip 79KB），
@@ -326,7 +326,11 @@ function evData(e: Ev) {
   if (!keys.length) return ''
   return keys.map(k => `${k}=${String((e.data as Record<string, unknown>)[k])}`).join('  ')
 }
-function clearEvents() {
+async function clearEvents() {
+  // 只清本地数组的话，下一次轮询会把后端存量事件又拉回来（"清空后点一下又出来"）。
+  // 必须同时清后端：scope='all' 连引擎日志的续读游标一起归零，否则 godot 抓取的事件照样复现。
+  if (!window.confirm('清空全部运行时事件（含已抓取的引擎日志）？此操作不可撤销。')) return
+  try { await runtimeApi.clear('all') } catch { /* 后端清不掉也要把本地清掉 */ }
   events.value = []
   seen.clear()
 }
@@ -342,6 +346,19 @@ function loadScene() {
   if (!value) { sceneMessage.value = '请先填写场景路径，例如 scenes/Main.tscn'; return }
   sceneMessage.value = ''
   scenePath.value = value
+}
+/** 打开「场景画布」时若还没指定场景，自动加载项目主场景（project.godot 的 run/main_scene），
+ *  避免出现"一块空画布、不知道该填什么"的困惑。用户已有输入/已加载则不覆盖。 */
+async function ensureSceneLoaded() {
+  if (scenePath.value || pathInput.value.trim()) return
+  try {
+    const r = await sceneApi.main()
+    if (r.ok && r.scene) {
+      pathInput.value = r.scene
+      sceneMessage.value = ''
+      scenePath.value = r.scene
+    }
+  } catch { /* 拿不到主场景就保持空态提示，不打扰用户 */ }
 }
 /** 编辑器里打开 .tscn 时自动同步到画布——点开场景就能看结构，不用再手抄路径 */
 watch(() => activeTab.value?.path, (next) => {
@@ -364,6 +381,7 @@ watch(open, v => {
     void refreshNativeStatus()
     void refreshDesktop()
     startTimers()
+    if (tab.value === 'scene') void ensureSceneLoaded()
   } else {
     stopTimers()
     // 弹窗一关，那块"引擎视窗"就不存在了；继续嵌着只会让引擎画在工作台别的位置上
@@ -378,6 +396,8 @@ watch(tab, v => {
   } else if (nativeRunning.value && autoEmbed.value && embedState.value !== 'embedded' && desktopReady.value) {
     void nativeEmbed()
   }
+  // 切到场景画布且还没加载场景时，自动带出项目主场景
+  if (v === 'scene') void ensureSceneLoaded()
 })
 
 onMounted(() => {

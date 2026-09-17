@@ -150,7 +150,7 @@ import hooks as agent_hooks
 import skills as agent_skills
 import pricing as pricing_mod
 from config import PROJECT_WEB_DIR
-from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
+from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear, main_scene
 from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, engine_running_roots, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_apply_parameters, comfy_queue, comfy_free_models, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable, start_engine_watchdog
 
 
@@ -378,7 +378,10 @@ class EngineEmbedReq(BaseModel):
 
     * 给了 x/y/width/height → **引擎视窗模式**：引擎只占工作台里那一块矩形，
       界面照常可用（推荐，前端按 .pb-framewrap 的位置算出来）。
-    * 都不给 → **铺满模式**：按宿主客户区铺满，顶部留 ``offset_y`` 像素给工作台顶栏。
+    * 都不给且 ``fill=False``（默认）→ **安全有界框**：在宿主客户区里嵌一块居中留边的小窗，
+      绝不铺满全屏（铺满会黑屏盖住工作台界面）。
+    * ``fill=True`` → **铺满模式**：按宿主客户区铺满（顶部留 ``offset_y`` 像素）。
+      会盖住整个工作台界面，仅限调用方明确要全屏嵌入时使用。
     """
     host_hwnd: int = 0
     x: int = 0
@@ -387,6 +390,7 @@ class EngineEmbedReq(BaseModel):
     height: int = 0
     offset_y: int = -1
     title_hint: str = ""
+    fill: bool = False
 
 
 class EngineFocusReq(BaseModel):
@@ -650,6 +654,8 @@ class EngineReq(BaseModel):
     host_hwnd: int = 0
     # 前端给的"引擎视窗"（宿主客户区物理像素）。给了它引擎只占那一块，工作台 UI 照常可用。
     rect: dict = {}
+    # 是否显式请求"铺满宿主客户区"。默认 False：rect 缺失时退化为安全有界框，绝不悄悄铺满全屏。
+    fill: bool = False
 class ComfyReq(BaseModel):
     url: str = "http://127.0.0.1:8188"
     workflow: dict = {}
@@ -833,7 +839,7 @@ async def engine_start_ep(req: EngineReq):
     # engine_status()["running"] 逻辑处理，这里只挑非目标 root。停引擎是"尽量清理"，
     # 失败不应阻断本次启动（_stop_other_engines 内部已容错）。
     stopped, warnings = await _stop_other_engines(root)
-    result = await run_in_threadpool(engine_start, root, req.executable, req.scene, host, req.embed, rect)
+    result = await run_in_threadpool(engine_start, root, req.executable, req.scene, host, req.embed, rect, req.fill)
     if isinstance(result, dict):
         parts = []
         if stopped:
@@ -864,7 +870,7 @@ async def engine_embed_ep(req: EngineEmbedReq):
     if req.width > 0 and req.height > 0:
         rect = {'x': req.x, 'y': req.y, 'width': req.width, 'height': req.height}
     return (await run_in_threadpool(engine_embed, root, host, req.width or None, req.height or None,
-                        req.title_hint, offset, rect))
+                        req.title_hint, offset, rect, req.fill))
 
 @app.post("/api/engine/place")
 async def engine_place_ep(req: EnginePlaceReq):
@@ -986,8 +992,10 @@ _COOP_HEADERS = {
 @app.get("/play/{token}")
 @app.get("/play/{token}/{file_path:path}")
 async def play_file_ep(token: str, file_path: str = "index.html"):
-    # 试玩产物服务：token 绑定当前代码库绝对路径，隔离不同项目；带 COOP/COEP 以启用 SharedArrayBuffer
-    root = _project_root_or_error()
+    # 试玩产物服务：token 绑定工程根目录，隔离不同项目；带 COOP/COEP 以启用 SharedArrayBuffer。
+    # 浏览器 iframe GET 不会带 X-DocMind-Project，不能依赖 _project_root_or_error() 的当前上下文，
+    # 必须按 token 反查 root（导出时缓存 / 项目注册表 + code_root 兜底）。
+    root = web_export.root_for_token(token)
     if not root or token != web_export.play_token(root):
         return JSONResponse({"ok": False, "error": "未知试玩会话。"}, status_code=404)
     target = web_export.resolve_play_file(root, file_path)
@@ -1442,6 +1450,12 @@ async def scene_property_ep(req: ScenePropertyReq):
     if not root: return {"ok":False,"error":"未配置代码库"}
     try: return set_scene_property(root, req.path, req.node, req.property, req.value)
     except Exception as e: return JSONResponse({"ok":False,"error":str(e)}, status_code=400)
+@app.get("/api/scene/main")
+async def scene_main_ep():
+    """项目主场景路径（读 project.godot 的 run/main_scene）——场景画布打开时自动加载用。"""
+    root=_project_root_or_error()
+    if not root: return {"ok":False,"error":"未配置代码库"}
+    return main_scene(root)
 @app.get("/api/scene/graph")
 async def scene_graph_ep(path: str):
     """场景画布图模型：节点 + 外部引用 + 层级/脚本/实例化边 + 写护栏。"""

@@ -1196,3 +1196,29 @@ def runtime_clear(root, scope='stored'):
                 offset = 0
             _write_state(root, {**_read_state(root), 'log_offset': offset})
     return {'ok': True, 'scope': scope, 'removed': removed}
+
+
+def main_scene(root):
+    """读取 project.godot 的 ``run/main_scene``（Godot 的"主场景"）。
+
+    场景画布打开时若还没有指定路径，就用它自动加载，省得用户不知道该填什么。
+    返回的路径已剥离 ``res://`` 前缀，可直接喂给 ``/api/scene/graph``。
+    """
+    root_abs = os.path.abspath(root)
+    proj = os.path.join(root_abs, 'project.godot')
+    if not os.path.isfile(proj):
+        return {'ok': False, 'error': '当前代码库不是 Godot 项目（缺少 project.godot）。'}
+    try:
+        with open(proj, encoding='utf-8-sig', errors='replace') as f:
+            text = f.read()
+    except OSError as exc:
+        return {'ok': False, 'error': '读取 project.godot 失败：%s' % exc}
+    m = re.search(r'^\s*run/main_scene\s*=\s*"([^"]*)"', text, re.M)
+    rel = (m.group(1).strip() if m else '')
+    if rel.startswith('res://'):
+        rel = rel[len('res://'):]
+    if not rel:
+        return {'ok': True, 'scene': '', 'exists': False,
+                'note': '项目未配置主场景（project.godot 的 run/main_scene 为空）。'}
+    exists = os.path.isfile(os.path.join(root_abs, rel.replace('/', os.sep)))
+    return {'ok': True, 'scene': rel, 'exists': exists}
