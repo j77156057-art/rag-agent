@@ -296,24 +296,81 @@ def _search_recency_query(q: str) -> str:
     return f"{q} after:{year}"
 
 
+# 平台别名 → 站点域名（web_search 的 platform: 参数自动映射，避免手敲 site:）。
+_SEARCH_PLATFORMS = {
+    "github": "github.com", "gh": "github.com",
+    "b站": "bilibili.com", "bilibili": "bilibili.com", "哔哩哔哩": "bilibili.com",
+    "微博": "weibo.com", "weibo": "weibo.com",
+    "贴吧": "tieba.baidu.com", "tieba": "tieba.baidu.com",
+    "百度": "baidu.com", "baidu": "baidu.com",
+    "知乎": "zhihu.com", "zhihu": "zhihu.com",
+    "csdn": "csdn.net",
+    "stackoverflow": "stackoverflow.com", "so": "stackoverflow.com",
+}
+
+
+def _parse_web_search_arg(arg):
+    """把 web_search 的单字符串入参解析成 (query, site)。
+
+    - 多行 key: value：query:/site:/platform:（platform 自动映射为域名）；
+    - 任何位置写 `site:github.com` 或 `platform:github`：自动从 query 剔除该标记；
+    - 否则整串作为 query。
+    返回 (query, site)，site 为 None 表示不限站。
+    """
+    text = (arg or "").strip()
+    if not text:
+        return "", None
+    site = [None]
+
+    def _take(key, val):
+        val = val.strip().strip("'\"")
+        site[0] = val if key == "site" else _SEARCH_PLATFORMS.get(val.lower(), val)
+
+    q_parts = []
+    for ln in text.splitlines():
+        m = re.match(r"^\s*(site|platform)\s*[:：]\s*(.+?)\s*$", ln, re.I)
+        if m:
+            _take(m.group(1).lower(), m.group(2))
+            continue
+        # 行内 site:/platform:（与 query 同行）
+        mi = re.search(r"\b(site|platform)\s*[:：]\s*(\S+)", ln, re.I)
+        if mi:
+            _take(mi.group(1).lower(), mi.group(2))
+            ln = re.sub(r"\b(site|platform)\s*[:：]\s*\S+", "", ln, flags=re.I).strip()
+        # 去掉本行可能的 query:/q:/keyword: 前缀
+        ln = re.sub(r"^(?:query|q|keyword)\s*[:：]\s*", "", ln, flags=re.I).strip()
+        if ln:
+            q_parts.append(ln)
+    q = re.sub(r"\s+", " ", " ".join(q_parts)).strip()
+    return q, site[0]
+
+
 def web_search(query):
     """联网搜索（无需 API Key）。
 
+    入参为单字符串，可带站点限定：
+    - `query: 关键词` 或直接写关键词；
+    - 追加 `site: github.com` 或 `platform: github`（自动映射为 site:github.com），
+      把结果收敛到指定站（GitHub / 哔哩哔哩 / 微博 / 百度贴吧 等）。
+
     后端策略（可用 env WEB_SEARCH_BACKEND 强制）：
-    - 默认 auto：先 DuckDuckGo HTML，被风控（202 挑战页）或无结果时自动换 Bing；
-    - bing / ddg：只走指定后端。
+    - 默认 auto：先 DuckDuckGo，再百度（国内更稳），最后 Bing 兜底；
+    - ddg / bing / baidu：只走指定后端。
     返回前 5 条结果的标题/摘要/链接；全部不可达时优雅降级并说明原因。
     """
-    q = (query or "").strip().strip("'\"")
+    q, site = _parse_web_search_arg(query)
     if not q:
         return "未提供搜索关键词。"
+    if site:
+        q = f"{q} site:{site}"
     q = _search_recency_query(q)
     forced = (os.getenv("WEB_SEARCH_BACKEND") or "auto").strip().lower()
-    order = [forced] if forced in ("ddg", "bing") else ["ddg", "bing"]
+    backends = {"ddg": _ddg_search, "bing": _bing_search, "baidu": _baidu_search}
+    order = [forced] if forced in backends else ["ddg", "baidu", "bing"]
     last = ""
     for backend in order:
         try:
-            r = _bing_search(q) if backend == "bing" else _ddg_search(q)
+            r = backends[backend](q)
         except Exception as e:  # noqa: BLE001
             last = f"搜索失败: {backend}: {type(e).__name__}: {e}"
             continue
@@ -323,7 +380,7 @@ def web_search(query):
     hard_error = last.startswith("搜索失败: ")
     return (last or "搜索失败：所有搜索后端均不可用。") + (
         "" if (not hard_error and last.startswith(_SEARCH_EMPTY_MARKERS)) else
-        "（DuckDuckGo/Bing 均不可达，请确认运行环境能访问外网，或配置带 Key 的搜索引擎）")
+        "（DuckDuckGo/百度/Bing 均不可达，请确认运行环境能访问外网，或配置带 Key 的搜索引擎）")
 
 
 def _ddg_search(q):
@@ -410,6 +467,48 @@ def _bing_search(q):
         link = _bing_real_url(hm.group(1))
         title = _clean(hm.group(2))
         sm = re.search(r'<p class="b_lineclamp[^"]*"[^>]*>(.*?)</p>', blk, re.S)
+        snippet = _clean(sm.group(1)) if sm else ""
+        results.append((title, snippet, link))
+        if len(results) >= 5:
+            break
+    if not results:
+        return "搜索未返回结果，可能是网络受限或该关键词无结果。"
+    lines = [f"· {t}\n  {s}\n  {link}" for (t, s, link) in results]
+    return "\n".join(lines)
+
+
+def _baidu_search(q):
+    """百度 HTML 搜索（无需 Key）。国内网络通常比 Bing 更稳，作为 auto 兜底层之一。"""
+    url = "https://www.baidu.com/s?wd=" + urllib.parse.quote(q)
+    req = urllib.request.Request(
+        url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+    )
+    with urllib.request.urlopen(req, timeout=12) as r:
+        page = r.read().decode("utf-8", "replace")
+
+    def _clean(s):
+        s = re.sub(r"<[^>]+>", "", s or "")
+        return urllib.parse.unquote(s).strip()
+
+    # 每个自然结果在 <div class="result ..."> 块内：标题 <h3 ...><a href="URL">文本</a></h3>，
+    # 摘要 <div class="c-abstract ...">文本</div>。百度偶把跳转塞进链接参数，原样保留即可。
+    blocks = re.split(r'<div class="result', page)[1:]
+    results = []
+    for blk in blocks:
+        hm = re.search(
+            r'<h3[^>]*>\s*<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>', blk, re.S
+        )
+        if not hm:
+            continue
+        link = hm.group(1)
+        title = _clean(hm.group(2))
+        sm = re.search(r'<div class="c-abstract[^"]*"[^>]*>(.*?)</div>', blk, re.S)
+        if not sm:
+            sm = re.search(r'class="[^"]*content-right[^"]*"[^>]*>(.*?)</span>', blk, re.S)
         snippet = _clean(sm.group(1)) if sm else ""
         results.append((title, snippet, link))
         if len(results) >= 5:
@@ -2656,7 +2755,7 @@ TOOLS = {
         "func": calculate,
     },
     "web_search": {
-        "description": "当知识库不足或需要时效性/外部信息时，联网搜索（DuckDuckGo，无需 Key）。输入为搜索关键词。返回前 5 条结果的标题/摘要/链接。",
+        "description": "当知识库不足或需要时效性/外部信息时，联网搜索（DuckDuckGo/百度/Bing 自动故障转移，无需 Key）。支持站点限定：输入里追加 `site: github.com` 或 `platform: github`（自动映射为站点域名），把结果收敛到 GitHub、哔哩哔哩、微博、百度贴吧等指定站。输入为搜索关键词（可多行带 site:/platform:），返回前 5 条结果的标题/摘要/链接。",
         "func": web_search,
     },
     "dev_http_request": {

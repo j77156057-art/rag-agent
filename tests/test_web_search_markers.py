@@ -23,9 +23,10 @@ class WebSearchFailureSuffixTests(unittest.TestCase):
         return {**os.environ, "WEB_SEARCH_BACKEND": "auto"}
 
     def test_both_backends_raise_keeps_unreachable_hint(self):
-        # ddg、bing 均抛异常（硬故障）→ 文案同时含「搜索失败」与「均不可达」
+        # ddg、百度、bing 均抛异常（硬故障）→ 文案同时含「搜索失败」与「均不可达」
         with patch.dict(tools.os.environ, self._auto_env(), clear=True), \
                 patch("tools._ddg_search", side_effect=OSError("boom")), \
+                patch("tools._baidu_search", side_effect=OSError("boom")), \
                 patch("tools._bing_search", side_effect=OSError("boom")):
             out = tools.web_search("q")
         self.assertIn("搜索失败", out)
@@ -33,10 +34,11 @@ class WebSearchFailureSuffixTests(unittest.TestCase):
         self.assertTrue(agent._is_failure(out), "硬异常必须被判定为失败")
 
     def test_both_backends_empty_no_unreachable_hint(self):
-        # ddg、bing 均返回空结果标记（不是硬故障）→ 不追加外网缺失提示
+        # ddg、百度、bing 均返回空结果标记（不是硬故障）→ 不追加外网缺失提示
         empty = "搜索未返回结果，可能是网络受限或该关键词无结果。"
         with patch.dict(tools.os.environ, self._auto_env(), clear=True), \
                 patch("tools._ddg_search", return_value=empty), \
+                patch("tools._baidu_search", return_value=empty), \
                 patch("tools._bing_search", return_value=empty):
             out = tools.web_search("q")
         self.assertIn("搜索未返回结果", out)
