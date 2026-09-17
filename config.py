@@ -490,6 +490,22 @@ def _apply_persisted_state():
     # 其余键（GPU 偏好 / 自定义窗口）调用方不会预设，行为保持不变。
     if isinstance(root, str) and root and os.path.isdir(root) and "code_root" not in _RUNTIME:
         _RUNTIME["code_root"] = root
+    # P2 迁移（**条件化**）：只有当项目注册表**不存在或为空**时（= 老用户首次升级的首次
+    # 迁移），才用持久化 code_root 做 ensure_project + set_current。若已有注册表，则完全
+    # 不迁移——保持用户持久化的 current_project_id（多项目下重启不得把 current 撞回 code_root
+    # 对应的旧项目）；current 缺失/非法时由 projects.current_project_id() 的既有兜底取
+    # last_opened 最新者，同样不撞回 code_root。用持久化的 root（磁盘真实状态）登记；显式
+    # set_runtime('code_root', …) 的覆盖只影响运行时值，不影响此处登记。projects 局部 import
+    # 以避开 config<->projects 的循环依赖，且不在导入期触发磁盘副作用。
+    if isinstance(root, str) and root and os.path.isdir(root):
+        try:
+            import projects
+            if projects.enabled() and not projects.list_projects():
+                pid = projects.ensure_project(root)
+                if pid:
+                    projects.set_current(pid)
+        except Exception:  # noqa: BLE001 —— 迁移失败绝不能阻断启动
+            pass
     # GPU 空闲卸载/采样间隔为用户在 GPU 面板设置的本机偏好，跟随状态文件恢复
     for key in ("gpu_idle_unload_seconds", "gpu_poll_interval"):
         val = data.get(key)

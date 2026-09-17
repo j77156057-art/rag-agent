@@ -8,8 +8,10 @@
 - 摘要压缩：轮数/字符超阈值时，把最早的若干轮交给 LLM 压缩成一段摘要，
   只保留最近 KEEP 轮原文 —— 长会话不会把上下文预算吃光。
 
-存储：<STATE_ROOT>/.docmind_sessions/<slug>.json（只存用户问题与模型回答，非敏感配置另存）。
-写盘失败一律静默降级，不影响主流程。
+存储：写只写 <STATE_ROOT>/.docmind_sessions/<project_id>/<slug>.json（P2 起按项目分桶；
+项目功能关闭或无当前项目时写旧的 .docmind_sessions/<slug>.json 扁平路径）。
+**读穿透**：读取时并上旧扁平目录的同名文件，使迁移前的历史会话不丢失（不搬文件）。
+只存用户问题与模型回答，非敏感配置另存。写盘失败一律静默降级，不影响主流程。
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ import threading
 from datetime import datetime
 
 from config import STATE_ROOT, state_path
+import projects
 
 SESSIONS_DIR = state_path("DOCMIND_SESSIONS_DIR", os.path.join(STATE_ROOT, ".docmind_sessions"))
 # 压缩以 token 占用为准（阈值由 Agent 按模型真实窗口换算后传入），轮数只留两道
@@ -40,61 +43,115 @@ def _slug(session_id) -> str:
     return s[:64]
 
 
-def _path(session_id) -> str:
-    return os.path.join(SESSIONS_DIR, _slug(session_id) + ".json")
+def _bucket_dir(project_id=None) -> str:
+    """会话落盘目录：项目功能开启且能确定项目时用 `<SESSIONS_DIR>/<pid>/`，否则用旧的扁平目录。
+
+    - 功能关闭 → 旧扁平目录（`DOCMIND_PROJECTS=0` 一键回滚，行为与今日完全一致）；
+    - 未显式传 project_id → 取当前项目；无当前项目（未登记/legacy）→ 旧扁平目录，
+      以保持「项目功能刚开启、还没切过项目」时对既有会话的向后兼容。
+    """
+    if not projects.enabled():
+        return SESSIONS_DIR
+    pid = project_id if project_id is not None else projects.current_project_id()
+    if not pid or pid == projects.LEGACY_ID:
+        return SESSIONS_DIR
+    return os.path.join(SESSIONS_DIR, _slug(pid))
+
+
+def _path(session_id, project_id=None) -> str:
+    return os.path.join(_bucket_dir(project_id), _slug(session_id) + ".json")
+
+
+def _legacy_dir() -> str:
+    """旧的扁平会话目录（P2 之前所有会话都在这里）。"""
+    return SESSIONS_DIR
+
+
+def _legacy_path(session_id) -> str:
+    return os.path.join(_legacy_dir(), _slug(session_id) + ".json")
+
+
+def _read_raw(path):
+    """读一个会话 JSON 文件；缺失/损坏/非 dict 返回 None。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _apply_raw(data: dict, raw) -> dict:
+    """把磁盘记录填进会话结构（raw 为 None → 保持空结构）。"""
+    if isinstance(raw, dict):
+        turns = raw.get("turns")
+        data["summary"] = raw.get("summary") or ""
+        data["turns"] = turns if isinstance(turns, list) else []
+        data["updated_at"] = raw.get("updated_at") or ""
+    return data
+
+
+def _dirs_for_read(bucket: str) -> list:
+    """读取时要覆盖的目录：项目桶优先，其次旧扁平目录（二者相同则只一个，避免重复计数）。"""
+    legacy = _legacy_dir()
+    return [bucket] if bucket == legacy else [bucket, legacy]
 
 
 def _default() -> dict:
     return {"session_id": "", "updated_at": "", "summary": "", "turns": []}
 
 
-def load(session_id) -> dict:
-    """读取一个会话记录；缺失/损坏返回空结构（调用方无需处理异常）。"""
+def load(session_id, project_id=None) -> dict:
+    """读取一个会话记录；缺失/损坏返回空结构（调用方无需处理异常）。
+
+    P2 读穿透：先读项目桶；桶内没有该文件、或 turns 为空时，回退读**旧扁平目录**的同名
+    文件（既有安装在迁移后仍能读到旧历史会话——不搬文件、零数据风险）。
+    """
     data = _default()
     data["session_id"] = str(session_id or "default")
-    p = _path(session_id)
-    if not os.path.isfile(p):
-        return data
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if isinstance(raw, dict):
-            turns = raw.get("turns")
-            data["summary"] = raw.get("summary") or ""
-            data["turns"] = turns if isinstance(turns, list) else []
-            data["updated_at"] = raw.get("updated_at") or ""
-    except (OSError, ValueError):
-        pass
-    return data
+    p = _path(session_id, project_id)
+    raw = _read_raw(p)
+    if isinstance(raw, dict) and raw.get("turns"):
+        return _apply_raw(data, raw)
+    lp = _legacy_path(session_id)
+    if lp != p:
+        raw2 = _read_raw(lp)
+        if isinstance(raw2, dict) and raw2.get("turns"):
+            return _apply_raw(data, raw2)
+        if raw is None:
+            raw = raw2
+    return _apply_raw(data, raw)
 
 
-def _write(session_id, data) -> bool:
+def _write(session_id, data, project_id=None) -> bool:
     try:
-        os.makedirs(SESSIONS_DIR, exist_ok=True)
+        d = _bucket_dir(project_id)
+        os.makedirs(d, exist_ok=True)
         data["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        tmp = _path(session_id) + ".tmp"
+        p = os.path.join(d, _slug(session_id) + ".json")
+        tmp = p + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, _path(session_id))
+        os.replace(tmp, p)
         return True
     except OSError:
         return False
 
 
-def history(session_id):
+def history(session_id, project_id=None):
     """返回给 Agent 回放的 turns 列表（list[{user, assistant}]）。"""
     return [{"user": t.get("user", ""), "assistant": t.get("assistant", "")}
-            for t in load(session_id).get("turns", []) if isinstance(t, dict)]
+            for t in load(session_id, project_id).get("turns", []) if isinstance(t, dict)]
 
 
-def summary_text(session_id) -> str:
-    return load(session_id).get("summary", "") or ""
+def summary_text(session_id, project_id=None) -> str:
+    return load(session_id, project_id).get("summary", "") or ""
 
 
-def save(session_id, turns, summary=None) -> bool:
+def save(session_id, turns, summary=None, project_id=None) -> bool:
     """整体落盘一个会话（turns = [{user, assistant}]）。"""
     with _lock:
-        data = load(session_id)
+        data = load(session_id, project_id)
         data["session_id"] = str(session_id or "default")
         if summary is not None:
             data["summary"] = summary
@@ -103,7 +160,7 @@ def save(session_id, turns, summary=None) -> bool:
              "ts": t.get("ts") or datetime.now().isoformat(timespec="seconds")}
             for t in (turns or []) if isinstance(t, dict)
         ]
-        return _write(session_id, data)
+        return _write(session_id, data, project_id)
 
 
 def _est_tokens(text: str) -> int:
@@ -200,38 +257,48 @@ def maybe_compact(session_id, turns, llm=None, trigger_tokens=None, keep_tokens=
     return kept, summary
 
 
-def list_sessions(limit=50):
-    """列出会话摘要（用于 /api/sessions 概览）。"""
-    out = []
-    if not os.path.isdir(SESSIONS_DIR):
-        return out
-    try:
-        for name in os.listdir(SESSIONS_DIR):
+def list_sessions(limit=50, project_id=None):
+    """列出会话摘要（用于 /api/sessions 概览）。
+
+    读取范围 = 「当前项目桶 ∪ 旧扁平目录」：同一 session_id 两处都有时**项目桶优先**、
+    稳定去重（不因两处内容不同而抖动）；再按 updated_at 倒序取前 limit。
+    """
+    bucket = _bucket_dir(project_id)
+    seen = {}
+    for d in _dirs_for_read(bucket):
+        if not os.path.isdir(d):
+            continue
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
             if not name.endswith(".json"):
                 continue
-            p = os.path.join(SESSIONS_DIR, name)
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
-            except (OSError, ValueError):
+            raw = _read_raw(os.path.join(d, name))
+            if not isinstance(raw, dict):
                 continue
-            out.append({
-                "session_id": raw.get("session_id") or name[:-5],
+            sid = raw.get("session_id") or name[:-5]
+            if sid in seen:
+                continue  # 项目桶先遍历 → 桶条目优先
+            seen[sid] = {
+                "session_id": sid,
                 "turns": len(raw.get("turns") or []),
                 "has_summary": bool(raw.get("summary")),
                 "updated_at": raw.get("updated_at") or "",
-            })
-    except OSError:
-        return out
-    out.sort(key=lambda x: x.get("updated_at") or "", reverse=True)
-    return out[:max(1, int(limit))]
+            }
+    rows = list(seen.values())
+    rows.sort(key=lambda x: x.get("updated_at") or "", reverse=True)
+    return rows[:max(1, int(limit))]
 
 
-def delete(session_id) -> bool:
-    try:
-        p = _path(session_id)
-        if os.path.isfile(p):
-            os.remove(p)
-        return True
-    except OSError:
-        return False
+def delete(session_id, project_id=None) -> bool:
+    """删除会话：项目桶与其旧扁平目录里的同名文件一并删除（对老会话也生效）。"""
+    ok = True
+    for p in {_path(session_id, project_id), _legacy_path(session_id)}:
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+        except OSError:
+            ok = False
+    return ok
