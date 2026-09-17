@@ -120,7 +120,7 @@ import skills as agent_skills
 import pricing as pricing_mod
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear
-from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_apply_parameters, comfy_queue, comfy_free_models, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable, start_engine_watchdog
+from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, engine_running_roots, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_apply_parameters, comfy_queue, comfy_free_models, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable, start_engine_watchdog
 
 
 @asynccontextmanager
@@ -669,9 +669,34 @@ async def engine_config_post_ep(req: EngineReq):
 @app.post("/api/engine/start")
 async def engine_start_ep(req: EngineReq):
     root=_project_root_or_error()
+    if not root: return {"ok":False,"error":"未配置代码库"}
     host = req.host_hwnd or _DESKTOP_HOST_HWND
     rect = req.rect if (req.rect or {}).get('width') and (req.rect or {}).get('height') else None
-    return (await run_in_threadpool(engine_start, root, req.executable, req.scene, host, req.embed, rect)) if root else {"ok":False,"error":"未配置代码库"}
+    # P1 单实例策略：启动新引擎前，先停掉「其它项目」的引擎，避免切了项目、旧引擎仍在后台
+    # 跑却找不到它（孤儿进程占 GPU、UI 无入口）。同一 root 重复启动由 engine_start 内部
+    # engine_status()["running"] 逻辑处理，这里只挑非目标 root。
+    # 停引擎是"尽量清理"，失败不应阻断本次启动（engine_stop 可能因桥接/权限抛异常）。
+    target = os.path.abspath(root)
+    stopped = []
+    warnings = []
+    for other in engine_running_roots():
+        if os.path.abspath(other) == target:
+            continue
+        try:
+            await run_in_threadpool(engine_stop, other)
+            stopped.append(other)
+        except Exception as e:  # noqa: BLE001  停不掉旧引擎不该阻断新引擎启动
+            warnings.append(f"未能停止 {other} 的引擎：{e}")
+    result = await run_in_threadpool(engine_start, root, req.executable, req.scene, host, req.embed, rect)
+    if isinstance(result, dict) and (stopped or warnings):
+        parts = []
+        if stopped:
+            parts.append("已自动停止其它项目的引擎：" + "、".join(stopped))
+        parts.extend(warnings)
+        note = "；".join(parts)
+        result = {**result, "auto_stopped_roots": stopped, "notice": note}
+        print("[engine] " + note, flush=True)
+    return result
 @app.post("/api/engine/stop")
 async def engine_stop_ep():
     root=_project_root_or_error(); return (await run_in_threadpool(engine_stop, root)) if root else {"ok":False,"error":"未配置代码库"}
@@ -1332,6 +1357,20 @@ async def ingest_code(root: str = Form(...)):
     """代码问答模式：接收一个代码根目录，遍历并索引其中的源码/配置文件到独立代码集合。"""
     if not os.path.isdir(root):
         return JSONResponse({"ok": False, "error": f"目录不存在: {root}"}, status_code=400)
+    # P1 单实例策略：切换项目前，先停掉「非新项目」的引擎，避免切了项目、旧引擎仍在后台跑
+    # 却找不到它（孤儿进程占 GPU、UI 无入口）。与 /api/engine/start 同构，非目标 root 才停；
+    # 停引擎失败只记警告、绝不阻断切换（否则旧引擎异常会让新项目根本切不了）。
+    new_root = os.path.abspath(root)
+    stopped = []
+    warnings = []
+    for other in engine_running_roots():
+        if os.path.abspath(other) == new_root:
+            continue
+        try:
+            await run_in_threadpool(engine_stop, other)
+            stopped.append(other)
+        except Exception as e:  # noqa: BLE001  停不掉旧引擎不该阻断切项目
+            warnings.append(f"未能停止 {other} 的引擎：{e}")
     try:
         # 重新索引前先清空代码集合：本端点语义是"把该目录完整重建索引"，
         # 不 reset 会导致同一切片被重复写入（实测 117 → 234 翻倍）。
@@ -1345,12 +1384,18 @@ async def ingest_code(root: str = Form(...)):
         set_runtime("project_rules", rules)
         # 索引代码 = 新话题，清空多轮上下文避免旧问答污染
         agent.history = []
+        parts = []
+        if stopped:
+            parts.append("已自动停止其它项目的引擎：" + "、".join(stopped))
+        parts.extend(warnings)
         return {
             "ok": True,
             "chunks": n,
             "code_root": abs_root,
             "code_sources": count(CODE_COLLECTION_NAME),
             "project_rules_loaded": bool(rules),
+            "auto_stopped_roots": stopped,
+            "notice": "；".join(parts),
         }
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)

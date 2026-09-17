@@ -685,6 +685,24 @@ def engine_reap_dead():
     return True
 
 
+def engine_running_roots():
+    """返回当前仍在运行的引擎 root 列表（已死进程顺带清理）。
+
+    先调用 engine_reap_dead() 清掉崩溃残留（它会把 poll() 非 None 的记录弹出），
+    再以 _ENGINE_PROCS 里 poll() is None 的 root 视为"正在运行"。返回按字典序排序，
+    供"启动新引擎 / 切换项目前停掉其它项目引擎"（单实例策略）使用。
+    """
+    try:
+        engine_reap_dead()
+    except Exception:  # noqa: BLE001  清理失败不应阻断调用方
+        pass
+    alive = []
+    for root, p in list(_ENGINE_PROCS.items()):
+        if p is not None and p.poll() is None:
+            alive.append(root)
+    return sorted(alive)
+
+
 _WATCHDOG_THREAD = None
 def start_engine_watchdog(interval=3.0):
     """起一个 daemon 线程周期调用 engine_reap_dead（与 gpu_coordinator 后台线程同构）。"""

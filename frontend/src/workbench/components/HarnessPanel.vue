@@ -3,7 +3,7 @@
 // 做成普通人看得懂的面板。静态预览（无后端）时自动使用演示数据。
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
-  harnessApi, setSessionId,
+  harnessApi, setSessionId, getSessionId, startNewSession,
   type BudgetStatus, type BudgetCheck, type SessionInfo,
   type TraceItem, type TraceSummary, type SkillInfo,
 } from '../api'
@@ -20,6 +20,8 @@ const error = ref('')
 const budget = ref<BudgetStatus | null>(null)
 const budgetCheck = ref<BudgetCheck | null>(null)
 const sessions = ref<SessionInfo[]>([])
+/** 当前标签页的会话 id：用于在列表里高亮「当前会话」。 */
+const currentId = ref(getSessionId())
 const traces = ref<TraceItem[]>([])
 const traceSummary = ref<TraceSummary | null>(null)
 const skills = ref<SkillInfo[]>([])
@@ -80,6 +82,7 @@ function providerLabel(p: string): string {
 async function loadAll() {
   loading.value = true
   error.value = ''
+  currentId.value = getSessionId()   // 每次刷新列表时同步「当前会话」标记
   try {
     if (demoMode.value) {
       budget.value = demoBudget.status
@@ -147,12 +150,27 @@ async function removeSession(id: string) {
   }
   if (!window.confirm(`删除会话「${id}」的历史记录？此操作不可恢复。`)) return
   const r = await harnessApi.deleteSession(id)
-  if (r.ok) sessions.value = sessions.value.filter((x) => x.session_id !== id)
+  if (!r.ok) return
+  sessions.value = sessions.value.filter((x) => x.session_id !== id)
+  // 删掉的正是当前会话：自动切到一段全新会话并让助手刷新（否则会停在已删除的空 id 上）。
+  if (id === currentId.value) {
+    currentId.value = startNewSession()
+    open.value = false
+    window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
+  }
 }
 /** 继续某段历史对话：把该 session_id 切为当前会话并让 AI 助手回灌其历史。 */
 function continueSession(id: string) {
   if (demoMode.value) { actionMsg.value = '演示模式不能续聊'; return }
   if (!setSessionId(id)) return
+  currentId.value = id
+  open.value = false
+  window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
+}
+/** 开一段全新对话：切到全新 session id（新 id 无历史），让 AI 助手显示空态。 */
+function newSession() {
+  if (demoMode.value) { actionMsg.value = '演示模式不能新建会话'; return }
+  currentId.value = startNewSession()
   open.value = false
   window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
 }
@@ -245,12 +263,15 @@ onBeforeUnmount(() => { open.value = false })
 
         <!-- ---------------- 对话 ---------------- -->
         <div v-else-if="tab === 'sessions'" class="hp-pane">
-          <p class="hp-plain">每段对话都会单独保存，互不串台。删除后该段问答历史不可恢复。</p>
+          <div class="hp-sesshead">
+            <p class="hp-plain">每段对话都会单独保存，互不串台。删除后该段问答历史不可恢复。</p>
+            <button class="hp-btn sm" title="开始一段全新对话（当前会话保留在列表里，可随时「继续」）" @click="newSession">+ 新会话</button>
+          </div>
           <div v-if="!sessions.length" class="hp-empty">还没有保存的对话。到下方「AI 助手」问一个问题试试。</div>
           <div v-else class="hp-list">
-            <div v-for="s in sessions" :key="s.session_id" class="hp-item">
+            <div v-for="s in sessions" :key="s.session_id" class="hp-item" :class="{ on: s.session_id === currentId }">
               <div class="hp-item-main">
-                <b>{{ s.session_id }}</b>
+                <b>{{ s.session_id }}<span v-if="s.session_id === currentId" class="hp-cur">当前</span></b>
                 <span>{{ s.turns }} 轮问答<template v-if="s.has_summary"> · 已生成早期摘要</template></span>
                 <em>{{ ago(s.updated_at) }}（{{ fmtTime(s.updated_at) }}）</em>
               </div>
@@ -389,6 +410,10 @@ onBeforeUnmount(() => { open.value = false })
 .hp-item-main b { font-size: 12px; color: #1b2433; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hp-item-main span { font-size: 11px; color: #5a6778; }
 .hp-item-main em { font-style: normal; font-size: 10px; color: #a7b2c2; }
+.hp-item.on { border-color: #9fc0f5; background: #f2f7ff; box-shadow: 0 0 0 2px rgba(47,111,237,.10); }
+.hp-cur { margin-left: 6px; font-size: 9.5px; font-weight: 700; color: #2f6fed; background: #eaf1fe; border: 1px solid #c8dcfa; border-radius: 999px; padding: 0 6px; }
+.hp-sesshead { display: flex; align-items: center; gap: 10px; }
+.hp-sesshead .hp-plain { flex: 1; margin: 0; }
 .hp-sumline { font-size: 11.5px; color: #5a6778; background: #f7f9fc; border: 1px solid #e4e9f2; border-radius: 9px; padding: 8px 10px; line-height: 1.8; }
 .hp-sumline b { color: #1b2433; }
 .hp-sumline b.bad { color: #d23b42; }

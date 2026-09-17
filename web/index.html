@@ -1000,6 +1000,21 @@
     if (e.dataTransfer && e.dataTransfer.files.length) addImageFiles(e.dataTransfer.files);
   });
 
+  // P0-4：问答首页也要带 session_id，否则同一后端上打开的所有标签页会全部落进 default 会话。
+  // 与工作台同键名、同规则（sessionStorage=每标签独立、刷新保留），两处不必共享具体值。
+  function currentSessionId() {
+    let sid = "";
+    try { sid = sessionStorage.getItem("docmind_session_id") || ""; } catch { sid = ""; }
+    if (sid) return sid;
+    const c = globalThis.crypto;
+    const raw = c && typeof c.randomUUID === "function"
+      ? c.randomUUID().replace(/-/g, "")
+      : Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
+    sid = "web-" + raw.replace(/[^0-9a-fA-F]/g, "").slice(0, 12).padEnd(12, "0");
+    try { sessionStorage.setItem("docmind_session_id", sid); } catch { /* 存储不可用：本次仍用该 id */ }
+    return sid;
+  }
+
   async function send() {
     const question = q.value.trim();
     if (!question && pendingImages.length === 0) return;
@@ -1021,6 +1036,8 @@
 
     const fd = new FormData();
     fd.append("question", question);
+    const sid = currentSessionId();
+    if (sid) fd.append("session_id", sid);
     imgs.forEach((it) => fd.append("images", it.blob, it.name));
     let resp;
     try {

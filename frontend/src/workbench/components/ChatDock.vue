@@ -5,7 +5,7 @@
 //   与 godot-ai 插件安装引导（安装前必须用户确认）。
 import { nextTick, ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
-import { aiApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, setSessionId } from '../api'
+import { aiApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, setSessionId, startTabProbe, probeSoleDocMindTab } from '../api'
 import type { McpServer, ModelConfigInfo, ContextUsage } from '../api'
 import type { SseEvent } from '../api'
 import { mdToHtml, extractFileRefs } from '../markdown'
@@ -278,9 +278,11 @@ function rebuildFromTurns(turns: { user: string; assistant: string }[]) {
   return rebuilt.length
 }
 
-/** 回灌历史：优先当前会话 id；查不到（浏览器存储被清 → 桌面壳重开生成了全新 id）
- *  则退回最近一段会话续上，并把该 id 写回存储。仅在没有正在发送的消息时执行，
- *  除非 force（如「继续这段对话」显式切换会话）。 */
+/** 回灌历史：优先当前会话 id。当前 id 无历史时，**仅当本标签是唯一 DocMind 标签**才
+ *  退回「最近一段有内容的会话」续上（保住单窗口「关掉重开自动续上」的体验）；
+ *  多标签 / 探测不确定时保持空态，历史由「会话列表」显式切换获得——绝不静默续接，
+ *  否则新标签会接到旧会话、把多标签合成为一段对话。
+ *  仅在没有正在发送的消息时执行，除非 force（如「继续这段对话」显式切换会话）。 */
 async function restoreHistory(force = false) {
   if (demoMode.value) return
   if (sending.value) return
@@ -291,15 +293,19 @@ async function restoreHistory(force = false) {
   try {
     let detail = await harnessApi.sessionDetail(getSessionId())
     let turns = detail.turns || []
-    if (!turns.length) {
-      // 当前 id 无历史：取最近一段有内容的会话续上（桌面壳往往不持久浏览器存储）
-      const list = await harnessApi.sessions()
-      const items = list.items || []
-      const recent = items.find((x) => (x.turns || 0) > 0) || items[0]
-      if (recent && recent.session_id && recent.session_id !== getSessionId()) {
-        setSessionId(recent.session_id)
-        detail = await harnessApi.sessionDetail(recent.session_id)
-        turns = detail.turns || []
+    if (!turns.length && !force) {
+      // 唯一性门禁：只有「本窗口是当前唯一 DocMind 标签」才允许自动续接最近一段会话；
+      // 多标签 / 探测不可用 → 保持空态（隔离优先）。
+      const sole = await probeSoleDocMindTab()
+      if (sole) {
+        const list = await harnessApi.sessions()
+        const items = list.items || []
+        const recent = items.find((x) => (x.turns || 0) > 0) || items[0]
+        if (recent && recent.session_id && recent.session_id !== getSessionId()) {
+          setSessionId(recent.session_id)
+          detail = await harnessApi.sessionDetail(recent.session_id)
+          turns = detail.turns || []
+        }
       }
     }
     if (turns.length) {
@@ -381,6 +387,7 @@ function onFocusChat(ev?: Event) {
 }
 onMounted(() => {
   window.addEventListener('docmind:focus-chat', onFocusChat as EventListener)
+  startTabProbe()   // 启动跨标签存活探测（供唯一性门禁判断）
   void loadModelConfig()
   void loadContextUsage()
   void restoreHistory()
