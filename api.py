@@ -40,6 +40,20 @@ from config import (
     edit_confirm_enabled,
     get_external_access_mode,
     set_external_access_mode,
+    get_web_search_provider,
+    set_web_search_provider,
+    get_web_search_api_key,
+    set_web_search_api_key,
+    get_web_search_api_url,
+    set_web_search_api_url,
+    get_web_search_prefer_builtin,
+    set_web_search_prefer_builtin,
+    get_web_fetch_provider,
+    set_web_fetch_provider,
+    get_web_fetch_api_key,
+    set_web_fetch_api_key,
+    get_web_fetch_api_url,
+    set_web_fetch_api_url,
     API_TOKEN,
     DOCMIND_CORS_ORIGINS,
     CHAT_IMAGE_MAX_FILES,
@@ -1911,6 +1925,14 @@ class ConfigReq(BaseModel):
     context_window: Optional[int] = None
     # AI 越界访问模式：'safe'=仅项目内；'high'=允许受控越界读写。None=不变
     external_access_mode: Optional[str] = None
+    # 网络搜索 / URL 获取服务商配置：None=不变
+    web_search_provider: Optional[str] = None
+    web_search_api_key: Optional[str] = None
+    web_search_api_url: Optional[str] = None
+    web_search_prefer_builtin: Optional[bool] = None
+    web_fetch_provider: Optional[str] = None
+    web_fetch_api_key: Optional[str] = None
+    web_fetch_api_url: Optional[str] = None
 
 
 def _build_time() -> str:
@@ -1999,6 +2021,14 @@ async def get_config():
         "build_time": _build_time(),
         # AI 越界访问模式：safe=仅项目内；high=允许受控越界读写（须配置白名单）
         "external_access_mode": get_external_access_mode(),
+        # 网络搜索 / URL 获取服务商配置（密钥不回显，仅回 has_key）
+        "web_search_provider": get_web_search_provider(),
+        "web_search_api_url": get_web_search_api_url(),
+        "web_search_has_key": bool(get_web_search_api_key()),
+        "web_search_prefer_builtin": get_web_search_prefer_builtin(),
+        "web_fetch_provider": get_web_fetch_provider(),
+        "web_fetch_api_url": get_web_fetch_api_url(),
+        "web_fetch_has_key": bool(get_web_fetch_api_key()),
         # 同步 urllib 探活放线程池，Ollama 不可达时不阻塞事件循环/拖慢面板打开
         "ollama_status": await run_in_threadpool(check_ollama),
     }
@@ -2574,6 +2604,22 @@ async def set_config(req: ConfigReq):
                     status_code=400)
         set_external_access_mode(req.external_access_mode)
 
+    # ---- 网络搜索 / URL 获取服务商配置 ----
+    if req.web_search_provider is not None:
+        set_web_search_provider(req.web_search_provider)
+    if req.web_search_api_key is not None:
+        set_web_search_api_key(req.web_search_api_key)
+    if req.web_search_api_url is not None:
+        set_web_search_api_url(req.web_search_api_url)
+    if req.web_search_prefer_builtin is not None:
+        set_web_search_prefer_builtin(req.web_search_prefer_builtin)
+    if req.web_fetch_provider is not None:
+        set_web_fetch_provider(req.web_fetch_provider)
+    if req.web_fetch_api_key is not None:
+        set_web_fetch_api_key(req.web_fetch_api_key)
+    if req.web_fetch_api_url is not None:
+        set_web_fetch_api_url(req.web_fetch_api_url)
+
     # 云端厂商需要 key 但未提供（custom 可能是免 key 的内网代理，不警告）
     envk = PROVIDERS[req.provider].get("api_key_env", "")
     if envk and not (get_runtime("llm_api_key") or LLM_API_KEY or os.getenv(envk, "")):
@@ -2595,6 +2641,13 @@ async def set_config(req: ConfigReq):
         "ingested_files": sorted(_INGESTED),
         "warnings": warnings,
         "external_access_mode": get_external_access_mode(),
+        "web_search_provider": get_web_search_provider(),
+        "web_search_api_url": get_web_search_api_url(),
+        "web_search_has_key": bool(get_web_search_api_key()),
+        "web_search_prefer_builtin": get_web_search_prefer_builtin(),
+        "web_fetch_provider": get_web_fetch_provider(),
+        "web_fetch_api_url": get_web_fetch_api_url(),
+        "web_fetch_has_key": bool(get_web_fetch_api_key()),
     }
 
 

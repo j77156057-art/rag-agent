@@ -15,7 +15,10 @@ import urllib.parse
 import datetime
 import mcp_client
 
-from config import TOP_K, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime, edit_confirm_enabled, external_access_high, EXTERNAL_API_ALLOWLIST
+from config import (TOP_K, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime,
+                     edit_confirm_enabled, external_access_high, EXTERNAL_API_ALLOWLIST,
+                     get_web_search_provider, get_web_search_api_key, get_web_search_api_url,
+                     get_web_fetch_provider, get_web_fetch_api_key, get_web_fetch_api_url)
 from embeddings import EmbeddingClient
 from vectorstore import query as vs_query, pretty_source
 from ingest import _CODE_EXT, _SKIP_DIRS
@@ -346,17 +349,16 @@ def _parse_web_search_arg(arg):
 
 
 def web_search(query):
-    """联网搜索（无需 API Key）。
+    """联网搜索（按设置选择服务商，无需 Key 的内置后端默认可用）。
 
     入参为单字符串，可带站点限定：
     - `query: 关键词` 或直接写关键词；
     - 追加 `site: github.com` 或 `platform: github`（自动映射为 site:github.com），
       把结果收敛到指定站（GitHub / 哔哩哔哩 / 微博 / 百度贴吧 等）。
 
-    后端策略（可用 env WEB_SEARCH_BACKEND 强制）：
-    - 默认 auto：先 DuckDuckGo，再百度（国内更稳），最后 Bing 兜底；
-    - ddg / bing / baidu：只走指定后端。
-    返回前 5 条结果的标题/摘要/链接；全部不可达时优雅降级并说明原因。
+    服务商（设置中可切换）：auto（内置 ddg→baidu→bing 故障转移）/ ddg / bing / baidu /
+    exa / tavily / searxng / bocha / firecrawl / zhipu / querit / parallel / mcp_exa。
+    API 类服务商需先在设置填 API Key（或自建实例地址）。返回前 5 条标题/摘要/链接。
     """
     q, site = _parse_web_search_arg(query)
     if not q:
@@ -364,9 +366,16 @@ def web_search(query):
     if site:
         q = f"{q} site:{site}"
     q = _search_recency_query(q)
-    forced = (os.getenv("WEB_SEARCH_BACKEND") or "auto").strip().lower()
+    provider = get_web_search_provider()
+    if provider in ("builtin_auto", "ddg", "bing", "baidu"):
+        return _builtin_search(provider, q)
+    return _api_web_search(provider, q)
+
+
+def _builtin_search(provider, q):
+    """内置无 Key 后端：auto 走 ddg→baidu→bing 故障转移；指定单后端则只走该后端。"""
     backends = {"ddg": _ddg_search, "bing": _bing_search, "baidu": _baidu_search}
-    order = [forced] if forced in backends else ["ddg", "baidu", "bing"]
+    order = [provider] if provider in backends else ["ddg", "baidu", "bing"]
     last = ""
     for backend in order:
         try:
@@ -381,6 +390,144 @@ def web_search(query):
     return (last or "搜索失败：所有搜索后端均不可用。") + (
         "" if (not hard_error and last.startswith(_SEARCH_EMPTY_MARKERS)) else
         "（DuckDuckGo/百度/Bing 均不可达，请确认运行环境能访问外网，或配置带 Key 的搜索引擎）")
+
+
+def _api_web_search(provider, q):
+    """API 类搜索服务商（需 Key 或自建地址），失败给出清晰原因或回退内置。"""
+    key = get_web_search_api_key()
+    url = get_web_search_api_url()
+    try:
+        if provider == "exa":
+            return _exa_search(q, key)
+        if provider == "tavily":
+            return _tavily_search(q, key)
+        if provider == "searxng":
+            return _searxng_search(q, url)
+        if provider == "bocha":
+            return _bocha_search(q, key)
+        if provider == "firecrawl":
+            return _firecrawl_search(q, key)
+        # zhipu / querit / parallel / mcp_exa：通用 keyed POST，需自定义 API 地址
+        if url:
+            return _generic_api_search(provider, q, key, url)
+        return ("该搜索服务商需要先在「网络搜索」设置里填写 API 地址或 API Key 才能使用；"
+                "请填写后保存，或把服务商切回「自动（内置）」。")
+    except Exception as e:  # noqa: BLE001
+        return f"搜索失败（{provider}）：{type(e).__name__}: {e}"
+
+
+def _exa_search(q, key):
+    if not key:
+        return "Exa 需要 API Key，请在「网络搜索」设置中填写后保存。"
+    api_url = "https://api.exa.ai/search"
+    payload = {"query": q, "numResults": 5, "contents": {"text": True}}
+    req = urllib.request.Request(
+        api_url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    results = data.get("results") or []
+    if not results:
+        return "搜索未返回结果，可能是网络受限或该关键词无结果。"
+    lines = []
+    for it in results[:5]:
+        text = (it.get("text") or "").strip().replace("\n", " ")
+        lines.append(f"· {it.get('title', '')}\n  {text[:200]}\n  {it.get('url', '')}")
+    return "\n".join(lines)
+
+
+def _tavily_search(q, key):
+    if not key:
+        return "Tavily 需要 API Key，请在「网络搜索」设置中填写后保存。"
+    api_url = "https://api.tavily.com/search"
+    payload = {"api_key": key, "query": q, "max_results": 5, "search_depth": "basic"}
+    req = urllib.request.Request(
+        api_url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    results = data.get("results") or []
+    if not results:
+        return "搜索未返回结果，可能是网络受限或该关键词无结果。"
+    lines = [f"· {it.get('title', '')}\n  {(it.get('content', '') or '')[:200]}\n  {it.get('url', '')}"
+             for it in results[:5]]
+    return "\n".join(lines)
+
+
+def _searxng_search(q, url):
+    if not url:
+        return "SearXNG 需要填写自建实例地址（API 地址），请在「网络搜索」设置中填写后保存。"
+    api_url = f"{url.rstrip('/')}/search?q={urllib.parse.quote(q)}&format=json"
+    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (DocMind/1.0)"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    results = data.get("results") or []
+    if not results:
+        return "搜索未返回结果，可能是网络受限或该关键词无结果。"
+    lines = [f"· {it.get('title', '')}\n  {(it.get('content', '') or '')[:200]}\n  {it.get('url', '')}"
+             for it in results[:5]]
+    return "\n".join(lines)
+
+
+def _bocha_search(q, key):
+    if not key:
+        return "Bocha 需要 API Key，请在「网络搜索」设置中填写后保存。"
+    api_url = "https://api.bochaai.com/openapi/v1/web-search"
+    payload = {"query": q, "count": 5, "freshness": "noLimit"}
+    req = urllib.request.Request(
+        api_url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    results = ((data.get("data") or {}).get("webPages") or {}).get("value") or []
+    if not results:
+        return "搜索未返回结果，可能是网络受限或该关键词无结果。"
+    lines = [f"· {it.get('name', '')}\n  {(it.get('snippet', '') or '')[:200]}\n  {it.get('url', '')}"
+             for it in results[:5]]
+    return "\n".join(lines)
+
+
+def _firecrawl_search(q, key):
+    if not key:
+        return "Firecrawl 需要 API Key，请在「网络搜索」设置中填写后保存。"
+    api_url = "https://api.firecrawl.dev/v1/search"
+    payload = {"query": q, "limit": 5, "pageOptions": {"fetchPageContent": False}}
+    req = urllib.request.Request(
+        api_url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    results = data.get("data") or []
+    if not results:
+        return "搜索未返回结果，可能是网络受限或该关键词无结果。"
+    lines = [f"· {it.get('title', '')}\n  {(it.get('description', '') or '')[:200]}\n  {it.get('url', '')}"
+             for it in results[:5]]
+    return "\n".join(lines)
+
+
+def _generic_api_search(provider, q, key, url):
+    """zhipu/querit/parallel/mcp_exa 等未内置端点的服务商：通用 keyed POST。"""
+    payload = {"query": q, "q": q, "numResults": 5, "max_results": 5, "count": 5}
+    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (DocMind/1.0)"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    results = data.get("results") or data.get("data") or []
+    if isinstance(results, dict):
+        results = results.get("results") or results.get("value") or []
+    if not results:
+        return "搜索未返回结果，可能是网络受限或该关键词无结果。"
+    lines = []
+    for it in results[:5]:
+        if isinstance(it, dict):
+            lines.append(f"· {it.get('title', it.get('name', ''))}\n"
+                         f"  {(it.get('snippet', it.get('content', it.get('description', '')) or '')[:200])}\n"
+                         f"  {it.get('url', it.get('link', ''))}")
+        else:
+            lines.append(f"· {it}")
+    return "\n".join(lines)
 
 
 def _ddg_search(q):
@@ -519,9 +666,87 @@ def _baidu_search(q):
     return "\n".join(lines)
 
 def web_fetch(url):
-    """读取公开网页正文的简化研究工具，返回标题、来源和清理后的文本。"""
+    """读取公开网页正文的简化研究工具，返回标题、来源和清理后的文本。
+
+    服务商（设置中可切换）：builtin（直接 urllib 抓 HTML 并清理）/ jina / firecrawl / custom。
+    jina 与 firecrawl 需 API Key；custom 需填 API 地址（POST {url: ...} 取 markdown/text）。
+    """
     ok, _ = _url_scheme_ok(url)
     if not ok: return "网页读取失败：只允许 http/https。"
+    provider = get_web_fetch_provider()
+    if provider == "builtin":
+        return _builtin_fetch(url)
+    key = get_web_fetch_api_key()
+    api_url = get_web_fetch_api_url()
+    if provider == "jina":
+        return _jina_fetch(url, key, api_url)
+    if provider == "firecrawl":
+        return _firecrawl_fetch(url, key, api_url)
+    if provider == "custom":
+        return _custom_fetch(url, key, api_url)
+    return _builtin_fetch(url)
+
+
+def _jina_fetch(url, key, api_url):
+    base = (api_url.rstrip("/") + "/") if api_url else "https://r.jina.ai/"
+    target = base + url
+    headers = {"User-Agent": "Mozilla/5.0 (DocMind research)"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        req = urllib.request.Request(target, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read(2_000_000).decode("utf-8", "replace")
+        raw = raw[:8000]
+        return f"来源：{url}\n正文：\n{raw}" + ("\n[正文已截断]" if len(raw) >= 8000 else "")
+    except Exception as e:
+        return f"网页读取失败：{type(e).__name__}: {e}"
+
+
+def _firecrawl_fetch(url, key, api_url):
+    if not key:
+        return "Firecrawl 需要 API Key，请在「URL 获取」设置中填写后保存。"
+    endpoint = (api_url.rstrip("/") if api_url else "https://api.firecrawl.dev") + "/v1/scrape"
+    payload = {"url": url, "formats": ["markdown"]}
+    req = urllib.request.Request(
+        endpoint, data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        md = ((data.get("data") or {}).get("markdown") or "").strip()
+        if not md:
+            return "网页读取失败：Firecrawl 未返回正文。"
+        md = md[:8000]
+        return f"来源：{url}\n正文：\n{md}" + ("\n[正文已截断]" if len(md) >= 8000 else "")
+    except Exception as e:
+        return f"网页读取失败：{type(e).__name__}: {e}"
+
+
+def _custom_fetch(url, key, api_url):
+    if not api_url:
+        return "自定义 URL 获取需要填写 API 地址，请在「URL 获取」设置中填写后保存。"
+    payload = {"url": url}
+    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (DocMind research)"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        req = urllib.request.Request(api_url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+        with urllib.request.urlopen(req, timeout=25) as r:
+            raw = r.read(2_000_000).decode("utf-8", "replace")
+        try:
+            data = json.loads(raw)
+            md = data.get("markdown") or data.get("text") or data.get("content") or raw
+        except Exception:
+            md = raw
+        md = md[:8000]
+        return f"来源：{url}\n正文：\n{md}" + ("\n[正文已截断]" if len(md) >= 8000 else "")
+    except Exception as e:
+        return f"网页读取失败：{type(e).__name__}: {e}"
+
+
+def _builtin_fetch(url):
+    """原 urllib 直抓 HTML 并清理的实现（builtin 服务商）。"""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (DocMind research)"})
         with urllib.request.urlopen(req, timeout=12) as r:

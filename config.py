@@ -367,6 +367,23 @@ EXTERNAL_ACCESS_MODE = os.getenv("DOCMIND_ACCESS_MODE", "safe").strip().lower()
 if EXTERNAL_ACCESS_MODE not in ("safe", "high"):
     EXTERNAL_ACCESS_MODE = "safe"
 
+# ---- 网络搜索 / URL 获取服务商配置 ----
+# 默认从 .env 读取；运行时可通过 /api/config 切换并持久化到 STATE_FILE。
+WEB_SEARCH_PROVIDER = os.getenv("WEB_SEARCH_PROVIDER", "builtin_auto").strip().lower()
+WEB_SEARCH_API_KEY = os.getenv("WEB_SEARCH_API_KEY", "")
+WEB_SEARCH_API_URL = os.getenv("WEB_SEARCH_API_URL", "")
+WEB_FETCH_PROVIDER = os.getenv("WEB_FETCH_PROVIDER", "builtin").strip().lower()
+WEB_FETCH_API_KEY = os.getenv("WEB_FETCH_API_KEY", "")
+WEB_FETCH_API_URL = os.getenv("WEB_FETCH_API_URL", "")
+# True=优先使用模型内置 Web 工具（如模型本身支持联网），False=使用 DocMind 自带的 web_search/web_fetch
+WEB_SEARCH_PREFER_BUILTIN = os.getenv("WEB_SEARCH_PREFER_BUILTIN", "0").strip().lower() in ("1", "true", "yes")
+
+_WEB_SEARCH_PROVIDERS = {
+    "builtin_auto", "ddg", "bing", "baidu", "exa", "tavily", "searxng",
+    "zhipu", "bocha", "querit", "firecrawl", "parallel", "mcp_exa",
+}
+_WEB_FETCH_PROVIDERS = {"builtin", "jina", "firecrawl", "custom"}
+
 # ---- 聊天图片输入（视觉模型，如 qwen3.6 系列）----
 CHAT_IMAGE_MAX_FILES = int(os.getenv("CHAT_IMAGE_MAX_FILES", "4"))  # 单条消息最多图片数
 CHAT_IMAGE_MAX_BYTES = int(os.getenv("CHAT_IMAGE_MAX_BYTES", str(10 * 1024 * 1024)))  # 单图大小上限（压缩前）
@@ -489,6 +506,9 @@ def _apply_persisted_state():
     if m in ("safe", "high") and "external_access_mode" not in _RUNTIME:
         _RUNTIME["external_access_mode"] = m
 
+    # 网络搜索 / URL 获取配置恢复
+    _apply_web_search_state(data)
+
 
 # 注：过去此处 import 期直接调用 _apply_persisted_state()（导入即磁盘读）。
 # 现改为由服务启动期显式调用（api.py lifespan，见 _app_lifespan），
@@ -530,3 +550,120 @@ def set_external_access_mode(mode):
     set_runtime("external_access_mode", mode)
     save_state("external_access_mode", mode)
     return mode
+
+
+# ---- 网络搜索 / URL 获取配置运行时覆盖 ----
+def _persist_web_search():
+    """把当前网络搜索运行时覆盖写回 STATE_FILE（供多个 setter 复用）。"""
+    save_state("web_search_provider", get_runtime("web_search_provider") or WEB_SEARCH_PROVIDER)
+    save_state("web_search_api_key", get_runtime("web_search_api_key") or WEB_SEARCH_API_KEY)
+    save_state("web_search_api_url", get_runtime("web_search_api_url") or WEB_SEARCH_API_URL)
+    save_state("web_search_prefer_builtin", bool(get_runtime("web_search_prefer_builtin")))
+
+
+def _persist_web_fetch():
+    save_state("web_fetch_provider", get_runtime("web_fetch_provider") or WEB_FETCH_PROVIDER)
+    save_state("web_fetch_api_key", get_runtime("web_fetch_api_key") or WEB_FETCH_API_KEY)
+    save_state("web_fetch_api_url", get_runtime("web_fetch_api_url") or WEB_FETCH_API_URL)
+
+
+def get_web_search_provider():
+    v = get_runtime("web_search_provider")
+    if v in _WEB_SEARCH_PROVIDERS:
+        return v
+    return WEB_SEARCH_PROVIDER if WEB_SEARCH_PROVIDER in _WEB_SEARCH_PROVIDERS else "builtin_auto"
+
+
+def set_web_search_provider(provider):
+    provider = (provider or "").strip().lower()
+    if provider not in _WEB_SEARCH_PROVIDERS:
+        provider = "builtin_auto"
+    set_runtime("web_search_provider", provider)
+    save_state("web_search_provider", provider)
+    return provider
+
+
+def get_web_search_api_key():
+    return get_runtime("web_search_api_key") or WEB_SEARCH_API_KEY or ""
+
+
+def set_web_search_api_key(key):
+    key = (key or "").strip()
+    set_runtime("web_search_api_key", key)
+    save_state("web_search_api_key", key)
+    return key
+
+
+def get_web_search_api_url():
+    return get_runtime("web_search_api_url") or WEB_SEARCH_API_URL or ""
+
+
+def set_web_search_api_url(url):
+    url = (url or "").strip().rstrip("/")
+    set_runtime("web_search_api_url", url)
+    save_state("web_search_api_url", url)
+    return url
+
+
+def get_web_search_prefer_builtin():
+    v = get_runtime("web_search_prefer_builtin")
+    if v is not None:
+        return bool(v)
+    return WEB_SEARCH_PREFER_BUILTIN
+
+
+def set_web_search_prefer_builtin(enabled):
+    enabled = bool(enabled)
+    set_runtime("web_search_prefer_builtin", enabled)
+    save_state("web_search_prefer_builtin", enabled)
+    return enabled
+
+
+def get_web_fetch_provider():
+    v = get_runtime("web_fetch_provider")
+    if v in _WEB_FETCH_PROVIDERS:
+        return v
+    return WEB_FETCH_PROVIDER if WEB_FETCH_PROVIDER in _WEB_FETCH_PROVIDERS else "builtin"
+
+
+def set_web_fetch_provider(provider):
+    provider = (provider or "").strip().lower()
+    if provider not in _WEB_FETCH_PROVIDERS:
+        provider = "builtin"
+    set_runtime("web_fetch_provider", provider)
+    save_state("web_fetch_provider", provider)
+    return provider
+
+
+def get_web_fetch_api_key():
+    return get_runtime("web_fetch_api_key") or WEB_FETCH_API_KEY or ""
+
+
+def set_web_fetch_api_key(key):
+    key = (key or "").strip()
+    set_runtime("web_fetch_api_key", key)
+    save_state("web_fetch_api_key", key)
+    return key
+
+
+def get_web_fetch_api_url():
+    return get_runtime("web_fetch_api_url") or WEB_FETCH_API_URL or ""
+
+
+def set_web_fetch_api_url(url):
+    url = (url or "").strip().rstrip("/")
+    set_runtime("web_fetch_api_url", url)
+    save_state("web_fetch_api_url", url)
+    return url
+
+
+def _apply_web_search_state(data):
+    """从 STATE_FILE 恢复网络搜索配置；显式 set_runtime 优先（同 external_access_mode）。"""
+    for key in ("web_search_provider", "web_search_api_key", "web_search_api_url",
+                "web_fetch_provider", "web_fetch_api_key", "web_fetch_api_url"):
+        v = data.get(key)
+        if v is not None and key not in _RUNTIME:
+            _RUNTIME[key] = v
+    pb = data.get("web_search_prefer_builtin")
+    if pb is not None and "web_search_prefer_builtin" not in _RUNTIME:
+        _RUNTIME["web_search_prefer_builtin"] = bool(pb)

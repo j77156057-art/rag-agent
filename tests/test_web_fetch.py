@@ -28,13 +28,20 @@ class WebFetchTests(unittest.TestCase):
 
 
 class WebSearchFailoverTests(unittest.TestCase):
-    """auto 模式：DuckDuckGo 被风控/无结果时必须自动转 Bing（实测 DDG 常返 202 挑战页）。"""
+    """auto 模式：DuckDuckGo 被风控/无结果时必须自动转 Bing（实测 DDG 常返 202 挑战页）。
+    第 2 部分起 web_search 改用 get_web_search_provider() 配置驱动（不再读 WEB_SEARCH_BACKEND）。"""
+
+    @staticmethod
+    def _env_no_recency():
+        # 关闭近因排序，避免查询被追加 after:<year> 干扰精确入参断言
+        return {**os.environ, "WEB_SEARCH_PREFER_RECENT": "0"}
 
     def test_ddg_empty_falls_back_to_bing(self):
         bing_result = "· 真实标题\n  摘要\n  https://example.test/real"
-        env = {**os.environ, "WEB_SEARCH_BACKEND": "auto"}
-        with patch.dict(tools.os.environ, env, clear=True), \
+        with patch.dict(tools.os.environ, self._env_no_recency(), clear=True), \
+                patch("tools.get_web_search_provider", return_value="builtin_auto"), \
                 patch("tools._ddg_search", return_value="搜索未返回结果，可能是网络受限或该关键词无结果。"), \
+                patch("tools._baidu_search", return_value="搜索未返回结果，可能是网络受限或该关键词无结果。"), \
                 patch("tools._bing_search", return_value=bing_result) as mb:
             out = tools.web_search("今天新闻")
         self.assertEqual(out, bing_result)
@@ -42,24 +49,25 @@ class WebSearchFailoverTests(unittest.TestCase):
 
     def test_ddg_success_skips_bing(self):
         ddg_result = "· DDG 标题\n  摘要\n  https://ddg.test/x"
-        env = {**os.environ, "WEB_SEARCH_BACKEND": "auto"}
-        with patch.dict(tools.os.environ, env, clear=True), \
+        with patch.dict(tools.os.environ, self._env_no_recency(), clear=True), \
+                patch("tools.get_web_search_provider", return_value="builtin_auto"), \
                 patch("tools._ddg_search", return_value=ddg_result), \
                 patch("tools._bing_search") as mb:
             self.assertEqual(tools.web_search("q"), ddg_result)
         mb.assert_not_called()
 
     def test_ddg_exception_falls_back_to_bing(self):
-        env = {**os.environ, "WEB_SEARCH_BACKEND": "auto"}
-        with patch.dict(tools.os.environ, env, clear=True), \
+        with patch.dict(tools.os.environ, self._env_no_recency(), clear=True), \
+                patch("tools.get_web_search_provider", return_value="builtin_auto"), \
                 patch("tools._ddg_search", side_effect=TimeoutError("202 challenge")), \
+                patch("tools._baidu_search", return_value="搜索未返回结果，可能是网络受限或该关键词无结果。"), \
                 patch("tools._bing_search", return_value="· B\n  s\n  https://b.test"):
             out = tools.web_search("q")
         self.assertIn("https://b.test", out)
 
     def test_forced_ddg_does_not_fail_over(self):
-        env = {**os.environ, "WEB_SEARCH_BACKEND": "ddg"}
-        with patch.dict(tools.os.environ, env, clear=True), \
+        with patch.dict(tools.os.environ, self._env_no_recency(), clear=True), \
+                patch("tools.get_web_search_provider", return_value="ddg"), \
                 patch("tools._ddg_search", return_value="搜索未返回结果，可能是网络受限或该关键词无结果。"), \
                 patch("tools._bing_search") as mb:
             out = tools.web_search("q")

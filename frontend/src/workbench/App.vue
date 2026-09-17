@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // DocMind 开发工作台 · P0 任务 4：多标签编辑 + 保存 + 新建/改名/删除。
-import { onMounted, onBeforeUnmount, computed } from 'vue'
+import { onMounted, onBeforeUnmount, computed, ref } from 'vue'
 import FileTree from './components/FileTree.vue'
 import CodeView from './components/CodeView.vue'
 import EditorTabs from './components/EditorTabs.vue'
@@ -21,6 +21,7 @@ import ChatDock from './components/ChatDock.vue'
 import AgentPolicyPanel from './components/AgentPolicyPanel.vue'
 import GpuPanel from './components/GpuPanel.vue'
 import HarnessPanel from './components/HarnessPanel.vue'
+import SettingsView from './components/SettingsView.vue'
 import SemanticLocateBar from './components/SemanticLocateBar.vue'
 import WorkspaceTabs from './components/WorkspaceTabs.vue'
 import AssetCenterView from './components/AssetCenterView.vue'
@@ -46,6 +47,8 @@ const {
 } = useWorkbench()
 
 const dirtyCount = computed(() => tabs.value.filter((t) => t.dirty).length)
+/** 统一设置页（网络搜索 / MCP / 智能体）显隐 */
+const settingsVisible = ref(false)
 /** 当前标签可回滚：已纳入 git 且磁盘或编辑器存在改动 */
 const canRevertActive = computed(() => {
   const t = activeTab.value
@@ -116,6 +119,17 @@ onBeforeUnmount(() => {
       <SemanticLocateBar v-if="tree || demoMode" class="wb-locate-slot" />
       <div class="wb-topbar-right">
         <a class="wb-question-link" href="/" title="回到 AI 问答首页：用大白话提问，让 AI 在代码库里找答案">AI 问答</a>
+        <button
+          class="wb-save-btn wb-settings-btn"
+          title="设置：网络搜索、MCP 连接器、智能体预设"
+          @click="settingsVisible = true"
+        >
+          <svg width="13" height="13" viewBox="0 0 13 13">
+            <circle cx="6.5" cy="6.5" r="2.1" fill="none" stroke="currentColor" stroke-width="1.1" />
+            <path d="M6.5 1.2 V2.6 M6.5 10.4 V11.8 M1.2 6.5 H2.6 M10.4 6.5 H11.8 M3 3 L4 4 M9 9 L10 10 M10 3 L9 4 M4 9 L3 10" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
+          </svg>
+          设置
+        </button>
         <!-- 引擎/生成类面板：窄屏按优先级分级隐藏（容器隐藏，不影响弹层逻辑） -->
         <span class="wb-tool wb-tool-te"><TaskEnginePanel /></span>
         <span class="wb-tool wb-tool-gp"><GpuPanel /></span>
@@ -315,5 +329,6 @@ onBeforeUnmount(() => {
     <RelationGraph />
     <UnityGraph />
     <SelectionToolbar />
+    <SettingsView :visible="settingsVisible" @close="settingsVisible = false" />
   </div>
 </template>

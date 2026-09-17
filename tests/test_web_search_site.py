@@ -6,6 +6,7 @@
 - 百度后端：auto 下作为 ddg 失败后的兜底层、可强制指定、HTML 解析正确。
 """
 import io
+import json
 import os
 import sys
 import unittest
@@ -84,8 +85,8 @@ class BaiduBackendTests(unittest.TestCase):
         m.assert_called_once()
 
     def test_forced_baidu_backend(self):
-        env = {**os.environ, "WEB_SEARCH_BACKEND": "baidu"}
-        with patch.dict(tools.os.environ, env, clear=True), \
+        # 指定单后端：经 config.get_web_search_provider() 读取，不走 auto 故障转移
+        with patch("tools.get_web_search_provider", return_value="baidu"), \
                 patch("tools._baidu_search", return_value="· 百度结果") as m, \
                 patch("tools._ddg_search", return_value="x") as ddg:
             out = tools.web_search("某关键词")
@@ -106,6 +107,64 @@ class BaiduBackendTests(unittest.TestCase):
         self.assertIn("示例标题", out)
         self.assertIn("示例摘要内容", out)
         self.assertIn("https://example.com/a", out)
+
+
+def _fake_json_response(payload):
+    """构造一个带 .read() 的假 HTTP 响应对象（urlopen 返回值）。"""
+    class _Resp:
+        def __init__(self, data):
+            self._b = json.dumps(data).encode("utf-8")
+        def read(self, *a, **k):
+            return self._b
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    return _Resp(payload)
+
+
+class ApiProviderDispatchTests(unittest.TestCase):
+    """API 类搜索/抓取服务商：缺失 Key/地址时给出清晰提示；mock urlopen 验证解析。"""
+
+    def test_exa_requires_key(self):
+        with patch("tools.get_web_search_provider", return_value="exa"), \
+                patch("tools.get_web_search_api_key", return_value=""):
+            self.assertIn("API Key", tools.web_search("某关键词"))
+
+    def test_tavily_parse(self):
+        resp = _fake_json_response({"results": [
+            {"title": "T 标题", "url": "https://x.com/1", "content": "T 摘要内容"},
+        ]})
+        with patch("tools.get_web_search_provider", return_value="tavily"), \
+                patch("tools.get_web_search_api_key", return_value="k"), \
+                patch("urllib.request.urlopen", return_value=resp), \
+                patch("urllib.request.Request", side_effect=lambda url, **kw: url):
+            out = tools.web_search("某关键词")
+        self.assertIn("T 标题", out)
+        self.assertIn("https://x.com/1", out)
+        self.assertIn("T 摘要内容", out)
+
+    def test_searxng_requires_url(self):
+        with patch("tools.get_web_search_provider", return_value="searxng"), \
+                patch("tools.get_web_search_api_url", return_value=""):
+            self.assertIn("API 地址", tools.web_search("某关键词"))
+
+    def test_generic_requires_url(self):
+        # zhipu/querit/parallel/mcp_exa 无内置端点，必须填自定义 API 地址
+        with patch("tools.get_web_search_provider", return_value="zhipu"), \
+                patch("tools.get_web_search_api_url", return_value=""):
+            self.assertIn("API 地址", tools.web_search("某关键词"))
+
+    def test_jina_fetch_requires_no_key_builtin_host(self):
+        resp = _fake_json_response({})  # 用非 json 正文模拟 jina markdown 返回
+        resp._b = "# 标题\n\n正文内容".encode("utf-8")
+        with patch("tools.get_web_fetch_provider", return_value="jina"), \
+                patch("tools.get_web_fetch_api_key", return_value=""), \
+                patch("tools.get_web_fetch_api_url", return_value=""), \
+                patch("urllib.request.urlopen", return_value=resp), \
+                patch("urllib.request.Request", side_effect=lambda url, **kw: url):
+            out = tools.web_fetch("https://example.com/p")
+        self.assertIn("正文内容", out)
 
 
 if __name__ == "__main__":
