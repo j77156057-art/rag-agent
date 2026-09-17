@@ -3,7 +3,8 @@
 // 下方为每区状态卡（目录/独立 git/分支/脏标记/文件数/依赖/导出/校验器），
 // 顶部横幅展示契约校验结果（依赖无环、导出文件存在）。
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { useWorkbench } from '../composables/workbench'
+import { useWorkbench, askConfirm } from '../composables/workbench'
+import { withProject } from '../api'
 import { regionColor } from '../theme'
 import type { RegionInfo } from '../api'
 
@@ -13,6 +14,36 @@ const {
 } = useWorkbench()
 
 const selectedKey = ref<string | null>(null)
+const adding = ref(false), regionKey = ref(''), regionName = ref(''), regionDir = ref(''), addError = ref(''), addBusy = ref(false)
+async function addRegion() {
+  addError.value = ''
+  if (!/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(regionKey.value)) { addError.value = '标识请使用英文字母开头，可含数字、下划线。'; return }
+  if (regionMap.value.regions.some(r => r.key === regionKey.value)) { addError.value = '此分区标识已存在，请使用新的标识。'; return }
+  const dir = regionDir.value.trim() || regionKey.value
+  if (/^[\\/]|:/.test(dir) || dir.replace(/\\/g, '/').split('/').some(p => p === '..' || p === '.')) {
+    addError.value = '目录必须是项目内的相对路径，不能包含 . 或 ..。'; return
+  }
+  if (!await askConfirm({ title: '新增项目分区', message: `新增「${regionName.value || regionKey.value}」，目录：${dir}。将更新分区配置、初始化目录及 Git。`, confirmText: '新增分区' })) return
+  addBusy.value = true
+  try {
+    async function post(url: string, body: unknown) {
+      const response = await fetch(url, withProject({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }))
+      const result = await response.json()
+      if (!response.ok || !result.ok) throw new Error(result.error || '分区操作失败')
+      return result
+    }
+    await post('/api/approval', { action: 'apply_regions', target: '*', user: 'workbench-user', approved: true })
+    await post('/api/add_region', { key: regionKey.value, dir, name: regionName.value })
+    adding.value = false
+    await openRegionMap()
+    await useWorkbench().loadTree()
+  } catch (e) { addError.value = (e as Error).message }
+  finally { addBusy.value = false }
+}
+function askAiForRegions() {
+  closeRegionMap()
+  window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { q: '请读取当前项目结构和现有分区，提出适合此项目的分区调整方案。先展示依据、建议目录和影响范围，等待我审核再修改。' } }))
+}
 
 const byKey = computed(() => new Map(regionMap.value.regions.map((r) => [r.key, r])))
 
@@ -138,6 +169,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
           <span class="rm-root" :title="regionMap.codeRoot">{{ regionMap.codeRoot }}</span>
         </div>
         <div class="rm-top-actions">
+          <button class="rm-refresh" @click="adding = !adding">新增分区</button>
+          <button class="rm-refresh" @click="askAiForRegions">让 AI 规划分区</button>
           <button class="rm-refresh" :disabled="regionMap.loading" @click="void openRegionMap()">
             <svg width="12" height="12" viewBox="0 0 12 12" :class="{ spinning: regionMap.loading }">
               <path d="M10.2 6 A4.2 4.2 0 1 1 6 1.8 A4.2 4.2 0 0 1 9.6 3.4 M9.6 1.4 V3.4 H7.6"
@@ -155,6 +188,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
       <div v-else-if="regionMap.error" class="rm-state"><p class="rm-error">{{ regionMap.error }}</p></div>
 
       <div v-else class="rm-body">
+        <form v-if="adding" class="rm-add" @submit.prevent="addRegion">
+          <label>分区名称<input v-model="regionName" placeholder="例如：任务系统" /></label>
+          <label>唯一标识<input v-model="regionKey" placeholder="quests" required /></label>
+          <label>项目内目录<input v-model="regionDir" placeholder="默认使用标识" /></label>
+          <button :disabled="addBusy" class="rm-refresh">{{ addBusy ? '创建中…' : '确认新增' }}</button>
+          <p v-if="addError" role="alert">{{ addError }}</p>
+        </form>
         <!-- 契约校验横幅 -->
         <div class="rm-contract" :class="regionMap.contracts?.ok ? 'ok' : 'bad'">
           <template v-if="regionMap.contracts">
@@ -305,6 +345,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 </template>
 
 <style scoped>
+.rm-add { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 16px; }
+.rm-add label { display: grid; gap: 6px; font-size: 12px; }
+.rm-add input { padding: 8px; border: 1px solid var(--border); border-radius: 5px; }
+.rm-add p { width: 100%; color: #b42318; }
 .rm-overlay {
   position: fixed;
   inset: 0;

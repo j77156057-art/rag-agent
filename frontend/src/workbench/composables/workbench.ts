@@ -20,6 +20,7 @@ export interface EditorTab {
   writable: boolean
   /** 只读快照：建编辑器时作为初始 doc，保存成功后更新 */
   savedContent: string
+  draftContent?: string
   dirty: boolean
   loading: boolean
   error: string | null
@@ -282,6 +283,46 @@ async function openRecent(path: string) {
 /** tab.id -> 取当前编辑器文本（由 CodeView 注册，保存时取最新内容） */
 const contentGetters = new Map<number, () => string>()
 
+// Page navigation must not discard editor drafts. Store per tab and project;
+// restored drafts retain their original mtime so save conflict checks still work.
+let restoredRoot = ''
+function persistWorkspace() {
+  if (!tree.value || restoredRoot !== tree.value.code_root) return
+  try {
+    sessionStorage.setItem('docmind.workspace:' + restoredRoot, JSON.stringify({
+      tabs: tabs.value.filter(t => !t.loading && !t.error).map(t => ({ ...t,
+        draftContent: contentGetters.get(t.id)?.() ?? t.draftContent ?? t.savedContent,
+      })), activeId: activeId.value, selectedPath: selectedPath.value, workspace: workspace.value,
+    }))
+  } catch { /* storage unavailable: beforeunload still protects dirty files */ }
+}
+async function restoreWorkspace() {
+  if (!tree.value || restoredRoot === tree.value.code_root) return
+  restoredRoot = tree.value.code_root
+  try {
+    const data = JSON.parse(sessionStorage.getItem('docmind.workspace:' + restoredRoot) || 'null')
+    if (!data || !Array.isArray(data.tabs) || tabs.value.length) return
+    tabs.value = data.tabs.filter((t: EditorTab) => typeof t.path === 'string' && typeof t.savedContent === 'string')
+      .map((t: EditorTab) => ({ ...t, saving: false, loading: false }))
+    tabSeq = Math.max(0, ...tabs.value.map(t => t.id)) + 1
+    activeId.value = data.activeId
+    selectedPath.value = data.selectedPath
+    if (['overview', 'code', 'assets'].includes(data.workspace)) workspace.value = data.workspace
+    for (const tab of tabs.value) {
+      if (tab.dirty) continue // Preserve the original base for conflict detection.
+      try {
+        const file = await fsApi.read(tab.path)
+        tab.savedContent = file.content
+        tab.draftContent = file.content
+        tab.mtime = file.mtime
+        docReplacers.get(tab.id)?.(file.content)
+      } catch (e) { tab.error = (e as Error).message }
+    }
+  } catch { /* damaged session data must not block opening a project */ }
+}
+window.addEventListener('pagehide', persistWorkspace)
+window.addEventListener('beforeunload', persistWorkspace)
+
 /**
  * tab.id -> 整文档替换器（由 CodeView 注册）。
  * P3 git 回滚/历史恢复后，磁盘内容在编辑器之外被改写：活动标签走 view.dispatch，
@@ -371,6 +412,7 @@ async function loadTree(selectPath?: string | null) {
   treeError.value = null
   try {
     tree.value = await fsApi.tree()
+    await restoreWorkspace()
     syncTabGitStates()
     if (selectPath !== undefined) selectedPath.value = selectPath
     void loadTags()  // 业务标签是增强层，静默加载（失败不弹错）
@@ -453,6 +495,7 @@ async function openPath(path: string, preferWritable?: boolean) {
 }
 
 function openNode(node: TreeNode) {
+  selectedPath.value = node.path
   if (node.type === 'file') void openPath(node.path, node.writable)
 }
 
@@ -561,6 +604,8 @@ export function registerContentGetter(id: number, fn: () => string) {
  * 这里不再逐文件弹确认，避免卡在一堆弹窗里无法完成切换。
  */
 function closeAllTabs() {
+  persistWorkspace()
+  restoredRoot = ''
   for (const t of tabs.value) {
     contentGetters.delete(t.id)
     docReplacers.delete(t.id)
@@ -575,9 +620,7 @@ function closeAllTabs() {
 async function saveTab(id: number, overwrite = false): Promise<boolean> {
   const tab = tabs.value.find((t) => t.id === id)
   if (!tab || !tab.writable || tab.saving) return false
-  const getter = contentGetters.get(id)
-  if (!getter) return false
-  const content = getter()
+  const content = contentGetters.get(id)?.() ?? tab.draftContent ?? tab.savedContent
   tab.saving = true
   tab.reindexWarn = null
   try {

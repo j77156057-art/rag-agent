@@ -67,7 +67,7 @@ watch(
 
 function onClick() {
   if (props.node.type === 'dir') emit('toggle', props.node.path)
-  else emit('select', props.node)
+  emit('select', props.node)
 }
 </script>
 

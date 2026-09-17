@@ -18,7 +18,7 @@ interface Ev {
   session: string
   data: Record<string, unknown>
   raw: Record<string, unknown>
-  /** 毫秒时间戳（无 timestamp 的事件按出现顺序递减补偿） */
+  /** 真实毫秒时间戳；缺失为 NaN，不虚构时间。 */
   t: number
 }
 
@@ -54,17 +54,10 @@ function ingest(list: Record<string, unknown>[]) {
       session: String(e.session ?? ''),
       data: (e.data && typeof e.data === 'object' ? e.data : {}) as Record<string, unknown>,
       raw: e,
-      t: Number.isNaN(parsed) ? 0 : parsed,
+      t: parsed,
     })
   }
-  events.value.sort((a, b) => a.t - b.t)
-  // 没有时间戳的事件（引擎 stdout 抓到但没带 timestamp）按顺序补一个单调时间，
-  // 否则它们会全部堆在 t=0，时间线看起来像一根柱子。
-  let cursor = 0
-  for (const ev of events.value) {
-    if (!ev.t) { cursor += 1; ev.t = cursor }
-    else cursor = ev.t
-  }
+  events.value.sort((a, b) => (Number.isFinite(a.t) ? a.t : Infinity) - (Number.isFinite(b.t) ? b.t : Infinity))
   if (events.value.length > 4000) {
     const dropped = events.value.splice(0, events.value.length - 4000)
     dropped.forEach(d => seen.delete(d.key))
@@ -137,6 +130,9 @@ const filtered = computed(() => events.value.filter(ev => {
   return true
 }))
 
+const timed = computed(() => filtered.value.filter(ev => Number.isFinite(ev.t)))
+const undatedCount = computed(() => filtered.value.length - timed.value.length)
+
 /** 指标候选：所有事件 data 里出现过的数值字段 */
 const metrics = computed(() => {
   const map = new Map<string, number>()
@@ -148,7 +144,7 @@ const metrics = computed(() => {
 
 const tracks = computed(() => {
   const map = new Map<string, Ev[]>()
-  for (const ev of filtered.value) {
+  for (const ev of timed.value) {
     if (!map.has(ev.type)) map.set(ev.type, [])
     map.get(ev.type)!.push(ev)
   }
@@ -158,7 +154,7 @@ const tracks = computed(() => {
 })
 
 const domain = computed(() => {
-  const list = filtered.value
+  const list = timed.value
   if (!list.length) return { t0: 0, t1: 1, span: 1 }
   const t0 = list[0].t
   const t1 = list[list.length - 1].t
@@ -180,7 +176,7 @@ const curvePoints = computed(() => {
   const pts: string[] = []
   let min = Infinity
   let max = -Infinity
-  const list = filtered.value.filter(ev => typeof ev.data[key] === 'number')
+  const list = timed.value.filter(ev => typeof ev.data[key] === 'number')
   for (const ev of list) {
     const v = ev.data[key] as number
     if (v < min) min = v
@@ -199,7 +195,7 @@ const curvePoints = computed(() => {
 const curveRange = computed(() => {
   const key = metric.value
   if (!key) return null
-  const vals = filtered.value.filter(ev => typeof ev.data[key] === 'number').map(ev => ev.data[key] as number)
+  const vals = timed.value.filter(ev => typeof ev.data[key] === 'number').map(ev => ev.data[key] as number)
   if (!vals.length) return null
   return { min: Math.min(...vals), max: Math.max(...vals) }
 })
@@ -247,7 +243,7 @@ function exportJson() {
     total: events.value.length,
     filtered: filtered.value.length,
     sessions: sessions.value,
-    events: filtered.value.map(ev => ({ ...ev.raw, timestamp: ev.timestamp || new Date(ev.t).toISOString() })),
+    events: filtered.value.map(ev => ev.raw),
   }
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
   const a = document.createElement('a')
@@ -290,6 +286,7 @@ function exportJson() {
       <button class="rt-btn danger" @click="clearAll">清空</button>
     </div>
 
+    <p v-if="undatedCount" class="rt-dim">{{ undatedCount }} 条事件缺少有效时间戳，仅保留原始导出，不绘制虚构时间。</p>
     <div class="rt-filters">
       <span class="rt-flabel">类型</span>
       <button
@@ -333,7 +330,7 @@ function exportJson() {
               <svg class="rt-svg" :width="trackWidth" :height="CURVE_H">
                 <polyline :points="curvePoints" fill="none" stroke="#58a6ff" stroke-width="1.6" />
                 <circle
-                  v-for="ev in filtered.filter(e => typeof e.data[metric] === 'number')"
+                  v-for="ev in timed.filter(e => typeof e.data[metric] === 'number')"
                   :key="`m-${ev.key}`"
                   :cx="xOf(ev.t)"
                   :cy="CURVE_H - 12 - (((ev.data[metric] as number) - (curveRange?.min ?? 0)) / ((curveRange?.max ?? 1) - (curveRange?.min ?? 0) || 1)) * (CURVE_H - 26)"

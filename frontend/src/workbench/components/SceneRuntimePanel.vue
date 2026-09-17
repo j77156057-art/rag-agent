@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
-import { runtimeApi, engineApi, playApi, sceneApi } from '../api'
+import { runtimeApi, engineApi, playApi, sceneApi, getProjectId } from '../api'
 import type { WebTemplates, WebExportResult, DesktopHost, EmbedRect } from '../api'
 import { useWorkbench } from '../composables/workbench'
 // 画布与时间线都引了重依赖（@vue-flow 约 243KB / gzip 79KB），
@@ -263,6 +263,10 @@ const fmtMB = (n: number) => `${(n / 1048576).toFixed(1)} MB`
 /* ---------------- 事件时间线 ---------------- */
 interface Ev { key: string; type: string; source: string; timestamp: string; data: Record<string, unknown>; eid: string }
 const events = ref<Ev[]>([])
+const showHistory = ref(false)
+const captureSince = ref(Date.now())
+const eventStatus = ref('等待事件')
+const visibleEvents = computed(() => events.value.filter(e => showHistory.value || Date.parse(e.timestamp) >= captureSince.value))
 const seen = new Set<string>()
 
 function evKey(e: Record<string, unknown>) {
@@ -287,21 +291,28 @@ function upsert(e: Record<string, unknown>) {
 }
 
 function onWindowMessage(ev: MessageEvent) {
+  if (ev.source !== iframeEl.value?.contentWindow || ev.origin !== window.location.origin) return
   const d = ev.data
   if (!d || d.source !== 'docmind-runtime') return
   const eid = String(d.eid ?? '')
+  eventStatus.value = '收到试玩事件'
   upsert({ eid, type: d.type, data: d.data ?? {}, timestamp: new Date().toISOString(), source: 'web' })
   runtimeApi.append([{ eid, type: d.type, data: d.data ?? {} }]).catch(() => {})
 }
 
 let pollEvTimer: number | undefined
 async function pollEvents() {
+  const project = getProjectId()
   try {
     const r = await runtimeApi.events()
+    if (project !== getProjectId()) return
     ;(r.events || []).forEach(upsert)
-  } catch { /* ignore */ }
+    eventStatus.value = '已同步 · 仅显示实际收到的事件'
+  } catch { eventStatus.value = '事件服务未连接' }
 }
 function startTimers() {
+  stopTimers()
+  captureSince.value = Date.now()
   void pollEvents()
   pollEvTimer = window.setInterval(pollEvents, 3000)
 }
@@ -330,7 +341,7 @@ async function clearEvents() {
   // 只清本地数组的话，下一次轮询会把后端存量事件又拉回来（"清空后点一下又出来"）。
   // 必须同时清后端：scope='all' 连引擎日志的续读游标一起归零，否则 godot 抓取的事件照样复现。
   if (!window.confirm('清空全部运行时事件（含已抓取的引擎日志）？此操作不可撤销。')) return
-  try { await runtimeApi.clear('all') } catch { /* 后端清不掉也要把本地清掉 */ }
+  try { await runtimeApi.clear('all') } catch { eventStatus.value = '清空失败，请重试'; return }
   events.value = []
   seen.clear()
 }
@@ -400,12 +411,28 @@ watch(tab, v => {
   if (v === 'scene') void ensureSceneLoaded()
 })
 
+function resetProject() {
+  stopTimers()
+  events.value = []
+  seen.clear()
+  showHistory.value = false
+  eventStatus.value = '等待事件'
+  iframeUrl.value = ''
+  lastExport.value = null
+  exportMsg.value = ''
+  scenePath.value = ''
+  pathInput.value = ''
+  sceneMessage.value = ''
+  nativeRunning.value = false
+}
 onMounted(() => {
+  window.addEventListener('docmind:project-changed', resetProject)
   window.addEventListener('message', onWindowMessage)
   window.addEventListener('resize', onWindowResize)
   watchDpi()
 })
 onUnmounted(() => {
+  window.removeEventListener('docmind:project-changed', resetProject)
   window.removeEventListener('message', onWindowMessage)
   window.removeEventListener('resize', onWindowResize)
   dpiMq?.removeEventListener('change', onDpiChange)
@@ -508,11 +535,11 @@ onUnmounted(() => {
           <div class="pb-side">
             <div class="pb-side-head">
               <b>运行时事件时间线</b>
-              <div><span class="pb-live">● LIVE</span><button class="pb-link" @click="clearEvents">清空</button><button class="pb-link" @click="pollEvents">刷新</button></div>
+              <div><span>{{ eventStatus }}</span><label><input v-model="showHistory" type="checkbox" /> 历史事件</label><button class="pb-link" @click="clearEvents">清空</button><button class="pb-link" @click="pollEvents">刷新</button></div>
             </div>
             <div class="pb-tl">
-              <div v-if="!events.length" class="pb-tl-empty">暂无事件。启动游戏后，掉血/死亡等事件会实时出现在这里。</div>
-              <div v-for="e in [...events].reverse()" :key="e.key" class="pb-ev" :class="evClass(e.type)">
+              <div v-if="!visibleEvents.length" class="pb-tl-empty">本次尚未收到事件。游戏需接入运行时通信桥并主动上报；可勾选历史事件查看此前记录。</div>
+              <div v-for="e in [...visibleEvents].reverse()" :key="e.key" class="pb-ev" :class="evClass(e.type)" :title="e.timestamp">
                 <span class="pb-ev-time">{{ evTime(e) }}</span>
                 <span class="pb-ev-type">{{ e.type }}</span>
                 <span class="pb-ev-src">{{ e.source }}</span>

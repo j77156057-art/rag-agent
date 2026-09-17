@@ -113,7 +113,7 @@ function isDocDirty(docText: string, saved: string): boolean {
 
 function buildState(tab: EditorTab): EditorState {
   return EditorState.create({
-    doc: tab.savedContent,
+    doc: tab.draftContent ?? tab.savedContent,
     extensions: [
       basicSetup,
       langExtension(tab.lang),
@@ -135,7 +135,10 @@ function buildState(tab: EditorTab): EditorState {
         if (u.selectionSet || u.docChanged) publishSelection(u.view, tab)
         if (!u.docChanged) return
         const t = tabs.value.find((x) => x.id === tab.id)
-        if (t) t.dirty = isDocDirty(u.state.doc.toString(), t.savedContent)
+        if (t) {
+          t.draftContent = u.state.doc.toString()
+          t.dirty = isDocDirty(t.draftContent, t.savedContent)
+        }
       }),
     ],
   })
@@ -159,6 +162,8 @@ function ensureState(tab: EditorTab): EditorState {
  * 非活动标签换 Map 里留存的 EditorState，切回去即为新内容。
  */
 function replaceTabDoc(tabId: number, content: string) {
+  const tab = tabs.value.find(t => t.id === tabId)
+  if (tab) tab.draftContent = content
   const old = states.get(tabId)
   if (!old) return
   if (view && (view as unknown as { __tabId?: number }).__tabId === tabId && view.state === old) {

@@ -148,7 +148,7 @@ onBeforeUnmount(() => {
       {{ summary }}
     </button>
 
-    <template v-if="open">
+    <Teleport to="body"><template v-if="open">
       <div class="gp-backdrop" @click="open = false" />
       <div class="gp-pop">
         <div class="gp-head">
@@ -240,7 +240,7 @@ onBeforeUnmount(() => {
           <button class="gp-danger" :disabled="busy || !st?.holders.length" @click="forceRelease()">全部强制回收</button>
         </div>
       </div>
-    </template>
+    </template></Teleport>
   </div>
 </template>
 
@@ -254,12 +254,12 @@ onBeforeUnmount(() => {
 }
 .gp-trigger:hover { color: var(--text); }
 .gp-busy { border-color: #dfb067; color: #8a5a16; }
-.gp-backdrop { position: fixed; inset: 0; z-index: 40; }
+.gp-backdrop { position: fixed; inset: 0; z-index: 299; }
 .gp-pop {
-  position: absolute; right: 0; top: 34px; width: 420px; max-height: 80vh; overflow-y: auto;
+  position: fixed; right: 16px; top: 64px; width: 420px; max-width: calc(100vw - 32px); max-height: calc(100vh - 80px); overflow-y: auto;
   padding: 12px; background: var(--bg-raised);
   border: 1px solid var(--border-strong); border-radius: 8px;
-  z-index: 41; font-size: 12px; line-height: 1.6;
+  z-index: 300; font-size: 12px; line-height: 1.6;
   box-shadow: 0 12px 32px rgba(35, 52, 84, 0.16);
 }
 .gp-head { display: flex; align-items: center; gap: 8px; }

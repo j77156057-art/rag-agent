@@ -1,5 +1,18 @@
 # DocMind 项目交接清单（给接手 AI）
 
+### 2026-09-18 工作台回归修复与桌面更新
+
+- 修复问答页 ↔ 工作台往返丢失：问答页与工作台从后端恢复当前会话历史；未发送聊天草稿、CodeMirror 未保存草稿按项目保存在 sessionStorage；项目切换会清理旧标签并重新回灌。
+- 修复文件树新建入口：选中目录时在该目录创建，选中文件时在其父目录创建；分区新增表单加入项目内相对路径校验，并提供 AI 规划入口。
+- AI 设置、任务与生成、GPU 面板改为 body Teleport，窄窗口仍可操作；后端断连不再自动伪装成演示项目，演示仅在 URL `?demo=1` 显式启用。
+- 运行时时间线不再为无时间戳事件编造时间；仅有真实时间戳的事件绘图，无时间事件单独提示并原样导出。切换项目会清理运行台状态。
+- 新增 `verify_workbench_regressions.mjs`：在 `verify_scene_canvas.py --serve 8011` 的临时项目上完成 9 组浏览器回归（往返、草稿、面板、目录创建、分区校验、时间线、空态、错误无演示数据）全部通过。
+- 验证：`npm run build` 通过；`.venv\Scripts\python.exe -m unittest discover -s tests -q` **935 项运行、0 失败、1 跳过**；本轮以 `dist\regression-20260918\DocMind` 生成独立新包，EXE SHA-256 `1EFE15A27EB3208FB72AF302603DBC28CCC2B9AD105608255E860A36F9B71F98`，server-only 冷启动 `/api/health`、`/workbench` 与哈希资源均返回 200。画布浏览器专项 `verify_scene_canvas_ui.mjs` **27/27**。
+- 桌面安装 `D:\WorkBuddy\DocMind` 已复制更新包内文件（1060 个），未删除/覆盖非包内用户状态文件；覆盖前文件备份 `D:\Temp\docmind-before-regression-20260918-034052`。安装目录 EXE 与新包 SHA 一致。自动审批策略拒绝后续从安装目录启动的复验命令（仅提示 blocked by policy），故原生桌面启动/窗口嵌入复验未宣称通过。
+- 本轮数据恢复边界：sessionStorage 草稿支持同标签页跳转/刷新，不承诺关闭标签后恢复；未完成 SSE 回答跨页面续传仍需后续实现。
+- 未验证：真实 Godot/Unity/Unreal 编辑器通信、真实 CUDA 多进程曲线、ComfyUI 实机链路；这些需硬件/外部进程条件，不能由本地回归替代。
+
+
 > **更新时间**：2026-09-18（引擎嵌入硬化 + Web 试玩多项目路由 + 运行游戏面板三处修复完成并入库，见 §4 `116f6a5`）｜ **基线提交**：`eb8516a`（第 18 次冻结构建）
 > **全量测试**：**450 项全部通过**（441 + 9 新增轨迹回传用例）｜ **场景画布自检**：`verify_scene_canvas.py` 54/54
 > **引擎嵌入实机自检**：`verify_engine_embed.py` **68/68**（真 Godot 4.7.2 + 真 Win32 宿主，含真实合成键鼠与 UI 调用路径）｜ **浏览器冒烟**：`verify_scene_canvas_ui.mjs` **27/27** ｜ **前端构建**：`npm run build` 通过

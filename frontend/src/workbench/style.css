@@ -96,7 +96,7 @@ button { font-family: inherit; }
   border-left: 1px solid var(--border-strong);
 }
 
-.wb-topbar-meta { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 0 1 auto; overflow: hidden; }
+.wb-topbar-meta { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
 .wb-locate-slot { flex: 0 0 auto; display: flex; min-width: 0; }
 /* 定位框分级收窄，保证任何宽度下都不把右侧按钮挤换行。
    注意 SemanticLocateBar 根节点就是 .lb，外部 class 合并在同一元素上，
@@ -582,8 +582,7 @@ button { font-family: inherit; }
 }
 
 /* ---------- 顶栏窄屏分级降级 ---------- */
-/* ≤1450：先收起引擎任务/GPU 两个偏引擎运维的面板 */
-@media (max-width: 1450px) { .wb-tool-te, .wb-tool-gp { display: none; } }
+/* 引擎任务与 GPU 面板始终保留入口；弹层已 teleport 到 body，不会被顶栏裁切。 */
 /* ≤1200：分区 pill 与地图组让位（分区入口在概览驾驶舱仍可到达）。
    项目选择器**保留**（切换项目是核心操作），只收窄显示，避免窄屏下无法切项目。 */
 @media (max-width: 1200px) {

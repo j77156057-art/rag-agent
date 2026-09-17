@@ -125,7 +125,10 @@ async function initProjects() {
   try {
     const r = await refreshProjects()
     const backendCurrent = r.current || ''
-    if (backendCurrent !== getProjectId()) setProjectId(backendCurrent)
+    if (backendCurrent !== getProjectId()) {
+      setProjectId(backendCurrent)
+      window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
+    }
     currentProjectId.value = backendCurrent
   } catch (e) {
     projectError.value = (e as Error).message || '加载项目列表失败'
@@ -260,10 +263,12 @@ onMounted(() => {
   // 先探测同源后端：静态预览（无 FastAPI）进演示模式，不发会失败的树请求。
   void probeBackend().then((online) => {
     if (online) {
-      void initProjects()
-      void loadTree()
-    } else {
+      void initProjects().then(() => loadTree())
+    } else if (demoMode.value) {
       seedDemoRegionCards(demoRegionCards)
+    } else {
+      // A failed health probe must expose the real connection error and retry UI.
+      void initProjects().then(() => loadTree())
     }
   })
   window.addEventListener('beforeunload', beforeUnload)

@@ -280,6 +280,11 @@ def serve(port=8011):
     """
     root = build_fixture()
     import config as _config
+    # Isolate the registry too: request middleware otherwise selects the real
+    # persisted project even though code_root below points at a fixture.
+    _config.STATE_FILE = os.path.join(root, '.docmind_test_state.json')
+    import projects
+    projects.set_current(projects.ensure_project(root, 'UI regression fixture'))
     import api as _api
     import uvicorn
     _config.set_runtime("code_root", root)

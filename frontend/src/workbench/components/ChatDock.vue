@@ -5,7 +5,7 @@
 //   与 godot-ai 插件安装引导（安装前必须用户确认）。
 import { nextTick, ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
-import { aiApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, setSessionId, startTabProbe, probeSoleDocMindTab } from '../api'
+import { aiApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, getProjectId, startTabProbe } from '../api'
 import type { McpServer, ModelConfigInfo, ContextUsage } from '../api'
 import type { SseEvent } from '../api'
 import { mdToHtml, extractFileRefs } from '../markdown'
@@ -32,7 +32,10 @@ interface ChatMsg {
 
 let msgSeq = 1
 const messages = ref<ChatMsg[]>([])
-const input = ref('')
+const draftKey = () => 'docmind.workbenchChatDraft:' + getProjectId() + ':' + getSessionId()
+function readDraft() { try { return sessionStorage.getItem(draftKey()) || '' } catch { return '' } }
+const input = ref(readDraft())
+watch(input, v => { try { sessionStorage.setItem(draftKey(), v) } catch {} })
 const sending = ref(false)
 let abortCtl: AbortController | null = null
 
@@ -48,13 +51,6 @@ function toggleDock() {
   collapsed.value = !collapsed.value
   if (!collapsed.value) nextTick(() => inputEl.value?.focus())
 }
-
-const QUICK_PROMPTS = [
-  '玩家角色的数值配置在哪些文件？',
-  '角色行为逻辑代码在哪里？',
-  '项目入口场景和主循环在哪？',
-  '帮我梳理这个项目的代码结构',
-]
 
 // ---------------------------------------------------------------- 模型 / 联网 / 思考
 const modelConfig = ref<ModelConfigInfo | null>(null)
@@ -278,36 +274,21 @@ function rebuildFromTurns(turns: { user: string; assistant: string }[]) {
   return rebuilt.length
 }
 
-/** 回灌历史：优先当前会话 id。当前 id 无历史时，**仅当本标签是唯一 DocMind 标签**才
- *  退回「最近一段有内容的会话」续上（保住单窗口「关掉重开自动续上」的体验）；
- *  多标签 / 探测不确定时保持空态，历史由「会话列表」显式切换获得——绝不静默续接，
- *  否则新标签会接到旧会话、把多标签合成为一段对话。
- *  仅在没有正在发送的消息时执行，除非 force（如「继续这段对话」显式切换会话）。 */
+/** 只恢复当前项目的当前会话，绝不自动续接其他历史。 */
 async function restoreHistory(force = false) {
   if (demoMode.value) return
   if (sending.value) return
   if (!force && messages.value.length) return
   // 记住进入时的消息数：await 期间用户可能已发送新消息（SSE 正在流），
   // 重建会整体覆盖 messages 并让 live() 匹配不到、静默丢流，故 await 后需复检。
+  const project = getProjectId(), session = getSessionId()
   const before = messages.value.length
   try {
-    let detail = await harnessApi.sessionDetail(getSessionId())
-    let turns = detail.turns || []
-    if (!turns.length && !force) {
-      // 唯一性门禁：只有「本窗口是当前唯一 DocMind 标签」才允许自动续接最近一段会话；
-      // 多标签 / 探测不可用 → 保持空态（隔离优先）。
-      const sole = await probeSoleDocMindTab()
-      if (sole) {
-        const list = await harnessApi.sessions()
-        const items = list.items || []
-        const recent = items.find((x) => (x.turns || 0) > 0) || items[0]
-        if (recent && recent.session_id && recent.session_id !== getSessionId()) {
-          setSessionId(recent.session_id)
-          detail = await harnessApi.sessionDetail(recent.session_id)
-          turns = detail.turns || []
-        }
-      }
-    }
+    const detail = await harnessApi.sessionDetail(session)
+    if (project !== getProjectId() || session !== getSessionId()) return
+    const turns = detail.turns || []
+    // Never silently load a different conversation into a fresh session.
+    if (force && !turns.length && !sending.value) messages.value = []
     if (turns.length) {
       // 竞态兜底：await 窗口内若有新消息涌入（或正在发送），放弃本次回灌，
       // 绝不覆盖用户正在进行的对话；force 切换只受 sending 拦截。
@@ -377,6 +358,7 @@ function onFocusChat(ev?: Event) {
   const q = detail?.q
   collapsed.value = false
   if (detail?.reload) {
+    input.value = readDraft()
     void restoreHistory(true).then(() => nextTick(() => inputEl.value?.focus()))
     return
   }
@@ -715,13 +697,6 @@ function connectorGuide(s: McpServer) {
 
     <template v-if="!collapsed">
       <div ref="scroller" class="cd-body" @scroll="onScroll">
-        <div v-if="messages.length === 0" class="cd-empty">
-          <p class="cd-empty-title">用大白话提问，AI 自己搜代码，并把答案定位到具体文件和行号 👇</p>
-          <div class="cd-quicks">
-            <button v-for="q in QUICK_PROMPTS" :key="q" class="cd-quick" @click="send(q)">{{ q }}</button>
-          </div>
-        </div>
-
         <div v-for="m in messages" :key="m.id" class="cd-msg" :class="`cd-msg-${m.role}`">
           <div v-if="m.role === 'user'" class="cd-user-bubble">{{ m.text }}</div>
           <template v-else>

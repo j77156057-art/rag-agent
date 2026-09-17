@@ -1,6 +1,14 @@
 # DocMind 分发版构建说明（2026-09-11）
 
-> 最新构建见下方「第二十五次重建（完整设置页 + 对话/检索历史持久化）」；历史构建清单保留在下文。
+> 最新构建：2026-09-18 工作台回归修复独立包，见下节；下方第二十五次为历史记录。
+
+## 2026-09-18 工作台回归修复包
+
+- 命令：`.venv\Scripts\python.exe -m PyInstaller --noconfirm --distpath dist\regression-20260918 --workpath build\regression-20260918 docmind.spec`。
+- 产物：`dist/regression-20260918/DocMind/DocMind.exe` 与 `_internal/web`；SHA-256 `1EFE15A27EB3208FB72AF302603DBC28CCC2B9AD105608255E860A36F9B71F98`。
+- 验证：935 项 Python 测试（0 失败、1 跳过）；工作台新增 9 组浏览器回归；场景画布浏览器 27/27；前端构建通过。独立 EXE server-only 端口 8044 健康检查、工作台、哈希 JS 均 200，验证后进程已停止。
+- 桌面安装路径 `D:\WorkBuddy\DocMind` 已更新包内文件并逐个备份覆盖前文件到 `D:\Temp\docmind-before-regression-20260918-034052`，安装 EXE SHA 与新包一致。安装目录启动复验命令被自动审批策略拒绝（blocked by policy），不能据此宣称原生桌面实测通过。原桌面快捷方式可继续使用；本轮未生成新安装器。
+
 
 ## 产物
 - 路径：`rag-agent/dist/DocMind/`（onedir 目录分发）

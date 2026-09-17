@@ -33,6 +33,12 @@ const effectiveTagMap = computed<Record<string, SemanticTagRecord>>(
 const openPaths = ref<Set<string>>(new Set())
 const flashPath = ref<string | null>(null)
 const flashNonce = ref(0)
+const createParent = computed(() => {
+  const node = props.selectedPath ? findNode(props.tree.nodes, props.selectedPath) : null
+  if (node?.type === 'dir') return node
+  const path = node?.path.split('/').slice(0, -1).join('/')
+  return path ? findNode(props.tree.nodes, path) : null
+})
 
 function allDirPaths(nodes: TreeNode[], acc: Set<string>) {
   for (const n of nodes) {
@@ -117,13 +123,13 @@ function rootLabel(p: string): string {
         <span class="ft-head-root" :title="tree.code_root">{{ rootLabel(tree.code_root) }}</span>
       </div>
       <div class="ft-head-actions">
-        <button class="ft-iconbtn" title="在根目录新建文件" @click="createAt(null, 'file')">
+        <button class="ft-iconbtn" :title="`新建文件：${createParent?.path || '根目录'}`" @click="createAt(createParent, 'file')">
           <svg width="13" height="13" viewBox="0 0 13 13">
             <path d="M7 1.5 H11.5 V11.5 H1.5 V6.2" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
             <path d="M6.7 4.6 V9.2 M4.4 6.9 H9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
           </svg>
         </button>
-        <button class="ft-iconbtn" title="在根目录新建文件夹" @click="createAt(null, 'folder')">
+        <button class="ft-iconbtn" :title="`新建文件夹：${createParent?.path || '根目录'}`" @click="createAt(createParent, 'folder')">
           <svg width="14" height="13" viewBox="0 0 14 13">
             <path d="M1 2.8 Q1 2.1 1.7 2.1 H5.2 L6.3 3.3 H12.3 Q13 3.3 13 4 V10.2 Q13 10.9 12.3 10.9 H1.7 Q1 10.9 1 10.2 Z" fill="none" stroke="currentColor" stroke-width="1"/>
             <path d="M7 5.6 V9.4 M5.1 7.5 H8.9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
