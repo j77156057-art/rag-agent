@@ -306,8 +306,51 @@ def _descendant_pids(pid):
     return result
 
 
+def _enum_all(user32, match):
+    """枚举全部顶层窗口，match(hwnd, found) 往 found 追加，返回完整列表。"""
+    found = []
+
+    def cb(hwnd, _):
+        match(int(hwnd) if hwnd else 0, found)
+        return True
+
+    user32.EnumWindows(_WNDPROCTYPE(cb), None)
+    return found
+
+
+def _rank_windows(candidates, title_hint=''):
+    """从候选窗口里挑"最像游戏主视口"的那个（纯逻辑，可单测）。
+
+    打分维度（从高到低）：标题命中 title_hint > 非最小化窗口 > 可见面积大。
+    引擎常有 splash / 控制台 / 主视口多个顶层窗口，取第一个会抓错，必须按这个顺序选。
+    """
+    hint = (title_hint or '').lower()
+
+    def score(c):
+        s = 0
+        if hint and hint in (c.get('title') or '').lower():
+            s += 100
+        if not c.get('iconic'):
+            s += 10
+        s += min(int(c.get('area', 0)), 10_000_000) // 10_000
+        return s
+
+    best = None
+    best_s = -1
+    for c in candidates:
+        sc = score(c)
+        if sc > best_s:
+            best_s = sc
+            best = c
+    return best
+
+
 def find_window(pid: int, title_hint: str = ''):
-    """通过进程 PID（含其全部后代进程）枚举顶层可见窗口，返回 (hwnd, title)。"""
+    """通过进程 PID（含其全部后代进程）枚举顶层可见窗口，返回 (hwnd, title)。
+
+    选窗口策略见 `_rank_windows`：标题命中 > 非最小化 > 面积大。引擎有多个顶层窗口
+    （splash / 控制台 / 主视口）时，取第一个会抓错，必须打分挑最优。
+    """
     user32 = _user32()
     if user32 is None:
         return None
@@ -323,11 +366,17 @@ def find_window(pid: int, title_hint: str = ''):
         title = buf.value
         if not title:
             return False
-        if not title_hint or title_hint.lower() in title.lower():
-            found.append((hwnd, title))
+        rect = window_rect(hwnd)
+        area = (rect['width'] * rect['height']) if rect else 0
+        found.append({'hwnd': hwnd, 'title': title,
+                      'iconic': bool(user32.IsIconic(hwnd)), 'area': area})
         return False
 
-    return _enum_windows(user32, match)
+    candidates = _enum_all(user32, match)
+    if not candidates:
+        return None
+    best = _rank_windows(candidates, title_hint)
+    return (best['hwnd'], best['title'])
 
 
 def windows_of_pids(pids):
@@ -380,14 +429,22 @@ def find_host(title_hint='DocMind'):
 # ---------------------------------------------------------------------------
 # 嵌入 / 解除 / 尺寸同步
 # ---------------------------------------------------------------------------
-def _target_size(hwnd_host, width, height, offset_y):
-    """算出子窗口应该占的尺寸。给定宽高就用给定值，否则按宿主客户区减顶部留白。"""
+def _target_size(hwnd_host, width, height, offset_y, cached=None):
+    """算出子窗口应该占的尺寸。给定宽高就用给定值，否则按宿主客户区减顶部留白。
+
+    宿主最小化 / 尚未布局完成时 GetClientRect 会返回 0×0——这时若上一次有有效的
+    宿主矩形（cached）就回退用它，避免嵌入失败或引擎被 MoveWindow(0,0,0,0) 塌成不可见。
+    """
     if width and height:
         return int(width), int(height), None
     rect = client_rect(hwnd_host)
-    if not rect:
-        return None, None, '无法读取宿主客户区尺寸'
-    return rect['width'], max(1, rect['height'] - int(offset_y)), rect
+    if rect and rect['width'] > 0 and rect['height'] > 0:
+        return rect['width'], max(1, rect['height'] - int(offset_y)), rect
+    if cached and int(cached.get('width', 0)) > 0 and int(cached.get('height', 0)) > 0:
+        return (int(cached['width']),
+                max(1, int(cached['height']) - int(offset_y)),
+                cached)
+    return None, None, '无法读取宿主客户区尺寸（窗口可能已最小化）'
 
 
 def embed(hwnd_child: int, hwnd_host: int, width=None, height=None,
@@ -418,7 +475,9 @@ def embed(hwnd_child: int, hwnd_host: int, width=None, height=None,
         else:
             mode = 'fill'
             pos_x, pos_y = 0, int(offset_y)
-            size_w, size_h, host_rect = _target_size(hwnd_host, width, height, offset_y)
+            with _STATE_LOCK:
+                cached = (_CHILD_STATE.get(hwnd_child) or {}).get('last_host_client')
+            size_w, size_h, host_rect = _target_size(hwnd_host, width, height, offset_y, cached)
             if not size_w:
                 return {'ok': False, 'error': host_rect}
 
@@ -445,6 +504,9 @@ def embed(hwnd_child: int, hwnd_host: int, width=None, height=None,
             state['mode'] = mode
             state['offset_y'] = int(offset_y)
             state['placed'] = {'x': pos_x, 'y': pos_y, 'width': size_w, 'height': size_h}
+            # 缓存当前有效的宿主客户区矩形：宿主最小化 / 尚未布局时 GetClientRect 返 0，
+            # 之后 fill_host / embed 可回退到此，避免引擎塌缩（见 _target_size）。
+            state['last_host_client'] = host_rect or client_rect(hwnd_host)
         return {'ok': True, 'hwnd': hwnd_child, 'host_hwnd': hwnd_host, 'title': title,
                 'mode': mode, 'x': pos_x, 'y': pos_y, 'offset_y': int(offset_y),
                 'width': size_w, 'height': size_h,
@@ -500,12 +562,15 @@ def fill_host(hwnd_child: int, offset_y=None):
         if not hwnd_host or not is_window(hwnd_host):
             return {'ok': False, 'error': '宿主窗口已失效'}
         top = state.get('offset_y', 0) if offset_y is None else offset_y
-        size_w, size_h, rect = _target_size(hwnd_host, None, None, top)
+        size_w, size_h, rect = _target_size(hwnd_host, None, None, top,
+                                           state.get('last_host_client'))
         if not size_w:
             return {'ok': False, 'error': rect}
         user32.MoveWindow(hwnd_child, 0, int(top), size_w, size_h, True)
         with _STATE_LOCK:
             state['placed'] = {'x': 0, 'y': int(top), 'width': size_w, 'height': size_h}
+            # 刷新缓存（宿主可能从最小化恢复、尺寸变化）
+            state['last_host_client'] = rect or client_rect(hwnd_host)
         return {'ok': True, 'hwnd': hwnd_child, 'host_hwnd': hwnd_host,
                 'width': size_w, 'height': size_h, 'offset_y': int(top),
                 'host_client': rect}
@@ -524,23 +589,28 @@ def fill_all(offset_y=None):
 def _detach_input_queues(state):
     """撤销 focus(keep_attached=True) 留下的跨线程输入队列挂接（尽力而为）。
 
-    挂接是 AttachThreadInput(调用线程, 引擎线程, True)；引擎进程退出后该挂接由系统自动释放，
-    这里用记录的 (attached_by, 伙伴线程) 对再调一次 False，避免线程池复用线程上残留挂接。
+    挂接以 (by_thread, partner_thread) 成对记录；引擎进程退出或 detach 时按所有对
+    再调一次 AttachThreadInput(..., False)。前台线程会变（用户切到别的应用），所以
+    必须累积全部历史挂接并逐个解除，不能只解除最近一次——否则旧挂接永远残留在线程上。
     目标线程已死时 AttachThreadInput 会失败，捕获后忽略即可。
     """
-    attached = state.get('attached')
-    by = state.get('attached_by')
-    if not attached or not by:
-        return
     user32 = _user32()
     if user32 is None:
         return
-    for t in attached:
-        if t and t != by:
+    pairs = [(int(b), int(t)) for b, t in (state.get('attached_pairs') or [])]
+    by = state.get('attached_by')
+    attached = state.get('attached') or []
+    for t in attached:  # 兼容旧字段
+        if t and by:
+            pairs.append((int(by), int(t)))
+    for by_t, partner in pairs:
+        if by_t and partner and by_t != partner:
             try:
-                user32.AttachThreadInput(ctypes.c_ulong(by), ctypes.c_ulong(t), False)
+                user32.AttachThreadInput(ctypes.c_ulong(by_t), ctypes.c_ulong(partner), False)
             except Exception:  # noqa: BLE001
                 pass
+    state['attached_pairs'] = []
+    state['attached'] = []
 
 
 def detach(hwnd_child: int):
@@ -636,15 +706,15 @@ def focus(hwnd_child: int, hwnd_host=None, keep_attached: bool = False):
         with _STATE_LOCK:
             target_state = _CHILD_STATE.setdefault(int(hwnd_child), {})
         via = []
-        attached = []
+        attached_pairs = []   # [(by_thread_id, partner_thread_id), ...]
         try:
             # 只 AttachThreadInput 到引擎线程还不够：后台进程调用 SetForegroundWindow
             # 会被系统直接拒绝（"不允许抢前台"）。必须同时接上当前前台线程的输入队列，
             # Windows 才认我们是"有资格设置前台"的那个进程。
-            for thread in {target_thread, foreground_thread}:
-                if thread and thread != current_thread:
-                    if user32.AttachThreadInput(current_thread, thread, True):
-                        attached.append(thread)
+            for thread in {int(target_thread), int(foreground_thread)}:
+                if thread and thread != int(current_thread):
+                    if user32.AttachThreadInput(int(current_thread), thread, True):
+                        attached_pairs.append((int(current_thread), thread))
             if host:
                 user32.BringWindowToTop(host)
                 if user32.SetForegroundWindow(host):
@@ -659,14 +729,26 @@ def focus(hwnd_child: int, hwnd_host=None, keep_attached: bool = False):
             now_foreground = int(user32.GetForegroundWindow() or 0)
             if keep_attached:
                 with _STATE_LOCK:
-                    target_state['attached'] = attached
-                    target_state['attached_by'] = current_thread
+                    existing = target_state.get('attached_pairs') or []
+                    merged = list(existing)
+                    for p in attached_pairs:
+                        if p not in merged:
+                            merged.append(p)
+                    target_state['attached_pairs'] = merged
+                    # 兼容旧字段（attached 只记伙伴线程，供返回/旧调用方读）
+                    target_state['attached'] = [t for _, t in merged]
+                    target_state['attached_by'] = int(current_thread)
         finally:
             if not keep_attached:
-                for thread in attached:
-                    user32.AttachThreadInput(current_thread, thread, False)
+                for by_t, partner in attached_pairs:
+                    try:
+                        user32.AttachThreadInput(ctypes.c_ulong(by_t),
+                                                 ctypes.c_ulong(partner), False)
+                    except Exception:  # noqa: BLE001
+                        pass
+        partner_threads = [t for _, t in attached_pairs]
         return {'ok': got == hwnd_child, 'focused': got, 'hwnd': hwnd_child,
-                'attached': attached, 'kept_attached': bool(keep_attached),
+                'attached': partner_threads, 'kept_attached': bool(keep_attached),
                 'foreground': now_foreground,
                 'foreground_is_host': (now_foreground == host),
                 'via': via}
@@ -690,6 +772,10 @@ def terminate_tree(pid: int, timeout: float = 5.0):
 
     Godot 的 `*_console.exe` 是转发器（会派生子进程）；只 terminate 直接子进程
     会留下一个真正的 GUI 进程和它的窗口 —— 那就是"孤儿窗口"的来源。
+
+    等待策略：先一次性 TerminateProcess 整棵进程树，再用 WaitForMultipleObjects
+    一次性并行等所有句柄（整体超时），而不是对每个句柄串行 WaitForSingleObject(满超时)——
+    后者在 console+GUI 多进程时要把超时累加好几轮，停止明显变慢。
     """
     if os.name != 'nt':
         return []
@@ -706,8 +792,18 @@ def terminate_tree(pid: int, timeout: float = 5.0):
         k32.TerminateProcess(handle, 1)
         handles.append((target, handle))
         killed.append(target)
-    deadline = timeout
-    for target, handle in handles:
-        k32.WaitForSingleObject(handle, int(deadline * 1000))
-        k32.CloseHandle(handle)
+    if handles:
+        # MAXIMUM_WAIT_OBJECTS = 64，超过要分批
+        for i in range(0, len(handles), 64):
+            batch = handles[i:i + 64]
+            arr = (ctypes.c_void_p * len(batch))(*[h for _, h in batch])
+            try:
+                k32.WaitForMultipleObjects(len(arr), arr, True, int(timeout * 1000))
+            except Exception:  # noqa: BLE001
+                pass
+        for _, handle in handles:
+            try:
+                k32.CloseHandle(handle)
+            except Exception:  # noqa: BLE001
+                pass
     return killed
