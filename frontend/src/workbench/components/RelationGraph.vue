@@ -361,7 +361,7 @@ function syncDom() {
 }
 
 // 初始模板绑定读取（首帧 Vue 渲染时用，之后命令式覆盖）
-function initialPos(id: string, axis: 'x' | 'y', wh: 'w' | 'h', half: number): number {
+function initialPos(id: string, axis: 'x' | 'y', wh: 'w' | 'h', half: boolean): number {
   const s = byId.get(id)
   if (!s) return 0
   return axis === 'x' ? s.x - (half ? s[wh] / 2 : 0) : s.y - (half ? s[wh] / 2 : 0)

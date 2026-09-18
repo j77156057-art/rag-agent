@@ -13,6 +13,5 @@
     "noEmit": true,
     "useDefineForClassFields": true
   },
-  "include": ["env.d.ts", "src/**/*.ts", "src/**/*.vue"],
-  "references": [{ "path": "./tsconfig.node.json" }]
+  "include": ["env.d.ts", "src/**/*.ts", "src/**/*.vue"]
 }

@@ -475,7 +475,7 @@ function syncDom() {
   }
 }
 
-function initialPos(id: string, axis: 'x' | 'y', wh: 'w' | 'h', half: number): number {
+function initialPos(id: string, axis: 'x' | 'y', wh: 'w' | 'h', half: boolean): number {
   const s = byId.get(id)
   if (!s) return 0
   return axis === 'x' ? s.x - (half ? s[wh] / 2 : 0) : s.y - (half ? s[wh] / 2 : 0)

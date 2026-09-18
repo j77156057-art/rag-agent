@@ -1071,7 +1071,16 @@
     return sid;
   }
 
-  let historyRestoring = false;
+  let historyRestoring = false, chatSending = false, chatAbort = null, partialTurn = null;
+  const interruptedKey = () => "docmind.interrupted:" + docmindCurrentProject() + ":" + currentSessionId();
+  function preservePartial() {
+    if (chatSending && partialTurn) { try { sessionStorage.setItem(interruptedKey(), JSON.stringify(partialTurn)); } catch {} }
+  }
+  window.addEventListener("beforeunload", e => {
+    if (chatSending) { preservePartial(); e.preventDefault(); e.returnValue = ""; }
+  });
+  window.addEventListener("pagehide", () => { preservePartial(); chatAbort?.abort(); });
+
   async function restoreChatHistory() {
     if (demoMode || chat.children.length) return;
     historyRestoring = true;
@@ -1089,6 +1098,17 @@
           linkifyShell(shell);
         }
       }
+      try {
+        const partial = JSON.parse(sessionStorage.getItem(interruptedKey()) || "null");
+        if (partial && typeof partial.user === "string" && typeof partial.assistant === "string") {
+          if ((detail.turns || []).some(t => t.user === partial.user && t.assistant)) sessionStorage.removeItem(interruptedKey());
+          else {
+            addUser(partial.user, []);
+            const shell = addBotShell();
+            shell.querySelector(".answer").textContent = partial.assistant + "\n（上次回答已中断，仅恢复已收到的内容，不会自动重试。）";
+          }
+        }
+      } catch {}
       chat.scrollTop = chat.scrollHeight;
     } catch (e) { status.textContent = "历史暂未加载，可刷新重试：" + e.message; }
     finally { historyRestoring = false; $("sendBtn").disabled = false; }
@@ -1100,7 +1120,7 @@
   });
 
   async function send() {
-    if (historyRestoring) return;
+    if (historyRestoring || chatSending) return;
     const question = q.value.trim();
     if (!question && pendingImages.length === 0) return;
     const imgs = pendingImages;
@@ -1119,6 +1139,12 @@
       return;
     }
 
+    chatSending = true;
+    $("sendBtn").disabled = true;
+    chatAbort = new AbortController();
+    partialTurn = { user: question, assistant: "" };
+    try { sessionStorage.removeItem(interruptedKey()); } catch {}
+    try {
     const fd = new FormData();
     fd.append("question", question);
     const sid = currentSessionId();
@@ -1126,7 +1152,7 @@
     imgs.forEach((it) => fd.append("images", it.blob, it.name));
     let resp;
     try {
-      resp = await fetch("/api/chat", { method: "POST", body: fd });
+      resp = await fetch("/api/chat", { method: "POST", body: fd, signal: chatAbort.signal });
     } catch (e) {
       ans.textContent = "请求发送失败：" + e.message;
       return;
@@ -1155,6 +1181,7 @@
         const ev = JSON.parse(line.slice(5).trim());
         if (ev.type === "token") {
           acc += ev.text;
+          partialTurn.assistant = acc;
           ans.textContent = acc;
         } else if (ev.type === "thought") {
           ans.textContent = acc; appendStep(shell, "thought", ev.text);
@@ -1166,6 +1193,7 @@
           appendStep(shell, "reflection", ev.text);
         } else if (ev.type === "final") {
           ans.textContent = ev.text;
+          partialTurn.assistant = ev.text;
           const td = shell.querySelector(".think-dot");
           if (td) td.classList.remove("active");
           linkifyShell(shell);
@@ -1175,6 +1203,14 @@
     loadPending();
     loadPowerStatus();  // 对话会让模型加载驻留，刷新显存开关状态
     if (chatNearBottom()) chat.scrollTop = chat.scrollHeight;
+    } catch (e) {
+      preservePartial();
+      status.textContent = "回答已中断：" + e.message + "。已执行的工具操作不会自动撤销。";
+    } finally {
+      chatSending = false; chatAbort = null;
+      $("sendBtn").disabled = false;
+      shell.querySelector(".think-dot")?.classList.remove("active");
+    }
   }
 
   $("sendBtn").onclick = send;

@@ -32,10 +32,13 @@ interface ChatMsg {
 
 let msgSeq = 1
 const messages = ref<ChatMsg[]>([])
-const draftKey = () => 'docmind.workbenchChatDraft:' + getProjectId() + ':' + getSessionId()
+let chatProject = getProjectId(), chatSession = getSessionId(), chatEpoch = 0
+const draftKey = () => 'docmind.workbenchChatDraft:' + chatProject + ':' + chatSession
+const recoveryKey = () => 'docmind.interrupted:' + chatProject + ':' + chatSession
+const historyError = ref('')
 function readDraft() { try { return sessionStorage.getItem(draftKey()) || '' } catch { return '' } }
 const input = ref(readDraft())
-watch(input, v => { try { sessionStorage.setItem(draftKey(), v) } catch {} })
+watch(input, v => { try { sessionStorage.setItem(draftKey(), v) } catch {} }, { flush: 'sync' })
 const sending = ref(false)
 let abortCtl: AbortController | null = null
 
@@ -142,6 +145,9 @@ function onModelSaved(info: ModelConfigInfo) {
 async function send(text?: string) {
   const q = (text ?? input.value).trim()
   if (!q || sending.value) return
+  const epoch = ++chatEpoch
+  historyError.value = ''
+  try { sessionStorage.removeItem(recoveryKey()) } catch {}
   input.value = ''
   stickToBottom.value = true  // 用户主动发送，恢复贴底自动滚动
   messages.value.push({ id: msgSeq++, role: 'user', text: q, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
@@ -158,9 +164,11 @@ async function send(text?: string) {
   const ac = new AbortController()
   abortCtl = ac
   await nextTick(scrollToBottom)
+  if (epoch !== chatEpoch) return
 
-  const live = () => messages.value.find((m) => m.id === turn.id)
+  const live = () => epoch === chatEpoch ? messages.value.find((m) => m.id === turn.id) : undefined
   const onEvent = (ev: SseEvent) => {
+    if (epoch !== chatEpoch) return
     // 上下文用量是全局指示，不挂在某条消息上
     if (ev.type === 'context') {
       applyUsage(ev)
@@ -168,7 +176,9 @@ async function send(text?: string) {
     }
     const t = live()
     if (!t) return
-    if (ev.type === 'final' && typeof ev.text === 'string' && ev.text) {
+    if (ev.type === 'token' && typeof ev.text === 'string') {
+      t.text += ev.text
+    } else if (ev.type === 'final' && typeof ev.text === 'string' && ev.text) {
       t.text = ev.text
     } else if (ev.type === 'reasoning' && typeof ev.text === 'string') {
       // 深度思考流：实时拼接到独立的思考窗口（与正文分开），流式期间自动展开
@@ -209,16 +219,45 @@ async function send(text?: string) {
       t.error = (e as { message?: string }).message || '请求失败'
     }
   } finally {
-    sending.value = false
-    abortCtl = null
+    if (epoch === chatEpoch) { sending.value = false; abortCtl = null }
     await nextTick(scrollToBottom)
   }
 }
 
 function stop() {
+  const turn = messages.value[messages.value.length - 1]
+  if (turn?.status === 'streaming') { turn.status = 'stopped'; turn.notices.push('回答已中断；已执行的工具操作不会自动撤销。') }
+  ++chatEpoch
   abortCtl?.abort()
   abortCtl = null
+  sending.value = false
 }
+function preserveInterrupted() {
+  if (!sending.value) return
+  const assistant = messages.value[messages.value.length - 1]
+  const user = messages.value[messages.value.length - 2]
+  try { sessionStorage.setItem(recoveryKey(), JSON.stringify({ user: user?.text || '', assistant: assistant?.text || '' })) } catch {}
+}
+function restoreInterrupted(turns: { user: string; assistant: string }[]) {
+  try {
+    const row = JSON.parse(sessionStorage.getItem(recoveryKey()) || 'null')
+    if (!row || typeof row.user !== 'string' || typeof row.assistant !== 'string') return
+    if (turns.some(t => t.user === row.user && t.assistant)) { sessionStorage.removeItem(recoveryKey()); return }
+    messages.value.push({ id: msgSeq++, role: 'user', text: row.user, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
+    messages.value.push({ id: msgSeq++, role: 'assistant', text: row.assistant, status: 'stopped', trace: [], reasoning: '', notices: ['上次回答因离开页面或切换项目中断，以下仅为已收到的内容；不会自动重试或重复执行工具。'], plan: [] })
+  } catch {}
+}
+function resetChatContext() {
+  preserveInterrupted()
+  stop()
+  chatProject = getProjectId(); chatSession = getSessionId()
+  messages.value = []; usage.value = null; historyError.value = ''
+  input.value = readDraft()
+  void restoreHistory(true)
+}
+function onPageHide() { preserveInterrupted(); stop() }
+function onBeforeLeave(e: BeforeUnloadEvent) { if (sending.value) { preserveInterrupted(); e.preventDefault(); e.returnValue = '' } }
+
 
 function onKeydown(ev: KeyboardEvent) {
   if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
@@ -237,6 +276,7 @@ function clearMessages() {
  *  会话 id 每标签页独立（见 api.ts::getSessionId），故这里只清理本标签页自己的会话，
  *  不影响其它标签页；删除失败（无会话文件 / 服务未启动）不阻塞清空 UI。 */
 async function clearConversation() {
+  try { sessionStorage.removeItem(recoveryKey()) } catch {}
   clearMessages()
   if (demoMode.value) return
   try {
@@ -281,11 +321,11 @@ async function restoreHistory(force = false) {
   if (!force && messages.value.length) return
   // 记住进入时的消息数：await 期间用户可能已发送新消息（SSE 正在流），
   // 重建会整体覆盖 messages 并让 live() 匹配不到、静默丢流，故 await 后需复检。
-  const project = getProjectId(), session = getSessionId()
+  const project = getProjectId(), session = getSessionId(), epoch = chatEpoch
   const before = messages.value.length
   try {
     const detail = await harnessApi.sessionDetail(session)
-    if (project !== getProjectId() || session !== getSessionId()) return
+    if (project !== getProjectId() || session !== getSessionId() || epoch !== chatEpoch) return
     const turns = detail.turns || []
     // Never silently load a different conversation into a fresh session.
     if (force && !turns.length && !sending.value) messages.value = []
@@ -297,8 +337,9 @@ async function restoreHistory(force = false) {
       stickToBottom.value = true
       await nextTick(scrollToBottom)
     }
-  } catch {
-    /* 服务未启动 / 无历史：保持空态，不打扰用户 */
+    restoreInterrupted(turns)
+  } catch (e) {
+    if (epoch === chatEpoch) { historyError.value = '历史加载失败：' + (e as Error).message; restoreInterrupted([]) }
   }
 }
 
@@ -358,8 +399,8 @@ function onFocusChat(ev?: Event) {
   const q = detail?.q
   collapsed.value = false
   if (detail?.reload) {
-    input.value = readDraft()
-    void restoreHistory(true).then(() => nextTick(() => inputEl.value?.focus()))
+    resetChatContext()
+    void nextTick(() => inputEl.value?.focus())
     return
   }
   nextTick(() => {
@@ -369,12 +410,21 @@ function onFocusChat(ev?: Event) {
 }
 onMounted(() => {
   window.addEventListener('docmind:focus-chat', onFocusChat as EventListener)
+  window.addEventListener('docmind:project-context-changed', resetChatContext)
+  window.addEventListener('pagehide', onPageHide)
+  window.addEventListener('beforeunload', onBeforeLeave)
   startTabProbe()   // 启动跨标签存活探测（供唯一性门禁判断）
   void loadModelConfig()
   void loadContextUsage()
   void restoreHistory()
 })
-onBeforeUnmount(() => window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener))
+onBeforeUnmount(() => {
+  onPageHide()
+  window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener)
+  window.removeEventListener('docmind:project-context-changed', resetChatContext)
+  window.removeEventListener('pagehide', onPageHide)
+  window.removeEventListener('beforeunload', onBeforeLeave)
+})
 
 function isNearBottom(el: HTMLElement) {
   return el.scrollHeight - el.scrollTop - el.clientHeight < 80
@@ -697,6 +747,7 @@ function connectorGuide(s: McpServer) {
 
     <template v-if="!collapsed">
       <div ref="scroller" class="cd-body" @scroll="onScroll">
+        <p v-if="historyError" role="alert">{{ historyError }}</p>
         <div v-for="m in messages" :key="m.id" class="cd-msg" :class="`cd-msg-${m.role}`">
           <div v-if="m.role === 'user'" class="cd-user-bubble">{{ m.text }}</div>
           <template v-else>

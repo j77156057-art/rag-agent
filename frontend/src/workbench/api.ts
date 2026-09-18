@@ -326,12 +326,27 @@ export function getProjectId(): string {
 
 /** 设置当前项目 id（空串 = 清除选择）；持久化以便刷新后保持。 */
 export function setProjectId(pid: string): void {
+  const previous = getProjectId()
   try {
     if (pid) localStorage.setItem(PROJECT_ID_KEY, pid)
     else localStorage.removeItem(PROJECT_ID_KEY)
   } catch {
     /* 写入失败（隐私模式等）不影响主流程 */
   }
+  if (previous !== pid) window.dispatchEvent(new CustomEvent('docmind:project-context-changed'))
+}
+
+export interface ActiveTask { id: string; region: string; allowedPaths: string[] }
+export function getActiveTask(project = getProjectId()): ActiveTask {
+  try {
+    const task = JSON.parse(localStorage.getItem('docmind.activeTask:' + project) || 'null')
+    if (task && typeof task.id === 'string' && typeof task.region === 'string' &&
+        Array.isArray(task.allowedPaths) && task.allowedPaths.every((p: unknown) => typeof p === 'string')) return task
+  } catch { /* Invalid or legacy unscoped records must not grant scope to another project. */ }
+  return { id: '', region: '', allowedPaths: [] }
+}
+export function setActiveTask(task: ActiveTask, project = getProjectId()) {
+  localStorage.setItem('docmind.activeTask:' + project, JSON.stringify(task))
 }
 
 /**
@@ -657,6 +672,7 @@ export const semanticApi = {
 }
 
 export const taskApi = {
+  list() { return request<{ ok: boolean; tasks: Record<string, unknown>[] }>('/api/tasks') },
   create(payload: Record<string, unknown>) { return postJson<{ ok: boolean; task?: Record<string, unknown>; error?: string }>('/api/tasks', payload) },
   validate(payload: Record<string, unknown>) { return postJson<{ ok: boolean; scope: TaskScope }>('/api/tasks/validate', payload) },
   impact(payload: Record<string, unknown>) { return postJson<{ ok: boolean; files: string[]; direct_files: string[]; related_files: string[] }>('/api/tasks/impact', payload) },
@@ -680,7 +696,7 @@ export const engineApi = {
   },
   host() { return request<DesktopHost>('/api/desktop/host') },
   /** 把已运行的引擎窗口嵌进桌面宿主。rect 省略时按宿主客户区铺满。 */
-  embed(rect?: EmbedRect | null) { return postJson<{ ok: boolean; error?: string; width?: number; height?: number }>('/api/engine/embed', rect || {}) },
+  embed(rect?: EmbedRect | null) { return postJson<{ ok: boolean; error?: string; width?: number; height?: number; embedded?: boolean }>('/api/engine/embed', rect || {}) },
   /** 引擎视窗随前端布局变化重新定位（弹窗移动、窗口缩放时调用）。 */
   place(rect: EmbedRect) { return postJson<{ ok: boolean; error?: string }>('/api/engine/place', rect) },
   detach() { return postJson<{ ok: boolean; was_embedded?: boolean; error?: string }>('/api/engine/detach', {}) },
@@ -1719,10 +1735,10 @@ export const modelApi = {
   get(): Promise<ModelConfigInfo> {
     return request('/api/config')
   },
-  save(req: SaveModelReq): Promise<ModelConfigInfo & { warnings?: string[]; model_error?: string }> {
+  save(req: SaveModelReq): Promise<ModelConfigInfo & { warnings?: string[]; model_error?: string; error?: string }> {
     // 后端配置保存失败是 HTTP 200 + {ok:false, model_error?}：必须走 rawJson 原样返回失败体，
     // 否则通用 request 会把真实原因吞成「请求失败（HTTP 200）」，model_error 分支永不触发。
-    return rawJson<ModelConfigInfo & { warnings?: string[]; model_error?: string }>('/api/config', req)
+    return rawJson<ModelConfigInfo & { warnings?: string[]; model_error?: string; error?: string }>('/api/config', req)
   },
   /** 实时探测本机已安装 Ollama 模型的真实上下文窗口 */
   probeOllama(model: string): Promise<OllamaProbeResult> {

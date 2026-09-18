@@ -3,6 +3,7 @@
 import { ref } from 'vue'
 // P4 收口：开发台内所有 /api/* 请求统一带上当前项目头（withProject）。健康探测本身与项目
 // 无关（后端 /api/health 不读项目上下文），但为一致性也走同一注入；未选项目时不带头（生命线）。
+import type { AssetItem } from '../api'
 import { withProject } from '../api'
 
 export const demoMode = ref(false)
@@ -207,7 +208,7 @@ const thumbAudio = svgThumb(
   [86, 110, 134, 158, 182, 206, 230].map((x, i) =>
     `<line x1="${x}" y1="${110 - 28 - (i % 3) * 12}" x2="${x}" y2="${110 + 28 + ((i + 1) % 3) * 12}"/>`).join('') + '</g>')
 
-export const demoAssetResults = [
+export const demoAssetResults: AssetItem[] = [
   { id: 'vintage_armchair', source: 'polyhaven', kind: 'model', name: '复古扶手椅',
     author: 'Kirill Sannikov', license: 'CC0', page_url: 'https://polyhaven.com/',
     thumb_url: thumbCube, tags: ['家具', '室内'], summary: '带布艺坐垫的木质扶手椅，室内场景道具' },

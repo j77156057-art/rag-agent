@@ -1,5 +1,15 @@
 # DocMind 项目交接清单（给接手 AI）
 
+### 2026-09-18 项目切换与流式竞态修复
+
+- 项目上下文：任务 ID、分区和允许路径改为按 `project_id` 保存；切换项目会重建任务面板，保存与选区 AI 不会读取旧项目的全局任务范围。
+- 流式回答：项目切换/离开页面会中止 SSE；迟到事件被丢弃；已收到的部分回答会恢复为“已中断”提示，绝不自动重放工具。
+- 编辑器：延迟磁盘读取期间若用户已输入、标签已关闭或项目已切换，不再覆盖草稿。
+- 画布与类型：修复 Vue Flow store 类型、场景文件卡双击打开、节点聚焦、资源类别映射和任务历史 API 类型；新增 `npm run typecheck`。
+- 专项验证：`verify_workbench_races.mjs` 5 项通过（延迟读取、项目切换中止流、任务范围隔离、首页并发发送、错误检查）；工作台回归 9 组、场景画布 27/27 继续通过；`npm run typecheck` 与 `npm run build` 通过。
+- 依赖：前端增加 `vue-tsc` 与 `@types/node`，锁文件已更新。
+- 仍有边界：复制标签页可能复制 sessionStorage 会话 ID；服务端已执行的工具无法回滚；真实引擎、GPU 和 ComfyUI 实机状态仍按 §5 单独验收。
+
 ### 2026-09-18 工作台回归修复与桌面更新
 
 - 修复问答页 ↔ 工作台往返丢失：问答页与工作台从后端恢复当前会话历史；未发送聊天草稿、CodeMirror 未保存草稿按项目保存在 sessionStorage；项目切换会清理旧标签并重新回灌。
@@ -796,3 +806,10 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - §8：新增第 31–32 条（lifespan 化改造的**顺序反转**坑；校验脚本的 code_root 语义与 TestClient 是否触发 lifespan——解释了「54/54 全过但 `--serve` 已坏」）。
 - `DocMind_BUILD.md`：新增「第二十二次重建」章节，顶部指引行与产物段更新为第 22 次；**第二十一次章节保留**（其 exe 20,536,866 B / SHA `f67eac87…` 是当时真实交付值，已被本次取代但不得改写历史）。
 - 本轮**未重跑**：`verify_regions.py`（不在冻结发布流水线内）。`docs/screenshots/*.png` 是校验脚本的副产物、不入库（跑完已 `git checkout --` 还原，避免工作树脏）。
+
+### 2026-09-18 工作台交互回归收尾
+
+- 修复并验证场景画布的真实聚焦/打开链路：回归脚本先确认“聚焦选中”确实把节点置于画布中心，再通过画布自带的适应视图恢复全图，双击 `behaviors/player.gd` 文件卡可打开实际编辑器；没有使用强制点击绕过遮挡。
+- 新增 `verify_workbench_races.mjs` 场景交互断言，覆盖延迟恢复不覆盖新输入、项目切换中止旧 SSE、回答中断恢复、首页重复发送防护、节点聚焦和文件卡双击打开。
+- 本轮验证：`npm --prefix frontend run typecheck` 通过；`npm --prefix frontend run build` 通过；`verify_workbench_races.mjs` 6/6 通过；`verify_workbench_regressions.mjs` 9/9 通过；`verify_scene_canvas_ui.mjs` 27/27 通过；Python 全量测试 **935/935 通过（1 项跳过）**。
+- 已知限制保持不变：真实 Unreal Editor 联机、物理多 GPU 和安装器独立 EXE 启动仍需对应环境实测；本轮未修改用户未跟踪的 Godot 工程文件。

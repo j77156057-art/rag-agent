@@ -9,14 +9,14 @@
 //       「层级布局」= DFS 前序的水平树；「空间布局」= 直接按场景坐标落点（可拖拽回写位置）。
 //   * 实例（instance）与脚本引用（ExtResource）另外画成"文件卡"，边用不同颜色区分，
 //     双击文件卡即在编辑器里打开该文件——场景图和代码因此连成一条线。
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, shallowRef, watch } from 'vue'
 import {
   VueFlow, applyNodeChanges, applyEdgeChanges, MarkerType,
 } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
 import { MiniMap } from '@vue-flow/minimap'
-import type { Node, Edge, NodeChange, EdgeChange } from '@vue-flow/core'
+import type { Node, Edge, NodeChange, EdgeChange, VueFlowStore } from '@vue-flow/core'
 // Vue Flow 的样式不带在包里，必须显式引（漏了不会报错，只会让 .vue-flow__node
 // 退化成 position:static —— 画布看起来"有东西"但节点其实堆成一列）。
 // 不引 node-resizer（本项目没用到它的缩放功能）。
@@ -32,11 +32,11 @@ import SceneFileCard from './SceneFileCard.vue'
 const props = defineProps<{ path: string }>()
 const emit = defineEmits<{ (e: 'open-file', rel: string): void }>()
 
-const nodeTypes = { sceneNode: SceneNodeCard, sceneFile: SceneFileCard }
 const COLORS = { '2d': '#58a6ff', '3d': '#bc8cff', root: '#e3a83a', instance: '#2ec4b6' }
 const EDGE = {
   hierarchy: '#5b6675',
   script: '#d2a8ff',
+  reference: '#5b6675',
   instance: '#2ec4b6',
 }
 
@@ -46,8 +46,8 @@ const message = ref('')
 const messageKind = ref<'info' | 'ok' | 'err'>('info')
 const busy = ref(false)
 
-const nodes = ref<Node[]>([])
-const edges = ref<Edge[]>([])
+const nodes = shallowRef<(Node & { selected?: boolean })[]>([])
+const edges = shallowRef<Edge[]>([])
 const selectedId = ref<string | null>(null)
 const selectedIds = ref<string[]>([])
 const layoutMode = ref<'hierarchy' | 'space'>('hierarchy')
@@ -74,7 +74,7 @@ const parentOf = ref<Map<string, string>>(new Map())
 const childMap = ref<Map<string, Set<string>>>(new Map())
 const fileIdSet = ref<Set<string>>(new Set())
 // Vue Flow 实例（聚焦选中 / 导出用）
-const vf = ref<any>(null)
+const vf = shallowRef<VueFlowStore | null>(null)
 
 const scene = computed(() => graph.value)
 const nodeById = computed(() => new Map((graph.value?.nodes ?? []).map(n => [n.id, n])))
@@ -120,7 +120,7 @@ function buildOrder(list: SceneNode[]): { node: SceneNode; depth: number }[] {
 
 // 空间缩放只在场景首次加载时算一次（见 reload 中按 path 固定），编辑后保持稳定，
 // 避免「拖一个节点→reload 重算全局缩放→所有节点朝原点塌缩聚拢」的 bug。
-function computeSpaceScale(nodes: Array<{ position?: [number, number] }> | undefined) {
+function computeSpaceScale(nodes: Array<{ position?: number[] | null }> | undefined) {
   const pts = (nodes || []).filter(n => n.position)
   const span = pts.reduce((acc, n) => Math.max(acc, Math.abs(n.position![0]), Math.abs(n.position![1])), 0)
   spaceScale.value = span > 2400 ? 2400 / span : 1
@@ -191,7 +191,7 @@ function layout(): { nodes: Node[]; edges: Edge[]; maxX: number; minY: number } 
       draggable: true,
       data: {
         file,
-        color: file.kind === 'instance' ? EDGE.instance : file.kind === 'script' ? EDGE.script : EDGE.hierarchy,
+        color: file.kind === 'scene' ? EDGE.instance : file.kind === 'script' ? EDGE.script : EDGE.hierarchy,
         id: file.id,
         onHover: setHover,
       },
@@ -231,7 +231,8 @@ function rebuild() {
 }
 
 function onNodesChange(changes: NodeChange[]) {
-  nodes.value = applyNodeChanges(changes, nodes.value)
+  if (!vf.value) return
+  nodes.value = applyNodeChanges(changes, vf.value.nodes.value)
   if (changes.some(c => c.type === 'select' || c.type === 'remove')) {
     selectedIds.value = nodes.value.filter(n => n.selected).map(n => n.id)
     const last = selectedIds.value[selectedIds.value.length - 1]
@@ -239,7 +240,8 @@ function onNodesChange(changes: NodeChange[]) {
   }
 }
 function onEdgesChange(changes: EdgeChange[]) {
-  edges.value = applyEdgeChanges(changes, edges.value)
+  if (!vf.value) return
+  edges.value = applyEdgeChanges(changes, vf.value.edges.value)
 }
 /**
  * Vue Flow v1 的事件载荷是**单个对象** `{ event, node, nodes, ... }`，不是 `(event, node)`。
@@ -572,7 +574,7 @@ function decorate() {
 function focusSelected() {
   const id = selectedId.value
   if (!id || !vf.value) return
-  const n = vf.value.getNode(id)
+  const n = vf.value.findNode(id)
   if (!n) return
   const p = n.position as { x: number; y: number }
   const zoom = Math.max(1, (vf.value.getViewport()?.zoom) || 1)
@@ -685,11 +687,11 @@ watch(hoverId, decorate)
 watch(selectedId, decorate)
 
 // 暴露给自动化探针（与 spike 一样留一个窄门面，避免探针依赖 Vue Flow store 形状）
-function onPaneReady(instance: { findNode: (id: string) => Node | undefined; nodes: Node[]; getNode: (id: string) => Node | undefined; setCenter: (x: number, y: number, o?: unknown) => void; getViewport: () => { zoom: number } }) {
+function onPaneReady(instance: VueFlowStore) {
   vf.value = instance
   ;(window as unknown as { __sceneCanvas: unknown }).__sceneCanvas = {
     findNode: (id: string) => instance.findNode(id),
-    nodeList: () => instance.nodes,
+    nodeList: () => instance.nodes.value,
     graph: () => graph.value,
     select: (id: string) => { selectedId.value = id },
   }
@@ -752,7 +754,6 @@ defineExpose({ reload, undo, redo, addChildNew })
         <VueFlow
           :nodes="nodes"
           :edges="edges"
-          :node-types="nodeTypes"
           :nodes-draggable="layoutMode === 'space'"
           :min-zoom="0.2"
           :max-zoom="2"
@@ -766,6 +767,8 @@ defineExpose({ reload, undo, redo, addChildNew })
           @node-drag-stop="onNodeDragStop"
           @pane-ready="onPaneReady"
         >
+          <template #node-sceneNode="nodeProps"><SceneNodeCard :data="nodeProps.data" :selected="nodeProps.selected" /></template>
+          <template #node-sceneFile="nodeProps"><SceneFileCard :data="nodeProps.data" :selected="nodeProps.selected" @open="openFile" /></template>
           <Background :gap="22" :size="1.4" color="#c6d0de" />
           <Controls />
           <MiniMap pannable zoomable :node-color="miniColor" />

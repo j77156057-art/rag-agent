@@ -251,7 +251,7 @@ function beforeUnload(e: BeforeUnloadEvent) {
 
 // Alt+1 概览 / Alt+2 代码（代码工作区需有打开的文件；输入框内不拦截）
 function onWorkspaceHotkey(e: KeyboardEvent) {
-  if (!e.altKey || e.altGraphKey) return
+  if (!e.altKey || e.getModifierState('AltGraph')) return
   const tag = (e.target as HTMLElement | null)?.tagName
   if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement | null)?.isContentEditable) return
   if (e.key === '1') { e.preventDefault(); setWorkspace('overview') }
@@ -370,7 +370,7 @@ onBeforeUnmount(() => {
           设置
         </button>
         <!-- 引擎/生成类面板：窄屏按优先级分级隐藏（容器隐藏，不影响弹层逻辑） -->
-        <span class="wb-tool wb-tool-te"><TaskEnginePanel /></span>
+        <span class="wb-tool wb-tool-te"><TaskEnginePanel :key="currentProjectId" /></span>
         <span class="wb-tool wb-tool-gp"><GpuPanel /></span>
         <span class="wb-tool wb-tool-hp"><HarnessPanel /></span>
         <span class="wb-tool wb-tool-ap"><AgentPolicyPanel /></span>
@@ -468,7 +468,7 @@ onBeforeUnmount(() => {
       <aside v-if="treeError" class="wb-tree-error">
         <p class="wb-tree-error-title">文件树不可用</p>
         <p class="wb-tree-error-msg">{{ treeError.message }}</p>
-        <button class="wb-retry" @click="loadTree">重试</button>
+        <button class="wb-retry" @click="loadTree()">重试</button>
       </aside>
 
       <template v-else-if="tree">

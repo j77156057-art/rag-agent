@@ -2,7 +2,7 @@
 // 对话框与右键菜单。组件只负责渲染与转发事件。
 import { computed, ref, shallowRef } from 'vue'
 import { EditorView } from '@codemirror/view'
-import { aiApi, fsApi, regionsApi, semanticApi, FsApiError } from '../api'
+import { aiApi, fsApi, regionsApi, semanticApi, FsApiError, getProjectId, getActiveTask } from '../api'
 import type {
   TreeNode, TreeResp, GitCommit, RegionInfo, ContractsResp,
   SemanticTagRecord, LocateResp, RegionCard,
@@ -299,6 +299,7 @@ function persistWorkspace() {
 async function restoreWorkspace() {
   if (!tree.value || restoredRoot === tree.value.code_root) return
   restoredRoot = tree.value.code_root
+  const project = getProjectId(), root = restoredRoot
   try {
     const data = JSON.parse(sessionStorage.getItem('docmind.workspace:' + restoredRoot) || 'null')
     if (!data || !Array.isArray(data.tabs) || tabs.value.length) return
@@ -311,12 +312,17 @@ async function restoreWorkspace() {
     for (const tab of tabs.value) {
       if (tab.dirty) continue // Preserve the original base for conflict detection.
       try {
+        const before = tab.draftContent ?? tab.savedContent
         const file = await fsApi.read(tab.path)
+        if (project !== getProjectId() || root !== restoredRoot) return
+        if (!tabs.value.includes(tab) || tab.dirty || (tab.draftContent ?? tab.savedContent) !== before) continue
         tab.savedContent = file.content
         tab.draftContent = file.content
         tab.mtime = file.mtime
         docReplacers.get(tab.id)?.(file.content)
-      } catch (e) { tab.error = (e as Error).message }
+      } catch (e) {
+        if (project === getProjectId() && root === restoredRoot && tabs.value.includes(tab) && !tab.dirty) tab.error = (e as Error).message
+      }
     }
   } catch { /* damaged session data must not block opening a project */ }
 }
@@ -373,7 +379,7 @@ function askConflict(path: string, serverMtime: number): Promise<boolean> {
   })
 }
 
-export function resolveDialog(value?: boolean | string) {
+export function resolveDialog(value?: boolean | string | null) {
   const d = dialog.value
   if (!d) return
   dialog.value = null
@@ -624,7 +630,7 @@ async function saveTab(id: number, overwrite = false): Promise<boolean> {
   tab.saving = true
   tab.reindexWarn = null
   try {
-    const taskId = window.localStorage.getItem('docmind.activeTaskId') || ''
+    const taskId = getActiveTask().id
     const resp = await fsApi.save(tab.path, content, overwrite ? null : tab.mtime, true, taskId)
     tab.mtime = resp.mtime
     tab.savedContent = content
@@ -1223,9 +1229,9 @@ async function runAi(action: AiAction, instruction?: string): Promise<void> {
           selection: sel.text,
           instruction,
           file_context: fileCtx,
-          task_id: window.localStorage.getItem('docmind.activeTaskId') || undefined,
-          task_region: window.localStorage.getItem('docmind.activeTaskRegion') || undefined,
-          allowed_paths: (window.localStorage.getItem('docmind.activeTaskAllowedPaths') || '').split(',').map((x) => x.trim()).filter(Boolean),
+          task_id: getActiveTask().id || undefined,
+          task_region: getActiveTask().region || undefined,
+          allowed_paths: getActiveTask().allowedPaths,
           engine: window.localStorage.getItem('docmind.engine') || 'godot',
         },
         { onEvent, signal: ac.signal },
