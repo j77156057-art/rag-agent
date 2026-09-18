@@ -2685,6 +2685,34 @@ def _ollama_name_variants(name: str):
     return out
 
 
+def _ollama_model_sizes(timeout: float = 8.0):
+    """从 Ollama /api/tags 读取各模型磁盘大小（bytes），用于预加载前显存安全校验。
+
+    服务不可达或响应异常时返回空字典，由调用方回退到当前行为。
+    """
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_BASE}/api/tags", timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        out = {}
+        for m in data.get("models", []):
+            name = m.get("name") or m.get("model")
+            if name:
+                out[name] = int(m.get("size") or 0)
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _match_model_size(name: str, sizes: dict) -> int:
+    """按模型名（支持缺 :latest）从 sizes 字典匹配大小（bytes）。"""
+    if not name or not sizes:
+        return 0
+    for v in _ollama_name_variants(name):
+        if v in sizes:
+            return sizes[v]
+    return 0
+
+
 def check_ollama():
     """探测本机 Ollama 服务可达性、所需模型是否已拉取，并返回用户引导文案。
 
@@ -2991,13 +3019,49 @@ async def model_power_ep(req: ModelPowerReq):
                     "ok": False,
                     "error": "当前 Provider 不是 Ollama（云端/演示模型不占本机显存），无需预加载。",
                 }
-            loaded, errors = [], []
+
+            # VRAM 安全校验：避免预加载超过单卡可用显存的模型，导致 Windows TDR/黑屏。
+            # Ollama 默认把模型加载到一张 GPU 上，故取单卡最大空闲显存（而非多卡总和）。
+            # 若探测不到 GPU（free_mb=0），回退到当前行为，由 Ollama 自己处理 CPU 路径。
+            PRELOAD_VRAM_HEADROOM_MB = 2048
+            mem = gpu.memory_info() or {}
+            gpus = mem.get("gpus") or []
+            free_mb = max((g.get("free_mb", 0) for g in gpus), default=0) if gpus else 0
+            safe_mb = max(0, free_mb - PRELOAD_VRAM_HEADROOM_MB)
+            tags_sizes = _ollama_model_sizes()
+
+            to_preload, skipped = [], []
             for name in wanted:
+                size_bytes = _match_model_size(name, tags_sizes)
+                size_mb = size_bytes / (1024 * 1024)
+                if free_mb > 0 and size_mb > safe_mb:
+                    skipped.append({
+                        "name": name,
+                        "size_gb": round(size_mb / 1024, 2),
+                        "free_gb": round(free_mb / 1024, 2),
+                    })
+                else:
+                    to_preload.append(name)
+
+            loaded, errors = [], []
+            for name in to_preload:
                 ok, err = await run_in_threadpool(_ollama_keep_alive, name, _preload_keep_alive())
                 (loaded if ok else errors).append(name if ok else f"{name}（{err}）")
-            result = {"ok": not errors, "action": "on", "preloaded": loaded}
+
+            result = {
+                "ok": not errors and not skipped,
+                "action": "on",
+                "preloaded": loaded,
+                "skipped": skipped,
+            }
+            parts = []
+            if skipped:
+                msgs = [f"{s['name']}（{s['size_gb']} GB）超过可用显存 {s['free_gb']} GB" for s in skipped]
+                parts.append("以下模型因显存不足已跳过预加载，避免系统黑屏/驱动超时：" + "、".join(msgs))
             if errors:
-                result["error"] = "部分模型预加载失败：" + "、".join(errors)
+                parts.append("部分模型预加载失败：" + "、".join(errors))
+            if parts:
+                result["error"] = "；".join(parts)
         # 回读最新驻留状态，前端直接渲染
         models = await run_in_threadpool(_ollama_ps)
         result["loaded"] = [_format_ps_model(m) for m in models]

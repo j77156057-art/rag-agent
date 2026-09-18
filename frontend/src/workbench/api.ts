@@ -1244,6 +1244,7 @@ export interface ModelPowerResult {
   action?: string
   unloaded?: string[]
   preloaded?: string[]
+  skipped?: { name: string; size_gb: number; free_gb: number }[]
   loaded?: ModelResident[]
   vram_gb?: number
   error?: string

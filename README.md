@@ -31,7 +31,7 @@ DocMind 的应对分两层：
 
 - 后端：Python · FastAPI（HTTP + SSE）· Chroma 双集合（文档 / 代码）· OpenAI 兼容多 Provider（qwen / deepseek / ollama / llamacpp / mock）· PyInstaller + pywebview
 - 前端：Vue 3.5 · Vite 5 · TypeScript · CodeMirror 6 · Vue Flow · 手写深色设计系统
-- 验证：`unittest` **450 项** · 场景画布自检 54 项 · 浏览器冒烟 27 项（Playwright + 系统 Edge）· 引擎嵌入实机自检 68 项
+- 验证：`unittest` **1065 项** · 场景画布自检 54 项 · 浏览器冒烟 27 项（Playwright + 系统 Edge）· 引擎嵌入实机自检 79 项
 
 ## 📁 目录结构
 

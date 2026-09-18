@@ -12,6 +12,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -582,6 +583,108 @@ class OllamaEvictHookRetryTest(unittest.TestCase):
         self.resident.clear()
         self.assertFalse(api._gpu_ollama_evict_hook())
         self.assertEqual(self.calls, [])
+
+
+class ModelPowerVramGuardTest(unittest.TestCase):
+    """/api/model_power 'on' 预加载前的显存安全护栏。
+
+    防止用户点击"预加载"时把 22GB 模型往 12GB 笔记本 GPU 里塞，
+    导致 Windows TDR 黑屏、WebView2 崩溃（msedgewebview2.exe 0xe0000008）。
+    """
+
+    def setUp(self):
+        self._orig_needed = api._ollama_needed_models
+        self._orig_sizes = api._ollama_model_sizes
+        self._orig_keep = api._ollama_keep_alive
+        self._orig_ps = api._ollama_ps
+        self._orig_preload_ka = api._preload_keep_alive
+
+    def tearDown(self):
+        api._ollama_needed_models = self._orig_needed
+        api._ollama_model_sizes = self._orig_sizes
+        api._ollama_keep_alive = self._orig_keep
+        api._ollama_ps = self._orig_ps
+        api._preload_keep_alive = self._orig_preload_ka
+
+    def _post_power(self, action):
+        from starlette.testclient import TestClient
+        client = TestClient(api.app)
+        return client.post('/api/model_power', json={'action': action})
+
+    def _mem(self, free_mb):
+        return {'free_mb': free_mb, 'gpus': [{'free_mb': free_mb}]}
+
+    def test_skips_oversized_model(self):
+        api._ollama_needed_models = lambda: ['qwen3.6:35b-a3b']
+        api._ollama_model_sizes = lambda timeout=8.0: {'qwen3.6:35b-a3b': 23 * 1024 ** 3}
+        api._ollama_keep_alive = lambda model, keep_alive, timeout=600.0: (True, '')
+        api._ollama_ps = lambda timeout=8.0: []
+        api._preload_keep_alive = lambda: '24h'
+
+        with patch.object(api.gpu, 'memory_info', return_value=self._mem(11000)):
+            resp = self._post_power('on')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertFalse(body['ok'])
+        self.assertEqual(body['preloaded'], [])
+        self.assertEqual(len(body['skipped']), 1)
+        self.assertEqual(body['skipped'][0]['name'], 'qwen3.6:35b-a3b')
+        self.assertIn('黑屏', body['error'])
+
+    def test_loads_fitting_model(self):
+        api._ollama_needed_models = lambda: ['bge-m3']
+        api._ollama_model_sizes = lambda timeout=8.0: {'bge-m3:latest': int(1.2 * 1024 ** 3)}
+        api._ollama_keep_alive = lambda model, keep_alive, timeout=600.0: (True, '')
+        api._ollama_ps = lambda timeout=8.0: []
+        api._preload_keep_alive = lambda: '24h'
+
+        with patch.object(api.gpu, 'memory_info', return_value=self._mem(11000)):
+            resp = self._post_power('on')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body['ok'])
+        self.assertEqual(body['preloaded'], ['bge-m3'])
+        self.assertEqual(body['skipped'], [])
+
+    def test_fallback_when_no_gpu_info(self):
+        api._ollama_needed_models = lambda: ['bge-m3']
+        api._ollama_model_sizes = lambda timeout=8.0: {'bge-m3:latest': int(1.2 * 1024 ** 3)}
+        calls = []
+
+        def fake_keep_alive(model, keep_alive, timeout=600.0):
+            calls.append(model)
+            return True, ''
+
+        api._ollama_keep_alive = fake_keep_alive
+        api._ollama_ps = lambda timeout=8.0: []
+        api._preload_keep_alive = lambda: '24h'
+
+        with patch.object(api.gpu, 'memory_info', return_value=self._mem(0)):
+            resp = self._post_power('on')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body['ok'])
+        self.assertEqual(body['preloaded'], ['bge-m3'])
+        self.assertEqual(calls, ['bge-m3'])
+
+    def test_mixed_fit_and_oversized(self):
+        api._ollama_needed_models = lambda: ['bge-m3', 'qwen3.6:35b-a3b']
+        api._ollama_model_sizes = lambda timeout=8.0: {
+            'bge-m3:latest': int(1.2 * 1024 ** 3),
+            'qwen3.6:35b-a3b': 23 * 1024 ** 3,
+        }
+        api._ollama_keep_alive = lambda model, keep_alive, timeout=600.0: (True, '')
+        api._ollama_ps = lambda timeout=8.0: []
+        api._preload_keep_alive = lambda: '24h'
+
+        with patch.object(api.gpu, 'memory_info', return_value=self._mem(11000)):
+            resp = self._post_power('on')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertFalse(body['ok'])
+        self.assertEqual(body['preloaded'], ['bge-m3'])
+        self.assertEqual(len(body['skipped']), 1)
+        self.assertEqual(body['skipped'][0]['name'], 'qwen3.6:35b-a3b')
 
 
 if __name__ == "__main__":
