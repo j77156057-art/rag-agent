@@ -13,7 +13,7 @@
   4. 物理多 GPU `multi` 模式和跨进程 CUDA UUID 隔离仍缺至少两张 NVIDIA GPU 的实机验收；单卡负对照已完成，不能把它写成多卡已验证。
   5. 桌面发布仍缺在用户桌面实际执行的独立 EXE 启动、覆盖升级和卸载验证；安装器已生成，但当前自动执行策略曾阻止本机自动启动验证。
   6. 项目状态隔离已落地，但全局 Ollama/联网配置、GPU 协调器和 Chroma 仍是实例级资源；需要长时间多项目并发压测后再收口。
-- 交接验证基线：Python 全量回归最近记录为 `939 项通过、1 项跳过`；前端 `typecheck` 与 `npm run build` 通过。继续改动后必须重新运行受影响专项和全量测试，并把结果追加到第 4 节时间线。
+- 交接验证基线：Python 全量回归最近记录为 **947 项通过、1 项跳过**；前端 `typecheck` 与 `npm run build` 通过。继续改动后必须重新运行受影响专项和全量测试，并把结果追加到第 4 节时间线。
 
 ### 2026-09-18 联网研究能力补齐
 
@@ -29,6 +29,7 @@
 - `frontend/src/workbench/api.ts` 增加 BroadcastChannel 会话仲裁：复制标签页带着相同 `sessionStorage` 会话进入时，两个页面用本次页面内随机 token 比较，只让一侧旋转到新 `session_id`；原有会话历史不会被删除。
 - 不写入 localStorage，不改变普通刷新行为；不支持 BroadcastChannel 的旧 WebView 仍依赖原有标签存活探测，不能宣称所有浏览器都能识别复制标签。
 - `npm --prefix frontend run typecheck` 与 `npm --prefix frontend run build` 已通过；需要在实际 Edge/WebView2 中开两个复制标签做一次行为验收。
+- 最新提交链：`f7cdfd8` 联网研究扩展 → `72e8dff` 字幕失败标记 → `9bf551c` 专用搜索回退 → `b454c6a` 缓存忽略 → `3b29256` 复制标签会话隔离 → `509898c` 回退诊断收口；当前 `main` 与 `origin/main` 同步。
 
 ### 2026-09-18 项目切换与流式竞态修复
 
