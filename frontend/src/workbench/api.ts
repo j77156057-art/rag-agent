@@ -1906,6 +1906,7 @@ export interface TraceItem {
   finish_reason?: string | null
   aborted: boolean
   error: string
+  final_chars?: number
   steps: TraceStep[]
 }
 export interface TraceSummary {

@@ -534,6 +534,15 @@ function closeUnityGraph() {
   unityGraphOpen.value = false
 }
 
+const flowOpen = ref(false)
+
+function openFlow() {
+  flowOpen.value = true
+}
+function closeFlow() {
+  flowOpen.value = false
+}
+
 /** 打开文件（必要时等待异步加载与 CM 挂载）并把光标定位/滚动到指定行。 */
 async function jumpToLine(path: string, line: number): Promise<void> {
   await openPath(path)
@@ -1486,6 +1495,8 @@ export function useWorkbench() {
     relationGraphOpen, openRelationGraph, closeRelationGraph,
     // P1-2 Unity GUID 引用图
     unityGraphOpen, openUnityGraph, closeUnityGraph,
+    // 阶段3 AI 工作流画布（trace 回看）
+    flowOpen, openFlow, closeFlow,
     // tabs
     activateTab, closeTab, saveTab, saveActive, registerContentGetter, registerDocReplacer,
     closeAllTabs,

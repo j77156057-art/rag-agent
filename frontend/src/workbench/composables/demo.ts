@@ -99,6 +99,33 @@ export const demoTraceItems = [
     outcome: 'aborted', aborted: true, error: '用户手动停止',
     steps: [],
   },
+  {
+    turn_id: 'demo-004', ts: new Date(Date.now() - 1000 * 60 * 3).toISOString(),
+    session_id: '敌人受击修复', provider: 'ollama', model: 'qwen3:14b', route: 'local',
+    question_chars: 31, messages_count: 12, prompt_tokens: 6842, completion_tokens: 1530,
+    total_tokens: 8372, cost_cny: 0, llm_calls: 7, llm_ms: 21400, elapsed_ms: 24800,
+    outcome: 'completed', aborted: false, error: '',
+    steps: [
+      { i: 0, action: 'search_code', latency_ms: 380, arg_chars: 18, obs_chars: 940, ok: true },
+      { i: 1, action: 'read_file', latency_ms: 70, arg_chars: 24, obs_chars: 2140, ok: true },
+      { i: 2, action: 'dev_region_edit', latency_ms: 310, arg_chars: 420, obs_chars: 180, ok: true },
+      { i: 3, action: 'dev_region_verify', latency_ms: 860, arg_chars: 12, obs_chars: 522, ok: false },
+      { i: 4, action: 'read_file', latency_ms: 65, arg_chars: 22, obs_chars: 1680, ok: true },
+      { i: 5, action: 'dev_region_edit', latency_ms: 280, arg_chars: 365, obs_chars: 196, ok: true },
+      { i: 6, action: 'game_playtest', latency_ms: 5200, arg_chars: 40, obs_chars: 760, ok: true },
+    ],
+  },
+  {
+    turn_id: 'demo-005', ts: new Date(Date.now() - 1000 * 60 * 1).toISOString(),
+    session_id: 'web-default', provider: 'deepseek', model: 'deepseek-chat', route: 'cloud',
+    question_chars: 26, messages_count: 8, prompt_tokens: 3210, completion_tokens: 920,
+    total_tokens: 4130, cost_cny: 0.0082, llm_calls: 3, llm_ms: 9600, elapsed_ms: 15200,
+    outcome: 'completed', aborted: false, error: '',
+    steps: [
+      { i: 0, action: 'web_research', latency_ms: 4200, arg_chars: 20, obs_chars: 3800, ok: true },
+      { i: 1, action: 'web_fetch', latency_ms: 1600, arg_chars: 64, obs_chars: 5200, ok: true },
+    ],
+  },
 ]
 
 export const demoSkills = {

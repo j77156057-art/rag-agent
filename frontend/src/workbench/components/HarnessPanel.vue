@@ -11,6 +11,9 @@ import {
   demoMode,
   demoBudget, demoSessions, demoTraceItems, demoTraceSummary, demoSkills, demoHooks,
 } from '../composables/demo'
+import { useWorkbench } from '../composables/workbench'
+
+const { openFlow } = useWorkbench()
 
 const open = ref(false)
 const tab = ref<'cost' | 'sessions' | 'trace' | 'skills'>('cost')
@@ -317,6 +320,7 @@ onBeforeUnmount(() => { open.value = false })
           </div>
           <div class="hp-footrow">
             <a class="hp-linkline" href="/trace.html" target="_blank" rel="noreferrer">打开完整轨迹页 ↗</a>
+            <button class="hp-btn sm" title="把每轮问答画成「提问→思考→调工具→回答」节点流水线" @click="open = false; openFlow()">流程图查看</button>
             <button class="hp-btn sm" @click="clearTraces">清空记录</button>
           </div>
         </div>

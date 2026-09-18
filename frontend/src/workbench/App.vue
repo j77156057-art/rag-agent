@@ -10,6 +10,7 @@ import SymbolOutline from './components/SymbolOutline.vue'
 import SymbolMap from './components/SymbolMap.vue'
 import RelationGraph from './components/RelationGraph.vue'
 import UnityGraph from './components/UnityGraph.vue'
+import FlowCanvas from './components/FlowCanvas.vue'
 import SelectionToolbar from './components/SelectionToolbar.vue'
 import SelectionAiPanel from './components/SelectionAiPanel.vue'
 import GitHistoryDialog from './components/GitHistoryDialog.vue'
@@ -40,7 +41,7 @@ const {
   tree, treeLoading, treeError, loadTree,
   tabs, activeTab, selectedPath, openNode, saveActive,
   openSymbolMap, openRelationGraph,
-  openUnityGraph,
+  openUnityGraph, openFlow,
   revertPath, openHistory,
   openRegionMap,
   aiPanelOpen,
@@ -418,6 +419,20 @@ onBeforeUnmount(() => {
           </svg>
           <span class="wb-map-label">Unity 图</span>
         </button>
+        <button
+          v-if="tree || demoMode"
+          class="wb-map-btn"
+          title="AI 工作流：把每轮问答画成「提问→思考→调工具→回答」流水线，每步耗时/成败/token 一目了然"
+          @click="openFlow"
+        >
+          <svg width="13" height="13" viewBox="0 0 13 13">
+            <circle cx="3" cy="2.6" r="1.25" fill="none" stroke="currentColor" stroke-width="0.95" />
+            <rect x="1.6" y="5.6" width="2.8" height="1.9" rx="0.5" fill="none" stroke="currentColor" stroke-width="0.95" />
+            <circle cx="10" cy="10.2" r="1.25" fill="none" stroke="currentColor" stroke-width="0.95" />
+            <path d="M3 3.8 V5.6 M3 7.5 C3 9 5.6 8.7 7.2 9.3 C8.4 9.7 9 9.4 9.2 9" fill="none" stroke="currentColor" stroke-width="0.85" stroke-dasharray="1.8 1.6" />
+          </svg>
+          <span class="wb-map-label">流程图</span>
+        </button>
         </span>
         <button
           v-if="activeTab && canHistoryActive"
@@ -567,6 +582,7 @@ onBeforeUnmount(() => {
     <SymbolMap />
     <RelationGraph />
     <UnityGraph />
+    <FlowCanvas />
     <SelectionToolbar />
     <SettingsView :visible="settingsVisible" @close="settingsVisible = false" />
   </div>
