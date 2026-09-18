@@ -3240,6 +3240,270 @@ def game_playtest(arg):
     f=_parse_keyed(arg or "",["command","timeout"]); return json.dumps(playtest(_get_code_root(),f.get("command") or "",int(f.get("timeout") or 30)),ensure_ascii=False)
 
 
+# ===========================================================================
+# 写后自验证工具 self_verify（Phase 1「写后自验证闭环」收尾门）
+# 详见 docs/agent-self-verify-memory.md。Agent 在 apply_edit / create_file 等写操作
+# 成功后自动调用本工具对改动做轻量校验；失败信息回填模型、触发 ReAct 自修
+# （复用 agent.py 既有 _FAILURE_MARKERS / _TOOL_FAIL_LIMIT / _TOTAL_FAIL_LIMIT 护栏）。
+# 校验策略按改动文件类型分 scope：
+#   backend  (.py)      → py_compile 每个改动文件 + 命中则跑对应 tests/test_<module>.py
+#   frontend (.ts/.vue) → npm run typecheck（严禁 build，并发铁律）
+#   scene/engine        → 仅 scope 显式指定时运行 verify_* 脚本（需 GUI/display，故非自动）
+# 任何异常一律降级为「跳过该 scope」，绝不因校验器自身故障阻断问答主流程。
+# 入参与文本协议 Action Input 同形：单行 "scope: auto" + 多行 "files: a.py\nfiles: b.py"
+# （前端自验证也可用 "files: frontend/src/x.ts"）。
+# ===========================================================================
+
+def _parse_self_verify_arg(arg):
+    """把 self_verify 的入参字符串解析为 (scope, files)。"""
+    arg = (arg or "").strip()
+    scope = "auto"
+    files_parts = []
+    has_scope = False
+    if not arg:
+        return scope, None
+    for line in arg.splitlines():
+        s = line.strip()
+        low = s.lower()
+        if low.startswith("scope:"):
+            scope = (s[len("scope:"):].strip() or "auto")
+            has_scope = True
+        elif low.startswith("files:"):
+            rest = s[len("files:"):].strip()
+            if rest:
+                files_parts.append(rest)
+    files = None
+    if files_parts:
+        files = [x.strip() for part in files_parts for x in re.split(r"[,\n]", part) if x.strip()]
+    # 纯文本（无 scope:/files: 关键字）→ 整段按文件列表处理
+    if files is None and not has_scope:
+        cand = [x.strip() for x in re.split(r"[,\n]", arg) if x.strip()]
+        if cand:
+            files = cand
+    return scope, files
+
+
+def _sv_changed_via_git(root):
+    """用 git diff 自动发现 code_root 内最近改动文件（staged + unstaged），返回绝对路径列表。"""
+    try:
+        out = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--", root],
+            capture_output=True, text=True, timeout=15, cwd=root,
+        )
+        files = [os.path.abspath(l.strip()) for l in (out.stdout or "").splitlines() if l.strip()]
+        out2 = subprocess.run(
+            ["git", "diff", "--name-only", "--cached", "--", root],
+            capture_output=True, text=True, timeout=15, cwd=root,
+        )
+        for l in (out2.stdout or "").splitlines():
+            if l.strip():
+                ap = os.path.abspath(l.strip())
+                if ap not in files:
+                    files.append(ap)
+        return files
+    except Exception:  # noqa: BLE001 —— git 不可用/失败一律退化为空（由调用方决定）
+        return []
+
+
+def _sv_classify(targets):
+    """把文件列表分到各 scope 的桶里，返回 (py, frontend, scene, engine) 绝对路径列表。"""
+    import re as _re
+    py, fe, scene, engine = [], [], [], []
+    for t in targets:
+        p = str(t)
+        low = p.lower()
+        if low.endswith(".py"):
+            py.append(p)
+        if low.endswith((".ts", ".tsx", ".vue", ".js")) or "/frontend/" in low:
+            fe.append(p)
+        if _re.search(r"scene", low):
+            scene.append(p)
+        if "engine_embed" in low or ("embed" in low and "desktop" in low) or low.endswith("desktop_bridge.py"):
+            engine.append(p)
+    return py, fe, scene, engine
+
+
+def _sv_verify_backend(py_files, root, result):
+    """后端校验：py_compile 每个改动 .py；命中则跑对应单测（有界到改动模块）。"""
+    import py_compile
+    for f in py_files:
+        try:
+            py_compile.compile(f, doraise=True)
+            result["ran"].append("py_compile:" + (os.path.relpath(f, root) if root else f))
+        except py_compile.PyCompileError as e:
+            result["failures"].append({
+                "scope": "backend", "file": f,
+                "error": "语法校验失败：" + str(getattr(e, "msg", e)),
+            })
+            continue
+        # 命中单测：只跑确实存在且与改动模块对应的 tests/test_<module>.py，
+        # 避免改一处就跑全仓 1000+ 用例（全量回归由 CI 门负责）。
+        base = os.path.splitext(os.path.basename(f))[0]
+        test_path = os.path.join(root or os.getcwd(), "tests", "test_" + base + ".py")
+        if not os.path.isfile(test_path):
+            continue
+        try:
+            r = subprocess.run(
+                [sys.executable, "-B", "-m", "unittest", "tests.test_" + base, "-v"],
+                capture_output=True, text=True, timeout=120, cwd=root or os.getcwd(),
+            )
+            if r.returncode != 0:
+                tail = (r.stdout or "")[-1200:] + (r.stderr or "")[-1200:]
+                result["failures"].append({
+                    "scope": "backend", "file": f,
+                    "error": "单测 tests.test_%s 未通过：\n%s" % (base, tail),
+                })
+            else:
+                result["ran"].append("unittest:tests.test_" + base)
+        except subprocess.TimeoutExpired:
+            result["failures"].append({
+                "scope": "backend", "file": f,
+                "error": "单测 tests.test_%s 超时（>120s）未结束。" % base,
+            })
+        except Exception as e:  # noqa: BLE001 —— 测试运行器自身故障：降级为跳过该模块
+            result["ran"].append("unittest:skip:tests.test_%s（%s）" % (base, type(e).__name__))
+
+
+def _sv_verify_frontend(fe_files, root, result):
+    """前端校验：仅 npm run typecheck（严禁 build，并发铁律）。"""
+    import shutil
+    for cand in ("frontend", "web", "ui"):
+        d = os.path.join(root, cand) if root else cand
+        if os.path.isdir(d):
+            fe_dir = d
+            break
+    else:
+        result["ran"].append("frontend:skip（未找到前端目录）")
+        return
+    pkg = os.path.join(fe_dir, "package.json")
+    if not os.path.isfile(pkg):
+        result["ran"].append("frontend:skip（无 package.json）")
+        return
+    try:
+        with open(pkg, encoding="utf-8") as f:
+            scripts = (json.load(f).get("scripts") or {})
+    except Exception:  # noqa: BLE001
+        scripts = {}
+    if "typecheck" not in scripts:
+        result["ran"].append("frontend:skip（无 typecheck 脚本）")
+        return
+    npm = os.getenv("DOCMIND_NPM_BIN") or shutil.which("npm")
+    if not npm:
+        result["ran"].append("frontend:skip（未找到 npm）")
+        return
+    try:
+        r = subprocess.run([npm, "run", "typecheck"], capture_output=True, text=True,
+                           timeout=180, cwd=fe_dir)
+        if r.returncode != 0:
+            tail = (r.stdout or "")[-1200:] + (r.stderr or "")[-1200:]
+            result["failures"].append({
+                "scope": "frontend", "file": fe_dir,
+                "error": "typecheck 未通过：\n" + tail,
+            })
+        else:
+            result["ran"].append("frontend:typecheck")
+    except subprocess.TimeoutExpired:
+        result["failures"].append({"scope": "frontend", "file": fe_dir,
+                                   "error": "typecheck 超时（>180s）。"})
+    except Exception as e:  # noqa: BLE001
+        result["ran"].append("frontend:skip（%s）" % type(e).__name__)
+
+
+def _sv_verify_script(script_name, kind, root, result):
+    """运行 verify_* 脚本（scene/engine，仅 scope 显式指定时调用，需 display）。"""
+    if root is None:
+        result["ran"].append(kind + ":skip（无 code_root）")
+        return
+    script = os.path.join(root, script_name)
+    if not os.path.isfile(script):
+        result["ran"].append(kind + ":skip（无 " + script_name + "）")
+        return
+    try:
+        r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                          timeout=180, cwd=root)
+        if r.returncode != 0:
+            tail = (r.stdout or "")[-1000:] + (r.stderr or "")[-1000:]
+            result["failures"].append({
+                "scope": kind, "file": script,
+                "error": "%s 未通过（exit=%d）：\n%s" % (script_name, r.returncode, tail),
+            })
+        else:
+            result["ran"].append(kind + ":" + script_name)
+    except subprocess.TimeoutExpired:
+        result["failures"].append({"scope": kind, "file": script,
+                                   "error": script_name + " 超时（>180s）。"})
+    except Exception as e:  # noqa: BLE001
+        result["ran"].append(kind + ":skip（%s）" % type(e).__name__)
+
+
+def self_verify(arg=""):
+    """对代码库最近改动做轻量自验证，返回结构化 JSON 字符串（与文本协议 Action Input 同形）。
+
+    入参（单行/多行 key: value）：
+      scope: auto(默认, 按改动文件自动选) / backend / frontend / scene / engine / all / skip
+      files: 显式指定待校验文件（相对/绝对路径，可多行或逗号分隔）；缺省时用 git diff 自动发现
+    返回 JSON：{"scope","ran":[...],"passed":bool,"failures":[...],"note":""}
+      passed=true 表示全部已执行的校验通过（ran 为空也返回 true，即「无需校验」）。
+    """
+    scope, files = _parse_self_verify_arg(arg)
+    root = _get_code_root()
+    result = {"scope": scope, "ran": [], "passed": True, "failures": [], "note": ""}
+
+    if scope == "skip":
+        result["note"] = "已跳过自验证（scope=skip）。"
+        return json.dumps(result, ensure_ascii=False)
+
+    # 1) 决定待校验文件集合
+    if files:
+        targets = []
+        for f in files:
+            f = str(f)
+            # 相对路径按 code_root 解析（Agent 收尾门传的是 root 相对路径），
+            # 避免按 cwd 解析导致文件"看起来不存在"被误判为跳过。
+            if root and not os.path.isabs(f):
+                f = os.path.join(root, f)
+            targets.append(os.path.abspath(f))
+    else:
+        targets = _sv_changed_via_git(root) if root else []
+    if not targets:
+        result["note"] = "未发现可校验的改动（无 git 改动或显式文件）。"
+        return json.dumps(result, ensure_ascii=False)
+
+    py_files, fe_files, scene_files, engine_files = _sv_classify(targets)
+
+    # 2) 选 scope：auto 只跑后端/前端（scene/engine 需 GUI，默认不自动跑）
+    if scope == "auto":
+        scopes = []
+        if py_files:
+            scopes.append("backend")
+        if fe_files:
+            scopes.append("frontend")
+    elif scope == "all":
+        scopes = ["backend", "frontend", "scene", "engine"]
+    else:
+        scopes = [scope]
+
+    for sc in scopes:
+        try:
+            if sc == "backend":
+                _sv_verify_backend(py_files, root, result)
+            elif sc == "frontend":
+                _sv_verify_frontend(fe_files, root, result)
+            elif sc == "scene":
+                _sv_verify_script("verify_scene_canvas.py", "scene", root, result)
+            elif sc == "engine":
+                _sv_verify_script("verify_engine_embed.py", "engine", root, result)
+            else:
+                result["ran"].append("skip:未知 scope=" + str(sc))
+        except Exception as e:  # noqa: BLE001 —— 单个 scope 校验器故障绝不阻断整体
+            result["ran"].append("%s:skip（校验器异常 %s）" % (sc, type(e).__name__))
+
+    result["passed"] = (len(result["failures"]) == 0)
+    if not result["ran"]:
+        result["note"] = result["note"] or "无可执行的校验（改动文件类型无对应校验器）。"
+    return json.dumps(result, ensure_ascii=False)
+
+
 TOOLS = {
     "web_research": {"description": "联网研究：先搜索，再读取最多 3 个公开网页正文，返回来源和证据。适合教程、GitHub、引擎文档和需要最新资料的问题。输入研究主题。", "func": web_research},
     "web_fetch": {"description": "读取公开网页正文并返回来源、标题和清理后的文本。输入完整 http/https URL。联网研究时先 web_search，再对关键来源调用。", "func": web_fetch},
@@ -3311,6 +3575,10 @@ TOOLS = {
     "create_file": {
         "description": "在代码库内【新建】一个文件（不能覆盖已有文件，修改已有文件请用 apply_edit）。用于新增模块/分区（如新建 combat/crit.py）。受路径沙箱、单文件 200KB 上限、.py 语法校验约束；父目录不存在会自动创建（仍在 code_root 内）。新建前建议先用 search_code/grep 确认不会与已有实现重复（防堆叠）。Action Input 格式：第一行 path: <相对或绝对路径>，最后 new_text: <文件内容（可多行）>。",
         "func": create_file,
+    },
+    "self_verify": {
+        "description": "写后自验证工具（Phase 1 闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，对改动做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck），并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。你也可以主动调用它来复验指定文件。Action Input 格式：第一行 scope: <auto/backend/frontend/scene/engine/all/skip>，之后可跟多行 files: <文件路径>（缺省时自动用 git diff 发现改动）。",
+        "func": self_verify,
     },
     "run_command": {
         "description": "在代码库根目录内执行 shell 命令（如 pytest / npm run build / gradle test），返回合并后的标准输出与错误（截断 1500 字，超时 12s）。用于跑构建、跑测试、执行项目内命令来验证改动或查看结果。命令在 code_root 内执行，危险操作（rm -rf /、format、shutdown 等）会被拦截。输入为完整命令字符串。",

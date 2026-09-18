@@ -21,7 +21,7 @@ from config import (
     get_runtime,
 )
 from llm import LLMClient, args_to_input
-from tools import TOOLS, tool_schemas
+from tools import TOOLS, tool_schemas, self_verify
 import agent_trace as _trace
 import sessions as _sessions
 import hooks as _hooks
@@ -59,6 +59,39 @@ _NO_PARALLEL_TOOLS = {"apply_edit", "create_file", "dev_region_edit", "run_comma
                       "dev_add_region", "dev_refactor", "dev_rebuild_index",
                       "orchestrate"}
 
+# 写后自验证收尾门开关（Phase 1 闭环）。默认开启；设 DOCMIND_SELF_VERIFY=0 可关闭
+# （例如纯问答场景或校验器本身不可用）。关闭时写操作不再自动触发 self_verify。
+_SELF_VERIFY_ENABLED = os.getenv("DOCMIND_SELF_VERIFY", "1") != "0"
+
+
+def _parse_written_rel(obs):
+    """从写工具成功 Observation 里解析出刚写入的相对路径（已写入/已创建 <rel>）。"""
+    m = re.search(r"已(写入|创建)\s+([^\s（(]+)", obs or "")
+    return m.group(2).strip() if m else None
+
+
+def _run_self_verify(rel_path):
+    """调用 tools.self_verify 校验刚写入的文件，返回 (observation_text, passed)。
+
+    任何异常一律降级为「跳过校验」并视为通过，绝不因校验器故障阻断问答主流程。
+    """
+    try:
+        data = json.loads(self_verify("scope: auto\nfiles: " + str(rel_path)))
+    except Exception as e:  # noqa: BLE001
+        return ("[自验证跳过] 校验器调用异常（%s），已跳过写后校验。" % type(e).__name__, True)
+    if data.get("passed"):
+        ran = data.get("ran") or []
+        tail = "；".join(str(r) for r in ran[:4]) if ran else (data.get("note") or "")
+        return ("自验证通过：%s（改动 %s 已通过校验，无需进一步修复）" % (tail, rel_path), True)
+    lines = ["- [%s] %s: %s" % (fl.get("scope"), fl.get("file"), fl.get("error"))
+             for fl in (data.get("failures") or [])[:6]]
+    return (
+        "自验证未通过，请阅读以下失败并修复后重试（不要声称已完成）：\n"
+        + "\n".join(lines)
+        + "\n修复后再次调用对应写工具，闭环会自动重新校验。",
+        False,
+    )
+
 SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以下工具来获取信息或执行动作。
 若系统消息中还附有「本项目规则」（分区约定 / 修改约束），其优先级高于本通用指引，必须逐条遵守。
 可用工具：
@@ -75,6 +108,7 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
 - dev_list_connector_tools(key): 列出某连接器暴露的工具（name/description），确定要调用的 name 与参数。仅对打算调用的连接器使用（godot 等 stdio 需先建立会话）。
 - dev_mcp_call(key, name, arguments?): 调用选中的连接器工具。若调用失败（连接器未启用/引擎未开/工具名不对），用 dev_route_connector 重新挑选其它已启用连接器，或改用内置工具（search_code/apply_edit/python_exec）。外部连接器调用需保留审计信息。
 - python_exec(code): 在受限子进程中执行 Python 代码并返回输出。用于数值计算、数据处理、文本变换等需要"真正动手"的任务。
+- self_verify(scope?, files?): 写后自验证工具（Phase 1 闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，对改动做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck）并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。你也可以主动调用它复验某文件（scope 取 auto/backend/frontend/scene/engine/all/skip）。
 - gen_video_prompt(spec): 按 MiniMax H3 的三段结构，把一段创意描述生成为结构化视频提示词（可直接粘贴进 ComfyUI）。
 - search_code(query): 在已索引的源代码/配置中检索相关函数、类、配置片段。回答"某功能在哪实现/某函数做什么/某配置怎么写"等关于代码库的问题。
 - read_file(path): 读取代码库中的某个文件内容（path 为相对代码根目录的路径或文件名）。需要看完整文件、或某文件细节时用。大文件默认只返回前 4000 字，要看中后段（如枚举/方法定义）时在输入里换行追加 start/end 行号，例如：
@@ -1495,6 +1529,24 @@ class Agent:
                 # 重新跑测试做验证（防重复护栏针对的是无意义空转，不是改后复验）。
                 if parsed["action"] in ("apply_edit", "create_file", "dev_region_edit"):
                     executed.clear()
+
+                # 写后自验证收尾门（Phase 1 闭环）：写成功即校验改动，失败把结果回填
+                # 模型触发 ReAct 自修；成功则在 trace 标记 verified=True。纯内部调用，
+                # 不占工具步数；自修循环由 MAX_AGENT_STEPS 与既有失败上限护栏封顶。
+                if (parsed["action"] in ("apply_edit", "create_file", "dev_region_edit")
+                        and not _is_failure(obs) and _SELF_VERIFY_ENABLED and turn is not None):
+                    _written = _parse_written_rel(obs)
+                    if _written:
+                        _sv_obs, _sv_passed = _run_self_verify(_written)
+                        trail.append(
+                            {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
+                        )
+                        trail.append(
+                            {"role": "user", "content": "Observation: " + _clip(_sv_obs, OBS_MAX_CHARS)}
+                        )
+                        yield {"type": "observation", "text": _sv_obs}
+                        if _sv_passed:
+                            turn.verified = True
 
                 # "产出即答案"的工具：结果已经正确，直接作为最终回答返回，
                 # 不再给模型多一轮（避免小模型反复调用同一工具导致步数耗尽 / 死循环）。

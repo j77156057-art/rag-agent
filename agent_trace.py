@@ -78,6 +78,7 @@ class Turn:
         self.actions = []
         self.reflections = 0
         self.outcome = None      # 回合结局：completed/max_steps/truncated/evidence_fallback/...
+        self.verified = False    # 写后自验证是否通过（Phase 1 闭环；仅当回合含写操作且校验通过才置 True）
         self.finish_reason = None
         self.final_chars = 0
         self.cost_cny = 0.0     # 本轮按 provider 计价的花费（元）
@@ -154,6 +155,7 @@ class Turn:
             "n_steps": len(self.steps),
             "reflections": self.reflections,
             "outcome": self.outcome or self.finish_reason or "completed",
+            "verified": self.verified,
             "finish_reason": self.finish_reason,
             "final_chars": self.final_chars,
             "aborted": self.aborted,

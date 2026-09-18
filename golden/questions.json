@@ -90,5 +90,15 @@
       "must_not_include": ["无法回答", "I cannot", "没有相关代码", "未配置代码库"],
       "no_error": true
     }
+  },
+  {
+    "id": "G11",
+    "question": "请先用 read_file 读取 tools.py 里 self_verify 工具的定义，再主动调用一次 self_verify(scope=skip)，并说明它返回的 JSON 里 passed / ran / failures / note 四个字段分别是什么意思。",
+    "expect": {
+      "must_call": ["read_file", "self_verify"],
+      "any_of": ["passed", "ran", "failures", "note", "自验证", "scope"],
+      "must_not_include": ["无法回答", "I cannot", "没有相关代码", "未配置代码库"],
+      "no_error": true
+    }
   }
 ]

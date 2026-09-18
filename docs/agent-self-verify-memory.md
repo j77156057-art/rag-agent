@@ -1,7 +1,7 @@
 # DocMind Agent 改造方案：写后自验证 + 跨会话经验记忆
 
 > 适用对象：Agent 内核维护者、架构评审。
-> 本文档是**设计提案**（Phase 0）。确认实施后再把任务项搬进 `HANDOFF.md §5`。
+> 本文档是**设计提案**（Phase 0），其中 **Phase 1 已实现**（见 §3.2 / §6 标注 ✅）。已实施项无需再搬 `HANDOFF.md §5`；Phase 2–4 待确认。
 > 定位：深化 DocMind 既有「代码 + 资产代码化协作 + AI 研发脚手架」切片，**不扩范围、不越界**（与 `docs/capability-boundary.md` 一致）。
 
 ---
@@ -41,10 +41,11 @@
 3. **折叠失败回循环**：校验结果与失败项作为 observation 注入 ReAct；复用既有 `_FAILURE_MARKERS`（`agent.py:257`）+ `_TOOL_FAIL_LIMIT=3` / `_TOTAL_FAIL_LIMIT=5`（`agent.py:247/249`）与 `streak>=_TOOL_FAIL_LIMIT or fail_total>=_TOTAL_FAIL_LIMIT` 的强制收尾（`agent.py:1444`），自然封顶自修次数。
 4. **区分「声明完成」与「验证完成」**：在 `agent_trace.py` 的回合记录里加 `verified: bool` 字段；前端 `/trace` 页可看到哪些回合是验证通过的。
 
-### 3.2 接口（新增）
+### 3.2 接口（已实现）
 
-- 工具 `self_verify(arg)`：`arg = {"scope": "auto|backend|frontend|scene|engine"}`，返回 `{ok, passed, failed, log_path}`。
-- `agent.py` 回合收尾守卫：写回合 → 注入「需验证」observation → Agent 调 `self_verify` → 结果折回。
+- 工具 `self_verify(arg)`（tools.py）：`arg` 为文本协议同形字符串，支持 `scope: <auto|backend|frontend|scene|engine|all|skip>` 与多行 `files: <路径>`；返回结构化 JSON `{scope, ran[], passed, failures[], note}`。`passed=true` 表示已执行校验全过（无改动/无对应校验器时也返回 true，即「无需校验」）；任何校验器异常一律降级为 skip，绝不阻断主流程。已在 `TOOLS` 注册，原生/文本通道共用。
+- 收尾守卫（agent.py）：写操作成功（非 `_FAILURE_MARKERS`）后，解析刚写入的相对路径，内部调用 `self_verify(files=[rel])` 并把结果作为 Observation 回填：失败则提示模型修复（触发既有的 fail-limit 守卫自然封顶自修），通过则 `turn.verified=True`。纯内部调用，不占工具步数。开关 `DOCMIND_SELF_VERIFY`（默认 1，置 0 关闭）。
+- `agent_trace.py`：`Turn` 增加 `verified: bool`，`to_record()` 输出 `verified` 字段，前端 `/trace` 可区分「声明完成」与「验证完成」。
 
 ### 3.3 风险与护栏
 
@@ -98,12 +99,14 @@
 
 ## 6. 分阶段路线图
 
-- **Phase 1（最低风险）**：`self_verify` 工具 + 后端单测 / 类型检查收尾门。复用 `python_exec` 与 fail-limit 守卫。
+- **Phase 1（已实现 ✅）**：`self_verify` 工具 + 写后自验证收尾门 + `verified` trace 字段 + 12 项单测（`tests/test_self_verify.py`）。挂载点：tools.py `self_verify`/`_sv_verify_*`、agent.py `_run_self_verify`/`_parse_written_rel`/`_SELF_VERIFY_ENABLED` + 写回合收尾守卫、agent_trace.py `verified`。复用 `python_exec` 与 fail-limit 守卫。
 - **Phase 2**：前端 `typecheck` 校验（严守 build 铁律）+ 场景/引擎域自检，按改动类型自动选策略。
 - **Phase 3**：`experience.py` + `recall_experience` 工具 + 回合收尾记录，按 `project_id` 隔离。
 - **Phase 4**：评测门扩展——golden 题加「改出 break → 自修通过」用例 + 反陈旧经验用例；接入冻结发布流程。
 
-**验收门槛（每阶段）**：新增单测全绿；完整 `discover`（当前 1065）不回退；前端 `npm run typecheck` 干净；自验证不得引入写工具的新执行路径（护栏复用）。
+**验收门槛（每阶段）**：新增单测全绿；完整 `discover` 不回退；前端 `npm run typecheck` 干净；自验证不得引入写工具的新执行路径（护栏复用）。
+
+**Phase 1 验证记录**：`tests/test_self_verify.py` 12 项全绿（坏 .py→failed、好 .py→passed、命中对应单测失败被捕获、scope=skip/无改动安全降级、入参多行/逗号解析、Agent 收尾门格式化 + 校验器异常降级为 passed）。
 
 **实施铁律**：动手前 `git status`；只 `git add` 明确路径、禁 `git add -A`；对方改前端时不跑 build；提交前 `git diff --stat` 核实无 stat-dirty 误判。
 
