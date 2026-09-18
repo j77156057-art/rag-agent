@@ -2,6 +2,7 @@
 import json, os, re, subprocess, math, time, mimetypes, sys, ast as _ast, urllib.request, urllib.parse, urllib.error, shutil, zipfile, tempfile, uuid, hashlib, threading
 import mcp_client
 import gpu_coordinator as _gpu
+import project_state as _project_state
 from gpu_coordinator import process_environment as _gpu_process_environment
 from datetime import datetime
 
@@ -16,18 +17,46 @@ _ENGINE_PROCS = {}
 _ENGINE_LOGS = {}
 # prompt_id -> 后台 watch 作业状态（轮询线程维护，不再单独持有 GPU 租约：
 # 租约由 comfy_queue 提交后 reown 给 comfyui:{prompt_id}，终态时由 history 释放）
+# Legacy/no-project bucket is kept for direct callers and old tests.  HTTP
+# requests always pass their explicit project root and use a separate bucket.
 _COMFY_JOBS = {}
+_COMFY_PROJECT_JOBS = {}
+_COMFY_LOADED = set()
 _COMFY_JOBS_LOCK = threading.Lock()
+# Kept as a compatibility constant for integrations that imported it; project
+# requests resolve their file through _comfy_history_file(root) below.
 _COMFY_HISTORY_FILE = os.getenv('DOCMIND_COMFY_HISTORY_FILE', os.path.join('.docmind','comfy_history.json'))
 _COMFY_SERVICE = None
-def _save_comfy_history():
+def _comfy_key(root=None):
+    return os.path.abspath(root) if root else ''
+
+def _comfy_jobs(root=None):
+    key = _comfy_key(root)
+    bucket = _COMFY_JOBS if not key else _COMFY_PROJECT_JOBS.setdefault(key, {})
+    if key not in _COMFY_LOADED:
+        _load_comfy_history(root)
+    return bucket
+
+def _comfy_history_file(root=None):
+    if root:
+        return _project_state.path(root, 'comfy_history.json', legacy=os.path.join('.docmind', 'comfy_history.json'))
+    return _COMFY_HISTORY_FILE
+
+def _save_comfy_history(root=None):
     try:
-        os.makedirs(os.path.dirname(_COMFY_HISTORY_FILE) or '.', exist_ok=True)
-        with open(_COMFY_HISTORY_FILE, 'w', encoding='utf-8') as f: json.dump(_COMFY_JOBS, f, ensure_ascii=False)
+        path = _comfy_history_file(root)
+        jobs = _COMFY_JOBS if not root else _comfy_jobs(root)
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f: json.dump(jobs, f, ensure_ascii=False)
     except Exception: pass
-def _load_comfy_history():
+def _load_comfy_history(root=None):
+    key = _comfy_key(root)
+    if key in _COMFY_LOADED:
+        return
+    jobs = _COMFY_JOBS if not root else _COMFY_PROJECT_JOBS.setdefault(key, {})
+    _COMFY_LOADED.add(key)
     try:
-        with open(_COMFY_HISTORY_FILE, encoding='utf-8') as f:
+        with open(_comfy_history_file(root), encoding='utf-8') as f:
             data = json.load(f)
         if isinstance(data, dict):
             # A daemon restart cannot safely resume a remote ComfyUI watcher.
@@ -41,9 +70,8 @@ def _load_comfy_history():
                     row.update({'running': False, 'status': 'recovered',
                                 'recovered_at': datetime.now().isoformat(timespec='seconds'),
                                 'recovery_note': '服务重启后未自动恢复远端任务，请确认 ComfyUI 状态后重新提交'})
-                _COMFY_JOBS[str(key)] = row
+                jobs[str(key)] = row
     except Exception: pass
-_load_comfy_history()
 # root_abs -> 嵌入状态 {child_hwnd, host_hwnd, offset_y, title, dpi, size}；
 # 保存它是为了"停止/解除嵌入"时能把引擎窗口原样还原，而不是留下一个失效的子窗口。
 _EMBED_STATE = {}
@@ -166,7 +194,7 @@ def engine_prepare(root, engine='godot', executable=''):
     cfg=engine_config(root, engine, path)
     return {'ok':True,'ready':True,'config':cfg,'projects':engine_scan(root).get('projects',[])}
 def engine_config(root, engine=None, executable=None):
- path=_file(root,'.docmind_engine.json')
+ path=_project_state.path(root, 'engine.json', legacy='.docmind_engine.json')
  if engine is not None:
   item=next((x for x in ENGINE_CATALOG if x['id']==engine),None)
   if not item: return {'ok':False,'error':'不支持的游戏引擎。'}
@@ -748,7 +776,7 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
     child_env = os.environ.copy()
     child_env.update(_gpu_process_environment(lease.get("gpu")))
     try:
-        log_path = _file(root_abs, ".docmind_engine.log")
+        log_path = _project_state.path(root_abs, "engine.log", legacy=".docmind_engine.log")
         log = open(log_path, "a", encoding="utf-8")
         p = subprocess.Popen(args, cwd=root_abs, stdout=log, stderr=subprocess.STDOUT, text=True, env=child_env)
         _ENGINE_PROCS[root_abs] = p
@@ -832,7 +860,7 @@ def engine_stop(root):
             "detached": detached.get('was_embedded', False), "killed": killed}
 
 def engine_logs(root, limit=200):
-    path = _file(root, ".docmind_engine.log")
+    path = _project_state.path(root, "engine.log", legacy=".docmind_engine.log")
     try:
         with open(path, encoding="utf-8", errors="replace") as f: lines = f.readlines()[-max(1, min(int(limit), 2000)):]
     except OSError: lines = []
@@ -938,7 +966,9 @@ def comfy_stop():
     _gpu.unregister_process(pid, 'stopped'); _COMFY_SERVICE = None
     return {'ok': True, 'running': False, 'stopped': True, 'pid': pid}
 
-def _comfy_job_owner(prompt_id):
+def _comfy_job_owner(prompt_id, root=None):
+    if root:
+        return f"comfyui:{_project_state.projects.project_id(root)}:{prompt_id}"
     return f"comfyui:{prompt_id}"
 
 
@@ -1005,13 +1035,19 @@ def comfy_free_models(url="http://127.0.0.1:8188", *, wait=True, timeout=20):
     return {'ok': True, 'freed_mb': freed, 'error': ''}
 
 
-def comfy_release_job(prompt_id):
+def comfy_release_job(prompt_id, root=None):
     """作业终态后释放 GPU 租约（asset_gen 自轮询路径不走 comfy_history，
     需要显式调用，否则租约要等 600s TTL 才回收，挡住下一次生成）。"""
     pid = str(prompt_id or '').strip()
     if not pid:
         return False
-    return _gpu.force_release(_comfy_job_owner(pid)) is not None
+    if root is None:
+        with _COMFY_JOBS_LOCK:
+            for candidate, jobs in _COMFY_PROJECT_JOBS.items():
+                if pid in jobs:
+                    root = candidate
+                    break
+    return _gpu.force_release(_comfy_job_owner(pid, root)) is not None
 
 
 def _gpu_busy_error(res):
@@ -1024,17 +1060,17 @@ def _gpu_busy_error(res):
     return msg
 
 # ---------------------------------------------------------------- ComfyUI 模板
-def comfy_templates():
+def comfy_templates(root=None):
     # Resolve the portable installation root without baking a developer
     # machine into the runtime.  Explicit project/env configuration wins;
     # common Windows locations remain a backwards-compatible fallback.
     return {'ok': True, 'templates': [
         {'id':'z-image-turbo','name':'Z-Image Turbo 图片','model':'z_image_turbo-Q8_0.gguf','kind':'image','author':'Tongyi-MAI','source_url':'https://github.com/Tongyi-MAI/Z-Image','license':'Apache-2.0','schema':{'prompt':'string','negative_prompt':'string','width':'integer','height':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}},
-        {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','author':'MiniMax','source_url':'https://github.com/MiniMax-AI','license':'check-model-card','workflow':_comfy_workflow_path(),'schema':{'prompt':'string','width':'integer','height':'integer','frames':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}}
+        {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','author':'MiniMax','source_url':'https://github.com/MiniMax-AI','license':'check-model-card','workflow':_comfy_workflow_path(root),'schema':{'prompt':'string','width':'integer','height':'integer','frames':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}}
     ]}
 
-def _comfy_workflow_path():
-    project = os.getenv('DOCMIND_PROJECT_ROOT', os.getcwd())
+def _comfy_workflow_path(root=None):
+    project = _root(root) if root else os.getenv('DOCMIND_PROJECT_ROOT', os.getcwd())
     configured = ''
     try:
         with open(os.path.join(project, '.docmind_comfy.json'), encoding='utf-8') as f:
@@ -1049,10 +1085,10 @@ def _comfy_workflow_path():
         if p and os.path.isfile(p): return p
     return next((p for p in candidates if p), '')
 
-def comfy_template_workflow(template_id):
+def comfy_template_workflow(template_id, root=None):
     # H3 路径由 _comfy_workflow_path 按项目配置、环境变量和常见目录解析。
     if template_id == 'minimax-h3-i2v':
-        path = _comfy_workflow_path()
+        path = _comfy_workflow_path(root)
         try:
             with open(path, encoding='utf-8') as f: return {'ok': True, 'id': template_id, 'workflow': json.load(f), 'format': 'ui'}
         except Exception as e: return {'ok': False, 'error': f'无法读取 H3 workflow：{e}'}
@@ -1381,7 +1417,7 @@ def comfy_apply_parameters(workflow, params):
     return {'ok':True,'workflow':wf}
 
 
-def comfy_queue(workflow, url="http://127.0.0.1:8188", min_free_mb=None):
+def comfy_queue(workflow, url="http://127.0.0.1:8188", min_free_mb=None, root=None):
     # ComfyUI exposes two JSON formats: the editor's UI graph (`nodes`/`links`)
     # and the API prompt graph (`{id: {class_type, inputs}}`).  The latter is
     # required by /prompt; fail early with an actionable message instead of
@@ -1422,23 +1458,24 @@ def comfy_queue(workflow, url="http://127.0.0.1:8188", min_free_mb=None):
     # 之后由 comfy_history 见终态释放、comfy_cancel 中断释放，或 TTL 兜底回收。
     prompt_id = str(resp.get("prompt_id") or "")
     if prompt_id:
-        _gpu.reown(submit_owner, _comfy_job_owner(prompt_id), purpose="comfyui", ttl=COMFY_JOB_TTL)
+        _gpu.reown(submit_owner, _comfy_job_owner(prompt_id, root), purpose="comfyui", ttl=COMFY_JOB_TTL)
     else:
         _gpu.release(submit_owner)
     canonical = json.dumps(workflow, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
     result = {"ok": True, "response": resp, "workflow_sha256": hashlib.sha256(canonical).hexdigest(),
-              "lease": {"owner": _comfy_job_owner(prompt_id) if prompt_id else "",
+              "lease": {"owner": _comfy_job_owner(prompt_id, root) if prompt_id else "",
                         "ttl": COMFY_JOB_TTL, "gpu": lease.get("gpu"),
                         "evicted": bool(lease.get("evicted"))}}
     if prompt_id:
         # 后台 watch 只负责轮询状态，不再单独持租约（租约已 reown 给本作业 owner）
-        result["watch"] = comfy_watch(prompt_id, url)
+        result["watch"] = comfy_watch(prompt_id, url, root=root)
+        jobs = _comfy_jobs(root)
         with _COMFY_JOBS_LOCK:
-            _COMFY_JOBS.setdefault(prompt_id, {}).update({'workflow': workflow, 'workflow_sha256': result['workflow_sha256'], 'gpu': lease.get('gpu'), 'status': 'queued', 'retry_count': 0})
-            _save_comfy_history()
+            jobs.setdefault(prompt_id, {}).update({'workflow': workflow, 'workflow_sha256': result['workflow_sha256'], 'gpu': lease.get('gpu'), 'status': 'queued', 'retry_count': 0, 'project_root': _comfy_key(root)})
+            _save_comfy_history(root)
     return result
 
-def comfy_history(prompt_id, url="http://127.0.0.1:8188", _release=True):
+def comfy_history(prompt_id, url="http://127.0.0.1:8188", _release=True, root=None):
     try: url = _safe_comfy_url(url)
     except ValueError as e: return {"ok": False, "error": str(e)}
     pid = str(prompt_id or "").strip()
@@ -1479,8 +1516,9 @@ def comfy_history(prompt_id, url="http://127.0.0.1:8188", _release=True):
         # Keep the durable local history aligned with the authoritative ComfyUI
         # response.  This is intentionally best effort: a history read must
         # still succeed when the state file cannot be written.
+        jobs = _comfy_jobs(root)
         with _COMFY_JOBS_LOCK:
-            job = _COMFY_JOBS.get(pid)
+            job = jobs.get(pid)
             if job is not None:
                 status_value = "failed" if failed else ("completed" if finished else "running")
                 job.update({"status": status_value, "progress": progress,
@@ -1490,18 +1528,18 @@ def comfy_history(prompt_id, url="http://127.0.0.1:8188", _release=True):
                                 "finished_at": job.get("finished_at") or datetime.now().isoformat(timespec="seconds")})
                     if job.get("cancel_requested"):
                         job["cancel_state"] = "terminated"
-                _save_comfy_history()
+                _save_comfy_history(root)
         if finished and _release:
             # 生成结束（成功/失败都算）：释放作业租约，让排队的 Ollama/下一作业上卡。
             # 后台 watch 轮询用 _release=False 只更新状态，避免与用户轮询
             # （API GET /api/comfy/history，前端 TaskEnginePanel 每 4s 轮询）抢释放，
             # 导致 lease_released 上报不确定；真正的释放由用户侧 history 轮询负责。
-            result["lease_released"] = _gpu.force_release(_comfy_job_owner(pid)) is not None
+            result["lease_released"] = _gpu.force_release(_comfy_job_owner(pid, root)) is not None
         return result
     except Exception as e:
         return {"ok": False, "error": f"ComfyUI 状态查询失败：{e}"}
 
-def comfy_cancel(prompt_id, url="http://127.0.0.1:8188"):
+def comfy_cancel(prompt_id, url="http://127.0.0.1:8188", root=None):
     """按 prompt_id 定向取消 ComfyUI 作业并释放 GPU 租约（用户取消 / 排队取消的落地动作）。
 
     ComfyUI 正确取消口径（P2-2 收尾修正）：
@@ -1527,33 +1565,34 @@ def comfy_cancel(prompt_id, url="http://127.0.0.1:8188"):
             deleted = 200 <= r.status < 300
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
+    jobs = _comfy_jobs(root)
     with _COMFY_JOBS_LOCK:
-        job = _COMFY_JOBS.get(pid)
+        job = jobs.get(pid)
         if job:
             job.update({'cancel_requested': True,
                         'cancel_state': 'requesting',
                         'cancel_requested_at': datetime.now().isoformat(timespec='seconds')})
-            _save_comfy_history()
+            _save_comfy_history(root)
     # watcher 存在时等待 ComfyUI history 报告终态再释放租约；没有 watcher
     # 的兼容调用才允许立即释放，避免取消请求尚未生效时发生 GPU 抢占。
     with _COMFY_JOBS_LOCK:
-        has_watcher = pid in _COMFY_JOBS
-    released = (not has_watcher) and (_gpu.force_release(_comfy_job_owner(pid)) is not None)
+        has_watcher = pid in jobs
+    released = (not has_watcher) and (_gpu.force_release(_comfy_job_owner(pid, root)) is not None)
     # ComfyUI 成功从队列删除即视为取消已生效
     if deleted and has_watcher:
         with _COMFY_JOBS_LOCK:
-            if pid in _COMFY_JOBS:
-                _COMFY_JOBS[pid]['cancel_state'] = 'requested'
-                _save_comfy_history()
+            if pid in jobs:
+                jobs[pid]['cancel_state'] = 'requested'
+                _save_comfy_history(root)
     return {"ok": released or deleted, "prompt_id": pid,
             "deleted": deleted, "interrupted": deleted, "lease_released": released,
             "cancel_state": 'requested' if deleted else 'failed',
             "error": err if (err and not (released or deleted)) else ""}
 
-def comfy_wait(prompt_id, url="http://127.0.0.1:8188", timeout=120, interval=1.0):
+def comfy_wait(prompt_id, url="http://127.0.0.1:8188", timeout=120, interval=1.0, root=None):
     deadline=time.time()+max(1,min(int(timeout),600))
     while time.time()<deadline:
-        result=comfy_history(prompt_id,url,_release=False)
+        result=comfy_history(prompt_id,url,_release=False,root=root)
         if not result.get("ok"): return result
         status=result.get("status") or {}
         if result.get("finished"):
@@ -1562,7 +1601,7 @@ def comfy_wait(prompt_id, url="http://127.0.0.1:8188", timeout=120, interval=1.0
     # 轮询超时不释放租约：ComfyUI 侧可能仍在生成，交给作业 TTL 兜底回收
     return {"ok":False,"prompt_id":str(prompt_id),"timeout":True,"error":"ComfyUI 生成轮询超时。"}
 
-def comfy_watch(prompt_id, url="http://127.0.0.1:8188", timeout=900, interval=1.0):
+def comfy_watch(prompt_id, url="http://127.0.0.1:8188", timeout=900, interval=1.0, root=None):
     """启动后台 ComfyUI history 轮询；返回可查询的 job 状态，不阻塞 API 请求。
 
     注意：watch 线程自身**不持有 GPU 租约**。整作业周期的租约由 comfy_queue
@@ -1570,16 +1609,17 @@ def comfy_watch(prompt_id, url="http://127.0.0.1:8188", timeout=900, interval=1.
     watch 再申请同名/异名租约都会造成重复占卡或自锁。
     """
     key = str(prompt_id)
+    jobs = _comfy_jobs(root)
     with _COMFY_JOBS_LOCK:
-        existing = _COMFY_JOBS.get(key)
+        existing = jobs.get(key)
         if existing and existing.get('running'):
             return {'ok': True, 'job': dict(existing)}
     with _COMFY_JOBS_LOCK:
         job = {'prompt_id': key, 'running': True, 'done': False, 'result': None,
                'started_at': datetime.now().isoformat(timespec='seconds')}
-        _COMFY_JOBS[key] = job
+        jobs[key] = job
     def worker():
-        result = comfy_wait(key, url, timeout, interval)
+        result = comfy_wait(key, url, timeout, interval, root=root)
         with _COMFY_JOBS_LOCK:
             job.update({'running': False, 'done': bool(result.get('finished') or result.get('done')),
                         'result': result,
@@ -1589,40 +1629,43 @@ def comfy_watch(prompt_id, url="http://127.0.0.1:8188", timeout=900, interval=1.
                         'finished_at': datetime.now().isoformat(timespec='seconds')})
             if job.get('cancel_requested') and result.get('finished'):
                 job['cancel_state'] = 'terminated'
-            _save_comfy_history()
+            _save_comfy_history(root)
     threading.Thread(target=worker, name='comfy-watch', daemon=True).start()
     return {'ok': True, 'job': dict(job)}
 
-def comfy_watch_status(prompt_id):
+def comfy_watch_status(prompt_id, root=None):
+    jobs = _comfy_jobs(root)
     with _COMFY_JOBS_LOCK:
-        job = _COMFY_JOBS.get(str(prompt_id))
+        job = jobs.get(str(prompt_id))
         return {'ok': bool(job), 'job': dict(job) if job else None}
 
-def comfy_history_list(page=1, page_size=20):
+def comfy_history_list(page=1, page_size=20, root=None):
     """返回本地持久化 ComfyUI 作业历史分页。"""
     try:
         page=max(1,int(page)); page_size=max(1,min(int(page_size),100))
     except Exception: page,page_size=1,20
+    jobs = _comfy_jobs(root)
     with _COMFY_JOBS_LOCK:
-        rows=[dict(v) for v in _COMFY_JOBS.values()]
+        rows=[dict(v) for v in jobs.values()]
     rows.sort(key=lambda x: x.get('finished_at') or x.get('started_at') or '', reverse=True)
     start=(page-1)*page_size
     return {'ok':True,'page':page,'page_size':page_size,'total':len(rows),'items':rows[start:start+page_size]}
 
-def comfy_retry(prompt_id, url='http://127.0.0.1:8188'):
+def comfy_retry(prompt_id, url='http://127.0.0.1:8188', root=None):
+    jobs = _comfy_jobs(root)
     with _COMFY_JOBS_LOCK:
-        job = _COMFY_JOBS.get(str(prompt_id))
+        job = jobs.get(str(prompt_id))
         if not job: return {'ok':False,'error':'找不到作业历史'}
         if job.get('status') not in ('failed','error'): return {'ok':False,'error':'仅失败作业可重试'}
         if int(job.get('retry_count',0)) >= 2: return {'ok':False,'error':'已达到最多 2 次重试'}
         workflow = job.get('workflow'); count = int(job.get('retry_count',0))+1
     if not workflow: return {'ok':False,'error':'历史中缺少 workflow，无法重试'}
-    result = comfy_queue(workflow, url)
+    result = comfy_queue(workflow, url, root=root)
     if result.get('ok'):
         with _COMFY_JOBS_LOCK:
             new_id = str((result.get('response') or {}).get('prompt_id') or '')
-            if new_id in _COMFY_JOBS: _COMFY_JOBS[new_id]['retry_count'] = count
-            _save_comfy_history()
+            if new_id in jobs: jobs[new_id]['retry_count'] = count
+            _save_comfy_history(root)
         result['retry_of'] = str(prompt_id); result['retry_count'] = count
     return result
 
@@ -1756,12 +1799,12 @@ def task_branch(root, task):
         created = True
     # 将分支写回任务记录，后续回滚/审计可追踪实际工作分支。
     if task.get('id'):
-        rows = _jsonl(_file(root, '.docmind_tasks.jsonl'))
+        rows = _jsonl(_project_state.path(root, 'tasks.jsonl', legacy='.docmind_tasks.jsonl'))
         for row in rows:
             if str(row.get('id')) == str(task.get('id')):
                 row['branch'] = full_branch
                 row['updated_at'] = datetime.now().isoformat(timespec='seconds')
-        with open(_file(root, '.docmind_tasks.jsonl'), 'w', encoding='utf-8') as f:
+        with open(_project_state.path(root, 'tasks.jsonl', legacy='.docmind_tasks.jsonl'), 'w', encoding='utf-8') as f:
             for row in rows: f.write(json.dumps(row, ensure_ascii=False) + '\n')
     return {'ok': True, 'branch': full_branch, 'created': created, 'current': full_branch}
 
@@ -1783,11 +1826,11 @@ def _jsonl(path):
     return out
 
 def list_tasks(root, status=""):
-    rows = _jsonl(_file(root, ".docmind_tasks.jsonl"))
+    rows = _jsonl(_project_state.path(root, 'tasks.jsonl', legacy='.docmind_tasks.jsonl'))
     return [x for x in rows if not status or x.get("status") == status]
 
 def upsert_task(root, task):
-    path = _file(root, ".docmind_tasks.jsonl"); rows = _jsonl(path)
+    path = _project_state.path(root, 'tasks.jsonl', legacy='.docmind_tasks.jsonl'); rows = _jsonl(path)
     tid = (task.get("id") or "TASK-" + datetime.now().strftime("%Y%m%d-%H%M%S")).strip()
     item = {"id": tid, "title": task.get("title", ""), "description": task.get("description", ""), "region": task.get("region", ""), "priority": task.get("priority", "normal"), "status": task.get("status", "open"), "owner": task.get("owner", ""), "files": task.get("files", []), "allowed_paths": task.get("allowed_paths", []), "symbols": task.get("symbols", []), "verification": task.get("verification", []), "impact_files": task.get("impact_files", []), "snapshot": task.get("snapshot", {}), "updated_at": datetime.now().isoformat(timespec="seconds")}
     rows = [x for x in rows if x.get("id") != tid] + [item]
@@ -1864,13 +1907,13 @@ def verify_task(root, task):
         except Exception as e: results.append({"command": cmd, "ok": False, "error": str(e)})
     report = {"ok": all(x["ok"] for x in results), "checks": results, "completed_at": datetime.now().isoformat(timespec="seconds")}
     if task.get("id"):
-        rows = _jsonl(_file(root, ".docmind_tasks.jsonl")); tid = str(task["id"])
+        rows = _jsonl(_project_state.path(root, 'tasks.jsonl', legacy='.docmind_tasks.jsonl')); tid = str(task["id"])
         for row in rows:
             if str(row.get("id")) == tid:
                 row["status"] = "verified" if report["ok"] else "failed"
                 row["verification_result"] = report
                 row["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        with open(_file(root, ".docmind_tasks.jsonl"), "w", encoding="utf-8") as f:
+        with open(_project_state.path(root, 'tasks.jsonl', legacy='.docmind_tasks.jsonl'), "w", encoding="utf-8") as f:
             for row in rows: f.write(json.dumps(row, ensure_ascii=False) + "\n")
     return report
 
@@ -2346,7 +2389,7 @@ APPROVAL_TTL_SECONDS = 1800  # 审批有效期 30 分钟
 
 
 def approval_ledger_path(root):
-    return _file(root, ".docmind_approvals.jsonl")
+    return _project_state.path(root, 'approvals.jsonl', legacy='.docmind_approvals.jsonl')
 
 
 def approval(root, action, user, approved=False, target=""):
@@ -2424,4 +2467,3 @@ def require_approval(root, action, target):
             f"审批通过后 {APPROVAL_TTL_SECONDS // 60} 分钟内该操作放行。"
         ),
     }
-

@@ -813,3 +813,12 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 新增 `verify_workbench_races.mjs` 场景交互断言，覆盖延迟恢复不覆盖新输入、项目切换中止旧 SSE、回答中断恢复、首页重复发送防护、节点聚焦和文件卡双击打开。
 - 本轮验证：`npm --prefix frontend run typecheck` 通过；`npm --prefix frontend run build` 通过；`verify_workbench_races.mjs` 6/6 通过；`verify_workbench_regressions.mjs` 9/9 通过；`verify_scene_canvas_ui.mjs` 27/27 通过；Python 全量测试 **935/935 通过（1 项跳过）**。
 - 已知限制保持不变：真实 Unreal Editor 联机、物理多 GPU 和安装器独立 EXE 启动仍需对应环境实测；本轮未修改用户未跟踪的 Godot 工程文件。
+
+### 2026-09-18 运行时状态项目隔离
+
+- 新增 `project_state.py`：所有按项目归属的内部运行时状态写入
+  `<STATE_ROOT>/.docmind/projects/<project_id>/`。`project_id` 由项目根目录规范化后稳定计算，后台任务不再依赖当前 UI 选择来判断归属。
+- 已迁移并按项目隔离：ComfyUI 历史/模板配置/任务 watcher、生成任务、引擎配置与日志、运行时事件、任务历史、审批与 Agent 权限日志、密钥、MCP 注册表和语义标签。ComfyUI prompt/job 的 owner 同时包含项目 ID，避免不同项目相同 prompt ID 互相取消或释放租约。
+- 旧项目根目录状态采用一次性复制迁移，保留原文件；`.migrated` 标记防止用户清空新状态后旧文件再次回灌。项目代码、资源、Git、`.docmind_backups` 与导出产物仍属于用户项目，未移动或删除。
+- 新增 `tests/test_project_runtime_state.py`，覆盖路径隔离、Comfy 历史 A/B 项目隔离、重启恢复和旧状态一次性迁移。最后一轮重点回归 106/106 通过；完整测试与前端构建需以本轮提交前命令结果为准。
+- 限制：全局模型/联网配置、GPU 协调器全机租约和 Chroma 索引仍是实例级资源；它们不伪装成项目级隔离。真实多项目并发后台服务尚未进行长时间实机压测。

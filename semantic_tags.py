@@ -20,6 +20,7 @@ import time
 from datetime import datetime
 
 from ingest import _CODE_EXT, _SKIP_DIRS, _MAX_CODE_FILE
+import project_state
 
 STORE_DIR = ".docmind"
 STORE_NAME = "semantic_tags.json"
@@ -97,7 +98,7 @@ _RULES: list[tuple[str, tuple[str, ...]]] = [
 # 存储
 # ---------------------------------------------------------------------------
 def store_path(root: str) -> str:
-    return os.path.join(root, STORE_DIR, STORE_NAME)
+    return project_state.path(root, STORE_NAME, legacy=os.path.join(STORE_DIR, STORE_NAME))
 
 
 def load_store(root: str) -> dict:
@@ -114,7 +115,7 @@ def load_store(root: str) -> dict:
 
 
 def save_store(root: str, data: dict) -> None:
-    d = os.path.join(root, STORE_DIR)
+    d = os.path.dirname(store_path(root))
     os.makedirs(d, exist_ok=True)
     p = store_path(root)
     tmp = p + ".tmp"

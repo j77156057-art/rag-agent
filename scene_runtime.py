@@ -18,6 +18,7 @@ import os
 import re
 import threading
 import uuid
+import project_state
 from datetime import datetime, timezone
 
 MAX_SCENE = 2 * 1024 * 1024        # .tscn 解析上限
@@ -980,7 +981,7 @@ def set_scene_property(root, rel, node_name, prop, value):
 # 运行时事件：读取（筛选/统计/会话）与写入
 # ---------------------------------------------------------------------------
 def _state_path(root):
-    return _resolve(root, STATE_FILE)[0]
+    return project_state.path(root, STATE_FILE)
 
 
 def _read_state(root):
@@ -1086,8 +1087,8 @@ def runtime_events(root, events=None, *, from_ts=None, to_ts=None, types=None, s
                    keyword=None, limit=None, with_sessions=False, gap_seconds=SESSION_GAP):
     """读取/追加运行时事件。写路径只做追加；读路径支持筛选、统计与会话切分。"""
     from workbench_fs import FsError
-    path, _ = _resolve(root, '.docmind_runtime.jsonl')
-    log_path, _ = _resolve(root, '.docmind_engine.log')
+    path = project_state.path(root, 'runtime.jsonl', legacy='.docmind_runtime.jsonl')
+    log_path = project_state.path(root, 'engine.log', legacy='.docmind_engine.log')
     if events is not None and (not isinstance(events, list) or len(events) > 500):
         raise FsError(413, '每批最多 500 条事件。')
     try:
@@ -1178,7 +1179,7 @@ def runtime_clear(root, scope='stored'):
     from workbench_fs import FsError
     if scope not in ('stored', 'all'):
         raise FsError(422, 'scope 只能是 stored 或 all。')
-    path, _ = _resolve(root, '.docmind_runtime.jsonl')
+    path = project_state.path(root, 'runtime.jsonl', legacy='.docmind_runtime.jsonl')
     removed = 0
     with _event_lock:
         if os.path.exists(path):
@@ -1189,7 +1190,7 @@ def runtime_clear(root, scope='stored'):
             except OSError as exc:
                 raise FsError(500, '清除事件失败：%s' % exc) from exc
         if scope == 'all':
-            log_path, _ = _resolve(root, '.docmind_engine.log')
+            log_path = project_state.path(root, 'engine.log', legacy='.docmind_engine.log')
             try:
                 offset = os.path.getsize(log_path)
             except OSError:

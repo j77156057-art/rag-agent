@@ -1094,9 +1094,13 @@ async def comfy_start_ep(root: str | None = None, port: int = 8188):
 async def comfy_stop_ep():
     return comfy_stop()
 @app.get("/api/comfy/templates")
-async def comfy_templates_ep(): return comfy_templates()
+async def comfy_templates_ep():
+    root = _project_root_or_error()
+    return comfy_templates(root=root) if root else {"ok": False, "error": "未配置代码库"}
 @app.get("/api/comfy/templates/{template_id}")
-async def comfy_template_ep(template_id: str): return comfy_template_workflow(template_id)
+async def comfy_template_ep(template_id: str):
+    root = _project_root_or_error()
+    return comfy_template_workflow(template_id, root=root) if root else {"ok": False, "error": "未配置代码库"}
 class ComfyParametersReq(BaseModel):
     workflow: dict
     parameters: dict = Field(default_factory=dict)
@@ -1106,10 +1110,13 @@ async def comfy_template_apply_ep(req: ComfyParametersReq):
 @app.post("/api/comfy/provenance/validate")
 async def comfy_provenance_validate_ep(req: dict): return comfy_validate_provenance(req)
 @app.get("/api/comfy/jobs")
-async def comfy_jobs_ep(page: int = 1, page_size: int = 20): return comfy_history_list(page, page_size)
+async def comfy_jobs_ep(page: int = 1, page_size: int = 20):
+    root = _project_root_or_error()
+    return comfy_history_list(page, page_size, root=root) if root else {"ok": False, "error": "未配置代码库"}
 @app.post("/api/comfy/retry/{prompt_id}")
 async def comfy_retry_ep(prompt_id: str, url: str = "http://127.0.0.1:8188"):
-    return await run_in_threadpool(comfy_retry, prompt_id, url)
+    root = _project_root_or_error()
+    return await run_in_threadpool(comfy_retry, prompt_id, url, root=root) if root else {"ok": False, "error": "未配置代码库"}
 @app.get("/api/gpu/status")
 async def gpu_status_ep():
     return {"ok": True, **gpu_status()}
@@ -1160,23 +1167,29 @@ async def gpu_configure_ep(req: GpuConfigureReq):
     return {"ok": True, **gpu_status()}
 @app.post("/api/comfy/queue")
 async def comfy_queue_ep(req: ComfyReq):
-    return comfy_queue(req.workflow, req.url)
+    root = _project_root_or_error()
+    return await run_in_threadpool(comfy_queue, req.workflow, req.url, root=root) if root else {"ok": False, "error": "未配置代码库"}
 @app.get("/api/comfy/history/{prompt_id}")
 async def comfy_history_ep(prompt_id: str, url: str = "http://127.0.0.1:8188"):
-    return comfy_history(prompt_id, url)
+    root = _project_root_or_error()
+    return await run_in_threadpool(comfy_history, prompt_id, url, root=root) if root else {"ok": False, "error": "未配置代码库"}
 @app.get("/api/comfy/wait/{prompt_id}")
 async def comfy_wait_ep(prompt_id: str, url: str = "http://127.0.0.1:8188", timeout: int = 120, interval: float = 1.0):
-    return comfy_wait(prompt_id, url, timeout, interval)
+    root = _project_root_or_error()
+    return await run_in_threadpool(comfy_wait, prompt_id, url, timeout, interval, root=root) if root else {"ok": False, "error": "未配置代码库"}
 @app.post("/api/comfy/watch/{prompt_id}")
 async def comfy_watch_ep(prompt_id: str, url: str = "http://127.0.0.1:8188", timeout: int = 900, interval: float = 1.0):
-    return comfy_watch(prompt_id, url, timeout, interval)
+    root = _project_root_or_error()
+    return comfy_watch(prompt_id, url, timeout, interval, root=root) if root else {"ok": False, "error": "未配置代码库"}
 @app.get("/api/comfy/watch/{prompt_id}")
 async def comfy_watch_status_ep(prompt_id: str):
-    return comfy_watch_status(prompt_id)
+    root = _project_root_or_error()
+    return comfy_watch_status(prompt_id, root=root) if root else {"ok": False, "error": "未配置代码库"}
 @app.post("/api/comfy/cancel")
 async def comfy_cancel_ep(req: ComfyCancelReq):
     """按 prompt_id 定向取消 ComfyUI 作业（`POST /queue` delete）并释放该作业的 GPU 租约。"""
-    return await run_in_threadpool(comfy_cancel, req.prompt_id, req.url)
+    root = _project_root_or_error()
+    return await run_in_threadpool(comfy_cancel, req.prompt_id, req.url, root=root) if root else {"ok": False, "error": "未配置代码库"}
 @app.post("/api/comfy/import")
 async def comfy_import_ep(req: ComfyImportReq):
     root=_project_root_or_error()
@@ -1401,12 +1414,14 @@ async def gen_upload_frame_ep(file: UploadFile = File(...), url: str = COMFY_URL
 
 @app.get("/api/assets/generate/jobs")
 async def gen_jobs_ep():
-    return {"ok": True, "jobs": asset_gen.jobs.list_jobs()}
+    root = _project_root_or_error()
+    return {"ok": True, "jobs": asset_gen.jobs.list_jobs(root=root) if root else []}
 
 
 @app.get("/api/assets/generate/jobs/{job_id}")
 async def gen_job_ep(job_id: str):
-    j = asset_gen.jobs.status(job_id)
+    root = _project_root_or_error()
+    j = asset_gen.jobs.status(job_id, root=root)
     if not j:
         return JSONResponse({"ok": False, "error": "任务不存在。"}, status_code=404)
     return {"ok": True, "job": j}
@@ -1418,7 +1433,8 @@ class GenCancelReq(BaseModel):
 
 @app.post("/api/assets/generate/jobs/{job_id}/cancel")
 async def gen_job_cancel_ep(job_id: str, req: GenCancelReq):
-    return await run_in_threadpool(_gen_guard, asset_gen.jobs.cancel, job_id, req.url)
+    root = _project_root_or_error()
+    return await run_in_threadpool(_gen_guard, asset_gen.jobs.cancel, job_id, req.url, root)
 
 @app.get("/api/fs/scene-tree")
 async def scene_tree_ep(path: str):

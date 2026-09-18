@@ -4,6 +4,7 @@ from datetime import datetime
 import os
 import re
 import difflib
+import project_state
 SELF_ROOT = Path(__file__).resolve().parent
 def route_for(prompt, files=None, requested='auto'):
     text=str(prompt or '').lower(); score=min(5,len(text)//600)+ (2 if any(x in text for x in ('架构','重构','并发','性能','复杂','blueprint')) else 0)+min(3,len(files or [])//8)
@@ -30,7 +31,7 @@ def record_permission(path, project_root, allow_external=False, approved=False):
     result=permission_check(path, project_root, allow_external)
     if not result.get('allowed') or (result.get('scope')=='external' and not approved):
         return {**result, 'recorded': False}
-    log=Path(project_root).resolve()/'.docmind_permissions.jsonl'
+    log=Path(project_state.path(project_root, 'permissions.jsonl', legacy='.docmind_permissions.jsonl'))
     row={'path':str(Path(path).resolve()),'scope':result.get('scope'),'approved':bool(approved),'created_at':datetime.now().isoformat(timespec='seconds')}
     with log.open('a',encoding='utf-8') as f: f.write(json.dumps(row,ensure_ascii=False)+'\n')
     return {**result,'recorded':True,'audit':row}
@@ -51,12 +52,13 @@ def apply_approved_external(root, approval_id, path, content):
     backup=target.with_name(target.name+'.docmind.bak'); backup.write_bytes(target.read_bytes()); target.write_text(content,encoding='utf-8',newline='')
     result=record_permission(str(target),root,True,True); result.update({'written':True,'backup':str(backup)}); return result
 
-def approval_file(root): return Path(root).resolve()/'.docmind_external_approvals.jsonl'
+def approval_file(root): return Path(project_state.path(root, 'external_approvals.jsonl', legacy='.docmind_external_approvals.jsonl'))
 def create_external_approval(root, paths, summary='', diff='', before='', after=''):
     import uuid
     if not diff and (before or after): diff=''.join(difflib.unified_diff(str(before).splitlines(True),str(after).splitlines(True),fromfile='before',tofile='after'))
     row={'id':'APR-'+uuid.uuid4().hex[:12],'paths':[str(Path(p).resolve()) for p in paths], 'summary':str(summary)[:2000], 'diff':str(diff)[:20000], 'status':'pending','created_at':datetime.now().isoformat(timespec='seconds')}
-    with approval_file(root).open('a',encoding='utf-8') as f: f.write(json.dumps(row,ensure_ascii=False)+'\n')
+    primary=approval_file(root)
+    with primary.open('a',encoding='utf-8') as f: f.write(json.dumps(row,ensure_ascii=False)+'\n')
     return row
 def list_approvals(root):
     try: return [json.loads(x) for x in approval_file(root).read_text(encoding='utf-8').splitlines() if x.strip()]

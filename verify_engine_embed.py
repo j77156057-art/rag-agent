@@ -520,7 +520,7 @@ def main():
     build_project(project)
     with open(os.path.join(project, '.docmind_engine.json'), 'w', encoding='utf-8') as f:
         json.dump({'engine': 'godot', 'executable': godot}, f, ensure_ascii=False, indent=2)
-    log_path = os.path.join(project, '.docmind_engine.log')
+    log_path = __import__('project_state').path(project, '.docmind_engine.log')
     event_file = probe_event_file(project)
     try:   # 探针文件在 %APPDATA% 下，会跨次运行累积；不清空计数断言必然被历史事件污染
         if os.path.exists(event_file):

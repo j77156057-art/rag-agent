@@ -2,11 +2,12 @@
 import base64, json, os
 import ctypes
 from pathlib import Path
+import project_state
 try:
     from cryptography.fernet import Fernet
 except Exception: Fernet = None
 
-def _key_path(root): return Path(root).resolve()/'.docmind_secret.key'
+def _key_path(root): return Path(project_state.path(root, 'secret.key', legacy='.docmind_secret.key'))
 def _box(root):
     p=_key_path(root); p.parent.mkdir(parents=True,exist_ok=True)
     if not p.exists(): p.write_bytes(Fernet.generate_key() if Fernet else os.urandom(32));
@@ -32,7 +33,7 @@ def _dpapi_decrypt(token):
     except Exception: return None
 def save(root, provider, value):
     if not value: return {'ok':False,'error':'空密钥不保存'}
-    p=Path(root).resolve()/'.docmind_secrets.json'; data={}
+    p=Path(project_state.path(root, 'secrets.json', legacy='.docmind_secrets.json')); data={}
     if p.exists():
         try: data=json.loads(p.read_text(encoding='utf-8'))
         except Exception: data={}
@@ -44,7 +45,7 @@ def save(root, provider, value):
     return {'ok':True,'provider':provider,'stored':True}
 def load(root, provider):
     try:
-        item=json.loads((Path(root).resolve()/'.docmind_secrets.json').read_text(encoding='utf-8')).get(str(provider),{})
+        item=json.loads(Path(project_state.path(root, 'secrets.json', legacy='.docmind_secrets.json')).read_text(encoding='utf-8')).get(str(provider),{})
         token=item.get('ciphertext','')
         if item.get('scheme')=='dpapi': return _dpapi_decrypt(token) or ''
         box=_box(root)
@@ -52,11 +53,11 @@ def load(root, provider):
     except Exception: return ''
 
 def providers(root):
-    try: return sorted(json.loads((Path(root).resolve()/'.docmind_secrets.json').read_text(encoding='utf-8')).keys())
+    try: return sorted(json.loads(Path(project_state.path(root, 'secrets.json', legacy='.docmind_secrets.json')).read_text(encoding='utf-8')).keys())
     except Exception: return []
 
 def remove(root, provider):
-    p=Path(root).resolve()/'.docmind_secrets.json'
+    p=Path(project_state.path(root, 'secrets.json', legacy='.docmind_secrets.json'))
     try: data=json.loads(p.read_text(encoding='utf-8')) if p.exists() else {}
     except Exception: data={}
     existed=str(provider) in data; data.pop(str(provider),None)

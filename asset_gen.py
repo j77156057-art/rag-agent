@@ -350,8 +350,8 @@ def _download(url: str, preview_url: str, max_bytes: int = 600 * 1024 * 1024) ->
         raise GenError(f'生成产物下载失败：{e}') from e
 
 
-def submit(workflow: dict, url: str, min_free_mb=None) -> str:
-    r = gw.comfy_queue(workflow, url, min_free_mb=min_free_mb)
+def submit(workflow: dict, url: str, min_free_mb=None, root=None) -> str:
+    r = gw.comfy_queue(workflow, url, min_free_mb=min_free_mb, root=root)
     if not r.get('ok'):
         raise GenError(r.get('error') or '工作流提交失败')
     pid = str((r.get('response') or {}).get('prompt_id') or '')
@@ -597,14 +597,17 @@ class JobManager:
         self._jobs: dict[str, dict] = {}
         self._lock = threading.Lock()
 
-    def status(self, job_id: str) -> dict | None:
+    def status(self, job_id: str, root: str | None = None) -> dict | None:
         with self._lock:
             j = self._jobs.get(job_id)
-            return dict(j) if j else None
+            if not j or (root and os.path.abspath(j.get('root', '')) != os.path.abspath(root)):
+                return None
+            return dict(j)
 
-    def list_jobs(self, limit: int = 20) -> list[dict]:
+    def list_jobs(self, limit: int = 20, root: str | None = None) -> list[dict]:
         with self._lock:
-            jobs = sorted(self._jobs.values(), key=lambda x: x.get('created_at', ''), reverse=True)
+            jobs = [j for j in self._jobs.values() if not root or os.path.abspath(j.get('root', '')) == os.path.abspath(root)]
+            jobs = sorted(jobs, key=lambda x: x.get('created_at', ''), reverse=True)
             return [dict(j) for j in jobs[:limit]]
 
     def _update(self, job_id: str, **kw):
@@ -613,13 +616,13 @@ class JobManager:
             if j:
                 j.update(kw)
 
-    def cancel(self, job_id: str, url: str) -> dict:
-        j = self.status(job_id)
+    def cancel(self, job_id: str, url: str, root: str | None = None) -> dict:
+        j = self.status(job_id, root=root)
         if not j:
             return {'ok': False, 'error': '任务不存在。'}
         pid = j.get('prompt_id')
         if pid and j.get('status') in ('queued', 'running'):
-            r = gw.comfy_cancel(pid, url)
+            r = gw.comfy_cancel(pid, url, root=j.get('root'))
             if not r.get('ok'):
                 return r
         self._update(job_id, cancel_requested=True, status='canceling')
@@ -630,7 +633,7 @@ class JobManager:
                      width: int, height: int, steps: int, seed: int, batch_size: int) -> str:
         job_id = uuid.uuid4().hex[:12]
         self._jobs[job_id] = {
-            'id': job_id, 'type': 'image', 'status': 'queued', 'phase': '准备工作流',
+            'id': job_id, 'root': os.path.abspath(root), 'type': 'image', 'status': 'queued', 'phase': '准备工作流',
             'progress': 0, 'prompt_id': '', 'prompt': prompt, 'result': None,
             'error': '', 'created_at': _now_iso(), 'cancel_requested': False,
         }
@@ -647,7 +650,7 @@ class JobManager:
                          first_frame_name: str = '') -> str:
         job_id = uuid.uuid4().hex[:12]
         self._jobs[job_id] = {
-            'id': job_id, 'type': 'animation', 'status': 'queued', 'phase': '准备工作流',
+            'id': job_id, 'root': os.path.abspath(root), 'type': 'animation', 'status': 'queued', 'phase': '准备工作流',
             'progress': 0, 'prompt_id': '', 'prompt': prompt, 'result': None,
             'error': '', 'created_at': _now_iso(), 'cancel_requested': False,
         }
@@ -679,7 +682,7 @@ class JobManager:
                     phase='正在切换模型，腾出生图显存…' if cross else '正在腾出显存…',
                     progress=3))
             wf = build_image_workflow(**kw)
-            pid = submit(wf, url)
+            pid = submit(wf, url, root=root)
             _LAST_COMFY_KIND = 'image'
             self._update(job_id, prompt_id=pid)
             hist = wait(pid, url, on_progress=self._on_progress(job_id, '本地生成图片中', (5, 80)))
@@ -724,7 +727,7 @@ class JobManager:
                     job_id,
                     phase='正在切换模型，腾出生视频显存…' if cross else '正在腾出显存…',
                     progress=5))
-            pid = submit(wf, url, min_free_mb=VIDEO_MIN_FREE_MB)
+            pid = submit(wf, url, min_free_mb=VIDEO_MIN_FREE_MB, root=root)
             _LAST_COMFY_KIND = 'video'
             self._update(job_id, prompt_id=pid)
             hist = wait(pid, url, timeout=1800,

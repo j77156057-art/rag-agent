@@ -21,6 +21,7 @@ import urllib.request
 import urllib.error
 from collections import deque
 from queue import Queue, Empty
+import project_state
 
 CONFIG_FILENAME = ".docmind_mcp.json"
 PROTOCOL_VERSION = "2024-11-05"
@@ -146,7 +147,7 @@ def normalize_server_config(cfg):
 # ---------------------------------------------------------------- 配置持久化
 
 def _config_path(root):
-    return os.path.join(os.path.abspath(root), CONFIG_FILENAME)
+    return project_state.path(root, CONFIG_FILENAME, legacy=CONFIG_FILENAME)
 
 
 def load_user_servers(root):

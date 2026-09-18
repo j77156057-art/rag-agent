@@ -465,9 +465,9 @@ class RuntimeEventTests(SceneFixture):
         self.assertTrue(len(sr.runtime_events(self.root)["events"]) >= 1)
         sr.runtime_clear(self.root, "all")
         self.assertEqual(sr.runtime_events(self.root)["total"], 0)
-        with open(os.path.join(self.root, ".docmind_engine.log"), encoding="utf-8") as f:
+        with open(sr.project_state.path(self.root, "engine.log", legacy=".docmind_engine.log"), encoding="utf-8") as f:
             self.assertIn(marker, f.read(), "清空不得截断正在写的引擎日志")
-        with open(os.path.join(self.root, ".docmind_engine.log"), "a", encoding="utf-8") as f:
+        with open(sr.project_state.path(self.root, "engine.log", legacy=".docmind_engine.log"), "a", encoding="utf-8") as f:
             f.write(sr.MARKER + json.dumps({"type": "new"}) + "\n")
         events = sr.runtime_events(self.root)["events"]
         self.assertEqual([e["type"] for e in events], ["new"], "清空后只应看到新产生的事件")
