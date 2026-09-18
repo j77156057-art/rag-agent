@@ -24,6 +24,12 @@
 - 搜索摘要增加运行时缓存：`<STATE_ROOT>/.docmind_web_search_cache.json`，默认 10 分钟、最多 64 项，可用 `DOCMIND_WEB_CACHE=0` 关闭；网页正文和密钥不落盘。
 - 新增 `tests/test_web_research_product.py`；Python 全量回归 **946 项通过、1 项跳过**，联网专项 5 项通过。真实 GitHub/B 站接口是否受当前网络、验证码或限流影响仍需联网环境实测。
 
+### 2026-09-18 复制标签页会话冲突缓解
+
+- `frontend/src/workbench/api.ts` 增加 BroadcastChannel 会话仲裁：复制标签页带着相同 `sessionStorage` 会话进入时，两个页面用本次页面内随机 token 比较，只让一侧旋转到新 `session_id`；原有会话历史不会被删除。
+- 不写入 localStorage，不改变普通刷新行为；不支持 BroadcastChannel 的旧 WebView 仍依赖原有标签存活探测，不能宣称所有浏览器都能识别复制标签。
+- `npm --prefix frontend run typecheck` 与 `npm --prefix frontend run build` 已通过；需要在实际 Edge/WebView2 中开两个复制标签做一次行为验收。
+
 ### 2026-09-18 项目切换与流式竞态修复
 
 - 项目上下文：任务 ID、分区和允许路径改为按 `project_id` 保存；切换项目会重建任务面板，保存与选区 AI 不会读取旧项目的全局任务范围。

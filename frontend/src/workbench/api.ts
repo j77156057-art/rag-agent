@@ -1363,6 +1363,9 @@ async function postSse(url: string, init: RequestInit, h: SseStreamHandlers): Pr
 // 「关掉重开找回历史」改由「会话列表显式切换」或单窗口下的唯一性门禁兜底（见 docmindTabs）。
 const SESSION_ID_KEY = 'docmind_session_id'
 let cachedSessionId: string | null = null
+const SESSION_COLLISION_CHANNEL = 'docmind-session-collision'
+const sessionRuntimeToken = newSessionId() + '-runtime'
+let sessionCollisionStarted = false
 
 /** 生成 slug 安全的会话 id（仅含 [A-Za-z0-9_-]），形如 web-<12位十六进制>。
  *  后端 sessions.py::_slug() 会把 id 用于拼文件名，故必须规避路径分隔符等字符。 */
@@ -1375,27 +1378,58 @@ function newSessionId(): string {
   return `web-${hex}`
 }
 
+/**
+ * 复制标签页会复制 sessionStorage。两个页面随后会带着同一个 session_id，
+ * 让后端误以为它们是同一条 Agent 对话。BroadcastChannel 可用时用内存 token
+ * 做一次确定性仲裁：token 较小的一侧换新会话，原标签的历史保持不变。
+ * 不依赖 localStorage，因此不会把会话内容写入跨标签持久存储；不支持该 API
+ * 的旧 WebView 仍由后端/标签存活探测保守隔离。
+ */
+function startSessionCollisionWatch(): void {
+  if (sessionCollisionStarted) return
+  sessionCollisionStarted = true
+  const BC = (globalThis as { BroadcastChannel?: typeof BroadcastChannel }).BroadcastChannel
+  if (typeof BC !== 'function') return
+  try {
+    const channel = new BC(SESSION_COLLISION_CHANNEL)
+    channel.onmessage = (ev: MessageEvent) => {
+      const msg = ev.data as { type?: string; token?: string; session?: string } | null
+      if (!msg || msg.type !== 'hello' || !msg.token || msg.token === sessionRuntimeToken) return
+      if (msg.session !== cachedSessionId || !cachedSessionId) return
+      // 两个复制标签都会收到 hello；只有 token 较小的一侧旋转，避免双向同时换号。
+      if (sessionRuntimeToken < msg.token) {
+        const fresh = newSessionId()
+        cachedSessionId = fresh
+        try { sessionStorage.setItem(SESSION_ID_KEY, fresh) } catch { /* 内存值仍有效 */ }
+        try { channel.postMessage({ type: 'rotated', token: sessionRuntimeToken, old: msg.session, session: fresh }) } catch { /* best effort */ }
+      }
+    }
+    channel.postMessage({ type: 'hello', token: sessionRuntimeToken, session: getSessionIdWithoutWatch() })
+    if (typeof window !== 'undefined') window.addEventListener('pagehide', () => channel.close(), { once: true })
+  } catch { /* BroadcastChannel 被禁用时保留原有会话逻辑 */ }
+}
+
+function getSessionIdWithoutWatch(): string {
+  if (cachedSessionId) return cachedSessionId
+  try {
+    const existing = sessionStorage.getItem(SESSION_ID_KEY)
+    if (existing) return (cachedSessionId = existing)
+    const fresh = newSessionId()
+    try { sessionStorage.setItem(SESSION_ID_KEY, fresh) } catch { /* 仅内存 */ }
+    return (cachedSessionId = fresh)
+  } catch {
+    return (cachedSessionId = newSessionId())
+  }
+}
+
 /** 当前会话 id（sessionStorage 持久化：标签页刷新后保留、关掉标签页即清除）。
  *  每个标签页各自独立——不再读 localStorage，避免同一浏览器多标签共享同一段对话
  *  （旧实现「localStorage 优先」会让新标签静默接到旧会话）。取不到就新生成一个。
  *  存储不可用（隐私模式 / 非浏览器）时 try/catch 退回模块级 id，保证同页一致。 */
 export function getSessionId(): string {
-  if (cachedSessionId) return cachedSessionId
-  try {
-    const existing = sessionStorage.getItem(SESSION_ID_KEY)
-    if (existing) {
-      cachedSessionId = existing
-      return existing
-    }
-    const fresh = newSessionId()
-    try { sessionStorage.setItem(SESSION_ID_KEY, fresh) } catch { /* 存储不可写：仅内存 */ }
-    cachedSessionId = fresh
-    return fresh
-  } catch {
-    // 非浏览器 / 隐私模式：退回模块级 id（同一页面内保持一致）
-    cachedSessionId = newSessionId()
-    return cachedSessionId
-  }
+  const value = getSessionIdWithoutWatch()
+  startSessionCollisionWatch()
+  return value
 }
 
 /** 显式切换当前会话 id（如「继续某段历史对话」/「新会话」）：只写 sessionStorage 并刷新缓存。
