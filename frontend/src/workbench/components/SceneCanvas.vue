@@ -86,9 +86,42 @@ function say(text: string, kind: 'info' | 'ok' | 'err' = 'info') {
   messageKind.value = kind
 }
 
-const ROW = 76
+const ROW = 84
 const COL = 296
 const FILE_COL = 330
+// 卡片近似尺寸（比 CSS 实测略大一圈），空间布局用它做矩形防重叠检测
+const CARD_W = 256
+const CARD_H = 72
+const FILE_W = 270
+const FILE_H = 62
+const CARD_GAP = 14
+
+interface Box { x: number; y: number; w: number; h: number }
+function boxesOverlap(a: Box, b: Box): boolean {
+  return a.x < b.x + b.w + CARD_GAP && a.x + a.w + CARD_GAP > b.x
+    && a.y < b.y + b.h + CARD_GAP && a.y + a.h + CARD_GAP > b.y
+}
+/** 在期望落点附近螺旋搜索最近的不重叠位置（优先向下找，符合树图阅读习惯） */
+function nearestFree(x: number, y: number, w: number, h: number, blockers: Box[]): { x: number; y: number } {
+  const snap = (v: number) => Math.round(v / 8) * 8
+  const sx = snap(x), sy = snap(y)
+  const hit = (cx: number, cy: number) => blockers.some(b => boxesOverlap({ x: cx, y: cy, w, h }, b))
+  if (!hit(sx, sy)) return { x: sx, y: sy }
+  const step = 24
+  for (let ring = 1; ring < 120; ring++) {
+    const d = ring * step
+    const tries: Array<[number, number]> = []
+    for (let k = -ring; k <= ring; k++) {
+      tries.push([sx + k * step, sy + d], [sx + k * step, sy - d], [sx - d, sy + k * step], [sx + d, sy + k * step])
+    }
+    tries.sort((p, q) => Math.hypot(p[0] - sx, p[1] - sy) - Math.hypot(q[0] - sx, q[1] - sy))
+    for (const [cx, cy] of tries) {
+      const fx = snap(cx), fy = snap(cy)
+      if (!hit(fx, fy)) return { x: fx, y: fy }
+    }
+  }
+  return { x: sx, y: sy }
+}
 
 /* ------------------------------------------------------------------ 布局 */
 function buildOrder(list: SceneNode[]): { node: SceneNode; depth: number }[] {
@@ -197,6 +230,20 @@ function layout(): { nodes: Node[]; edges: Edge[]; maxX: number; minY: number } 
       },
     })
   })
+
+  // 空间布局：真实坐标里多个节点常常重合（都没填 position 就是 0,0），统一做矩形避让。
+  // 只改画布展示坐标，不回写场景文件。
+  if (layoutMode.value === 'space') {
+    const placed: Box[] = []
+    for (const vn of out) {
+      const isFile = vn.type === 'sceneFile'
+      const w = isFile ? FILE_W : CARD_W
+      const h = isFile ? FILE_H : CARD_H
+      const free = nearestFree(vn.position.x, vn.position.y, w, h, placed)
+      vn.position = free
+      placed.push({ x: free.x, y: free.y, w, h })
+    }
+  }
 
   const fileIds = new Set(visibleFiles.map(f => f.id))
   const edgeList: Edge[] = []
@@ -390,7 +437,23 @@ async function redo() {
 /* 拖拽落点 -> 写回 position（只在空间布局下生效，且排除根节点） */
 async function onNodeDragStop(...args: unknown[]) {
   const node = pickNode(args)
-  if (layoutMode.value !== 'space' || !node || node.type !== 'sceneNode') return
+  if (layoutMode.value !== 'space' || !node) return
+  const isScene = node.type === 'sceneNode'
+  const w = isScene ? CARD_W : FILE_W
+  const h = isScene ? CARD_H : FILE_H
+  // 落点若压在别的卡片上，把被拖卡片挪到最近空位，避免「一拖就叠在一起」
+  const blockers: Box[] = (vf.value?.nodes.value ?? [])
+    .filter(n => n.id !== node.id)
+    .map(n => ({
+      x: n.position.x, y: n.position.y,
+      w: n.type === 'sceneFile' ? FILE_W : CARD_W,
+      h: n.type === 'sceneFile' ? FILE_H : CARD_H,
+    }))
+  const free = nearestFree(node.position.x, node.position.y, w, h, blockers)
+  node.position = free
+  nodes.value = nodes.value.map(n => (n.id === node.id ? { ...n, position: free } : n))
+
+  if (!isScene) return // 文件卡只做展示避让，不回写
   const target = nodeById.value.get(node.id)
   if (!target || target.id === graph.value?.root_id) {
     rebuild()
@@ -402,10 +465,14 @@ async function onNodeDragStop(...args: unknown[]) {
     return
   }
   const scale = spaceScale.value || 1
-  const moved = [Math.round(node.position.x / scale), Math.round(node.position.y / scale)]
+  const moved = [Math.round(free.x / scale), Math.round(free.y / scale)]
   const current = target.position ?? [0, 0]
   if (Math.abs(moved[0] - current[0]) < 1 && Math.abs(moved[1] - current[1]) < 1) return
-  if (!canEdit.value) return
+  if (!canEdit.value) {
+    say('该场景只读，拖拽不会写回。', 'info')
+    rebuild()
+    return
+  }
   await runOp({ op: 'move', node: node.id, position: moved })
   say(`已写回 ${target.name} position = Vector2(${moved[0]}, ${moved[1]})`, 'ok')
 }

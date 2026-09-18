@@ -388,7 +388,7 @@ onBeforeUnmount(() => {
             <circle cx="8.2" cy="10" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
             <path d="M4.6 4.2 L8.4 3.6 M4.3 4.6 L7.3 9 M9 4.4 L8.5 8.6" stroke="currentColor" stroke-width="0.8" />
           </svg>
-          代码地图
+          <span class="wb-map-label">代码地图</span>
         </button>
         <button
           v-if="tree"
@@ -402,7 +402,7 @@ onBeforeUnmount(() => {
             <circle cx="6.6" cy="10" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
             <path d="M4.4 4.2 L8.8 4.2 M4 4.8 L5.8 8.8 M9.2 4.8 L7.4 8.8" stroke="currentColor" stroke-width="0.85" />
           </svg>
-          关系图
+          <span class="wb-map-label">关系图</span>
         </button>
         <button
           v-if="tree"
@@ -416,7 +416,7 @@ onBeforeUnmount(() => {
             <rect x="4.6" y="8.2" width="4.2" height="3.6" rx="0.8" fill="none" stroke="currentColor" stroke-width="0.9" />
             <path d="M5.4 3.2 L8 2.8 M3.6 5.3 L5.8 8.1 M9.6 5.4 L7.8 8.2" fill="none" stroke="currentColor" stroke-width="0.8" />
           </svg>
-          Unity 图
+          <span class="wb-map-label">Unity 图</span>
         </button>
         </span>
         <button

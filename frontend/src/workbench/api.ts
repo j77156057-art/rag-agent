@@ -1052,6 +1052,10 @@ export interface GenJob {
   error: string
   created_at: string
   cancel_requested?: boolean
+  /** 云端任务自带：engine='cloud'，并带服务商与模型 */
+  engine?: 'local' | 'cloud'
+  provider?: string
+  model?: string
 }
 export interface GenSubmitResp { ok: boolean; job_id?: string; error?: string }
 
@@ -1086,6 +1090,54 @@ export const genApi = {
   cancel(id: string) {
     return postJson<{ ok: boolean; error?: string }>(
       `/api/assets/generate/jobs/${encodeURIComponent(id)}/cancel`, {})
+  },
+}
+
+/** 云端 AI 生成（cloud_gen.py / /api/assets/cloud/*，用户自带 Key） */
+export interface CloudModelInfo { id: string; label: string; i2v?: boolean }
+export interface CloudProvider {
+  id: string
+  name: string
+  base_url: string
+  adapter: string
+  key_url: string
+  doc_url: string
+  note: string
+  image_models: CloudModelInfo[]
+  video_models: CloudModelInfo[]
+}
+export interface CloudKeyState { saved: boolean; mask: string }
+
+export const cloudGenApi = {
+  providers() {
+    return request<{ ok: boolean; providers: CloudProvider[] }>('/api/assets/cloud/providers')
+  },
+  keys() {
+    return request<{ ok: boolean; keys: Record<string, CloudKeyState> }>('/api/assets/cloud/keys')
+  },
+  saveKey(provider: string, key: string) {
+    return postJson<{ ok: boolean; error?: string }>('/api/assets/cloud/key', { provider, key })
+  },
+  deleteKey(provider: string) {
+    return postJson<{ ok: boolean; error?: string }>('/api/assets/cloud/key/delete', { provider, key: '' })
+  },
+  image(p: { provider: string; model: string; prompt: string; negative_prompt?: string;
+              width: number; height: number; seed?: number; batch?: number;
+              api_key?: string; base_url?: string }) {
+    return postJson<GenSubmitResp>('/api/assets/cloud/image', p)
+  },
+  animation(p: { provider: string; model: string; prompt: string; first_frame_path?: string;
+                  duration: number; seed?: number; fps: number; max_frames: number;
+                  api_key?: string; base_url?: string }) {
+    return postJson<GenSubmitResp>('/api/assets/cloud/animation', p)
+  },
+  async uploadFrame(file: File) {
+    const fd = new FormData()
+    fd.append('file', file)
+    const r = await fetch('/api/assets/cloud/upload-frame', withProject({ method: 'POST', body: fd }))
+    const body = await r.json().catch(() => ({})) as { ok?: boolean; path?: string; error?: string }
+    if (!r.ok || !body.ok) throw new FsApiError(r.status, body.error || '首帧上传失败')
+    return body.path as string
   },
 }
 

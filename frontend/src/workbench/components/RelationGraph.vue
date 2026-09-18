@@ -28,7 +28,7 @@ interface Sim {
   w: number; h: number
 }
 interface SimEdge { a: Sim; b: Sim; e: RelationEdge }
-interface Geo { w: number; h: number; label: string; sub: string }
+interface Geo { w: number; h: number; label: string; sub: string; doc: string }
 
 let sim: Sim[] = []
 const byId = new Map<string, Sim>()
@@ -47,6 +47,8 @@ let dragSim: Sim | null = null
 let panning = false
 let panStart = { x: 0, y: 0, px: 0, py: 0 }
 let down: { id: string; x: number; y: number; moved: boolean } | null = null
+let bgDown: { x: number; y: number; moved: boolean } | null = null
+const selectedId = ref<string | null>(null)
 
 // ------------------------------------------------------------ 数据加载
 
@@ -187,14 +189,18 @@ function buildLayout() {
 
   nodes.forEach((n, i) => {
     const st = graphNodeStyle(n.kind)
-    const label = fitText(n.label, 200, 12, true)
+    const label = fitText(n.label, 220, 12, true)
     const subRaw = n.external ? (n.sub ? `(${n.sub})` : '') : n.sub
-    const sub = subRaw ? fitText(subRaw, 200, 9.5, false) : ''
+    const sub = subRaw ? fitText(subRaw, 220, 9.5, false) : ''
+    // 卡片第三行：文档/注释首行，帮用户不打开文件也能认出这个类/场景是干什么的
+    const docRaw = (n.doc || '').split(/\r?\n/)[0].trim()
+    const doc = !n.external && docRaw && docRaw !== n.label ? fitText(docRaw, 220, 9.5, false) : ''
     const labelW = measure(label, 12, true)
     const subW = sub ? measure(sub, 9.5, false) : 0
-    const w = Math.max(92, Math.min(250, Math.max(labelW, subW) + 40))
-    const h = sub ? 46 : 32
-    geo[n.id] = { w, h, label, sub }
+    const docW = doc ? measure(doc, 9.5, false) : 0
+    const w = Math.max(112, Math.min(264, Math.max(labelW, subW, docW) + 42))
+    const h = doc ? 58 : sub ? 46 : 32
+    geo[n.id] = { w, h, label, sub, doc }
 
     const old = prev.get(n.id)
     let x: number, y: number
@@ -202,9 +208,9 @@ function buildLayout() {
       x = old.x
       y = old.y
     } else {
-      const ring = n.external ? 1.9 : 1
+      const ring = n.external ? 2.1 : 1
       const ang = (i / Math.max(1, nodes.length)) * Math.PI * 2
-      const r = (90 + nodes.length * 9) * ring
+      const r = (120 + nodes.length * 12) * ring
       x = Math.cos(ang) * r
       y = Math.sin(ang) * r * 0.62
     }
@@ -229,8 +235,11 @@ function buildLayout() {
 function step(a: number) {
   const REP = 52000
   const SPRING = 0.05
-  const IDEAL_INH = 150
-  const IDEAL_MNT = 190
+  const IDEAL_INH = 170
+  const IDEAL_MNT = 210
+  const IDEAL_CALL = 190
+  // 碰撞分离不能随 alpha 一起消失：否则拖动余温结束后节点会失去防重叠保护
+  const settle = Math.max(a, 0.35)
   const n = sim.length
 
   for (let i = 0; i < n; i++) {
@@ -253,26 +262,37 @@ function step(a: number) {
       s.vy += uy * f
       t.vx -= ux * f
       t.vy -= uy * f
-      // 矩形碰撞兜底：重叠时强分离
-      const minD = (s.w + t.w) / 4 + 12
-      if (d < minD) {
-        const push = ((minD - d) * 0.5 * a) / 1
-        s.vx += ux * push
-        s.vy += uy * push
-        t.vx -= ux * push
-        t.vy -= uy * push
+      // 矩形碰撞：沿 AABB 最小穿透轴做位置级硬分离（保证卡片绝不叠在一起），
+      // 另补一点速度让自然布局也保持间隙；正在拖的卡不吃位移，份额全给另一张
+      const ox = (s.w + t.w) / 2 + 8 - Math.abs(dx)
+      const oy = (s.h + t.h) / 2 + 8 - Math.abs(dy)
+      if (ox > 0 && oy > 0) {
+        const pen = Math.min(ox, oy)
+        let sx = 0, sy = 0
+        if (ox < oy) sx = dx >= 0 ? 1 : -1
+        else sy = dy >= 0 ? 1 : -1
+        const shareA = s === dragSim ? 0 : t === dragSim ? 1 : 0.5
+        const shareB = t === dragSim ? 0 : s === dragSim ? 1 : 0.5
+        s.x += sx * pen * shareA
+        s.y += sy * pen * shareA
+        t.x -= sx * pen * shareB
+        t.y -= sy * pen * shareB
+        const vk = 0.15 * settle
+        s.vx += sx * pen * vk
+        s.vy += sy * pen * vk
+        t.vx -= sx * pen * vk
+        t.vy -= sy * pen * vk
       }
     }
-    // 中心引力（不随 alpha 消失，拖动后也回聚）
-    s.vx -= s.x * 0.012
-    s.vy -= s.y * 0.012
+    // 中心引力必须随 alpha 衰减，否则停止加热后所有节点会被恒力拽回 (0,0) 叠成一堆
+    s.vx -= s.x * 0.02 * a
+    s.vy -= s.y * 0.02 * a
   }
 
   for (const { a: sa, b: sb, e } of simEdges) {
     const dx = sb.x - sa.x
     const dy = sb.y - sa.y
     const d = Math.sqrt(dx * dx + dy * dy) || 0.01
-    const IDEAL_CALL = 170
     const ideal = e.kind === 'mounts' ? IDEAL_MNT : e.kind === 'calls' ? IDEAL_CALL : IDEAL_INH
     const f = (d - ideal) * SPRING * (0.25 + 0.75 * a)
     const ux = dx / d
@@ -358,6 +378,15 @@ function syncDom() {
     const el = nodeEl(s.id)
     if (el) el.setAttribute('transform', `translate(${s.x - s.w / 2}, ${s.y - s.h / 2})`)
   }
+}
+
+// 卡片三行文字的 y 坐标：有 doc 时 16/32/48，只有 sub 时 17/37，单行垂直居中
+function geoY(id: string, line: 'label' | 'sub' | 'doc'): number {
+  const g = geometry.value[id]
+  if (!g) return line === 'label' ? 16 : 0
+  if (g.doc) return line === 'label' ? 16 : line === 'sub' ? 32 : 48
+  if (g.sub) return line === 'label' ? 17 : 37
+  return (g.h || 32) / 2 + 4
 }
 
 // 初始模板绑定读取（首帧 Vue 渲染时用，之后命令式覆盖）
@@ -467,6 +496,7 @@ function onNodeDown(ev: PointerEvent, n: RelationNode) {
 function onBgDown(ev: PointerEvent) {
   if (!ready.value) return
   panning = true
+  bgDown = { x: ev.clientX, y: ev.clientY, moved: false }
   panStart = { x: ev.clientX, y: ev.clientY, px: panX.value, py: panY.value }
   ;(ev.currentTarget as Element).setPointerCapture?.(ev.pointerId)
 }
@@ -481,23 +511,94 @@ function onPointerMove(ev: PointerEvent) {
     dragSim.vy = 0
     reheat(0.5)
   } else if (panning) {
+    if (bgDown && Math.hypot(ev.clientX - bgDown.x, ev.clientY - bgDown.y) > 4) bgDown.moved = true
     panX.value = panStart.px + (ev.clientX - panStart.x)
     panY.value = panStart.py + (ev.clientY - panStart.y)
   }
 }
 
-async function onPointerUp() {
-  const clicked = down
-  dragSim = null
-  panning = false
-  down = null
-  if (clicked && !clicked.moved) {
-    const n = data.value?.nodes.find((x) => x.id === clicked.id)
-    if (n && n.rel) {
-      closeRelationGraph()
-      await jumpToLine(n.rel, n.line || 1)
-    }
+function settleBurst(steps = 120) {
+  // 松手/加热结束后的收尾：只做碰撞分离与弹簧归位，不引入新的中心引力
+  for (let i = 0; i < steps; i++) step(0.05)
+  alpha = 0
+  syncDom()
+}
+
+let suppressBgClick = false
+
+function onNodeClick(ev: MouseEvent, n: RelationNode) {
+  // 选中走 click：浏览器对“按下后轻微抖动”有自带容差，比手写 pointerup 判定更稳
+  ev.stopPropagation()
+  selectedId.value = n.id
+}
+
+function onBgClick() {
+  // 平移画布松手也会触发 click，平移过就不当作“取消选中”
+  if (suppressBgClick) {
+    suppressBgClick = false
+    return
   }
+  selectedId.value = null
+}
+
+function onPointerUp() {
+  const clicked = down
+  const draggedNode = !!dragSim
+  dragSim = null
+  down = null
+  if (clicked && clicked.moved && draggedNode) {
+    // 拖完节点后立即补一轮短迭代，把被挤开/重叠的卡片排开
+    settleBurst()
+  }
+  suppressBgClick = !!(bgDown && bgDown.moved)
+  bgDown = null
+  panning = false
+}
+
+async function onNodeDbl(n: RelationNode) {
+  if (n.rel) {
+    closeRelationGraph()
+    await jumpToLine(n.rel, n.line || 1)
+  }
+}
+
+async function openSelected() {
+  const n = selectedNode.value
+  if (n?.rel) {
+    closeRelationGraph()
+    await jumpToLine(n.rel, n.line || 1)
+  }
+}
+
+// ------------------------------------------------------------ 选中详情
+
+interface Incident { edge: RelationEdge; other: RelationNode | null }
+const selectedNode = computed<RelationNode | null>(
+  () => data.value?.nodes.find((n) => n.id === selectedId.value) || null)
+const selectedIncident = computed<{ out: Incident[]; incoming: Incident[] }>(() => {
+  const id = selectedId.value
+  const d = data.value
+  if (!id || !d) return { out: [], incoming: [] }
+  const nodeById = new Map(d.nodes.map((n) => [n.id, n]))
+  const out: Incident[] = []
+  const incoming: Incident[] = []
+  for (const edge of d.edges) {
+    if (edge.source === id) out.push({ edge, other: nodeById.get(edge.target) || null })
+    else if (edge.target === id) incoming.push({ edge, other: nodeById.get(edge.source) || null })
+  }
+  const byLabel = (x: Incident, y: Incident) => (x.other?.label || '').localeCompare(y.other?.label || '')
+  return { out: out.sort(byLabel), incoming: incoming.sort(byLabel) }
+})
+function kindText(k: string): string {
+  return graphNodeStyle(k).label
+}
+function edgeKindText(k: string): string {
+  return k === 'inherits' ? '继承' : k === 'mounts' ? '场景挂载' : k === 'calls' ? '调用' : k
+}
+function incidentMethods(it: Incident): string {
+  const ms = it.edge.methods || []
+  const head = ms.slice(0, 4).join('、')
+  return ms.length > 4 ? `${head} 等 ${ms.length} 个方法` : head
 }
 
 const viewport = computed(() => `translate(${panX.value}, ${panY.value}) scale(${zoom.value})`)
@@ -578,6 +679,7 @@ const colorOf = regionColor
           class="rg-svg"
           :class="{ grabbing: panning }"
           @pointerdown="onBgDown"
+          @click="onBgClick"
           @wheel="onWheel"
         >
           <defs>
@@ -624,9 +726,11 @@ const colorOf = regionColor
                 :key="n.id"
                 :ref="(el) => setNodeRef(el, n.id)"
                 class="rg-node"
-                :class="{ ext: n.external, dim: nodeDim(n), clickable: !!n.rel }"
+                :class="{ ext: n.external, dim: nodeDim(n), selected: selectedId === n.id }"
                 :transform="`translate(${initialPos(n.id, 'x', 'w', true)}, ${initialPos(n.id, 'y', 'h', true)})`"
                 @pointerdown="onNodeDown($event, n)"
+                @click="onNodeClick($event, n)"
+                @dblclick="onNodeDbl(n)"
               >
                 <rect
                   :width="geometry[n.id]?.w || 100"
@@ -648,12 +752,16 @@ const colorOf = regionColor
                   {{ styleOf(n.kind).mark }}
                 </text>
                 <text class="rg-label" :fill="styleOf(n.kind).text" x="30"
-                      :y="geometry[n.id]?.sub ? 17 : ((geometry[n.id]?.h || 32) / 2 + 4)">
+                      :y="geoY(n.id, 'label')">
                   {{ geometry[n.id]?.label }}
                 </text>
                 <text v-if="geometry[n.id]?.sub" class="rg-sub" x="30"
-                      :y="(geometry[n.id]?.h || 32) - 9">
+                      :y="geoY(n.id, 'sub')">
                   {{ geometry[n.id]?.sub }}
+                </text>
+                <text v-if="geometry[n.id]?.doc" class="rg-doc" x="30"
+                      :y="geoY(n.id, 'doc')">
+                  {{ geometry[n.id]?.doc }}
                 </text>
                 <title>{{ n.rel ? `${n.rel}${n.doc ? '\n' + n.doc : ''}` : `${n.label}（${styleOf(n.kind).label}）` }}</title>
               </g>
@@ -661,12 +769,60 @@ const colorOf = regionColor
           </g>
         </svg>
 
+        <!-- 节点详情卡：单击节点出现 -->
+        <aside v-if="selectedNode" class="rg-detail" @pointerdown.stop>
+          <header class="rg-d-head">
+            <span class="rg-d-mark" :style="{ color: styleOf(selectedNode.kind).stroke }">{{ styleOf(selectedNode.kind).mark }}</span>
+            <b class="rg-d-title">{{ selectedNode.label }}</b>
+            <button class="rg-d-x" title="关闭详情" @click="selectedId = null">×</button>
+          </header>
+          <div class="rg-d-tags">
+            <span class="rg-d-kind">{{ kindText(selectedNode.kind) }}</span>
+            <span v-if="selectedNode.region_name" class="rg-d-region">
+              <i :style="{ background: colorOf(selectedNode.region) }" />{{ selectedNode.region_name }}
+            </span>
+            <span v-if="selectedNode.external" class="rg-d-ext">引擎 / 外部基类</span>
+          </div>
+          <p v-if="selectedNode.doc" class="rg-d-doc">{{ selectedNode.doc }}</p>
+          <p v-if="selectedNode.rel" class="rg-d-rel">
+            <span class="rg-d-path">{{ selectedNode.rel }}</span><span
+              v-if="selectedNode.line" class="rg-d-line">:{{ selectedNode.line }}</span>
+          </p>
+          <p v-else class="rg-d-rel rg-d-faint">引擎内置类型，不在项目文件中</p>
+
+          <div class="rg-d-sec">出边 · {{ selectedIncident.out.length }}</div>
+          <ul v-if="selectedIncident.out.length" class="rg-d-list">
+            <li v-for="(it, idx) in selectedIncident.out" :key="'o' + idx">
+              <i class="rg-d-arrow" :class="it.edge.kind">→</i>
+              <a v-if="it.other" class="rg-d-link" @click="selectedId = it.other!.id">{{ it.other.label }}</a>
+              <span v-else class="rg-d-faint">?</span>
+              <em>{{ edgeKindText(it.edge.kind) }}<template v-if="incidentMethods(it)"> · {{ incidentMethods(it) }}</template></em>
+            </li>
+          </ul>
+          <p v-else class="rg-d-empty">无</p>
+
+          <div class="rg-d-sec">入边 · {{ selectedIncident.incoming.length }}</div>
+          <ul v-if="selectedIncident.incoming.length" class="rg-d-list">
+            <li v-for="(it, idx) in selectedIncident.incoming" :key="'i' + idx">
+              <i class="rg-d-arrow" :class="it.edge.kind">←</i>
+              <a v-if="it.other" class="rg-d-link" @click="selectedId = it.other!.id">{{ it.other.label }}</a>
+              <span v-else class="rg-d-faint">?</span>
+              <em>{{ edgeKindText(it.edge.kind) }}<template v-if="incidentMethods(it)"> · {{ incidentMethods(it) }}</template></em>
+            </li>
+          </ul>
+          <p v-else class="rg-d-empty">无</p>
+
+          <button class="rg-d-open" :disabled="!selectedNode.rel" @click="openSelected">
+            {{ selectedNode.rel ? '打开文件（或双击节点）' : '该节点无项目文件' }}
+          </button>
+        </aside>
+
         <div v-if="ready && viewNodes.length" class="rg-legend">
           <span><i class="rg-lg rg-lg-class" />命名类</span>
           <span><i class="rg-lg rg-lg-script" />脚本</span>
           <span><i class="rg-lg rg-lg-scene" />场景</span>
           <span><i class="rg-lg rg-lg-ext" />外部基类</span>
-          <span class="rg-legend-tip">滚轮缩放 · 拖动平移 · 点节点打开文件</span>
+          <span class="rg-legend-tip">滚轮缩放 · 拖动平移 · 单击看详情 · 双击打开文件</span>
         </div>
       </div>
     </section>
@@ -823,14 +979,71 @@ const colorOf = regionColor
 .rg-elabel-tx.mounts { fill: #8a4d12; }
 .rg-elabel-tx.calls { fill: #0c6b58; }
 
-.rg-node { cursor: default; }
-.rg-node.clickable { cursor: pointer; }
+.rg-node { cursor: pointer; }
 .rg-node rect { stroke-width: 1.3; }
-.rg-node.clickable:hover rect { stroke-width: 2; filter: brightness(1.18); }
+.rg-node:hover rect { stroke-width: 2; filter: brightness(1.08); }
+.rg-node.selected rect { stroke-width: 2.4; filter: drop-shadow(0 2px 6px rgba(47,111,237,.35)); }
 .rg-node.dim { opacity: 0.13; }
 .rg-mark { font-family: var(--font-mono); font-size: 10.5px; font-weight: 700; text-anchor: middle; }
 .rg-label { font-size: 12px; font-weight: 600; }
 .rg-sub { font-size: 9.5px; fill: var(--text-faint); font-family: var(--font-mono); }
+.rg-doc { font-size: 9.5px; fill: var(--text-muted); }
+
+/* 节点详情卡 */
+.rg-detail {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 300px;
+  max-height: calc(100% - 24px);
+  overflow-y: auto;
+  background: rgba(255, 255, 255, 0.97);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(35, 52, 84, 0.16);
+  padding: 11px 13px;
+  font-size: 11.5px;
+  z-index: 5;
+}
+.rg-d-head { display: flex; align-items: center; gap: 8px; }
+.rg-d-mark { font-family: var(--font-mono); font-weight: 700; font-size: 13px; }
+.rg-d-title { flex: 1 1 auto; font-size: 13px; font-weight: 600; word-break: break-all; }
+.rg-d-x {
+  border: none; background: none; font-size: 17px; line-height: 1;
+  color: var(--text-faint); cursor: pointer; padding: 0 2px;
+}
+.rg-d-x:hover { color: var(--text); }
+.rg-d-tags { display: flex; flex-wrap: wrap; gap: 5px; margin: 7px 0; }
+.rg-d-tags span {
+  font-size: 10px; border-radius: 4px; padding: 1px 7px;
+  border: 1px solid var(--border); color: var(--text-muted); background: var(--bg);
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.rg-d-kind { color: #1b3c73 !important; border-color: #4d7fc066 !important; }
+.rg-d-region i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.rg-d-ext { color: #8a4d12 !important; border-color: #c9762f66 !important; }
+.rg-d-doc { margin: 4px 0 6px; color: var(--text); line-height: 1.5; }
+.rg-d-rel { margin: 0 0 6px; word-break: break-all; }
+.rg-d-path { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-muted); }
+.rg-d-line { font-family: var(--font-mono); font-size: 10.5px; color: #2f6fed; }
+.rg-d-faint { color: var(--text-faint); }
+.rg-d-sec { font-size: 10.5px; font-weight: 600; color: var(--text-faint); margin: 8px 0 3px; }
+.rg-d-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.rg-d-list li { display: flex; align-items: baseline; gap: 6px; font-size: 11px; }
+.rg-d-arrow { font-style: normal; font-family: var(--font-mono); width: 14px; text-align: center; flex: 0 0 auto; }
+.rg-d-arrow.inherits { color: #4d7fc0; }
+.rg-d-arrow.mounts { color: #c9762f; }
+.rg-d-arrow.calls { color: #1c9e66; }
+.rg-d-link { color: #2f6fed; cursor: pointer; word-break: break-all; }
+.rg-d-link:hover { text-decoration: underline; }
+.rg-d-list em { font-style: normal; color: var(--text-faint); font-size: 10px; }
+.rg-d-empty { margin: 0 0 2px; font-size: 10.5px; color: var(--text-faint); }
+.rg-d-open {
+  width: 100%; margin-top: 10px;
+  border: 1px solid #2560d4; background: #2f6fed; color: #fff;
+  border-radius: 6px; padding: 7px 10px; font-size: 12px; cursor: pointer;
+}
+.rg-d-open:disabled { opacity: .5; cursor: not-allowed; }
 
 .rg-state {
   position: absolute;

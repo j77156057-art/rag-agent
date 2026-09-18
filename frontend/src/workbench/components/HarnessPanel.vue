@@ -210,7 +210,7 @@ onBeforeUnmount(() => { open.value = false })
       <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
         <path d="M1 6.5 H3.2 L4.6 2 L6.8 11 L8.2 6.5 H12" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
-      AI 运行台
+      <span class="hp-label">AI 运行台</span>
     </button>
 
     <template v-if="open">

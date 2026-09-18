@@ -140,6 +140,7 @@ def _desktop_host_source(project_id) -> str:
 import workbench_fs
 import asset_sources
 import asset_gen
+import cloud_gen
 import mcp_client
 import web_export
 import unity_graph
@@ -1425,13 +1426,19 @@ async def gen_upload_frame_ep(file: UploadFile = File(...), url: str = COMFY_URL
 @app.get("/api/assets/generate/jobs")
 async def gen_jobs_ep():
     root = _project_root_or_error()
-    return {"ok": True, "jobs": asset_gen.jobs.list_jobs(root=root) if root else []}
+    if not root:
+        return {"ok": True, "jobs": []}
+    jobs = asset_gen.jobs.list_jobs(root=root) + cloud_gen.jobs.list_jobs(root=root)
+    jobs.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+    return {"ok": True, "jobs": jobs[:40]}
 
 
 @app.get("/api/assets/generate/jobs/{job_id}")
 async def gen_job_ep(job_id: str):
     root = _project_root_or_error()
     j = asset_gen.jobs.status(job_id, root=root)
+    if not j:
+        j = cloud_gen.jobs.status(job_id, root=root)
     if not j:
         return JSONResponse({"ok": False, "error": "任务不存在。"}, status_code=404)
     return {"ok": True, "job": j}
@@ -1444,7 +1451,154 @@ class GenCancelReq(BaseModel):
 @app.post("/api/assets/generate/jobs/{job_id}/cancel")
 async def gen_job_cancel_ep(job_id: str, req: GenCancelReq):
     root = _project_root_or_error()
+    # 云端任务 id 以 c 开头（本地为 12 位 hex），交给云端管理器
+    if job_id.startswith('c') and cloud_gen.jobs.status(job_id, root=root):
+        return await run_in_threadpool(cloud_gen.jobs.cancel, job_id, root)
     return await run_in_threadpool(_gen_guard, asset_gen.jobs.cancel, job_id, req.url, root)
+
+
+# ============================ 云端 AI 生成（外部联网，自带 Key） ============================
+@app.get("/api/assets/cloud/providers")
+async def cloud_providers_ep():
+    return {"ok": True, "providers": cloud_gen.public_providers()}
+
+
+@app.get("/api/assets/cloud/keys")
+async def cloud_keys_ep():
+    root = _project_root_or_error()
+    if not root:
+        return {"ok": False, "error": "未配置代码库"}
+    return {"ok": True, "keys": cloud_gen.key_status(root)}
+
+
+class CloudKeyReq(BaseModel):
+    provider: str
+    key: str = ""
+
+
+@app.post("/api/assets/cloud/key")
+async def cloud_key_save_ep(req: CloudKeyReq):
+    root = _project_root_or_error()
+    if not root:
+        return {"ok": False, "error": "未配置代码库"}
+    try:
+        return await run_in_threadpool(cloud_gen.save_key, root, req.provider, req.key)
+    except cloud_gen.CloudError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/assets/cloud/key/delete")
+async def cloud_key_delete_ep(req: CloudKeyReq):
+    root = _project_root_or_error()
+    if not root:
+        return {"ok": False, "error": "未配置代码库"}
+    try:
+        return await run_in_threadpool(cloud_gen.delete_key, root, req.provider)
+    except cloud_gen.CloudError as e:
+        return {"ok": False, "error": str(e)}
+
+
+class CloudImageReq(BaseModel):
+    provider: str
+    model: str
+    prompt: str
+    negative_prompt: str = ""
+    width: int = 1024
+    height: int = 1024
+    seed: Optional[int] = None
+    batch: int = 1
+    api_key: str = ""
+    base_url: str = ""
+
+
+@app.post("/api/assets/cloud/image")
+async def cloud_image_ep(req: CloudImageReq):
+    root = _project_root_or_error()
+    if not root:
+        return {"ok": False, "error": "未配置代码库"}
+    if not req.prompt.strip():
+        return {"ok": False, "error": "请填写画面描述（提示词）。"}
+    if not (256 <= req.width <= 2048 and 256 <= req.height <= 2048):
+        return {"ok": False, "error": "宽高需在 256–2048 之间。"}
+
+    def _submit():
+        jid = cloud_gen.jobs.submit_image(
+            root, provider=req.provider, model=req.model, prompt=req.prompt.strip(),
+            width=req.width, height=req.height, negative_prompt=req.negative_prompt,
+            seed=req.seed, batch=req.batch, inline_key=req.api_key, base_url=req.base_url)
+        return {"ok": True, "job_id": jid}
+    return await run_in_threadpool(_submit)
+
+
+class CloudAnimReq(BaseModel):
+    provider: str
+    model: str
+    prompt: str
+    first_frame_path: str = ""
+    duration: float = 5.0
+    seed: Optional[int] = None
+    fps: int = 12
+    max_frames: int = 64
+    api_key: str = ""
+    base_url: str = ""
+
+
+@app.post("/api/assets/cloud/animation")
+async def cloud_animation_ep(req: CloudAnimReq):
+    root = _project_root_or_error()
+    if not root:
+        return {"ok": False, "error": "未配置代码库"}
+    if not req.prompt.strip():
+        return {"ok": False, "error": "请填写动作描述（提示词）。"}
+    if not (1 <= req.fps <= 30 and 1 <= req.max_frames <= 128):
+        return {"ok": False, "error": "帧率需 1–30，帧数上限需 1–128。"}
+    first_frame = None
+    rp = (req.first_frame_path or "").strip()
+    if rp:
+        try:
+            if os.path.splitext(rp)[1].lower() not in _FRAME_IMG_EXTS:
+                return {"ok": False, "error": "首帧只支持 PNG/JPG/WebP。"}
+            full, _ = asset_sources.raw_file(root, rp)
+            first_frame = open(full, "rb").read()
+            if len(first_frame) > FRAME_UPLOAD_MAX:
+                return {"ok": False, "error": "首帧图片超过 10MB。"}
+        except asset_sources.AssetError as e:
+            return {"ok": False, "error": str(e)}
+
+    def _submit():
+        jid = cloud_gen.jobs.submit_animation(
+            root, provider=req.provider, model=req.model, prompt=req.prompt.strip(),
+            first_frame=first_frame, duration=req.duration, seed=req.seed,
+            fps=req.fps, max_frames=req.max_frames,
+            inline_key=req.api_key, base_url=req.base_url)
+        return {"ok": True, "job_id": jid}
+    return await run_in_threadpool(_submit)
+
+
+@app.post("/api/assets/cloud/upload-frame")
+async def cloud_upload_frame_ep(file: UploadFile = File(...)):
+    """云端首帧：存到项目 assets/generated/images 下返回相对路径（不经 ComfyUI）。"""
+    root = _project_root_or_error()
+    if not root:
+        return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _FRAME_IMG_EXTS:
+        return JSONResponse({"ok": False, "error": "首帧只支持 PNG/JPG/WebP。"}, status_code=400)
+    data = await file.read(FRAME_UPLOAD_MAX + 1)
+    if len(data) > FRAME_UPLOAD_MAX:
+        return JSONResponse({"ok": False, "error": "首帧图片超过 10MB。"}, status_code=400)
+    try:
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        name = asset_sources.safe_name(f'cloud_firstframe_{stamp}{ext}', default='firstframe.png')
+        rel = '/'.join([asset_sources.GENERATED_DIR.replace('\\', '/'),
+                        asset_gen.IMAGE_SUBDIR, name]).replace('\\', '/')
+        full = asset_sources.safe_join(root, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, 'wb') as f:
+            f.write(data)
+        return {"ok": True, "path": rel, "name": name}
+    except asset_sources.AssetError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
 @app.get("/api/fs/scene-tree")
 async def scene_tree_ep(path: str):

@@ -145,7 +145,7 @@ onBeforeUnmount(() => {
         <rect x="7.2" y="3.4" width="2" height="2" rx="0.3" fill="currentColor" opacity="0.5" />
         <path d="M2.5 10.2 H4 M8 10.2 H9.5 M3 9.2 V10.4 M9 9.2 V10.4" stroke="currentColor" stroke-width="0.8" />
       </svg>
-      {{ summary }}
+      <span class="gp-label">{{ summary }}</span>
     </button>
 
     <Teleport to="body"><template v-if="open">

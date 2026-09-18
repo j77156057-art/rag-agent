@@ -102,10 +102,12 @@ button { font-family: inherit; }
    注意 SemanticLocateBar 根节点就是 .lb，外部 class 合并在同一元素上，
    必须用同元素复合选择器（.lb.wb-locate-slot），后代写法永不命中。
    特异度 0,3,0 压过组件 scoped 的 .lb[data-v]（0,2,0）。 */
-@media (max-width: 1450px) { .wb-topbar .lb.wb-locate-slot { width: 280px; } }
-@media (max-width: 1280px) { .wb-topbar .lb.wb-locate-slot { width: 210px; } }
+@media (max-width: 2200px) { .wb-topbar .lb.wb-locate-slot { width: 300px; } }
+@media (max-width: 1450px) { .wb-topbar .lb.wb-locate-slot { width: 260px; } }
+@media (max-width: 1280px) { .wb-topbar .lb.wb-locate-slot { width: 200px; } }
 @media (max-width: 1024px) { .wb-topbar .lb.wb-locate-slot { width: 170px; } }
-@media (max-width: 760px)  { .wb-topbar .lb.wb-locate-slot { width: 128px; } }
+@media (max-width: 820px)  { .wb-topbar .lb.wb-locate-slot { width: 110px; } }
+@media (max-width: 760px)  { .wb-topbar .lb.wb-locate-slot { width: 100px; } }
 .wb-rootpath {
   display: inline-flex;
   align-items: center;
@@ -581,25 +583,50 @@ button { font-family: inherit; }
   flex: 0 0 auto;
 }
 
-/* ---------- 顶栏窄屏分级降级 ---------- */
-/* 引擎任务与 GPU 面板始终保留入口；弹层已 teleport 到 body，不会被顶栏裁切。 */
-/* ≤1200：分区 pill 与地图组让位（分区入口在概览驾驶舱仍可到达）。
-   项目选择器**保留**（切换项目是核心操作），只收窄显示，避免窄屏下无法切项目。 */
-@media (max-width: 1200px) {
+/* ---------- 顶栏窄屏分级降级 ----------
+   原则：先收定位框 → 面板/图谱按钮「图标化」（入口一个不丢，hover 看全名）
+   → 再隐藏低优先级文字入口 → 极端窄宽才减按钮。任何宽度下「保存」必须完整可见。
+   弹层均 teleport 到 body，图标化/隐藏触发器不影响面板功能。 */
+/* ≤2200（覆盖全部常见 1080P/2K 桌面）：5 个面板触发器 + 3 个图谱按钮仅留图标 */
+@media (max-width: 2200px) {
+  .wb-topbar .wb-tool .te-label,
+  .wb-topbar .wb-tool .gp-label,
+  .wb-topbar .wb-tool .hp-label,
+  .wb-topbar .wb-tool .ap-label,
+  .wb-topbar .wb-tool .sr-label,
+  .wb-topbar .wb-topbar-maps .wb-map-label { display: none; }
+  .wb-topbar .wb-tool .te-trigger,
+  .wb-topbar .wb-tool .gp-trigger,
+  .wb-topbar .wb-tool .hp-trigger,
+  .wb-topbar .wb-tool .ap-trigger,
+  .wb-topbar .wb-tool .sr-trigger,
+  .wb-topbar .wb-topbar-maps .wb-map-btn { gap: 0; padding-left: 8px; padding-right: 8px; }
+}
+/* ≤1280：分区 pill 让位（分区入口在概览驾驶舱仍可到达），项目选择器保留只收窄 */
+@media (max-width: 1280px) {
   .wb-topbar-meta .wb-region-pill { display: none; }
-  .wb-topbar-maps { display: none; }
   .wb-proj-btn { max-width: 150px; }
   .wb-proj-name { max-width: 104px; }
   .wb-rootpath { max-width: 160px; }
 }
-/* ≤1024：再收 AI 运行台与运行游戏（功能仍可从 AI 助手侧进入） */
-@media (max-width: 1024px) { .wb-tool-hp, .wb-tool-sr { display: none; } }
-/* ≤820：品牌副标题、AI 设置收起，只留品牌/定位/AI 问答/文件操作 */
-@media (max-width: 820px) {
-  .wb-brand-name em { display: none; }
-  .wb-tool-ap { display: none; }
-  .wb-topbar { gap: 10px; padding: 0 10px; }
+/* ≤1180：品牌副标题、AI 问答链接、保存快捷键提示收起 */
+@media (max-width: 1180px) {
+  .wb-brand-name em,
+  .wb-question-link,
+  .wb-save-btn kbd { display: none; }
 }
+/* ≤1024：再收 AI 运行台 / 运行游戏 / AI 设置（功能仍可从 AI 助手侧进入） */
+@media (max-width: 1024px) { .wb-tool-hp, .wb-tool-sr, .wb-tool-ap { display: none; } }
+/* ≤820：任务面板与 Unity 图收起，项目选择器再收窄 */
+@media (max-width: 820px) {
+  .wb-topbar { gap: 10px; padding: 0 10px; }
+  .wb-proj-btn { max-width: 120px; }
+  .wb-proj-name { max-width: 76px; }
+  .wb-tool-te,
+  .wb-topbar-maps .wb-map-btn:nth-child(3) { display: none; }
+}
+/* ≤760：历史/回滚按钮让位（文件标签右键与 Ctrl+S 仍可保存） */
+@media (max-width: 760px) { .wb-history-btn, .wb-revert-btn { display: none; } }
 .wb-question-link { color: var(--text-muted); text-decoration: none; font-size: 11.5px; line-height: 1; font-weight: 600;
   border: 1px solid var(--border-strong); border-radius: 6px; padding: 7px 11px; white-space: nowrap;
   background: var(--bg-raised);

@@ -491,7 +491,7 @@ onUnmounted(() => {
 
 <template>
   <div class="sr-panel">
-    <button class="sr-trigger" title="一键导出并在工作台里运行游戏，边玩边看日志和场景" @click="open = true">▶ 运行游戏</button>
+    <button class="sr-trigger" title="一键导出并在工作台里运行游戏，边玩边看日志和场景" @click="open = true"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 2.2 L9.6 6 L3 9.8 Z" fill="currentColor"/></svg><span class="sr-label">运行游戏</span></button>
     <template v-if="open">
       <div class="pb-mask" @click.self="open = false" />
       <div class="pb-pop">
@@ -631,7 +631,7 @@ onUnmounted(() => {
 
 <style scoped>
 .sr-panel { position: relative; }
-.sr-trigger { border: 1px solid var(--border-strong); background: transparent; color: var(--text-muted); border-radius: 5px; padding: 5px 9px; cursor: pointer; }
+.sr-trigger { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border-strong); background: transparent; color: var(--text-muted); border-radius: 5px; padding: 5px 9px; cursor: pointer; white-space: nowrap; }
 .sr-trigger:hover { color: var(--text); border-color: #b9d0f5; }
 
 .pb-mask { position: fixed; inset: 0; background: rgba(38, 52, 77, 0.38); z-index: 65; }

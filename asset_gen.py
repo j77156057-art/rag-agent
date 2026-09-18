@@ -530,7 +530,9 @@ def save_generated_images(root: str, images: list[bytes], *, prompt: str,
 def save_animation(root: str, frames: list, info: dict, *, name: str, prompt: str,
                    model: str, seed, duration, fps: int = DEFAULT_FPS,
                    video_bytes: bytes | None = None, video_ext: str = '.mp4',
-                   first_frame_name: str = '', dest_subdir: str = ANIM_SUBDIR) -> dict:
+                   first_frame_name: str = '', dest_subdir: str = ANIM_SUBDIR,
+                   source: str = 'comfyui-h3',
+                   author: str = 'MiniMax H3（本地生成）') -> dict:
     """落盘帧序列 + SpriteSheet + 动画清单；返回清单（含相对路径）。"""
     safe = assets.safe_name(name, default='animation').replace(' ', '_')
     dir_rel = '/'.join([assets.GENERATED_DIR.replace('\\', '/'), dest_subdir, safe])
@@ -560,8 +562,8 @@ def save_animation(root: str, frames: list, info: dict, *, name: str, prompt: st
         'name': safe,
         'kind': 'animation',
         'asset_kind': 'animation',
-        'source': 'comfyui-h3',
-        'author': 'MiniMax H3（本地生成）',
+        'source': source,
+        'author': author,
         'license': 'check-model-card',
         'created_at': _now_iso(),
         'imported_at': _now_iso(),
