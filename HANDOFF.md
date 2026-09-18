@@ -37,6 +37,7 @@
 - **Unreal/Unity**：本机没有 UnrealEditor 或 Unity Editor 进程/可执行文件；协议、安全拒绝和离线诊断专项 **29/29 通过**，不能写成真实编辑器联机已验收。仍需安装对应 Editor 后启动 bridge/plugin 实测。
 - **物理多 GPU**：`nvidia-smi` 仅发现 1 张 RTX 5070 Ti Laptop GPU（12227 MiB，UUID `GPU-ba80…`）；多 GPU 租约、UUID 隔离和异常回收无实机条件。单卡结果不能替代多卡验收。
 - **安装器**：`dist/installer/DocMind-Setup.exe` 存在（91,673,430 bytes，SHA-256 `6788288E5A42DFAFC15A3D3433675AC63C1500666114A73B0CB6DE740A27F5F1`）。本轮只做产物完整性检查，未自动执行安装/覆盖升级/卸载，避免修改用户系统；这三项仍需在桌面手动验收。
+- 安装器隔离冒烟尝试被当前执行策略拒绝（`Start-Process` 启动 Setup 返回 policy blocked），不是安装器运行结果；请在用户桌面双击或解除策略后执行 `/VERYSILENT /DIR=<临时目录>`，再检查 `DocMind.exe`、重复覆盖安装和 `unins*.exe`。
 
 ### 2026-09-18 项目切换与流式竞态修复
 
