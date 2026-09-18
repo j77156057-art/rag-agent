@@ -704,6 +704,8 @@ export const engineApi = {
   /** 按宿主当前客户区重排"铺满模式"的嵌入窗口 */
   resizeEngine() { return postJson<{ ok: boolean; error?: string }>('/api/engine/resize', {}) },
   stop() { return postJson<{ ok: boolean; stopped: boolean }>('/api/engine/stop', {}) },
+  /** 保存启动参数并快速重启运行中的 Godot，恢复原嵌入位置。 */
+  reload() { return postJson<{ ok: boolean; running?: boolean; embedded?: boolean; reloaded?: boolean; reload_mode?: string; error?: string }>('/api/engine/reload', {}) },
   logs(limit = 200) { return request<{ ok: boolean; lines: string[]; errors: { path: string; line: number; message: string }[] }>(`/api/engine/logs?limit=${limit}`) },
   verify(executable = 'godot') { return postJson<{ ok: boolean; output?: string; error?: string }>('/api/engine/verify', { executable }) },
 }

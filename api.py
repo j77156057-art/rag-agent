@@ -151,7 +151,7 @@ import skills as agent_skills
 import pricing as pricing_mod
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear, main_scene
-from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, engine_running_roots, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_apply_parameters, comfy_queue, comfy_free_models, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable, start_engine_watchdog
+from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_reload, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, engine_running_roots, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_apply_parameters, comfy_queue, comfy_free_models, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable, start_engine_watchdog
 
 
 @asynccontextmanager
@@ -859,6 +859,11 @@ async def engine_start_ep(req: EngineReq):
 @app.post("/api/engine/stop")
 async def engine_stop_ep():
     root=_project_root_or_error(); return (await run_in_threadpool(engine_stop, root)) if root else {"ok":False,"error":"未配置代码库"}
+@app.post("/api/engine/reload")
+async def engine_reload_ep():
+    """热重载运行中的 Godot：快速重启并恢复原来的嵌入矩形。"""
+    root=_project_root_or_error()
+    return (await run_in_threadpool(engine_reload, root)) if root else {"ok":False,"error":"未配置代码库"}
 @app.post("/api/engine/embed")
 async def engine_embed_ep(req: EngineEmbedReq):
     """把已运行的引擎窗口嵌进桌面宿主（引擎视窗模式优先，否则铺满宿主客户区）。"""

@@ -15,6 +15,8 @@ COMFY_MIN_FREE_MB = float(os.getenv("DOCMIND_COMFY_MIN_FREE_MB", "1024") or 0)
 
 _ENGINE_PROCS = {}
 _ENGINE_LOGS = {}
+# 保留最后一次启动参数，供 Godot 热重载在重启进程后恢复原来的嵌入方式。
+_ENGINE_LAUNCH = {}
 # prompt_id -> 后台 watch 作业状态（轮询线程维护，不再单独持有 GPU 租约：
 # 租约由 comfy_queue 提交后 reown 给 comfyui:{prompt_id}，终态时由 history 释放）
 # Legacy/no-project bucket is kept for direct callers and old tests.  HTTP
@@ -612,6 +614,7 @@ def engine_embed(root, host_hwnd, width=None, height=None, title_hint='',
                                   'offset_y': int(offset_y), 'title': child[1],
                                   'dpi': r.get('dpi'), 'host_dpi': r.get('host_dpi'),
                                   'mode': r.get('mode'),
+                                  'rect': dict(rect) if isinstance(rect, dict) else None,
                                   'size': {'width': r.get('width'), 'height': r.get('height')}}
         return r
     except Exception as e:  # noqa: BLE001
@@ -629,6 +632,7 @@ def engine_place(root, x, y, width, height):
         r = bridge_place(state['child_hwnd'], x, y, width, height)
         if r.get('ok'):
             state['mode'] = 'rect'
+            state['rect'] = {'x': int(x), 'y': int(y), 'width': int(width), 'height': int(height)}
             state['size'] = {'width': r.get('width'), 'height': r.get('height')}
         return r
     except Exception as e:  # noqa: BLE001
@@ -780,6 +784,10 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
         log = open(log_path, "a", encoding="utf-8")
         p = subprocess.Popen(args, cwd=root_abs, stdout=log, stderr=subprocess.STDOUT, text=True, env=child_env)
         _ENGINE_PROCS[root_abs] = p
+        _ENGINE_LAUNCH[root_abs] = {'executable': executable, 'scene': scene or '',
+                                    'embed': bool(embed), 'host_hwnd': int(host_hwnd or 0),
+                                    'rect': dict(rect) if isinstance(rect, dict) else None,
+                                    'fill': bool(fill), 'engine': selected}
         _gpu.register_process(p.pid, lease_owner, lease.get('gpu'), selected)
         _ENGINE_LOGS[root_abs] = log
         result = {"ok": True, "running": True, "pid": p.pid, "gpu": lease.get("gpu")}
@@ -828,6 +836,7 @@ def engine_stop(root):
     if not p or p.poll() is not None:
         if p: _gpu.unregister_process(p.pid, "exited")
         _ENGINE_PROCS.pop(root_abs, None)
+        _ENGINE_LAUNCH.pop(root_abs, None)
         _gpu.release('engine:' + root_abs)
         return {"ok": True, "stopped": False, "detached": detached.get('was_embedded', False)}
     pid = p.pid
@@ -854,10 +863,54 @@ def engine_stop(root):
         except Exception:  # noqa: BLE001
             pass
     _ENGINE_PROCS.pop(root_abs, None)
+    _ENGINE_LAUNCH.pop(root_abs, None)
     _gpu.unregister_process(pid, "stopped")
     _gpu.release('engine:' + root_abs)
     return {"ok": True, "stopped": True, "pid": pid,
             "detached": detached.get('was_embedded', False), "killed": killed}
+
+
+def engine_reload(root):
+    """快速重载当前 Godot 运行实例。
+
+    原生 Godot 游戏没有一个跨版本、无需插件的进程内 reload RPC。这里采用可审计的
+    快速重启：保存启动参数和嵌入矩形，停止旧进程，再用同一参数启动；项目文件、脚本
+    和场景会重新导入，GPU 租约与窗口嵌入状态也随生命周期正确释放/重建。Web 试玩
+    仍使用 docmind_bridge 的真正 ``reload_current_scene`` 路径。
+    """
+    root_abs = _root(root)
+    selected = str(engine_config(root_abs).get('engine', 'godot')).lower()
+    if selected != 'godot':
+        return {'ok': False, 'error': '当前热重载仅支持 Godot。Unity/Unreal 请使用各自编辑器的脚本重载能力。'}
+    st = engine_status(root_abs)
+    if not st.get('running'):
+        return {'ok': False, 'error': '引擎当前未运行，无法热重载。'}
+    launch = dict(_ENGINE_LAUNCH.get(root_abs) or {})
+    embed = dict(_EMBED_STATE.get(root_abs) or {})
+    if not launch:
+        # 兼容旧进程记录：至少按 Godot 项目重新启动，不伪造原嵌入状态。
+        launch = {'executable': 'godot', 'scene': '', 'embed': False, 'host_hwnd': 0,
+                  'rect': None, 'fill': False, 'engine': 'godot'}
+    was_embedded = bool(st.get('embedded')) and bool(launch.get('host_hwnd') or embed.get('host_hwnd'))
+    host = int(launch.get('host_hwnd') or embed.get('host_hwnd') or 0)
+    rect = launch.get('rect') or embed.get('rect')
+    fill = bool(launch.get('fill')) or (embed.get('mode') == 'fill')
+    launch['embed'] = was_embedded
+    launch['host_hwnd'] = host
+    launch['rect'] = rect if isinstance(rect, dict) else None
+    launch['fill'] = fill
+    stopped = engine_stop(root_abs)
+    if not stopped.get('ok'):
+        return {'ok': False, 'error': '停止旧引擎失败，未执行热重载。', 'stop': stopped}
+    result = engine_start(root_abs, launch.get('executable') or 'godot', launch.get('scene') or '',
+                          host_hwnd=host or None, embed=was_embedded,
+                          rect=launch.get('rect'), fill=fill)
+    result['reloaded'] = bool(result.get('running'))
+    result['reload_mode'] = 'process_restart'
+    result['previous_pid'] = st.get('pid')
+    if not result.get('running'):
+        result.setdefault('error', '热重载启动新引擎失败。')
+    return result
 
 def engine_logs(root, limit=200):
     path = _project_state.path(root, "engine.log", legacy=".docmind_engine.log")

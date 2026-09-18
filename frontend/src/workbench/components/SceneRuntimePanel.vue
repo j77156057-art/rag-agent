@@ -32,6 +32,7 @@ const installing = ref(false)
    嵌入的意义是"游戏跑在工作台窗口里"，边玩边让 AI 改代码；
    独立窗口模式下 Web 工作台和游戏窗口是两个窗口，来回切很别扭。 */
 const nativeRunning = ref(false)
+const reloadingNative = ref(false)
 const desktop = ref<DesktopHost | null>(null)
 const embedState = ref<'off' | 'embedded' | 'failed'>('off')
 const embedMsg = ref('')
@@ -310,6 +311,33 @@ async function pollEvents() {
     eventStatus.value = '已同步 · 仅显示实际收到的事件'
   } catch { eventStatus.value = '事件服务未连接' }
 }
+
+async function nativeReload() {
+  if (!nativeRunning.value || reloadingNative.value) return
+  reloadingNative.value = true
+  embedMsg.value = '正在热重载 Godot（快速重启运行实例）…'
+  try {
+    const r = await engineApi.reload()
+    if (r.ok && r.running) {
+      nativeRunning.value = true
+      embedState.value = r.embedded ? 'embedded' : 'off'
+      embedMsg.value = r.reload_mode === 'process_restart'
+        ? 'Godot 已热重载，脚本和场景重新导入完成。'
+        : 'Godot 热重载完成。'
+      if (embedState.value === 'embedded') {
+        await syncEngineRect(true)
+        await engineApi.focusEngine(true).catch(() => {})
+      }
+    } else {
+      embedMsg.value = r.error || 'Godot 热重载失败。'
+    }
+  } catch (e) {
+    embedMsg.value = 'Godot 热重载失败：' + (e as Error).message
+  } finally {
+    reloadingNative.value = false
+    await refreshNativeStatus()
+  }
+}
 function startTimers() {
   stopTimers()
   captureSince.value = Date.now()
@@ -482,6 +510,7 @@ onUnmounted(() => {
               <template v-else>
                 <span class="pb-chip" :class="embedState">{{ embedState === 'embedded' ? '已嵌入' : embedState === 'failed' ? '嵌入失败' : '独立窗口' }}</span>
                 <button v-if="embedState === 'embedded'" class="pb-btn" title="把键盘焦点交给游戏窗口（点过工作台之后要还回去）" @click="nativeFocus">聚焦</button>
+                <button class="pb-btn" :disabled="reloadingNative" title="保存启动参数并快速重启 Godot，重新载入脚本和场景" @click="nativeReload">{{ reloadingNative ? '重载中…' : '↻ 热重载' }}</button>
                 <button v-if="embedState === 'embedded'" class="pb-btn" title="引擎回到独立窗口，进程继续运行" @click="nativeDetach">解除嵌入</button>
                 <button class="pb-btn warn" @click="nativeStop">停止桌面窗口</button>
               </template>
