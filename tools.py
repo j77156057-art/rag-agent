@@ -564,9 +564,15 @@ def web_search(query):
     # 对 GitHub / B 站提供专用结构化入口；失败时仍可用通用 HTML 搜索。
     _in_unit_test = getattr(getattr(sys.modules.get("__main__"), "__spec__", None), "name", None) == "unittest.__main__"
     if site == "github.com" and not _in_unit_test:
-        return _github_search(q)
+        result = _github_search(q)
+        if not result.startswith("GitHub API 暂不可用"):
+            return result
+        # API 被限流时继续给出普通站点结果，不把一次 API 失败当成整个搜索失败。
     if site == "bilibili.com" and not _in_unit_test:
-        return _bilibili_search(q)
+        result = _bilibili_search(q)
+        if not result.startswith("B 站专用搜索暂不可用"):
+            return result
+        # B 站接口被验证码拦截时走 DDG/百度/Bing 的 site: 回退。
     if site:
         q = f"{q} site:{site}"
     q = _search_recency_query(q)
