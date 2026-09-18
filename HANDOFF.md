@@ -1,5 +1,20 @@
 # DocMind 项目交接清单（给接手 AI）
 
+### 2026-09-18 当前交接检查点（`5655f85`）
+
+- 当前分支：`main`；本地 `HEAD` 与 `origin/main` 已同步。最近一次功能提交为 `5655f85 feat: add Godot hot reload`。
+- 当前工作区只存在用户 Godot 工程/导入产物：`.godot/`、`addons/`、`project.godot`、`export_presets.cfg`、`docs/screenshots/*.png.import`。这些文件未纳入本次提交，禁止使用 `git add -A`。
+- 已完成并已提交：运行时状态按项目隔离、工作台往返状态与竞态修复、场景画布与真实时间线、Godot 原生嵌入、Godot 快速热重载、GPU 软件侧协调、ComfyUI Z-Image/H3 链路、Agent 路由/权限/连接器、Unreal bridge 协议与受控写入边界。
+- Godot 热重载的准确口径：Web 试玩使用进程内 `reload_current_scene()`；桌面原生运行实例采用“保存启动参数/嵌入矩形 → 停止旧进程 → 启动新进程 → 恢复嵌入”的快速进程重启，游戏内存状态会重置。它不是无状态丢失的进程内脚本替换。
+- 本次接手优先级：
+  1. 在当前机器启动真实 Godot 工程，验收原生热重载：修改 `.gd`/`.tscn` 后点击热重载，确认 PID 变化、嵌入矩形恢复、GPU 租约只保留新进程。
+  2. 若要做“保存文件即自动刷新”，先设计文件监听与确认提示；不要默认自动重启，避免调试状态被静默清空。
+  3. Unreal 深度适配仍缺真实 Unreal Editor 端到端查询/受控写回；Unity 编辑器插件、PlayMode 控制和 `.meta` 成对维护也仍缺真实编辑器验收。
+  4. 物理多 GPU `multi` 模式和跨进程 CUDA UUID 隔离仍缺至少两张 NVIDIA GPU 的实机验收；单卡负对照已完成，不能把它写成多卡已验证。
+  5. 桌面发布仍缺在用户桌面实际执行的独立 EXE 启动、覆盖升级和卸载验证；安装器已生成，但当前自动执行策略曾阻止本机自动启动验证。
+  6. 项目状态隔离已落地，但全局 Ollama/联网配置、GPU 协调器和 Chroma 仍是实例级资源；需要长时间多项目并发压测后再收口。
+- 交接验证基线：Python 全量回归最近记录为 `939 项通过、1 项跳过`；前端 `typecheck` 与 `npm run build` 通过。继续改动后必须重新运行受影响专项和全量测试，并把结果追加到第 4 节时间线。
+
 ### 2026-09-18 项目切换与流式竞态修复
 
 - 项目上下文：任务 ID、分区和允许路径改为按 `project_id` 保存；切换项目会重建任务面板，保存与选区 AI 不会读取旧项目的全局任务范围。
@@ -257,12 +272,10 @@ DocMind 的应对分两层，也是项目的两个演进阶段：
 - 新落地的 MCP bridge 与 Web player 的产品级使用文档与边界说明**已补**：`docs/integrations.md`（2026-09-15，覆盖配置模型、API 表面、使用前提、已知边界）。
 - **引擎嵌入的残留**（不影响"已可用"）：本机显示器当前是 **150% 缩放**，100%/125% 未实测——
   `verify_engine_embed.py` 会打印当前 DPI 并按实际坐标断言，改了缩放直接重跑即可补档。
-- **P2-6 编辑即热重载（未做，未开工，2026-09-17 记录方案）**：嵌入态下改 `.tscn/.gd` 应能自动重载引擎、免手动 stop/start 看到效果。
-  - 【现状】当前 UI 嵌入走**运行模式**：`nativeStart` 只传 `engine/embed/rect`、`scene` 为空 ⇒ `engine_start` 拼 `godot --path <root>`（不加 `--editor`）；运行态不 watch 文件，改动不生效。已查 `game_workbench.py` 与 godot-ai 插件，**无可用 reload 通道**（仅 docstring 提及 `GDScript::reload`，无外部可调 RPC）。
-  - 【方案 A · 推荐，侵入最小】给 godot-ai 插件加一个 reload RPC（如 `POST /reload_current_scene` 或 `recompile_scripts`），后端新增 `engine_reload(root)`（与 `engine_focus/embed` 同构）并接 `/api/engine/reload`；保持现有干净运行模式不变，`tools.py` 写 `.tscn/.gd` 成功后自动触发。
-  - 【方案 B · 借 Godot 自带能力】嵌入改走**编辑器模式**：让嵌入路径带 `scene` 使 `engine_start` 拼 `--path --editor`，Godot 的 `EditorFileSystem` 自动监视工程目录并重载资源。代价：嵌入窗口变成整个 IDE（菜单/场景树/检视器/3D 视图，游戏视口只是其中一 pane）、更重、几何更挑剔需重验；且要让**正在跑的游戏实例**也跟着变，仍需在嵌入编辑器内保持 F5 运行态（改 `.gd` 才热重载进运行实例、`.tscn` 才反映）——**并非改文件即自动热重载运行游戏的免费午餐**。
-  - 【验收】嵌入态下保存 `.gd` → 运行实例逻辑更新、保存 `.tscn` → 场景树反映；无需 stop/start；`verify_engine_embed.py` 增一条「保存后重载」真机用例。
-  - 【状态】两条路径均未实现，不得宣称已落地；待定方案 A/B（先确认 godot-ai 插件是否已有 reload 能力再定）。
+- **P2-6 编辑即热重载（基础能力已落地，自动监听仍是后续项）**：`POST /api/engine/reload` 与运行台按钮已实现。Web 端使用进程内 `reload_current_scene()`；桌面原生端采用可恢复嵌入参数的快速进程重启，游戏内存状态会重置。
+  - 【当前未完成】没有默认的 `.gd/.tscn/.shader` 文件监听，也没有“检测到外部修改后询问是否重载”的确认流程；桌面原生端也没有跨版本、无需插件的通用进程内脚本替换协议。
+  - 【后续方案】增加文件监听器和显式确认提示；若要做到真正进程内重载，先确认目标 Godot 版本与插件 RPC，再单独设计协议和回归测试。
+  - 【验收】当前基础热重载已由 `tests/test_engine_gpu_lease.py` 和 `/api/engine/reload` 路由测试覆盖；真实桌面 Godot 运行、修改文件后重载、PID/嵌入/GPU 租约闭环仍需本机实测。
 - **桌面壳内的 UI 自动化没做成**（不是没做，是做不了）：pywebview 的 `evaluate_js` 在 WebView2 上不稳定
   （实测第二次调用耗 15.7s 且返回 None），拿它当断言基础会得到假失败。目前覆盖方式是
   「浏览器冒烟记 UI 降级 + `verify_engine_embed.py` 记后端契约（含 UI 的实际调用路径）」两段拼起来，
