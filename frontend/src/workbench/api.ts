@@ -1677,7 +1677,7 @@ export const aiApi = {
   askGrounded(
     question: string,
     h: SseStreamHandlers,
-    opts: { web?: boolean; thinking?: boolean | null } = {},
+    opts: { web?: boolean; thinking?: boolean | null; images?: Blob[] } = {},
   ): Promise<void> {
     const fd = new FormData()
     fd.append('question', question)
@@ -1685,6 +1685,10 @@ export const aiApi = {
     fd.append('web_mode', opts.web ? '1' : '0')
     if (opts.thinking === true) fd.append('thinking_mode', '1')
     else if (opts.thinking === false) fd.append('thinking_mode', '0')
+    // 多模态：附带图片（后端按 filename 扩展名 + 文件头魔数双重校验）
+    for (const img of opts.images || []) {
+      fd.append('images', img, (img as File).name || 'image.png')
+    }
     return postSse('/api/chat', { method: 'POST', body: fd }, h)
   },
   /** 改写：直连 LLM 快通道，强约束只产出可直接替换的纯代码。 */
