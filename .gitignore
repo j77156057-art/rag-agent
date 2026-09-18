@@ -51,6 +51,7 @@ web/favicon.ico
 .docmind_secrets.json
 .docmind/
 .docmind_secret.key
+.docmind_web_search_cache.json
 
 # AI 工具目录 / 运行日志（2026-09-16 补）
 .trae/
