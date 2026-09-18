@@ -133,5 +133,58 @@ class AgentGateFormatTest(unittest.TestCase):
         self.assertIn("跳过", obs)
 
 
+class SelfVerifyScopeAutoTest(unittest.TestCase):
+    def setUp(self):
+        self.proj = _TmpProject()
+
+    def tearDown(self):
+        self.proj.close()
+
+    def test_auto_includes_scene(self):
+        # scene 子系统文件在 auto 模式应自动触发 verify_scene_canvas.py（用 stub 代替重型真脚本）
+        self.proj.write("verify_scene_canvas.py", "import sys\nsys.exit(0)\n")
+        self.proj.write("scenes/Main.tscn", "[gd_scene format=3]\n")
+        data = json.loads(tools.self_verify("scope: auto\nfiles: scenes/Main.tscn"))
+        self.assertTrue(data["passed"])
+        self.assertTrue(any("scene" in r for r in data["ran"]))
+
+    def test_auto_engine_skipped_without_flag(self):
+        # engine 默认不自动跑（需真 Godot），应降级 skip 并在 note 说明
+        self.proj.write("verify_engine_embed.py", "import sys\nsys.exit(0)\n")
+        self.proj.write("desktop_bridge.py", "X = 1\n")
+        with mock.patch.dict(os.environ, {"DOCMIND_SELF_VERIFY_ENGINE": "0"}):
+            data = json.loads(tools.self_verify("scope: auto\nfiles: desktop_bridge.py"))
+        self.assertTrue(data["passed"])
+        self.assertFalse(any("engine" in r for r in data["ran"]))
+        self.assertIn("engine", data.get("note", ""))
+
+    def test_auto_engine_runs_with_flag(self):
+        self.proj.write("verify_engine_embed.py", "import sys\nsys.exit(0)\n")
+        self.proj.write("desktop_bridge.py", "X = 1\n")
+        with mock.patch.dict(os.environ, {"DOCMIND_SELF_VERIFY_ENGINE": "1"}):
+            data = json.loads(tools.self_verify("scope: auto\nfiles: desktop_bridge.py"))
+        self.assertTrue(data["passed"])
+        self.assertTrue(any("engine" in r for r in data["ran"]))
+
+    def test_scope_all_runs_engine_without_flag(self):
+        # scope:all 显式触发，不依赖 flag
+        self.proj.write("verify_engine_embed.py", "import sys\nsys.exit(0)\n")
+        self.proj.write("desktop_bridge.py", "X = 1\n")
+        with mock.patch.dict(os.environ, {"DOCMIND_SELF_VERIFY_ENGINE": "0"}):
+            data = json.loads(tools.self_verify("scope: all\nfiles: desktop_bridge.py"))
+        self.assertTrue(any("engine" in r for r in data["ran"]))
+
+
+class ClassifyTest(unittest.TestCase):
+    def test_classify_scene(self):
+        _py, _fe, scene, engine = tools._sv_classify(["x/scenes/Main.tscn", "scene_runtime.py"])
+        self.assertTrue(scene)
+        self.assertFalse(engine)
+
+    def test_classify_engine(self):
+        _py, _fe, scene, engine = tools._sv_classify(["desktop_bridge.py", "engine_embed.py"])
+        self.assertTrue(engine)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

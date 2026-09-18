@@ -3241,14 +3241,17 @@ def game_playtest(arg):
 
 
 # ===========================================================================
-# 写后自验证工具 self_verify（Phase 1「写后自验证闭环」收尾门）
+# 写后自验证工具 self_verify（Phase 1/2「写后自验证闭环」收尾门）
 # 详见 docs/agent-self-verify-memory.md。Agent 在 apply_edit / create_file 等写操作
 # 成功后自动调用本工具对改动做轻量校验；失败信息回填模型、触发 ReAct 自修
 # （复用 agent.py 既有 _FAILURE_MARKERS / _TOOL_FAIL_LIMIT / _TOTAL_FAIL_LIMIT 护栏）。
-# 校验策略按改动文件类型分 scope：
-#   backend  (.py)      → py_compile 每个改动文件 + 命中则跑对应 tests/test_<module>.py
-#   frontend (.ts/.vue) → npm run typecheck（严禁 build，并发铁律）
-#   scene/engine        → 仅 scope 显式指定时运行 verify_* 脚本（需 GUI/display，故非自动）
+# 校验策略按改动文件类型分 scope（auto 模式自动选）：
+#   backend  (.py)            → py_compile 每个改动文件 + 命中则跑对应 tests/test_<module>.py
+#   frontend (.ts/.vue)       → npm run typecheck（严禁 build，并发铁律）
+#   scene   (场景子系统文件)  → 自动跑 verify_scene_canvas.py（无 GUI，进程内 FastAPI 自检）
+#   engine  (引擎嵌入模块)    → 需真 Godot GUI，默认仅 scope 显式指定 / scope:all /
+#                              开 DOCMIND_SELF_VERIFY_ENGINE=1 时运行 verify_engine_embed.py，
+#                              否则自动策略里降级为 skip（避免每次写都拉起 Godot 打断并发写入者）
 # 任何异常一律降级为「跳过该 scope」，绝不因校验器自身故障阻断问答主流程。
 # 入参与文本协议 Action Input 同形：单行 "scope: auto" + 多行 "files: a.py\nfiles: b.py"
 # （前端自验证也可用 "files: frontend/src/x.ts"）。
@@ -3471,13 +3474,25 @@ def self_verify(arg=""):
 
     py_files, fe_files, scene_files, engine_files = _sv_classify(targets)
 
-    # 2) 选 scope：auto 只跑后端/前端（scene/engine 需 GUI，默认不自动跑）
+    # 2) 选 scope：auto 按改动文件类型自动选策略。
+    #    backend(.py) / frontend(.ts/.vue) / scene(场景子系统，无 GUI 可自动) 始终纳入；
+    #    engine(引擎嵌入) 需真 Godot GUI 且会拉起引擎进程，默认不自动跑（避免每次写都启
+    #    Godot 打断并发写入者）——仅当用户显式开 DOCMIND_SELF_VERIFY_ENGINE=1 才纳入自动，
+    #    或经 scope:engine / scope:all 显式触发。其余情况优雅降级为 skip（见 _sv_verify_script）。
     if scope == "auto":
         scopes = []
         if py_files:
             scopes.append("backend")
         if fe_files:
             scopes.append("frontend")
+        if scene_files:
+            scopes.append("scene")
+        if engine_files and os.getenv("DOCMIND_SELF_VERIFY_ENGINE") == "1":
+            scopes.append("engine")
+        elif engine_files:
+            result["note"] = ((result.get("note") or "") +
+                              "（engine 域自检需真 Godot 且默认关闭，已跳过；"
+                              "显式 scope:engine 或开 DOCMIND_SELF_VERIFY_ENGINE=1 可启用）")
     elif scope == "all":
         scopes = ["backend", "frontend", "scene", "engine"]
     else:

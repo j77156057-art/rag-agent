@@ -108,7 +108,7 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
 - dev_list_connector_tools(key): 列出某连接器暴露的工具（name/description），确定要调用的 name 与参数。仅对打算调用的连接器使用（godot 等 stdio 需先建立会话）。
 - dev_mcp_call(key, name, arguments?): 调用选中的连接器工具。若调用失败（连接器未启用/引擎未开/工具名不对），用 dev_route_connector 重新挑选其它已启用连接器，或改用内置工具（search_code/apply_edit/python_exec）。外部连接器调用需保留审计信息。
 - python_exec(code): 在受限子进程中执行 Python 代码并返回输出。用于数值计算、数据处理、文本变换等需要"真正动手"的任务。
-- self_verify(scope?, files?): 写后自验证工具（Phase 1 闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，对改动做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck）并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。你也可以主动调用它复验某文件（scope 取 auto/backend/frontend/scene/engine/all/skip）。
+- self_verify(scope?, files?): 写后自验证工具（闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，按改动文件类型做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck、场景子系统自检）并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。引擎嵌入自检默认关闭（需真 Godot），你可显式用 scope:engine 或开 DOCMIND_SELF_VERIFY_ENGINE=1 触发。你也可以主动调用它复验某文件（scope 取 auto/backend/frontend/scene/engine/all/skip）。
 - gen_video_prompt(spec): 按 MiniMax H3 的三段结构，把一段创意描述生成为结构化视频提示词（可直接粘贴进 ComfyUI）。
 - search_code(query): 在已索引的源代码/配置中检索相关函数、类、配置片段。回答"某功能在哪实现/某函数做什么/某配置怎么写"等关于代码库的问题。
 - read_file(path): 读取代码库中的某个文件内容（path 为相对代码根目录的路径或文件名）。需要看完整文件、或某文件细节时用。大文件默认只返回前 4000 字，要看中后段（如枚举/方法定义）时在输入里换行追加 start/end 行号，例如：
