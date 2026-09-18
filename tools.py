@@ -563,16 +563,19 @@ def web_search(query):
         return "未提供搜索关键词。"
     # 对 GitHub / B 站提供专用结构化入口；失败时仍可用通用 HTML 搜索。
     _in_unit_test = getattr(getattr(sys.modules.get("__main__"), "__spec__", None), "name", None) == "unittest.__main__"
+    specialized_error = ""
     if site == "github.com" and not _in_unit_test:
         result = _github_search(q)
         if not result.startswith("GitHub API 暂不可用"):
             return result
         # API 被限流时继续给出普通站点结果，不把一次 API 失败当成整个搜索失败。
+        specialized_error = result
     if site == "bilibili.com" and not _in_unit_test:
         result = _bilibili_search(q)
         if not result.startswith("B 站专用搜索暂不可用"):
             return result
         # B 站接口被验证码拦截时走 DDG/百度/Bing 的 site: 回退。
+        specialized_error = result
     if site:
         q = f"{q} site:{site}"
     q = _search_recency_query(q)
@@ -586,6 +589,8 @@ def web_search(query):
         result = _builtin_search(provider, q)
     else:
         result = _api_web_search(provider, q)
+    if specialized_error and not any(result.startswith(m) for m in _SEARCH_EMPTY_MARKERS):
+        result = specialized_error + "\n\n通用搜索回退结果：\n" + result
     if _search_cache_enabled() and not any(result.startswith(m) for m in _SEARCH_EMPTY_MARKERS):
         _web_cache_write(cache_key, result)
     return result

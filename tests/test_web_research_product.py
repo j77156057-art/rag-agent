@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -37,6 +38,16 @@ class WebResearchProductTests(unittest.TestCase):
 
     def test_subtitles_requires_video_id(self):
         self.assertIn("BV 号或 av 号", tools.web_subtitles("https://www.bilibili.com/"))
+
+    def test_specialized_failure_keeps_diagnostic_on_fallback(self):
+        with patch("tools._bilibili_search", return_value="B 站专用搜索暂不可用（验证码）"), \
+                patch("tools._ddg_search", return_value="· fallback\n  s\n  https://example.com"), \
+                patch("tools.get_web_search_provider", return_value="ddg"), \
+                patch.object(sys.modules["__main__"], "__spec__", types.SimpleNamespace(name="test")), \
+                patch.dict(tools.os.environ, {"WEB_SEARCH_PREFER_RECENT": "0", "DOCMIND_WEB_CACHE": "0"}, clear=False):
+            out = tools.web_search("platform: b站\n教程")
+        self.assertIn("B 站专用搜索暂不可用", out)
+        self.assertIn("通用搜索回退结果", out)
 
 
 if __name__ == "__main__":
