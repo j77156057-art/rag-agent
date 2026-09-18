@@ -49,6 +49,7 @@ class ApiRouteTests(unittest.TestCase):
             ('/api/engine/start', 'POST'),
             ('/api/engine/stop', 'POST'),
             ('/api/engine/reload', 'POST'),
+            ('/api/engine/changes', 'GET'),
             ('/api/engine/embed', 'POST'),
             ('/api/engine/place', 'POST'),
             ('/api/engine/detach', 'POST'),

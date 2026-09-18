@@ -10,6 +10,7 @@ class EngineGpuLeaseTests(unittest.TestCase):
         gw._ENGINE_PROCS.clear()
         gw._ENGINE_LOGS.clear()
         gw._ENGINE_LAUNCH.clear()
+        gw._ENGINE_SNAPSHOT.clear()
         gw._EMBED_STATE.clear()
         gw._gpu.force_release()
 
@@ -66,6 +67,42 @@ class EngineGpuLeaseTests(unittest.TestCase):
             self.assertEqual(embed.call_args.kwargs.get('rect'), rect)
             self.assertEqual(gw._ENGINE_LAUNCH[os.path.abspath(d)]['rect'], rect)
             self.assertEqual(gw._ENGINE_LAUNCH[os.path.abspath(d)]['host_hwnd'], 9)
+
+    def test_engine_changes_reports_relevant_external_edits(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "scripts"))
+            with open(os.path.join(d, "project.godot"), "w", encoding="utf-8") as f:
+                f.write("[application]\n")
+            with open(os.path.join(d, "scripts", "player.gd"), "w", encoding="utf-8") as f:
+                f.write("extends Node\n")
+            with open(os.path.join(d, "ignored.txt"), "w", encoding="utf-8") as f:
+                f.write("before\n")
+            gw._ENGINE_SNAPSHOT[os.path.abspath(d)] = gw._engine_snapshot(d)
+            with open(os.path.join(d, "scripts", "player.gd"), "a", encoding="utf-8") as f:
+                f.write("func _ready(): pass\n")
+            os.remove(os.path.join(d, "project.godot"))
+            with open(os.path.join(d, "scripts", "new.tscn"), "w", encoding="utf-8") as f:
+                f.write("[gd_scene format=3]\n")
+            with open(os.path.join(d, "ignored.txt"), "a", encoding="utf-8") as f:
+                f.write("after\n")
+            result = gw.engine_changes(d)
+            self.assertEqual(result["changed"], ["scripts/player.gd"])
+            self.assertEqual(result["added"], ["scripts/new.tscn"])
+            self.assertEqual(result["deleted"], ["project.godot"])
+            self.assertEqual(result["count"], 3)
+
+    def test_engine_stop_clears_change_baseline(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc = MagicMock()
+            proc.pid = 9101
+            proc.poll.return_value = None
+            gw._ENGINE_PROCS[os.path.abspath(d)] = proc
+            gw._ENGINE_SNAPSHOT[os.path.abspath(d)] = {"project.godot": {"mtime_ns": 1, "size": 1}}
+            with patch.object(gw, 'engine_detach', return_value={'was_embedded': False}), \
+                 patch('desktop_bridge.terminate_tree', return_value=[9101]):
+                result = gw.engine_stop(d)
+            self.assertTrue(result["ok"])
+            self.assertNotIn(os.path.abspath(d), gw._ENGINE_SNAPSHOT)
 
 
 if __name__ == '__main__':

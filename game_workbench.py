@@ -17,6 +17,9 @@ _ENGINE_PROCS = {}
 _ENGINE_LOGS = {}
 # 保留最后一次启动参数，供 Godot 热重载在重启进程后恢复原来的嵌入方式。
 _ENGINE_LAUNCH = {}
+# root_abs -> 文件监视基线。只记录可影响运行结果的 Godot 项目文件，
+# 不把 .godot、构建产物或依赖目录的内部变化误报给用户。
+_ENGINE_SNAPSHOT = {}
 # prompt_id -> 后台 watch 作业状态（轮询线程维护，不再单独持有 GPU 租约：
 # 租约由 comfy_queue 提交后 reown 给 comfyui:{prompt_id}，终态时由 history 释放）
 # Legacy/no-project bucket is kept for direct callers and old tests.  HTTP
@@ -580,6 +583,49 @@ def engine_status(root):
     return out
 
 
+def _engine_snapshot(root):
+    """Capture lightweight mtimes/sizes for files that can affect a Godot run."""
+    root_abs = _root(root)
+    extensions = {'.gd', '.tscn', '.tres', '.shader', '.gdshader', '.gdextension',
+                  '.godot', '.cfg', '.json'}
+    ignored = {'.git', '.godot', '.venv', 'node_modules', 'build', 'dist', '__pycache__'}
+    rows = {}
+    if not os.path.isdir(root_abs):
+        return rows
+    for base, dirs, files in os.walk(root_abs):
+        dirs[:] = [d for d in dirs if d not in ignored]
+        for name in files:
+            if name == 'project.godot' or os.path.splitext(name)[1].lower() in extensions:
+                path = os.path.join(base, name)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                rel = os.path.relpath(path, root_abs).replace('\\', '/')
+                rows[rel] = {'mtime_ns': st.st_mtime_ns, 'size': st.st_size}
+    return rows
+
+
+def engine_changes(root):
+    """Report project files changed since the current engine instance started."""
+    root_abs = _root(root)
+    baseline = _ENGINE_SNAPSHOT.get(root_abs)
+    if baseline is None:
+        return {'ok': True, 'running': bool(engine_status(root_abs).get('running')),
+                'changed': [], 'added': [], 'deleted': [], 'count': 0}
+    current = _engine_snapshot(root_abs)
+    changed = sorted([
+        path for path, meta in current.items()
+        if path in baseline and meta != baseline[path]
+    ])
+    added = sorted([path for path in current if path not in baseline])
+    deleted = sorted([path for path in baseline if path not in current])
+    files = sorted(set(changed + added + deleted))
+    return {'ok': True, 'running': bool(engine_status(root_abs).get('running')),
+            'changed': changed, 'added': added, 'deleted': deleted,
+            'files': files, 'count': len(files)}
+
+
 def engine_embed(root, host_hwnd, width=None, height=None, title_hint='',
                  offset_y=EMBED_TOP_STRIP, rect=None, fill=False):
     """把已运行的引擎窗口嵌进宿主窗口。
@@ -784,6 +830,7 @@ def engine_start(root, executable="godot", scene="", host_hwnd=None, embed=False
         log = open(log_path, "a", encoding="utf-8")
         p = subprocess.Popen(args, cwd=root_abs, stdout=log, stderr=subprocess.STDOUT, text=True, env=child_env)
         _ENGINE_PROCS[root_abs] = p
+        _ENGINE_SNAPSHOT[root_abs] = _engine_snapshot(root_abs)
         _ENGINE_LAUNCH[root_abs] = {'executable': executable, 'scene': scene or '',
                                     'embed': bool(embed), 'host_hwnd': int(host_hwnd or 0),
                                     'rect': dict(rect) if isinstance(rect, dict) else None,
@@ -837,6 +884,7 @@ def engine_stop(root):
         if p: _gpu.unregister_process(p.pid, "exited")
         _ENGINE_PROCS.pop(root_abs, None)
         _ENGINE_LAUNCH.pop(root_abs, None)
+        _ENGINE_SNAPSHOT.pop(root_abs, None)
         _gpu.release('engine:' + root_abs)
         return {"ok": True, "stopped": False, "detached": detached.get('was_embedded', False)}
     pid = p.pid
@@ -864,6 +912,7 @@ def engine_stop(root):
             pass
     _ENGINE_PROCS.pop(root_abs, None)
     _ENGINE_LAUNCH.pop(root_abs, None)
+    _ENGINE_SNAPSHOT.pop(root_abs, None)
     _gpu.unregister_process(pid, "stopped")
     _gpu.release('engine:' + root_abs)
     return {"ok": True, "stopped": True, "pid": pid,

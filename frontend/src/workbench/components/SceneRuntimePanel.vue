@@ -33,6 +33,7 @@ const installing = ref(false)
    独立窗口模式下 Web 工作台和游戏窗口是两个窗口，来回切很别扭。 */
 const nativeRunning = ref(false)
 const reloadingNative = ref(false)
+const changedEngineFiles = ref<string[]>([])
 const desktop = ref<DesktopHost | null>(null)
 const embedState = ref<'off' | 'embedded' | 'failed'>('off')
 const embedMsg = ref('')
@@ -48,6 +49,17 @@ const hostDpi = computed(() => desktop.value?.dpi || 96)
 
 async function refreshDesktop() {
   try { desktop.value = await engineApi.host() } catch { desktop.value = null }
+}
+
+async function pollEngineChanges() {
+  if (!nativeRunning.value) {
+    changedEngineFiles.value = []
+    return
+  }
+  try {
+    const r = await engineApi.changes()
+    if (r.running !== false) changedEngineFiles.value = r.files || []
+  } catch { /* 引擎状态轮询失败不打断试玩 */ }
 }
 
 /**
@@ -302,6 +314,7 @@ function onWindowMessage(ev: MessageEvent) {
 }
 
 let pollEvTimer: number | undefined
+let engineChangeTimer: number | undefined
 async function pollEvents() {
   const project = getProjectId()
   try {
@@ -328,6 +341,7 @@ async function nativeReload() {
         await syncEngineRect(true)
         await engineApi.focusEngine(true).catch(() => {})
       }
+      changedEngineFiles.value = []
     } else {
       embedMsg.value = r.error || 'Godot 热重载失败。'
     }
@@ -342,11 +356,15 @@ function startTimers() {
   stopTimers()
   captureSince.value = Date.now()
   void pollEvents()
+  void pollEngineChanges()
   pollEvTimer = window.setInterval(pollEvents, 3000)
+  engineChangeTimer = window.setInterval(pollEngineChanges, 2500)
 }
 function stopTimers() {
   if (pollEvTimer) window.clearInterval(pollEvTimer)
+  if (engineChangeTimer) window.clearInterval(engineChangeTimer)
   pollEvTimer = undefined
+  engineChangeTimer = undefined
 }
 
 function evClass(t: string) {
@@ -452,6 +470,7 @@ function resetProject() {
   pathInput.value = ''
   sceneMessage.value = ''
   nativeRunning.value = false
+  changedEngineFiles.value = []
 }
 onMounted(() => {
   window.addEventListener('docmind:project-changed', resetProject)
@@ -518,6 +537,9 @@ onUnmounted(() => {
 
             <div v-if="exportMsg" class="pb-msg" :class="{ err: exportMsg.includes('失败') }">{{ exportMsg }}</div>
             <div v-if="embedMsg" class="pb-msg" :class="{ err: embedState === 'failed' }">{{ embedMsg }}</div>
+            <div v-if="nativeRunning && changedEngineFiles.length" class="pb-msg pb-change">
+              检测到外部修改：{{ changedEngineFiles.slice(0, 4).join('、') }}<template v-if="changedEngineFiles.length > 4"> 等 {{ changedEngineFiles.length }} 个文件</template>。确认保存后再点击「热重载」。
+            </div>
             <div v-if="!desktopReady" class="pb-hintline">
               当前是浏览器模式：原生引擎只能开独立窗口。用桌面端启动 DocMind 后，勾上「嵌入工作台」即可让游戏跑在这块区域里。
             </div>

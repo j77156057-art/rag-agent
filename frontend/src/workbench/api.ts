@@ -706,6 +706,8 @@ export const engineApi = {
   stop() { return postJson<{ ok: boolean; stopped: boolean }>('/api/engine/stop', {}) },
   /** 保存启动参数并快速重启运行中的 Godot，恢复原嵌入位置。 */
   reload() { return postJson<{ ok: boolean; running?: boolean; embedded?: boolean; reloaded?: boolean; reload_mode?: string; error?: string }>('/api/engine/reload', {}) },
+  /** 检查引擎启动后项目脚本/场景/资源是否被外部修改，不会自动重载。 */
+  changes() { return request<{ ok: boolean; running?: boolean; changed?: string[]; added?: string[]; deleted?: string[]; files?: string[]; count?: number; error?: string }>('/api/engine/changes') },
   logs(limit = 200) { return request<{ ok: boolean; lines: string[]; errors: { path: string; line: number; message: string }[] }>(`/api/engine/logs?limit=${limit}`) },
   verify(executable = 'godot') { return postJson<{ ok: boolean; output?: string; error?: string }>('/api/engine/verify', { executable }) },
 }
