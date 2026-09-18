@@ -149,8 +149,14 @@ def build_host_window(api_base: str = "", title: str = "DocMind 开发工作台"
     win_title = title if not project_id else f"{title} · {project_id}"
 
     def _host_hwnd():
-        """通过标题枚举拿到 pywebview 的宿主 HWND（必须在窗口创建之后）。"""
-        from desktop_bridge import find_host
+        """Prefer this window's native handle, including initially hidden windows."""
+        from desktop_bridge import find_host, is_window
+        try:
+            hwnd = int(win.native.Handle.ToInt64())
+            if hwnd and is_window(hwnd):
+                return hwnd
+        except (AttributeError, TypeError, ValueError):
+            pass  # Non-WinForms backends / older pywebview use title fallback.
         host = find_host(win_title) or find_host("DocMind")
         return host[0] if host else None
 

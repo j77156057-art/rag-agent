@@ -162,23 +162,23 @@ async function removeSession(id: string) {
   sessions.value = sessions.value.filter((x) => x.session_id !== id)
   // 删掉的正是当前会话：自动切到一段全新会话并让助手刷新（否则会停在已删除的空 id 上）。
   if (id === currentId.value) {
-    currentId.value = startNewSession()
+    currentId.value = await startNewSession()
     open.value = false
     window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
   }
 }
 /** 继续某段历史对话：把该 session_id 切为当前会话并让 AI 助手回灌其历史。 */
-function continueSession(id: string) {
+async function continueSession(id: string) {
   if (demoMode.value) { actionMsg.value = '演示模式不能续聊'; return }
-  if (!setSessionId(id)) return
+  if (!await setSessionId(id)) { actionMsg.value = '该会话正在另一个页面使用，请先关闭那个页面。'; return }
   currentId.value = id
   open.value = false
   window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
 }
 /** 开一段全新对话：切到全新 session id（新 id 无历史），让 AI 助手显示空态。 */
-function newSession() {
+async function newSession() {
   if (demoMode.value) { actionMsg.value = '演示模式不能新建会话'; return }
-  currentId.value = startNewSession()
+  currentId.value = await startNewSession()
   open.value = false
   window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
 }

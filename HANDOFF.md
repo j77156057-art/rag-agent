@@ -1,9 +1,9 @@
 # DocMind 项目交接清单（给接手 AI）
 
-### 2026-09-18 当前交接检查点（`5655f85`）
+### 2026-09-18 当前交接检查点（会话/安装验收收口）
 
-- 当前分支：`main`；本地 `HEAD` 与 `origin/main` 已同步。最近一次功能提交为 `5655f85 feat: add Godot hot reload`。
-- 当前工作区只存在用户 Godot 工程/导入产物：`.godot/`、`addons/`、`project.godot`、`export_presets.cfg`、`docs/screenshots/*.png.import`。这些文件未纳入本次提交，禁止使用 `git add -A`。
+- 当前分支：`main`；本轮修改尚未提交。提交前必须只加入明确文件清单，并确认 `HEAD == origin/main`。
+- 当前工作区同时包含本轮会话/桌面修复代码和用户 Godot 工程/导入产物：`.godot/`、`addons/`、`project.godot`、`export_presets.cfg`、`docs/screenshots/*.png.import`。后者未纳入提交，禁止使用 `git add -A`。
 - 已完成并已提交：运行时状态按项目隔离、工作台往返状态与竞态修复、场景画布与真实时间线、Godot 原生嵌入、Godot 快速热重载、GPU 软件侧协调、ComfyUI Z-Image/H3 链路、Agent 路由/权限/连接器、Unreal bridge 协议与受控写入边界。
 - Godot 热重载的准确口径：Web 试玩使用进程内 `reload_current_scene()`；桌面原生运行实例采用“保存启动参数/嵌入矩形 → 停止旧进程 → 启动新进程 → 恢复嵌入”的快速进程重启，游戏内存状态会重置。它不是无状态丢失的进程内脚本替换。
 - 本次接手优先级：
@@ -11,9 +11,9 @@
   2. 若要做“保存文件即自动刷新”，先设计文件监听与确认提示；不要默认自动重启，避免调试状态被静默清空。
   3. Unreal 深度适配仍缺真实 Unreal Editor 端到端查询/受控写回；Unity 编辑器插件、PlayMode 控制和 `.meta` 成对维护也仍缺真实编辑器验收。
   4. 物理多 GPU `multi` 模式和跨进程 CUDA UUID 隔离仍缺至少两张 NVIDIA GPU 的实机验收；单卡负对照已完成，不能把它写成多卡已验证。
-  5. 桌面发布仍缺在用户桌面实际执行的独立 EXE 启动、覆盖升级和卸载验证；安装器已生成，但当前自动执行策略曾阻止本机自动启动验证。
+  5. 桌面发布隔离验收已完成：独立 EXE 启动、API/工作台健康检查、v2 覆盖升级、版本变化、用户状态保留、卸载和卸载注册表清理均已实测；正式用户安装目录仍不应被自动验收流程改写。
   6. 项目状态隔离已落地，但全局 Ollama/联网配置、GPU 协调器和 Chroma 仍是实例级资源；需要长时间多项目并发压测后再收口。
-- 交接验证基线：Python 全量回归最近记录为 **947 项通过、1 项跳过**；前端 `typecheck` 与 `npm run build` 通过。继续改动后必须重新运行受影响专项和全量测试，并把结果追加到第 4 节时间线。
+- 交接验证基线：Python 全量回归最近记录为 **949 项通过、1 项跳过**；前端 `typecheck` 与 `npm run build` 通过。继续改动后必须重新运行受影响专项和全量测试，并把结果追加到第 4 节时间线。
 
 ### 2026-09-18 联网研究能力补齐
 
@@ -24,20 +24,18 @@
 - 搜索摘要增加运行时缓存：`<STATE_ROOT>/.docmind_web_search_cache.json`，默认 10 分钟、最多 64 项，可用 `DOCMIND_WEB_CACHE=0` 关闭；网页正文和密钥不落盘。
 - 新增 `tests/test_web_research_product.py`；Python 全量回归 **946 项通过、1 项跳过**，联网专项 6 项通过。当前机器真实探测：GitHub Search API 返回仓库结果；B 站接口返回 HTTP 412（验证码/风控），系统会保留该诊断并附通用搜索回退结果，未把回退内容标成 B 站结果。
 
-### 2026-09-18 复制标签页会话冲突缓解
+### 2026-09-18 复制标签页会话隔离收口
 
-- `frontend/src/workbench/api.ts` 增加 BroadcastChannel 会话仲裁：复制标签页带着相同 `sessionStorage` 会话进入时，两个页面用本次页面内随机 token 比较，只让一侧旋转到新 `session_id`；原有会话历史不会被删除。
-- 不写入 localStorage，不改变普通刷新行为；不支持 BroadcastChannel 的旧 WebView 仍依赖原有标签存活探测，不能宣称所有浏览器都能识别复制标签。
-- `npm --prefix frontend run typecheck` 与 `npm --prefix frontend run build` 已通过；需要在实际 Edge/WebView2 中开两个复制标签做一次行为验收。
-- 最新提交链：`f7cdfd8` 联网研究扩展 → `72e8dff` 字幕失败标记 → `9bf551c` 专用搜索回退 → `b454c6a` 缓存忽略 → `3b29256` 复制标签会话隔离 → `509898c` 回退诊断收口；当前 `main` 与 `origin/main` 同步。
+- 页面加载前由 `frontend/public/session.js` 取得每会话独占的 `navigator.locks`；复制标签即使继承相同 `sessionStorage`，也会旋转到新的 `session_id`，原标签历史保持不变。没有 Web Locks 的旧 WebView 直接为当前文档分配新会话，避免静默共用。
+- 工作台与问答页都在挂载/发送请求前等待同一个初始化 Promise；显式“继续会话”只有在原页面释放锁后才允许切换。
+- Edge 151 真实浏览器专项 **10/10**；pywebview EdgeChromium 隐藏窗口专项 **4/4**；`npm run typecheck` 与 `npm run build` 通过。
 
 ### 2026-09-18 四项实机核验
 
-- **Edge/WebView2 复制标签**：当前 Edge 147 + WebView2 环境中，`verify_session_collision.mjs` 在同一浏览器 context 复制 `sessionStorage` 后通过，两个标签最终使用不同 `session_id`。仲裁使用短 TTL 的 localStorage 声明配合 BroadcastChannel；声明只含随机 token/时间，不含对话内容。
+- **Edge/WebView2 复制标签**：Edge 151 的 `verify_session_collision.mjs` **10/10** 通过；pywebview EdgeChromium `verify_webview_sessions.py` **4/4** 通过。两者均验证复制存储隔离、刷新保持、问答/工作台往返和关闭后显式续聊。当前机制是页面加载前 Web Locks，旧 WebView 无锁时分配新文档会话。
 - **Unreal/Unity**：本机没有 UnrealEditor 或 Unity Editor 进程/可执行文件；协议、安全拒绝和离线诊断专项 **29/29 通过**，不能写成真实编辑器联机已验收。仍需安装对应 Editor 后启动 bridge/plugin 实测。
 - **物理多 GPU**：`nvidia-smi` 仅发现 1 张 RTX 5070 Ti Laptop GPU（12227 MiB，UUID `GPU-ba80…`）；多 GPU 租约、UUID 隔离和异常回收无实机条件。单卡结果不能替代多卡验收。
-- **安装器**：`dist/installer/DocMind-Setup.exe` 存在（91,673,430 bytes，SHA-256 `6788288E5A42DFAFC15A3D3433675AC63C1500666114A73B0CB6DE740A27F5F1`）。本轮只做产物完整性检查，未自动执行安装/覆盖升级/卸载，避免修改用户系统；这三项仍需在桌面手动验收。
-- 安装器隔离冒烟尝试被当前执行策略拒绝（`Start-Process` 启动 Setup 返回 policy blocked），不是安装器运行结果；请在用户桌面双击或解除策略后执行 `/VERYSILENT /DIR=<临时目录>`，再检查 `DocMind.exe`、重复覆盖安装和 `unins*.exe`。
+- **安装器**：隔离目录 `D:\Temp\DocMind-Acceptance-20260918-Run1` 已实测 v1 安装、独立 `DocMind.exe` 启动、`/api/health` 与 `/workbench` 返回 200、v2 覆盖升级（版本 `0.1.0 → 0.1.1`）、`acceptance-state\preserve.json` 保留，以及 `unins000.exe` 卸载。卸载后程序文件、开始菜单快捷方式和卸载注册表项清理；用户状态目录保留，符合“程序清理、用户数据保留”策略。正式安装目录 `D:\WorkBuddy\DocMind` 未被该验收流程删除。
 
 ### 2026-09-18 项目切换与流式竞态修复
 
@@ -47,7 +45,7 @@
 - 画布与类型：修复 Vue Flow store 类型、场景文件卡双击打开、节点聚焦、资源类别映射和任务历史 API 类型；新增 `npm run typecheck`。
 - 专项验证：`verify_workbench_races.mjs` 5 项通过（延迟读取、项目切换中止流、任务范围隔离、首页并发发送、错误检查）；工作台回归 9 组、场景画布 27/27 继续通过；`npm run typecheck` 与 `npm run build` 通过。
 - 依赖：前端增加 `vue-tsc` 与 `@types/node`，锁文件已更新。
-- 仍有边界：复制标签页可能复制 sessionStorage 会话 ID；服务端已执行的工具无法回滚；真实引擎、GPU 和 ComfyUI 实机状态仍按 §5 单独验收。
+- 仍有边界：服务端已执行的工具无法回滚；真实 Unreal/Unity 编辑器通信与物理多 GPU 仍按 §5 单独验收；ComfyUI 真实生成依赖用户本地服务与模型。
 
 ### 2026-09-18 工作台回归修复与桌面更新
 

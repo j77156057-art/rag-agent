@@ -1352,132 +1352,18 @@ async function postSse(url: string, init: RequestInit, h: SseStreamHandlers): Pr
 }
 
 // ---------------------------------------------------------------- 会话 id
-// 每个浏览器标签页使用独立的 session_id：后端每个 session_id 对应一个长驻共享 Agent，
-// 逐请求开关（web_enabled / thinking_enabled / tool_mode / plan_mode / llm）由 Agent.run()
-// 在开头快照、finally 还原，只保证「串行」正确；而 /api/chat 的 SSE 由工作线程消费，
-// 同一会话的两个请求会真正并行并互相覆盖这些开关。给每个标签页分配独立 id，
-// 从根上隔离并发请求的逐请求开关（而不是在后端加锁把流式响应串行化）。
-//
-// 存储位置：sessionStorage（每标签独立）。标签页刷新后仍保留本会话，关掉标签页即清除；
-// localStorage 不再承载会话 id——旧实现「localStorage 优先」会让新标签静默接到旧会话。
-// 「关掉重开找回历史」改由「会话列表显式切换」或单窗口下的唯一性门禁兜底（见 docmindTabs）。
-const SESSION_ID_KEY = 'docmind_session_id'
-let cachedSessionId: string | null = null
-const SESSION_COLLISION_CHANNEL = 'docmind-session-collision'
-const sessionRuntimeToken = newSessionId() + '-runtime'
-let sessionCollisionStarted = false
-let sessionCollisionChannel: BroadcastChannel | null = null
-const SESSION_CLAIM_TTL_MS = 15000
-
-/** 生成 slug 安全的会话 id（仅含 [A-Za-z0-9_-]），形如 web-<12位十六进制>。
- *  后端 sessions.py::_slug() 会把 id 用于拼文件名，故必须规避路径分隔符等字符。 */
-function newSessionId(): string {
-  const c = globalThis.crypto as Crypto | undefined
-  const raw = c && typeof c.randomUUID === 'function'
-    ? c.randomUUID().replace(/-/g, '')
-    : Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2)
-  const hex = raw.replace(/[^0-9a-fA-F]/g, '').slice(0, 12).padEnd(12, '0')
-  return `web-${hex}`
+// Shared browser lock is acquired before either page mounts (public/session.js).
+interface BrowserSession {
+  ready: Promise<string>
+  get(): string
+  set(id: string): Promise<boolean>
+  create(): Promise<string>
 }
-
-/**
- * 复制标签页会复制 sessionStorage。两个页面随后会带着同一个 session_id，
- * 让后端误以为它们是同一条 Agent 对话。BroadcastChannel 可用时用内存 token
- * 做一次确定性仲裁：token 较小的一侧换新会话，原标签的历史保持不变。
- * 不依赖 localStorage，因此不会把会话内容写入跨标签持久存储；不支持该 API
- * 的旧 WebView 仍由后端/标签存活探测保守隔离。
- */
-function startSessionCollisionWatch(): void {
-  if (sessionCollisionStarted) return
-  sessionCollisionStarted = true
-  claimSessionId()
-  const BC = (globalThis as { BroadcastChannel?: typeof BroadcastChannel }).BroadcastChannel
-  if (typeof BC !== 'function') return
-  try {
-    sessionCollisionChannel = new BC(SESSION_COLLISION_CHANNEL)
-    const channel = sessionCollisionChannel
-    channel.onmessage = (ev: MessageEvent) => {
-      const msg = ev.data as { type?: string; token?: string; session?: string } | null
-      if (!msg || msg.type !== 'hello' || !msg.token || msg.token === sessionRuntimeToken) return
-      if (msg.session !== cachedSessionId || !cachedSessionId) return
-      // 两个复制标签都会收到 hello；只有 token 较大的一侧旋转，避免双向同时换号。
-      if (sessionRuntimeToken > msg.token) {
-        const fresh = newSessionId()
-        cachedSessionId = fresh
-        try { sessionStorage.setItem(SESSION_ID_KEY, fresh) } catch { /* 内存值仍有效 */ }
-        try { channel.postMessage({ type: 'rotated', token: sessionRuntimeToken, old: msg.session, session: fresh }) } catch { /* best effort */ }
-      }
-    }
-    channel.postMessage({ type: 'hello', token: sessionRuntimeToken, session: getSessionIdWithoutWatch() })
-    // 复制标签可能在另一页的模块初始化前发出 hello；短暂重复一次只做仲裁，不产生请求。
-    if (typeof window !== 'undefined') {
-      window.setTimeout(() => {
-        try { channel.postMessage({ type: 'hello', token: sessionRuntimeToken, session: getSessionIdWithoutWatch() }) } catch { /* closed */ }
-      }, 250)
-      window.addEventListener('pagehide', () => { channel.close(); sessionCollisionChannel = null }, { once: true })
-    }
-  } catch { /* BroadcastChannel 被禁用时保留原有会话逻辑 */ }
-}
-
-function getSessionIdWithoutWatch(): string {
-  if (cachedSessionId) return cachedSessionId
-  try {
-    const existing = sessionStorage.getItem(SESSION_ID_KEY)
-    if (existing) return (cachedSessionId = existing)
-    const fresh = newSessionId()
-    try { sessionStorage.setItem(SESSION_ID_KEY, fresh) } catch { /* 仅内存 */ }
-    return (cachedSessionId = fresh)
-  } catch {
-    return (cachedSessionId = newSessionId())
-  }
-}
-
-function claimSessionId(): void {
-  const session = getSessionIdWithoutWatch()
-  try {
-    const key = 'docmind-session-claim:' + session
-    const raw = localStorage.getItem(key)
-    let other: { token?: string; ts?: number } | null = null
-    try { other = raw ? JSON.parse(raw) as { token?: string; ts?: number } : null } catch { other = null }
-    const fresh = !other || typeof other.token !== 'string' || !Number.isFinite(Number(other.ts)) || Date.now() - Number(other.ts) > SESSION_CLAIM_TTL_MS
-    if (!fresh && other!.token !== sessionRuntimeToken && sessionRuntimeToken > other!.token!) {
-      const next = newSessionId()
-      cachedSessionId = next
-      try { sessionStorage.setItem(SESSION_ID_KEY, next) } catch { /* 内存值仍有效 */ }
-      localStorage.setItem('docmind-session-claim:' + next, JSON.stringify({ token: sessionRuntimeToken, ts: Date.now() }))
-      return
-    }
-    localStorage.setItem(key, JSON.stringify({ token: sessionRuntimeToken, ts: Date.now() }))
-  } catch { /* 隐私模式/禁用存储时由 BroadcastChannel 与旧探测兜底 */ }
-}
-
-/** 当前会话 id（sessionStorage 持久化：标签页刷新后保留、关掉标签页即清除）。
- *  每个标签页各自独立——不再读 localStorage，避免同一浏览器多标签共享同一段对话
- *  （旧实现「localStorage 优先」会让新标签静默接到旧会话）。取不到就新生成一个。
- *  存储不可用（隐私模式 / 非浏览器）时 try/catch 退回模块级 id，保证同页一致。 */
-export function getSessionId(): string {
-  getSessionIdWithoutWatch()
-  startSessionCollisionWatch()
-  return cachedSessionId || getSessionIdWithoutWatch()
-}
-
-/** 显式切换当前会话 id（如「继续某段历史对话」/「新会话」）：只写 sessionStorage 并刷新缓存。
- *  返回是否切换成功（空 id 视为无效）。存储不可用时仍更新内存缓存。 */
-export function setSessionId(id: string): boolean {
-  const v = (id || '').trim()
-  if (!v) return false
-  try { sessionStorage.setItem(SESSION_ID_KEY, v) } catch { /* 存储不可用：仍更新内存 */ }
-  cachedSessionId = v
-  return true
-}
-
-/** 开始一段全新会话：生成新 id、写入存储并刷新缓存，返回该 id。
- *  ChatDock 会因新 id 无历史而显示空态（区别于 clearConversation 的「清空并删档」）。 */
-export function startNewSession(): string {
-  const fresh = newSessionId()
-  setSessionId(fresh)
-  return fresh
-}
+declare global { interface Window { DocMindSession: BrowserSession } }
+export function getSessionId(): string { return window.DocMindSession.get() }
+export function setSessionId(id: string): Promise<boolean> { return window.DocMindSession.set(id) }
+export function startNewSession(): Promise<string> { return window.DocMindSession.create() }
+function newSessionId(): string { return 'web-' + crypto.randomUUID().replaceAll('-', '').slice(0, 24) }
 
 // ---------------------------------------------------------------- 标签页存活探测
 // 目的：判断「本标签页是否为当前唯一打开的 DocMind 标签」。该判断仅供「关掉重开自动续上
