@@ -229,6 +229,10 @@ button { font-family: inherit; }
 
 .wb-body { flex: 1; display: flex; min-height: 0; }
 
+/* 阶段 4：运行面板常驻（docked）承载槽——唯一 SceneRuntimePanel 实例的 docked 主体 teleport 到此，
+   在主区内联填充（左栏文件树与顶部工作区标签保留，便于边玩边改）。 */
+.wb-playpane-slot { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--bg); }
+
 .wb-main { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
 .wb-editor-row { flex: 1; display: flex; min-height: 0; }
 

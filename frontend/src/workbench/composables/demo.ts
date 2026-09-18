@@ -3,7 +3,7 @@
 import { ref } from 'vue'
 // P4 收口：开发台内所有 /api/* 请求统一带上当前项目头（withProject）。健康探测本身与项目
 // 无关（后端 /api/health 不读项目上下文），但为一致性也走同一注入；未选项目时不带头（生命线）。
-import type { AssetItem, FlowDef } from '../api'
+import type { AssetItem, FlowDef, BugItem, ChangesetItem } from '../api'
 import { withProject } from '../api'
 
 export const demoMode = ref(false)
@@ -403,4 +403,44 @@ export const demoFlows: FlowDef[] = [
 export const demoFlowFlaky: Record<string, string[]> = {
   'flow-demo-1': ['n3'],
 }
+
+// ---------------------------------------------------------------- 阶段 4：Bug 反馈闭环（边玩边改）演示
+// 一条「发现问题 → 归档 → 让 AI 修 → 重导出 → 回滚」的离线示例（?demo=1 可看）。
+export const demoBugs: BugItem[] = [
+  {
+    id: 'BUG-20260918-101530-a1b2c3', title: '敌人受击后血量不下降',
+    severity: 'error', source_region: 'behaviors', status: 'open',
+    error: "Invalid access to property 'hp' on a base object of type: 'Node2D'.",
+    traceback: 'scripts/enemy/enemy_ai.gd:42\ntake_damage(damage) -> hp -= damage',
+    reproduction: '运行「战斗场景」，让玩家攻击敌人，敌人 HP 条不变化。',
+    created_at: new Date(Date.now() - 1000 * 60 * 12).toISOString(),
+  },
+  {
+    id: 'BUG-20260918-100210-d4e5f6', title: '玩家初始生命值调成 120 后 HUD 仍显示 100',
+    severity: 'warning', source_region: 'values', status: 'investigating',
+    error: 'balance.json 的 player_hp 与 HUD 绑定不一致',
+    traceback: '', reproduction: '改 values/balance.json 的 player_hp=120，重导出后 HUD 仍显示 100。',
+    created_at: new Date(Date.now() - 1000 * 60 * 55).toISOString(),
+  },
+  {
+    id: 'BUG-20260917-203355-9a8b7c', title: '新手引导第 3 步点不动「继续」',
+    severity: 'info', source_region: 'ui', status: 'fixed',
+    error: '按钮 hitbox 与 sprite 尺寸不一致', traceback: '', reproduction: '进入新手引导到第 3 步。',
+    created_at: new Date(Date.now() - 1000 * 60 * 60 * 20).toISOString(),
+    updated_at: new Date(Date.now() - 1000 * 60 * 60 * 19).toISOString(),
+  },
+]
+
+/** 演示态变更集（供「回滚本次改动」展示）。 */
+export const demoChangesets: ChangesetItem[] = [
+  { id: 'cs-9f3a1c2b', message: 'fix: 修正敌人受击扣血逻辑', commits: { behaviors: 'a1b2c3d', ui: 'b2c3d4e' } },
+  { id: 'cs-1a2b3c4d', message: '调平玩家初始生命值为 120', commits: { values: 'e4f5g6h' } },
+]
+
+/** 演示态「让 AI 修」返回的修复结论。 */
+export const demoBugFixAnswer =
+  '已定位：scripts/enemy/enemy_ai.gd:42 在 take_damage() 里误用 owner.hp（Node2D 无此属性）。\n' +
+  '修复：改为读取 $Stats.hp 并回写，受击后同步刷新血条。\n' +
+  '改动文件：behaviors/scripts/enemy/enemy_ai.gd（1 处）。\n' +
+  '建议：点「重导出并重载」在浏览器里验证；不满意可「回滚本次改动」。'
 

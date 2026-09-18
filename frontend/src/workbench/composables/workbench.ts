@@ -230,16 +230,30 @@ function setWorkspace(v: WorkspaceView) {
 
 // ---------------------------------------------------------------- 画布 / 运行：顶层 tab 联动 SceneRuntimePanel
 // 顶层「画布 / 运行」是真实功能入口（场景画布 / 运行游戏），点击打开弹窗并切到对应 tab。
+// 阶段 4：新增「常驻」态——「运行」入口把面板常驻进主区（docked），边玩边改不用来回开关弹窗。
 export type RuntimePanelTab = 'play' | 'scene' | 'timeline'
 const runtimeOpen = ref(false)
 const runtimeTab = ref<RuntimePanelTab>('play')
+// 常驻态：true = 面板停靠在主区（docked），false = 传统弹窗（popup）。与 runtimeOpen 互斥。
+const runtimeResident = ref(false)
 
 function openRuntime(t: RuntimePanelTab) {
   runtimeTab.value = t
+  runtimeResident.value = false   // 弹窗与常驻互斥，避免弹层叠在常驻面板上
   runtimeOpen.value = true
+}
+/** 把运行面板常驻进主区（docked），并切到指定 tab。 */
+function openRuntimeResident(t: RuntimePanelTab) {
+  runtimeTab.value = t
+  runtimeOpen.value = false
+  runtimeResident.value = true
+}
+function closeRuntimeResident() {
+  runtimeResident.value = false
 }
 function closeRuntime() {
   runtimeOpen.value = false
+  runtimeResident.value = false
 }
 
 // ---------------------------------------------------------------- 最近打开的文件
@@ -1523,5 +1537,7 @@ export function useWorkbench() {
     runLocate, clearLocate, openLocateFile, openLocateRegion,
     // 顶层「画布 / 运行」tab：联动 SceneRuntimePanel
     runtimeOpen, runtimeTab, openRuntime, closeRuntime,
+    // 阶段 4：常驻态（docked）开关
+    runtimeResident, openRuntimeResident, closeRuntimeResident,
   }
 }

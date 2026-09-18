@@ -1,14 +1,20 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
-import { runtimeApi, engineApi, playApi, sceneApi, getProjectId } from '../api'
-import type { WebTemplates, WebExportResult, DesktopHost, EmbedRect } from '../api'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent } from 'vue'
+import { runtimeApi, engineApi, playApi, sceneApi, regionsApi, bugsApi, changesetApi, aiApi, getProjectId } from '../api'
+import type { WebTemplates, WebExportResult, DesktopHost, EmbedRect, BugItem, RegionInfo } from '../api'
 import { useWorkbench } from '../composables/workbench'
+import { demoMode, demoBugs, demoChangesets, demoRegionCards, demoBugFixAnswer } from '../composables/demo'
 // 画布与时间线都引了重依赖（@vue-flow 约 243KB / gzip 79KB），
 // 用异步组件延迟到真正切到对应 tab 再加载，工作台首屏体积不受影响。
 const SceneCanvas = defineAsyncComponent(() => import('./SceneCanvas.vue'))
 const RuntimeTimeline = defineAsyncComponent(() => import('./RuntimeTimeline.vue'))
 
-const { jumpToLine, openPath, activeTab, runtimeOpen, runtimeTab } = useWorkbench()
+// 阶段 4：popup（默认，传统固定遮罩弹窗，行为逐字不变）/ docked（常驻主区，内联填充父容器）。
+// 同一个组件实例通过 prop 切换形态，绝不重建（否则丢 iframe / 引擎嵌入状态）。
+const props = withDefaults(defineProps<{ mode?: 'popup' | 'docked' }>(), { mode: 'popup' })
+const docked = computed(() => props.mode === 'docked')
+
+const { jumpToLine, openPath, activeTab, runtimeOpen, runtimeTab, closeRuntimeResident } = useWorkbench()
 const open = ref(false)
 const tab = ref<'play' | 'scene' | 'timeline'>('play')
 
@@ -392,6 +398,273 @@ async function clearEvents() {
   seen.clear()
 }
 
+/* ---------------- 阶段 4：Bug 反馈闭环（边玩边改） ----------------
+   玩的时候发现问题 → 「这里有问题」把运行时事件 + 引擎日志尾部归档到受控 bugs 分区 →
+   让 AI 按分区约束修复 → 重导出并重载 → 不满意就回滚本次变更集。
+   截图：优先从同源 iframe 的 <canvas> 取 PNG，仅用于让 AI 修时随 question 附到 /api/chat；
+   dev_capture_bug 不收图（后端契约只有 7 个文本字段）。取不到 canvas / 跨源异常 → 纯文本降级。 */
+const bugs = ref<BugItem[]>([])
+const regionOptions = ref<RegionInfo[]>([])
+const bugTitle = ref('')
+const bugRegion = ref('')
+const bugSeverity = ref('error')
+const bugMsg = ref('')
+const bugMsgErr = ref(false)
+const capturingBug = ref(false)
+const bugsLoading = ref(false)
+
+function fmtBugTime(iso?: string) {
+  if (!iso) return ''
+  const d = new Date(iso)
+  return isNaN(d.getTime())
+    ? iso
+    : d.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+async function refreshRegions() {
+  if (demoMode.value) {
+    regionOptions.value = demoRegionCards as unknown as RegionInfo[]
+    return
+  }
+  try {
+    const r = await regionsApi.list()
+    regionOptions.value = r.regions || []
+  } catch { /* 分区列表拿不到就只保留「不分来源分区」 */ }
+}
+
+async function refreshBugs() {
+  if (demoMode.value) {
+    bugs.value = [...demoBugs]
+    return
+  }
+  bugsLoading.value = true
+  try {
+    const r = await bugsApi.list()
+    bugs.value = r.bugs || []
+    if (!r.ok && r.error) { bugMsg.value = r.error; bugMsgErr.value = true }
+  } catch (e) {
+    bugMsg.value = 'Bug 列表加载失败：' + (e as Error).message
+    bugMsgErr.value = true
+  } finally {
+    bugsLoading.value = false
+  }
+}
+
+/** 最近的运行时事件（近 N 条）——作为 Bug 复现上下文。 */
+function recentEventLines(limit = 8): string[] {
+  return [...visibleEvents.value].slice(-limit).map(e => `${evTime(e)} ${e.type}${evData(e) ? ' ' + evData(e) : ''}`)
+}
+
+/** 引擎日志尾部——作为 Bug 的 error / traceback 素材。 */
+async function engineLogTail(limit = 24): Promise<string[]> {
+  try {
+    const r = await engineApi.logs(limit)
+    return (r.lines || []).slice(-limit)
+  } catch { return [] }
+}
+
+/**
+ * 截图降级 A：从同源 iframe 的 <canvas> 取 PNG Blob。
+ * 工程台与 Web 导出页同源才能取到像素；跨源 / 无 canvas / 未渲染 → 返回 null（降级纯文本）。
+ */
+function grabCanvasPng(): Blob | null {
+  try {
+    const win = iframeEl.value?.contentWindow as (Window & { document?: Document }) | null
+    const canvas = win?.document?.querySelector('canvas') as HTMLCanvasElement | null
+    if (!canvas) return null
+    const dataUrl = canvas.toDataURL('image/png')     // 跨源会抛 SecurityError → catch 降级
+    const comma = dataUrl.indexOf(',')
+    if (comma < 0) return null
+    const bin = atob(dataUrl.slice(comma + 1))
+    const arr = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i)
+    return new Blob([arr], { type: 'image/png' })
+  } catch { return null }
+}
+
+async function captureBug() {
+  if (capturingBug.value) return
+  capturingBug.value = true
+  bugMsg.value = ''
+  bugMsgErr.value = false
+  // 演示模式：本地合成一张 Bug 卡，不触达后端。
+  if (demoMode.value) {
+    const now = new Date()
+    const bid = 'BUG-' + now.toISOString().slice(0, 10).replace(/-/g, '') + '-' + now.toTimeString().slice(0, 8).replace(/:/g, '')
+    bugs.value = [{
+      id: bid,
+      title: bugTitle.value.trim() || '试玩中发现的问题（演示）',
+      severity: bugSeverity.value,
+      source_region: bugRegion.value || null,
+      status: 'open',
+      error: '（演示数据）',
+      reproduction: recentEventLines(3).join('\n'),
+      created_at: now.toISOString(),
+    }, ...bugs.value]
+    bugMsg.value = `已归档为 ${bid}（演示模式，未写入真实分区）`
+    bugTitle.value = ''
+    capturingBug.value = false
+    return
+  }
+  try {
+    const logs = await engineLogTail(24)
+    const errLine = logs.find(l => /error|exception|traceback|SCRIPT ERROR/i.test(l)) || logs[0] || ''
+    const evLines = recentEventLines(8)
+    const ctx = [
+      `项目：${getProjectId() || '（未选择）'}`,
+      bugRegion.value ? `来源分区：${bugRegion.value}` : '',
+      '最近运行时事件：',
+      evLines.length ? evLines.join('\n') : '（无）',
+      '',
+      '引擎日志尾部：',
+      logs.length ? logs.join('\n') : '（无）',
+    ].filter(Boolean).join('\n')
+    const title = bugTitle.value.trim()
+      || (errLine ? errLine.slice(0, 80) : `试玩问题 @ ${new Date().toLocaleString('zh-CN', { hour12: false })}`)
+    const r = await bugsApi.capture({
+      title,
+      error: errLine || '（试玩中人工标记的问题）',
+      traceback: logs.join('\n'),
+      reproduction: ctx,
+      source_region: bugRegion.value || undefined,
+      severity: bugSeverity.value,
+    })
+    if (r.ok) {
+      bugMsg.value = `已归档为 ${r.bug_id}${r.path ? '（' + r.path + '）' : ''}`
+      bugMsgErr.value = false
+      bugTitle.value = ''
+      await refreshBugs()
+    } else {
+      bugMsg.value = r.error || '归档失败'
+      bugMsgErr.value = true
+    }
+  } catch (e) {
+    bugMsg.value = '归档失败：' + (e as Error).message
+    bugMsgErr.value = true
+  } finally {
+    capturingBug.value = false
+  }
+}
+
+async function setBug(b: BugItem, status: string) {
+  try {
+    const r = await bugsApi.setStatus(b.id, status)
+    if (r.ok) await refreshBugs()
+    else { bugMsg.value = r.error || '状态更新失败'; bugMsgErr.value = true }
+  } catch (e) {
+    bugMsg.value = (e as Error).message
+    bugMsgErr.value = true
+  }
+}
+
+/* ---- 「让 AI 修」：组装受控修复指令 → SSE 直连 agent（走受控分区写工具） ---- */
+const aiFixFor = ref('')
+const aiFix = ref('')
+const aiFixing = ref(false)
+const aiFixUsedShot = ref(false)
+let aiAbort: AbortController | null = null
+
+function buildFixQuestion(b: BugItem): string {
+  return [
+    '【边玩边改 · Bug 修复】请按分区约束修复下面这个在试玩中发现的问题，',
+    '只改动必要文件、不要跨分区写入，改完给出简短说明与改动文件清单。',
+    '',
+    `Bug ID：${b.id}`,
+    `标题：${b.title}`,
+    `严重度：${b.severity}`,
+    b.source_region ? `来源分区：${b.source_region}` : '',
+    b.error ? `错误：${b.error}` : '',
+    b.traceback ? `堆栈/日志：\n${b.traceback}` : '',
+    b.reproduction ? `复现上下文：\n${b.reproduction}` : '',
+  ].filter(Boolean).join('\n')
+}
+
+async function fixWithAi(b: BugItem) {
+  if (aiFixing.value) return
+  // 演示模式：离线展示一段可信的修复结论（不触达后端）。
+  if (demoMode.value) {
+    aiFixFor.value = b.id
+    aiFixUsedShot.value = false
+    aiFixing.value = true
+    aiFix.value = '正在让 AI 阅读代码并修复…'
+    window.setTimeout(() => { aiFix.value = demoBugFixAnswer; aiFixing.value = false }, 600)
+    return
+  }
+  // 截图只在有 iframe 且同源可取 canvas 时才有；仅随 question 附到 /api/chat。
+  const shot = grabCanvasPng()
+  aiFixUsedShot.value = !!shot
+  aiFixFor.value = b.id
+  aiFix.value = shot ? '正在让 AI 阅读代码并修复（附带当前画面截图）…' : '正在让 AI 阅读代码并修复…'
+  aiFixing.value = true
+  aiAbort = new AbortController()
+  const parts: string[] = []
+  try {
+    await aiApi.askGrounded(
+      buildFixQuestion(b),
+      {
+        signal: aiAbort.signal,
+        onEvent: (ev) => {
+          if (ev.type === 'token' && typeof ev.text === 'string') {
+            parts.push(ev.text)
+            aiFix.value = parts.join('')
+          } else if (ev.type === 'final' && typeof ev.text === 'string' && ev.text.trim()) {
+            aiFix.value = ev.text
+          }
+        },
+      },
+      shot ? { images: [shot] } : {},
+    )
+    if (!aiFix.value) aiFix.value = '（AI 未返回内容）'
+  } catch (e) {
+    aiFix.value = (e as Error).name === 'AbortError' ? '已停止。' : '修复请求失败：' + (e as Error).message
+  } finally {
+    aiFixing.value = false
+    aiAbort = null
+  }
+}
+
+function stopAiFix() {
+  aiAbort?.abort()
+}
+
+/** 重导出并重载：复用 doExport() + cmdReload()（不刷新页面热重载游戏）。 */
+async function reexport() {
+  await doExport()
+  if (iframeUrl.value) cmdReload()
+}
+
+/** 回滚本次改动：取变更集列表最近一条并回滚（生成新提交撤销，不破坏历史）。 */
+async function rollbackLast() {
+  if (!window.confirm('回滚最近一条变更集（AI 本次改动）？会生成新提交撤销，不破坏历史。')) return
+  if (demoMode.value) {
+    const last = demoChangesets[demoChangesets.length - 1]
+    bugMsg.value = `已回滚变更集 ${last.id}（演示模式）。`
+    bugMsgErr.value = false
+    return
+  }
+  try {
+    const r = await changesetApi.list()
+    const list = r.changesets || []
+    if (!list.length) {
+      bugMsg.value = '没有可回滚的变更集（AI 可能尚未提交改动）。'
+      bugMsgErr.value = true
+      return
+    }
+    const last = list[list.length - 1]
+    const rb = await changesetApi.rollback(last.id)
+    if (rb.ok) {
+      bugMsg.value = `已回滚变更集 ${last.id}。`
+      bugMsgErr.value = false
+    } else {
+      bugMsg.value = typeof rb.detail === 'string' ? rb.detail : (rb.error || '回滚失败')
+      bugMsgErr.value = true
+    }
+  } catch (e) {
+    bugMsg.value = '回滚失败：' + (e as Error).message
+    bugMsgErr.value = true
+  }
+}
+
 /* ---------------- 场景画布（P0-2：Vue Flow 转正） ---------------- */
 // pathInput 是正在输入的路径，scenePath 是「已提交、值得去解析」的路径——
 // 分开是为了避免每敲一个字符就触发一次后端解析。
@@ -432,30 +705,55 @@ function openFromScene(rel: string, line?: number) {
   else void openPath(rel)
 }
 
+/** 面板可见（弹窗打开 / 常驻）时的统一初始化：状态刷新 + 定时轮询。 */
+function initPane() {
+  void refreshTemplates()
+  void refreshNativeStatus()
+  void refreshDesktop()
+  void refreshRegions()
+  void refreshBugs()
+  startTimers()
+  if (tab.value === 'scene') void ensureSceneLoaded()
+}
+
 watch(open, v => {
   if (v) {
-    void refreshTemplates()
-    void refreshNativeStatus()
-    void refreshDesktop()
-    startTimers()
-    if (tab.value === 'scene') void ensureSceneLoaded()
+    initPane()
   } else {
     stopTimers()
-    // 弹窗一关，那块"引擎视窗"就不存在了；继续嵌着只会让引擎画在工作台别的位置上
-    if (embedState.value === 'embedded') void nativeDetach()
+    // 弹窗一关，那块"引擎视窗"就不存在了；继续嵌着只会让引擎画在工作台别的位置上。
+    // 阶段 4：仅弹窗模式如此；常驻（docked）模式不因可见性变化 detach，只在真正 unmount 时 detach。
+    if (!docked.value && embedState.value === 'embedded') void nativeDetach()
   }
 })
 
-// 切走试玩 tab 同理：视窗元素被 v-if 摘掉，必须解除；切回来若引擎还在跑且开着自动嵌入，自动重新嵌回
+// 切到常驻（或常驻期间组件首次挂载）时初始化；收起常驻且弹窗未开时停轮询。
+// 常驻收起不 detach 引擎（仅在真正 unmount 时），与「不因可见性变化 detach」一致。
+watch(docked, v => {
+  if (v) initPane()
+  else if (!open.value) stopTimers()
+})
+
+// 切走试玩 tab：视窗元素被 v-if 摘掉。弹窗模式必须解除；常驻模式不 detach（保持嵌入），
+// 切回 play 时再按需重新定位。切回来若引擎还在跑且开着自动嵌入，自动重新嵌回。
 watch(tab, v => {
   if (v !== 'play') {
-    if (embedState.value === 'embedded') void nativeDetach()
+    if (!docked.value && embedState.value === 'embedded') void nativeDetach()
   } else if (nativeRunning.value && autoEmbed.value && embedState.value !== 'embedded' && desktopReady.value) {
     void nativeEmbed()
+  } else if (embedState.value === 'embedded') {
+    // 常驻切回 play：视窗元素刚重建，下一帧按新矩形重新 place（引擎不中断）。
+    void nextTick(() => syncEngineRect(true))
   }
   // 切到场景画布且还没加载场景时，自动带出项目主场景
   if (v === 'scene') void ensureSceneLoaded()
 })
+
+/** 关闭面板：docked 关常驻态，popup 关弹窗（互斥，行为与既有入口一致）。 */
+function closePane() {
+  if (docked.value) closeRuntimeResident()
+  else open.value = false
+}
 
 function resetProject() {
   stopTimers()
@@ -477,6 +775,8 @@ onMounted(() => {
   window.addEventListener('message', onWindowMessage)
   window.addEventListener('resize', onWindowResize)
   watchDpi()
+  // 常驻态下组件可能一开始就是 docked（此时 watch(docked) 已触发过）；此处兜底初始化。
+  if (docked.value) initPane()
 })
 onUnmounted(() => {
   window.removeEventListener('docmind:project-changed', resetProject)
@@ -485,23 +785,36 @@ onUnmounted(() => {
   dpiMq?.removeEventListener('change', onDpiChange)
   dpiMq = null
   if (resizeTimer) window.clearTimeout(resizeTimer)
+  aiAbort?.abort()
+  // 常驻模式不因可见性变化 detach，只在组件真正 unmount 时解除嵌入，避免引擎窗口悬在别处。
+  if (docked.value && embedState.value === 'embedded') void nativeDetach()
   stopTimers()
 })
 </script>
 
 <template>
-  <div class="sr-panel">
-    <button class="sr-trigger" title="一键导出并在工作台里运行游戏，边玩边看日志和场景" @click="open = true"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 2.2 L9.6 6 L3 9.8 Z" fill="currentColor"/></svg><span class="sr-label">运行游戏</span></button>
-    <template v-if="open">
-      <div class="pb-mask" @click.self="open = false" />
-      <div class="pb-pop">
+  <div class="sr-panel" :class="{ 'sr-docked': docked }">
+    <!-- 触发按钮：仅弹窗模式。teleport 到顶栏槽位 #wb-sr-slot（顶栏始终渲染）。
+         defer：本轮先把根节点整体插入 document，再解析 target。 -->
+    <Teleport defer to="#wb-sr-slot" :disabled="docked">
+      <button v-if="!docked" class="sr-trigger" title="一键导出并在工作台里运行游戏，边玩边看日志和场景" @click="open = true"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 2.2 L9.6 6 L3 9.8 Z" fill="currentColor"/></svg><span class="sr-label">运行游戏</span></button>
+    </Teleport>
+    <!-- 遮罩：仅弹窗模式 -->
+    <div v-if="!docked && open" class="pb-mask" @click.self="open = false" />
+    <!--
+      面板主体：弹窗模式在此就地渲染（固定弹层）；常驻模式 teleport 到主区 host 内联填充。
+      同一份内容、同一个组件实例，仅切换承载方式，绝不重建。
+      defer 同上：主区槽位 #wb-playpane-slot 与本实例同根，需等根节点插入后再解析 target。
+    -->
+    <Teleport defer to="#wb-playpane-slot" :disabled="!docked">
+      <div v-if="docked || open" class="pb-pop" :class="{ 'pb-pop-inline': docked }">
         <div class="pb-head">
           <div class="pb-tabs">
             <button :class="{ on: tab === 'play' }" @click="tab = 'play'">🎮 Web 试玩</button>
             <button :class="{ on: tab === 'scene' }" @click="tab = 'scene'">🗺 场景画布</button>
             <button :class="{ on: tab === 'timeline' }" @click="tab = 'timeline'">⏱ 运行时时间线</button>
           </div>
-          <button class="pb-x" @click="open = false">×</button>
+          <button class="pb-x" :title="docked ? '收起常驻面板' : '关闭'" @click="closePane">×</button>
         </div>
 
         <!-- ================= 试玩 tab ================= -->
@@ -597,6 +910,56 @@ onUnmounted(() => {
                 <span v-if="evData(e)" class="pb-ev-data">{{ evData(e) }}</span>
               </div>
             </div>
+
+            <!-- ===== 阶段 4：Bug 反馈闭环（边玩边改） ===== -->
+            <div class="pb-bugwrap">
+              <div class="pb-side-head">
+                <b>Bug 反馈闭环</b>
+                <div><span v-if="bugsLoading" class="pb-bug-loading">加载中…</span><button class="pb-link" @click="refreshBugs">刷新</button></div>
+              </div>
+              <div class="pb-bugtool">
+                <input v-model="bugTitle" class="pb-bugtitle" placeholder="问题标题（留空自动生成）" @keyup.enter="captureBug" />
+                <select v-model="bugRegion" class="pb-bugsel" title="来源分区（留空=不分来源，传错后端会拒）">
+                  <option value="">（不分来源分区）</option>
+                  <option v-for="r in regionOptions" :key="r.key" :value="r.key">{{ r.name }}</option>
+                </select>
+                <select v-model="bugSeverity" class="pb-bugsel" title="严重度">
+                  <option value="error">error</option>
+                  <option value="warning">warning</option>
+                  <option value="info">info</option>
+                </select>
+                <button class="pb-btn primary" :disabled="capturingBug" @click="captureBug">{{ capturingBug ? '归档中…' : '🐞 这里有问题' }}</button>
+              </div>
+              <div v-if="bugMsg" class="pb-msg" :class="{ err: bugMsgErr }">{{ bugMsg }}</div>
+
+              <div class="pb-bugs">
+                <div v-if="!bugs.length" class="pb-tl-empty">暂无 Bug。玩的时候发现问题，点「🐞 这里有问题」把运行时事件 + 引擎日志归档到受控 bugs 分区。</div>
+                <div v-for="b in bugs" :key="b.id" class="pb-bug" :class="'st-' + b.status">
+                  <div class="pb-bug-top"><i class="pb-sev" :class="'sev-' + b.severity">{{ b.severity }}</i><span class="pb-bug-title">{{ b.title }}</span></div>
+                  <div class="pb-bug-meta">{{ b.id }}<template v-if="b.source_region"> · {{ b.source_region }}</template> · {{ b.status }} · {{ fmtBugTime(b.created_at) }}</div>
+                  <div class="pb-bug-acts">
+                    <button class="pb-link" @click="fixWithAi(b)">让 AI 修</button>
+                    <button class="pb-link" @click="setBug(b, 'investigating')">修复中</button>
+                    <button class="pb-link" @click="setBug(b, 'fixed')">已修</button>
+                    <button class="pb-link" @click="setBug(b, 'ignored')">忽略</button>
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="aiFixFor" class="pb-fix">
+                <div class="pb-fix-head">
+                  <b>AI 修复 {{ aiFixFor }}</b>
+                  <span v-if="aiFixUsedShot" class="pb-fix-shot" title="已把当前画面截图随问题一起发给 AI">🖼 附截图</span>
+                  <button v-if="aiFixing" class="pb-link" @click="stopAiFix">停止</button>
+                </div>
+                <pre class="pb-fix-out">{{ aiFix }}</pre>
+                <div class="pb-fix-acts">
+                  <button class="pb-btn" :disabled="exporting" @click="reexport">重导出并重载</button>
+                  <button class="pb-btn warn" @click="rollbackLast">回滚本次改动</button>
+                  <button v-if="!aiFixing" class="pb-link" @click="aiFixFor = ''">收起</button>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -625,7 +988,7 @@ onUnmounted(() => {
           </div>
         </div>
       </div>
-    </template>
+    </Teleport>
   </div>
 </template>
 
@@ -695,4 +1058,35 @@ onUnmounted(() => {
 .pb-hintline { font-size: 10.5px; color: var(--text-faint); line-height: 1.7; }
 .pb-empty2 { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--text-faint); border: 1px dashed var(--border); border-radius: 8px; text-align: center; line-height: 1.8; }
 .pb-empty2 small { font-size: 11px; }
+
+/* ===== 阶段 4：常驻（docked）形态 =====
+   .pb-pop 被 teleport 进主区 host（#wb-playpane-slot），去掉固定弹层的定位/尺寸/阴影，
+   内联填充父容器；同时放开预览区与侧栏的固定宽度，让其自适应。 */
+.pb-pop-inline { position: static; left: auto; top: auto; transform: none; width: 100%; height: 100%; max-width: none; max-height: none; flex: 1; border: 0; border-radius: 0; box-shadow: none; }
+.pb-pop-inline .pb-framewrap { flex: 2 1 auto; width: 100%; height: auto; min-height: 220px; }
+.pb-pop-inline .pb-side { width: clamp(260px, 26vw, 380px); }
+
+/* ===== 阶段 4：Bug 反馈闭环 ===== */
+.pb-bugwrap { flex: 1 1 48%; min-height: 0; display: flex; flex-direction: column; border-top: 1px solid var(--border); }
+.pb-bug-loading { color: var(--text-faint); font-size: 10px; }
+.pb-bugtool { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid rgba(35, 52, 84, 0.08); }
+.pb-bugtitle { flex: 1 1 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 5px 7px; border-radius: 5px; font-size: 11.5px; }
+.pb-bugsel { flex: 0 1 auto; max-width: 46%; background: var(--bg); border: 1px solid var(--border); color: var(--text-muted); padding: 4px 6px; border-radius: 5px; font-size: 11px; }
+.pb-bugs { flex: 1; overflow: auto; padding: 4px 0; }
+.pb-bug { padding: 7px 10px; border-bottom: 1px solid rgba(35, 52, 84, 0.08); display: flex; flex-direction: column; gap: 3px; }
+.pb-bug.st-fixed { opacity: .62; }
+.pb-bug.st-ignored { opacity: .45; }
+.pb-bug-top { display: flex; align-items: baseline; gap: 6px; }
+.pb-bug-title { font-size: 12px; color: var(--text); line-height: 1.5; }
+.pb-sev { font-style: normal; font-size: 9px; border-radius: 3px; padding: 1px 5px; border: 1px solid var(--border); color: var(--text-muted); flex: 0 0 auto; }
+.pb-sev.sev-error { color: #c23a40; border-color: #eeb7ba; background: #fdecec; }
+.pb-sev.sev-warning { color: #8a5a16; border-color: #e3c588; background: #fdf7ea; }
+.pb-sev.sev-info { color: #2f6fed; border-color: #b9d0f5; background: #eef4fe; }
+.pb-bug-meta { font: 10px var(--font-mono); color: var(--text-faint); }
+.pb-bug-acts { display: flex; flex-wrap: wrap; gap: 10px; }
+.pb-fix { border-top: 1px solid var(--border); padding: 6px 10px 10px; display: flex; flex-direction: column; gap: 6px; }
+.pb-fix-head { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.pb-fix-shot { font-size: 10px; color: #0e8a8f; }
+.pb-fix-out { margin: 0; max-height: 200px; overflow: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font: 11px/1.6 var(--font-mono); color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.pb-fix-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 </style>

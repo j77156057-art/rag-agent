@@ -47,6 +47,8 @@ const {
   aiPanelOpen,
   workspace, setWorkspace, seedDemoRegionCards,
   closeAllTabs, closeRuntime,
+  // 阶段 4：运行面板常驻（docked）态
+  runtimeResident,
 } = useWorkbench()
 
 const dirtyCount = computed(() => tabs.value.filter((t) => t.dirty).length)
@@ -375,7 +377,8 @@ onBeforeUnmount(() => {
         <span class="wb-tool wb-tool-gp"><GpuPanel /></span>
         <span class="wb-tool wb-tool-hp"><HarnessPanel /></span>
         <span class="wb-tool wb-tool-ap"><AgentPolicyPanel /></span>
-        <span class="wb-tool wb-tool-sr"><SceneRuntimePanel /></span>
+        <!-- 运行游戏：触发按钮由唯一 SceneRuntimePanel 实例 teleport 到此槽位（保持原位置） -->
+        <span id="wb-sr-slot" class="wb-tool wb-tool-sr"></span>
         <span class="wb-topbar-maps">
         <button
           v-if="tree"
@@ -486,18 +489,54 @@ onBeforeUnmount(() => {
         <button class="wb-retry" @click="loadTree()">重试</button>
       </aside>
 
-      <template v-else-if="tree">
-        <FileTree
-          :tree="tree"
-          :selected-path="selectedPath"
-          :loading="treeLoading"
-          @select="openNode"
-        />
+      <FileTree
+        v-else-if="tree"
+        :tree="tree"
+        :selected-path="selectedPath"
+        :loading="treeLoading"
+        @select="openNode"
+      />
 
-        <main class="wb-main">
-          <WorkspaceTabs />
+      <aside v-else-if="demoMode" class="wb-sidebar wb-demo-side">
+        <div class="wb-demo-side-note">项目文件（示例）</div>
+        <ul>
+          <li class="wb-demo-dir">📁 assets</li>
+          <li class="wb-demo-dir">📁 scripts
+            <ul>
+              <li class="wb-demo-dir">📁 player
+                <ul>
+                  <li>player_stats.gd<span class="wb-demo-tag">#{{ demoBadgeOf('player_stats.gd') }}</span></li>
+                  <li>player_controller.gd<span class="wb-demo-tag">#{{ demoBadgeOf('player_controller.gd') }}</span></li>
+                </ul>
+              </li>
+              <li class="wb-demo-dir">📁 combat
+                <ul>
+                  <li>damage_calc.gd<span class="wb-demo-tag">#{{ demoBadgeOf('damage_calc.gd') }}</span></li>
+                </ul>
+              </li>
+              <li class="wb-demo-dir">📁 enemy
+                <ul>
+                  <li>enemy_ai.gd<span class="wb-demo-tag">#{{ demoBadgeOf('enemy_ai.gd') }}</span></li>
+                </ul>
+              </li>
+              <li>inventory_system.gd<span class="wb-demo-tag">#{{ demoBadgeOf('inventory_system.gd') }}</span></li>
+            </ul>
+          </li>
+          <li class="wb-demo-dir">📁 scenes</li>
+          <li>project.godot</li>
+        </ul>
+        <p>本地版会在这里列出你项目的真实文件，点击文件名即可查看和编辑。</p>
+      </aside>
+
+      <!-- 主区用 v-show 常驻（而非 v-if）：保证 #wb-playpane-slot 在组件挂载期就已存在于文档中。
+           否则树/演示分支异步渲染，Teleport 目标在挂载时解析为 null → dock 迁移抛错、常驻面板落空。 -->
+      <main class="wb-main" v-show="tree || demoMode">
+        <WorkspaceTabs />
+        <!-- 阶段 4：运行面板常驻（docked）承载槽（主区，左侧文件树/示例保留，便于边玩边改） -->
+        <div id="wb-playpane-slot" class="wb-playpane-slot" v-show="runtimeResident" />
+        <template v-if="!runtimeResident">
           <AssetCenterView v-if="workspace === 'assets'" />
-          <template v-else>
+          <template v-else-if="tree">
             <EditorTabs v-if="workspace === 'code'" />
             <div class="wb-editor-row">
               <CodeView :tab="workspace === 'code' ? activeTab : null" />
@@ -517,45 +556,7 @@ onBeforeUnmount(() => {
               </span>
             </footer>
           </template>
-        </main>
-      </template>
-
-      <template v-else-if="demoMode">
-        <aside class="wb-sidebar wb-demo-side">
-          <div class="wb-demo-side-note">项目文件（示例）</div>
-          <ul>
-            <li class="wb-demo-dir">📁 assets</li>
-            <li class="wb-demo-dir">📁 scripts
-              <ul>
-                <li class="wb-demo-dir">📁 player
-                  <ul>
-                    <li>player_stats.gd<span class="wb-demo-tag">#{{ demoBadgeOf('player_stats.gd') }}</span></li>
-                    <li>player_controller.gd<span class="wb-demo-tag">#{{ demoBadgeOf('player_controller.gd') }}</span></li>
-                  </ul>
-                </li>
-                <li class="wb-demo-dir">📁 combat
-                  <ul>
-                    <li>damage_calc.gd<span class="wb-demo-tag">#{{ demoBadgeOf('damage_calc.gd') }}</span></li>
-                  </ul>
-                </li>
-                <li class="wb-demo-dir">📁 enemy
-                  <ul>
-                    <li>enemy_ai.gd<span class="wb-demo-tag">#{{ demoBadgeOf('enemy_ai.gd') }}</span></li>
-                  </ul>
-                </li>
-                <li>inventory_system.gd<span class="wb-demo-tag">#{{ demoBadgeOf('inventory_system.gd') }}</span></li>
-              </ul>
-            </li>
-            <li class="wb-demo-dir">📁 scenes</li>
-            <li>project.godot</li>
-          </ul>
-          <p>本地版会在这里列出你项目的真实文件，点击文件名即可查看和编辑。</p>
-        </aside>
-
-        <main class="wb-main">
-          <WorkspaceTabs />
-          <AssetCenterView v-if="workspace === 'assets'" />
-          <template v-else>
+          <template v-else-if="demoMode">
             <EditorTabs />
             <div class="wb-editor-row">
               <CodeView :tab="null" />
@@ -565,14 +566,19 @@ onBeforeUnmount(() => {
               <span class="wb-status-faint">示例演示模式 · 未连接本地项目</span>
             </footer>
           </template>
-        </main>
-      </template>
+        </template>
+      </main>
 
-      <div v-else class="wb-booting">
+      <div v-if="!treeError && !tree && !demoMode" class="wb-booting">
         <div class="cv-spinner" />
         <p>正在连接本地 DocMind 服务…</p>
       </div>
     </div>
+
+    <!-- 唯一实例：popup（默认，固定弹层，行为不变）/ docked（常驻主区）由 runtimeResident 切换。
+         docked 主体 teleport 进主区 #wb-playpane-slot；同实例仅切 mode，不重建，
+         故 iframe 与引擎嵌入状态得以保留。触发按钮由该实例 teleport 回顶栏 #wb-sr-slot。 -->
+    <SceneRuntimePanel :mode="runtimeResident ? 'docked' : 'popup'" />
 
     <ContextMenu />
     <AppDialog />

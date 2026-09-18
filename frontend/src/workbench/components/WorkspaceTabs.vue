@@ -5,7 +5,7 @@
 import { useWorkbench } from '../composables/workbench'
 import type { WorkspaceView } from '../composables/workbench'
 
-const { workspace, setWorkspace, tabs, runtimeOpen, runtimeTab, openRuntime } = useWorkbench()
+const { workspace, setWorkspace, tabs, runtimeOpen, runtimeTab, runtimeResident, openRuntime, openRuntimeResident } = useWorkbench()
 
 const real: { key: WorkspaceView; name: string; icon: string }[] = [
   { key: 'overview', name: '概览', icon: 'home' },
@@ -26,16 +26,22 @@ function pick(key: WorkspaceView) {
   setWorkspace(key)
 }
 
-// 顶层「画布 / 运行」→ 弹窗对应 tab
+// 顶层「画布 / 运行」→ 主区常驻面板（docked）。
+// 「运行」直接常驻进主区；「画布」若已常驻则复用同一面板切到画布，避免弹层叠在常驻面板上。
 function pickSoon(key: string) {
-  if (key === 'canvas') openRuntime('scene')
-  else if (key === 'runtime') openRuntime('play')
+  if (key === 'canvas') {
+    if (runtimeResident.value) openRuntimeResident('scene')
+    else openRuntime('scene')
+  } else if (key === 'runtime') {
+    openRuntimeResident('play')
+  }
 }
-// 顶层入口高亮：与弹窗当前 tab 对齐
+// 顶层入口高亮：常驻面板与弹窗都与当前 tab 对齐
 function soonActive(key: string) {
-  if (!runtimeOpen.value) return false
-  if (key === 'canvas') return runtimeTab.value === 'scene'
-  if (key === 'runtime') return runtimeTab.value === 'play'
+  const residentHit = runtimeResident.value
+  const popupHit = runtimeOpen.value
+  if (key === 'canvas') return (residentHit || popupHit) && runtimeTab.value === 'scene'
+  if (key === 'runtime') return (residentHit || popupHit) && runtimeTab.value === 'play'
   return false
 }
 </script>
