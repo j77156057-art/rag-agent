@@ -1924,6 +1924,26 @@ export interface TraceStep {
   obs_chars?: number
   ok?: boolean
 }
+/**
+ * trace 记录级 `error` 字段：
+ * - 普通 Agent 回合：错误原文（字符串，来源 agent_trace）；
+ * - flow 回合（AI 工具流编排器）：按隐私边界（方案 §9.5）已脱敏为元数据对象
+ *   `{ error_kind, chars }`，**绝不**含原文 / 文件路径 / 代码。
+ */
+export type TraceError = string | { error_kind?: string; chars?: number }
+
+/**
+ * 统一格式化 trace 的 `error` 字段，供各面板渲染，避免对象被直接渲染成 `[object Object]`。
+ * - 字符串 → 原样返回（普通回合的原文错误）；
+ * - 对象 → 显示可读中文（flow 回合的脱敏元数据）；
+ * - 空 → 返回空串。
+ */
+export function fmtTraceError(err: TraceError | null | undefined): string {
+  if (!err) return ''
+  if (typeof err === 'string') return err
+  return `已脱敏（错误类型：${err.error_kind || 'unknown'}）`
+}
+
 export interface TraceItem {
   turn_id: string
   ts: string
@@ -1943,7 +1963,7 @@ export interface TraceItem {
   outcome: string
   finish_reason?: string | null
   aborted: boolean
-  error: string
+  error: TraceError
   final_chars?: number
   steps: TraceStep[]
 }
@@ -2116,6 +2136,83 @@ export const WEB_FETCH_PROVIDERS: ProviderOption[] = [
   { value: 'firecrawl', label: 'Firecrawl', needs_key: true, desc: 'v1/scrape' },
   { value: 'custom', label: '自定义服务', needs_url: true, desc: 'POST {url} 取 markdown' },
 ]
+
+// ---------------------------------------------------------------- 阶段 3b：AI 工具流编排器
+// 对应后端 flows.py：/api/flows（列表/保存/删除）+ /api/flows/run-step（单步受控执行）。
+// 节点动作都在「受控动作白名单」内（后端强制），前端只负责编排与展示。
+export interface FlowField {
+  name: string
+  label: string
+  kind: 'region' | 'relpath' | 'changeset' | 'message' | 'text'
+  required: boolean
+  placeholder: string
+}
+export interface FlowAction {
+  action: string
+  label: string
+  glyph: string
+  cat: string
+  mutating: boolean
+  summary: string
+  fields: FlowField[]
+}
+export interface FlowNode {
+  id: string
+  action: string
+  label: string
+  params: Record<string, string>
+  x?: number
+  y?: number
+}
+export interface FlowEdge { source: string; target: string }
+export interface FlowDef {
+  id: string
+  name: string
+  desc: string
+  nodes: FlowNode[]
+  edges: FlowEdge[]
+  created_at?: string
+  updated_at?: string
+}
+/** 单步执行结果（与后端 execute_step 返回同构）。 */
+export interface FlowStepResult {
+  ok: boolean
+  action: string
+  status: 'ok' | 'fail'
+  output: string
+  detail?: Record<string, unknown> | null
+  error?: string
+  latency_ms?: number
+  trace_written?: boolean
+  /** 前端补充：参数字数 / 返回字数（trace step 同构用） */
+  arg_chars?: number
+  obs_chars?: number
+}
+
+export const flowsApi = {
+  list(): Promise<{ ok: boolean; flows: FlowDef[] }> {
+    return request<{ ok: boolean; flows: FlowDef[] }>('/api/flows')
+  },
+  /** 保存流程：走 rawJson 原样返回失败体（读 error/errors），不把 ok:false 抛错。 */
+  save(flow: FlowDef): Promise<{ ok: boolean; flow?: FlowDef; error?: string; errors?: string[] }> {
+    return rawJson('/api/flows', flow)
+  },
+  remove(id: string): Promise<{ ok: boolean; deleted?: string; error?: string }> {
+    return rawJson('/api/flows/delete', { id })
+  },
+  /** 服务端执行单个受控步骤；失败也当数据返回（读 output/error 分支）。 */
+  runStep(payload: {
+    action: string
+    params?: Record<string, string>
+    run_id?: string
+    flow_id?: string
+    flow_name?: string
+    node_id?: string
+    finish?: boolean
+  }): Promise<FlowStepResult> {
+    return rawJson<FlowStepResult>('/api/flows/run-step', payload)
+  },
+}
 
 export const settingsApi = {
   /** 读取模型 + 搜索相关配置（复用 /api/config）。 */

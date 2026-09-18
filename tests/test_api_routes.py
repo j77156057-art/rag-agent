@@ -92,7 +92,7 @@ class ApiRouteTests(unittest.TestCase):
         import ast
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         for name in ('api.py', 'game_workbench.py', 'tools.py', 'agent.py',
-                     'scene_runtime.py', 'workbench_fs.py'):
+                     'scene_runtime.py', 'workbench_fs.py', 'flows.py'):
             path = os.path.join(root, name)
             if not os.path.isfile(path):
                 continue

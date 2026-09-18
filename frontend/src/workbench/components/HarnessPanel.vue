@@ -3,7 +3,7 @@
 // 做成普通人看得懂的面板。静态预览（无后端）时自动使用演示数据。
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
-  harnessApi, setSessionId, getSessionId, startNewSession,
+  harnessApi, setSessionId, getSessionId, startNewSession, fmtTraceError,
   type BudgetStatus, type BudgetCheck, type SessionInfo,
   type TraceItem, type TraceSummary, type SkillInfo,
 } from '../api'
@@ -315,7 +315,7 @@ onBeforeUnmount(() => { open.value = false })
               <div v-if="toolNames(it).length" class="hp-tools">
                 <i v-for="(a, i) in toolNames(it)" :key="i">{{ a }}</i>
               </div>
-              <div v-else-if="it.error" class="hp-traceerr">{{ it.error }}</div>
+              <div v-else-if="it.error" class="hp-traceerr">{{ fmtTraceError(it.error) }}</div>
             </div>
           </div>
           <div class="hp-footrow">

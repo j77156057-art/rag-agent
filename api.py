@@ -138,6 +138,7 @@ def _desktop_host_source(project_id) -> str:
     return 'none'
 
 import workbench_fs
+import flows
 import asset_sources
 import asset_gen
 import cloud_gen
@@ -3530,6 +3531,9 @@ async def reject_edit(req: PendingId):
 
 # 开发工作台文件系统接口（P0）：/api/fs/tree|file|save|create|rename|delete|gitlog
 app.include_router(workbench_fs.router)
+
+# 阶段 3b 工具流编排器：/api/flows（列表/保存/删除）+ /api/flows/run-step（单步受控执行）
+app.include_router(flows.router)
 
 app.mount("/static", StaticFiles(directory=PROJECT_WEB_DIR), name="static")
 

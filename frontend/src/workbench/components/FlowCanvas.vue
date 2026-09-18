@@ -5,19 +5,23 @@
 // 每个节点显示真实元数据（耗时 / 输入输出规模 / 成败 / token / 花费），失败节点标红，
 // 点节点看右侧详情。trace 按隐私设计只存元数据（不存提问正文与文件路径），这里不伪造跳转。
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
-import { VueFlow, useVueFlow } from '@vue-flow/core'
+import { VueFlow, useVueFlow, Handle, Position } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
 import type { Node, Edge } from '@vue-flow/core'
 import '@vue-flow/core/dist/style.css'
 import '@vue-flow/core/dist/theme-default.css'
 import '@vue-flow/controls/dist/style.css'
-import { harnessApi, type TraceItem, type TraceStep } from '../api'
+import { harnessApi, fmtTraceError, type TraceItem, type TraceStep, type FlowNode } from '../api'
 import { demoMode, demoTraceItems } from '../composables/demo'
 import { useWorkbench } from '../composables/workbench'
+import {
+  useFlowRunner, FLOW_ACTIONS, actionMeta as flowActionMeta, type StepState,
+} from '../composables/flowRunner'
 
 const { flowOpen, closeFlow } = useWorkbench()
-const { fitView } = useVueFlow()
+// 回看 / 编排两个 VueFlow 实例用显式 id，避免默认 store 串扰（同一时刻只挂载其一）
+const { fitView } = useVueFlow('flow-review')
 
 // --------------------------------------------------------------- 动作元数据
 // 后端真实工具名 → 中文类别/名称（与 tools.py TOOLS 注册表对齐；未知动作不编造，原样展示）
@@ -256,6 +260,111 @@ function providerLabel(p: string) {
   if (!p || p === '?') return '测试/离线'
   return p
 }
+
+// =============================================================== 阶段 3b：编排模式
+// 与回看模式共用同一套 .fl-node 渲染与红/黄/绿样式；编排模式在其上增加：
+// 可拖拽节点面板、连线编辑（拖拽 Handle 连线）、参数表单、模板保存/列表、一键执行逐步高亮。
+const mode = ref<'review' | 'build'>('review')
+const {
+  flows: flowList, current: flowCurrent, running: flowRunning,
+  activeId: flowActiveId, message: flowMessage, messageKind: flowMessageKind,
+  lastChangeset: flowLastChangeset,
+  stateOf: flowStateOf, orderNodes: flowOrderNodes,
+  loadFlows, selectFlow, newFlow, addNode, removeNode, moveNode, connect,
+  setNodeParams, saveFlow, deleteFlow, run: runFlow, runSingle: runFlowSingle,
+  resumeFrom: resumeFlowFrom, stop: stopFlow,
+} = useFlowRunner()
+
+const addAction = ref<string>('dev_region_verify')
+const buildSelectedId = ref<string>('')
+const buildSelected = computed<FlowNode | null>(() => {
+  const f = flowCurrent.value
+  if (!f || !buildSelectedId.value) return null
+  return f.nodes.find((n) => n.id === buildSelectedId.value) || null
+})
+
+watch(flowOpen, (v) => { if (v && mode.value === 'build') void loadFlows() })
+watch(mode, (v) => { if (v === 'build') void loadFlows() })
+
+type BuildNodeData = { node?: FlowNode; st?: StepState; order?: number; count?: number }
+const W_BSTEP = 300, H_BSTEP = 100, H_BTERM = 62
+
+const buildModel = computed<{ nodes: Node<BuildNodeData>[]; edges: Edge[] }>(() => {
+  const f = flowCurrent.value
+  if (!f) return { nodes: [], edges: [] }
+  const order = flowOrderNodes()
+  const orderIdx = new Map(order.map((n, i) => [n.id, i]))
+  const nodes: Node<BuildNodeData>[] = []
+  nodes.push({ id: '__start', type: 'fl-bstart', position: { x: -W_BSTEP / 2, y: 0 }, data: {}, draggable: false, selectable: false })
+  let y = H_BTERM + 30
+  f.nodes.forEach((n, i) => {
+    nodes.push({
+      id: n.id, type: 'fl-bstep',
+      position: { x: (n.x ?? (-W_BSTEP / 2)), y: (n.y ?? y) },
+      data: { node: n, st: flowStateOf(n.id), order: (orderIdx.get(n.id) ?? i) + 1 },
+      draggable: true, selectable: true,
+    })
+    if (n.x == null) y += H_BSTEP + 28
+  })
+  nodes.push({ id: '__end', type: 'fl-bend', position: { x: -W_BSTEP / 2, y: y + 6 }, data: { count: f.nodes.length }, draggable: false, selectable: false })
+  const edges: Edge[] = []
+  const first = order[0]?.id
+  const last = order[order.length - 1]?.id
+  if (first) edges.push({ id: 'be-start', source: '__start', target: first, type: 'smoothstep', style: { stroke: '#b9c9e2', strokeDasharray: '4 3' } })
+  f.edges.forEach((e, i) => {
+    const st = flowStateOf(e.source)
+    const c = st?.status === 'fail' ? '#e0525a' : st?.status === 'ok' ? '#2fbf7e' : undefined
+    edges.push({
+      id: 'be' + i, source: e.source, target: e.target, type: 'smoothstep',
+      animated: st?.status === 'run',
+      style: c ? { stroke: c, strokeWidth: 2 } : undefined,
+    })
+  })
+  if (last) edges.push({ id: 'be-end', source: last, target: '__end', type: 'smoothstep', style: { stroke: '#b9c9e2', strokeDasharray: '4 3' } })
+  return { nodes, edges }
+})
+const buildNodes = computed(() => buildModel.value.nodes)
+const buildEdges = computed(() => buildModel.value.edges)
+
+// Vue Flow v1 事件载荷是单个对象 { node, ... }；两种形态都兜住（与 SceneCanvas 同款）
+function pickNode(args: unknown[]): Node | undefined {
+  const looksLikeNode = (value: unknown): value is Node =>
+    !!value && typeof value === 'object' && 'id' in value && 'position' in value
+  if (looksLikeNode(args[1])) return args[1]
+  const first = args[0] as { node?: unknown } | null | undefined
+  return looksLikeNode(first?.node) ? (first!.node as Node) : undefined
+}
+function onBuildNodeClick(p: { node: Node }) { buildSelectedId.value = p.node.id }
+function onBuildNodeDragStop(...args: unknown[]) {
+  const node = pickNode(args)
+  const f = flowCurrent.value
+  if (!node || !f) return
+  const n = f.nodes.find((x) => x.id === node.id)
+  if (n) { n.x = node.position.x; n.y = node.position.y }
+}
+function onBuildConnect(conn: unknown) {
+  const c = conn as { source?: string | null; target?: string | null } | null
+  if (c && c.source && c.target) connect(c.source, c.target)
+}
+function onParam(id: string, name: string, value: string) { setNodeParams(id, { [name]: value }) }
+function onFlowName(v: string) { if (flowCurrent.value) flowCurrent.value.name = v }
+function addStep() {
+  addNode(addAction.value)
+  const f = flowCurrent.value
+  if (f && f.nodes.length) buildSelectedId.value = f.nodes[f.nodes.length - 1].id
+}
+function removeSelected() {
+  if (!buildSelected.value) return
+  const id = buildSelected.value.id
+  removeNode(id)
+  buildSelectedId.value = ''
+}
+function stepStatusClass(st?: StepState) { return st ? ('st-' + st.status) : '' }
+function glyphStyle(action: string) {
+  const cat = flowActionMeta(action).cat as CatKey
+  const c = (CAT_META[cat] || CAT_META.other).color
+  return { background: c + '1f', color: c, borderColor: c + '55' }
+}
 </script>
 
 <template>
@@ -271,20 +380,25 @@ function providerLabel(p: string) {
             <path d="M3.5 4.6 V7.4 M3.5 9.8 C3.5 11.4 6 11 8 11.6 C10 12.2 11 11.4 11.2 10.9" fill="none" stroke="#93a0b5" stroke-width="1" stroke-dasharray="2 2" />
           </svg>
           <b>AI 工作流</b>
-          <span>每一轮问答的操作流水线：提问 → 思考 → 调工具 → 回答（耗时 / 成败 / token 全记录）</span>
+          <span v-if="mode === 'review'">每一轮问答的操作流水线：提问 → 思考 → 调工具 → 回答（耗时 / 成败 / token 全记录）</span>
+          <span v-else>把常用动作链编排成流水线：定位分区 → 改码 → 校验 → 提交变更集 → 导出试玩 → 不行就回滚</span>
         </div>
         <div class="fl-head-actions">
-          <button class="fl-iconbtn" title="重新加载" @click="load">
+          <div class="fl-seg fl-mode-seg">
+            <button :class="{ on: mode === 'review' }" @click="mode = 'review'">回看</button>
+            <button :class="{ on: mode === 'build' }" @click="mode = 'build'">编排</button>
+          </div>
+          <button class="fl-iconbtn" :title="mode === 'review' ? '重新加载' : '刷新流程列表'" @click="mode === 'review' ? load() : loadFlows()">
             <svg width="13" height="13" viewBox="0 0 13 13"><path d="M11 2.8 V5.4 H8.4 M2.2 7.2 A4.6 4.6 0 1 0 3 4.1 L11 5.4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
           <button class="fl-iconbtn" title="关闭（Esc）" @click="closeFlow">×</button>
         </div>
       </div>
 
-      <div v-if="demoMode" class="fl-demo">示例演示模式：以下为演示流水线。真实使用时，你在 AI 助手里的每轮问答都会自动记录并画成图。</div>
-      <p v-if="errorMsg" class="fl-err">{{ errorMsg }} <button class="fl-link" @click="load">重试</button></p>
+      <div v-if="mode === 'review' && demoMode" class="fl-demo">示例演示模式：以下为演示流水线。真实使用时，你在 AI 助手里的每轮问答都会自动记录并画成图。</div>
+      <p v-if="mode === 'review' && errorMsg" class="fl-err">{{ errorMsg }} <button class="fl-link" @click="load">重试</button></p>
 
-      <div class="fl-body">
+      <div v-if="mode === 'review'" class="fl-body">
         <!-- 左：回合列表 -->
         <aside class="fl-turns">
           <div class="fl-filter">
@@ -335,6 +449,7 @@ function providerLabel(p: string) {
           </div>
           <div v-if="selectedTurn" class="fl-canvas">
             <VueFlow
+              id="flow-review"
               :nodes="nodes"
               :edges="edges"
               :min-zoom="0.25"
@@ -442,12 +557,179 @@ function providerLabel(p: string) {
               <p class="fl-d-line"><label>总耗时</label><span>{{ fmtMs(selectedDetail.turn.elapsed_ms) }}</span></p>
               <p class="fl-d-line"><label>token</label><span>入 {{ selectedDetail.turn.prompt_tokens.toLocaleString() }} / 出 {{ selectedDetail.turn.completion_tokens.toLocaleString() }}</span></p>
               <p class="fl-d-line"><label>花费</label><span>{{ money(selectedDetail.turn.cost_cny) }}（本地模型为 ¥0）</span></p>
-              <p v-if="selectedDetail.turn.error" class="fl-d-line"><label>错误</label><span class="fl-bad">{{ selectedDetail.turn.error }}</span></p>
+              <p v-if="selectedDetail.turn.error" class="fl-d-line"><label>错误</label><span class="fl-bad">{{ fmtTraceError(selectedDetail.turn.error) }}</span></p>
             </template>
             <p class="fl-d-privacy">trace 只记录操作元数据（动作名 / 字数 / 耗时 / 成败），不记录问题、代码与文件路径原文。</p>
           </template>
           <div v-else class="fl-detail-empty">
             点击流水线中的任意节点<br />查看这一步的详细数据
+          </div>
+        </aside>
+      </div>
+
+      <!-- 编排模式 -->
+      <div v-else class="fl-body">
+        <!-- 左：流程模板列表 -->
+        <aside class="fl-turns">
+          <div class="fl-filter">
+            <div class="fl-seg">
+              <button class="on" style="cursor:default">流程模板 {{ flowList.length }}</button>
+            </div>
+            <button class="fl-btn-block" @click="newFlow">＋ 新建流程</button>
+          </div>
+          <div v-if="!flowList.length" class="fl-hint">
+            还没有保存的流程。<br />点「新建流程」开始编排。
+          </div>
+          <div v-else class="fl-turn-list">
+            <button
+              v-for="fl in flowList"
+              :key="fl.id"
+              class="fl-turn"
+              :class="{ on: flowCurrent && flowCurrent.id === fl.id }"
+              @click="selectFlow(fl)"
+            >
+              <div class="fl-turn-row">
+                <span class="fl-turn-model">{{ fl.name }}</span>
+                <span class="fl-turn-time">{{ fl.nodes.length }} 步</span>
+              </div>
+              <div class="fl-turn-meta"><span>{{ fl.desc || '（无说明）' }}</span></div>
+            </button>
+          </div>
+        </aside>
+
+        <!-- 中：编排画布 -->
+        <section class="fl-canvas-wrap">
+          <div class="fl-build-bar">
+            <input
+              class="fl-name"
+              :value="flowCurrent ? flowCurrent.name : ''"
+              placeholder="流程名称"
+              @input="onFlowName(($event.target as HTMLInputElement).value)"
+            />
+            <div class="fl-action-add">
+              <select v-model="addAction" class="fl-select">
+                <option v-for="a in FLOW_ACTIONS" :key="a.action" :value="a.action">
+                  {{ a.label }}{{ a.mutating ? '（写）' : '' }}
+                </option>
+              </select>
+              <button class="fl-btn-mini" :disabled="!flowCurrent" @click="addStep">＋ 添加步骤</button>
+            </div>
+            <div class="fl-build-ops">
+              <button class="fl-btn-mini ok" :disabled="flowRunning || !flowCurrent" @click="runFlow(0)">▶ 执行</button>
+              <button class="fl-btn-mini" :disabled="!flowRunning" @click="stopFlow">■ 停止</button>
+              <button class="fl-btn-mini" :disabled="flowRunning || !flowCurrent" @click="saveFlow">保存模板</button>
+              <button class="fl-btn-mini danger" :disabled="!flowCurrent || !flowCurrent.id" @click="flowCurrent && deleteFlow(flowCurrent.id)">删除</button>
+            </div>
+          </div>
+          <p v-if="flowMessage" class="fl-build-msg" :class="flowMessageKind">{{ flowMessage }}</p>
+          <p v-if="demoMode" class="fl-demo fl-demo-inline">
+            示例演示模式：点「执行」跑完整条流水线。校验步刻意「首次失败」，用来演示「红卡 → 单步重跑修复 → 从失败步续跑」。
+          </p>
+          <div v-if="flowCurrent" class="fl-canvas">
+            <VueFlow
+              id="flow-build"
+              :nodes="buildNodes"
+              :edges="buildEdges"
+              :min-zoom="0.25"
+              :max-zoom="1.6"
+              :pan-on-scroll="false"
+              :zoom-on-scroll="true"
+              :fit-view-on-init="true"
+              :nodes-draggable="true"
+              :nodes-connectable="true"
+              @node-click="onBuildNodeClick"
+              @node-drag-stop="onBuildNodeDragStop"
+              @connect="onBuildConnect"
+            >
+              <Background :gap="18" :size="1.2" pattern-color="#cfd8e6" />
+              <Controls position="bottom-right" :show-interactive="false" />
+
+              <template #node-fl-bstart>
+                <div class="fl-bterm start">
+                  <span>起点 · 开始执行</span>
+                  <Handle type="source" :position="Position.Bottom" class="fl-handle" />
+                </div>
+              </template>
+
+              <template #node-fl-bstep="{ data, id }">
+                <div :class="['fl-node', 'fl-n-tool', stepStatusClass(data.st), { sel: buildSelectedId === id, run: flowActiveId === id }]">
+                  <Handle type="target" :position="Position.Top" class="fl-handle" />
+                  <div class="fl-n-head">
+                    <span class="fl-n-glyph" :style="glyphStyle(data.node.action)">{{ flowActionMeta(data.node.action).glyph }}</span>
+                    <b>{{ data.node.label || flowActionMeta(data.node.action).label }}</b>
+                    <span class="fl-n-idx">第 {{ data.order }} 步</span>
+                  </div>
+                  <div class="fl-n-sub mono">
+                    {{ data.node.action }}<span v-if="flowActionMeta(data.node.action).mutating" class="fl-n-mut">写盘</span>
+                  </div>
+                  <div class="fl-n-stats">
+                    <span v-if="!data.st || data.st.status === 'pending'">待执行</span>
+                    <span v-else-if="data.st.status === 'run'">执行中…</span>
+                    <span v-else-if="data.st.status === 'skipped'">已跳过</span>
+                    <span v-else>{{ fmtMs(data.st.latency_ms) }}</span>
+                    <span v-if="data.st && data.st.status !== 'pending'">入 {{ data.st.arg_chars }} / 出 {{ data.st.obs_chars }} 字</span>
+                    <span v-if="data.st && data.st.status === 'fail'" class="fl-n-ok bad">失败</span>
+                    <span v-else-if="data.st && data.st.status === 'ok'" class="fl-n-ok good">成功</span>
+                  </div>
+                  <div v-if="data.st && data.st.error" class="fl-n-err">{{ data.st.error }}</div>
+                  <Handle type="source" :position="Position.Bottom" class="fl-handle" />
+                </div>
+              </template>
+
+              <template #node-fl-bend="{ data }">
+                <div class="fl-bterm end">
+                  <Handle type="target" :position="Position.Top" class="fl-handle" />
+                  <span>终点 · 共 {{ data.count }} 步</span>
+                </div>
+              </template>
+            </VueFlow>
+          </div>
+          <div v-else class="fl-canvas fl-empty-canvas">
+            <span>点左侧选择一个流程模板，或新建一条</span>
+          </div>
+        </section>
+
+        <!-- 右：节点参数表单 -->
+        <aside class="fl-detail">
+          <template v-if="buildSelected">
+            <h4>{{ buildSelected.label || flowActionMeta(buildSelected.action).label }}</h4>
+            <p class="fl-d-line"><label>动作</label><span class="mono">{{ buildSelected.action }}</span></p>
+            <p class="fl-d-line"><label>类别</label><span>{{ (CAT_META[flowActionMeta(buildSelected.action).cat as CatKey] || CAT_META.other).text }}</span></p>
+            <p class="fl-d-plain">{{ flowActionMeta(buildSelected.action).summary }}</p>
+            <p v-if="flowActionMeta(buildSelected.action).mutating" class="fl-d-warn">⚠ 该步骤会写盘（分区内受控写 / 提交 / 回滚）。</p>
+
+            <div v-for="fld in flowActionMeta(buildSelected.action).fields" :key="fld.name" class="fl-form-row">
+              <label>{{ fld.label }}<span v-if="fld.required" class="fl-req">*</span></label>
+              <textarea
+                v-if="fld.kind === 'text'"
+                :value="buildSelected.params[fld.name] || ''"
+                :placeholder="fld.placeholder"
+                rows="4"
+                @input="onParam(buildSelected.id, fld.name, ($event.target as HTMLTextAreaElement).value)"
+              />
+              <input
+                v-else
+                :value="buildSelected.params[fld.name] || ''"
+                :placeholder="fld.placeholder"
+                @input="onParam(buildSelected.id, fld.name, ($event.target as HTMLInputElement).value)"
+              />
+            </div>
+            <p v-if="!flowActionMeta(buildSelected.action).fields.length" class="fl-d-plain">该动作无需参数。</p>
+
+            <div class="fl-form-actions">
+              <button @click="moveNode(buildSelected.id, -1)">上移</button>
+              <button @click="moveNode(buildSelected.id, 1)">下移</button>
+              <button class="danger" @click="removeSelected">删除</button>
+            </div>
+            <button class="fl-btn-block primary" :disabled="flowRunning" @click="runFlowSingle(buildSelected.id)">↻ 重跑此步</button>
+            <button class="fl-btn-block" :disabled="flowRunning" @click="resumeFlowFrom(buildSelected.id)">▶ 从此步续跑</button>
+            <p v-if="flowLastChangeset" class="fl-d-line"><label>变更集</label><span class="mono">{{ flowLastChangeset }}</span></p>
+            <p class="fl-d-privacy">
+              节点动作都在受控动作白名单内；写盘/校验/回滚全部走既有受控端点（分区写越区即拒），运行过程按元数据写 trace，回看模式可见。
+            </p>
+          </template>
+          <div v-else class="fl-detail-empty">
+            点画布节点编辑参数，<br />或点上方「添加步骤」新增
           </div>
         </aside>
       </div>
@@ -619,5 +901,94 @@ function providerLabel(p: string) {
   .fl-detail { display: none; }
   .fl-turns { flex-basis: 176px; }
   .fl-title span { display: none; }
+}
+
+/* ---------- 编排模式 ---------- */
+.fl-mode-seg { flex: 0 0 auto; background: #eef2f8; }
+.fl-mode-seg button { padding: 5px 12px; }
+.fl-btn-block {
+  width: 100%; border: 1px solid #d3dcea; background: #fff; color: #33455f;
+  border-radius: 8px; padding: 7px 10px; font: inherit; font-size: 12px; cursor: pointer;
+}
+.fl-btn-block:hover { border-color: #9fb0c6; background: #f5f8fc; }
+.fl-btn-block.primary { background: #2f6fed; border-color: #2f6fed; color: #fff; font-weight: 600; }
+.fl-btn-block.primary:hover { background: #255ecf; }
+.fl-btn-block:disabled, .fl-btn-mini:disabled { opacity: .5; cursor: not-allowed; }
+
+.fl-build-bar {
+  flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 9px 12px; background: #eef2f8; border-bottom: 1px solid #e2e8f1;
+}
+.fl-name {
+  flex: 1 1 160px; min-width: 120px; padding: 6px 10px; border: 1px solid #d3dcea;
+  border-radius: 7px; font: inherit; font-size: 12.5px; font-weight: 600; color: #23304a;
+  background: #fff; outline: none;
+}
+.fl-name:focus { border-color: #2f6fed; }
+.fl-action-add { display: flex; gap: 6px; align-items: center; }
+.fl-select {
+  padding: 6px 8px; border: 1px solid #d3dcea; border-radius: 7px; font: inherit;
+  font-size: 11.5px; color: #33455f; background: #fff; max-width: 190px;
+}
+.fl-btn-mini {
+  border: 1px solid #d3dcea; background: #fff; color: #33455f; border-radius: 7px;
+  padding: 6px 10px; font: inherit; font-size: 11.5px; cursor: pointer; white-space: nowrap;
+}
+.fl-btn-mini:hover { border-color: #9fb0c6; background: #f5f8fc; }
+.fl-btn-mini.ok { background: #e6f7ee; border-color: #b6e6c8; color: #128053; font-weight: 600; }
+.fl-btn-mini.ok:hover { background: #d7f1e3; }
+.fl-btn-mini.danger { color: #c0434a; }
+.fl-btn-mini.danger:hover { background: #fdecec; border-color: #f3c4c7; }
+.fl-build-ops { display: flex; gap: 6px; margin-left: auto; }
+.fl-build-msg {
+  flex: 0 0 auto; margin: 8px 12px 0; padding: 6px 10px; border-radius: 7px;
+  font-size: 11.5px; line-height: 1.5;
+}
+.fl-build-msg.info { color: #46536a; background: #eef2f8; border: 1px solid #dbe2ee; }
+.fl-build-msg.ok { color: #128053; background: #e6f7ee; border: 1px solid #b6e6c8; }
+.fl-build-msg.err { color: #b32d33; background: #fdecec; border: 1px solid #f3c4c7; }
+.fl-demo-inline { margin: 8px 12px 0; }
+
+.fl-bterm {
+  position: relative; background: #fff; border: 1.5px dashed #b9c9e2; border-radius: 12px;
+  padding: 12px 16px; text-align: center; font-size: 12px; color: #3a5684; font-weight: 600;
+  min-width: 220px; box-shadow: 0 3px 10px rgba(31, 45, 72, .06);
+}
+.fl-bterm.end { border-color: #9ed8b5; color: #128053; background: #f7fef9; }
+.fl-handle { width: 8px; height: 8px; background: #2f6fed; border: 1.5px solid #fff; }
+.fl-n-tool.st-run { border-color: #8fb2f2; box-shadow: 0 0 0 2px rgba(47,111,237,.18); }
+.fl-n-tool.st-ok { border-color: #9ed8b5; }
+.fl-n-tool.st-fail { border-color: #ef9ba0; box-shadow: 0 3px 12px rgba(224,82,90,.18); }
+.fl-n-tool.st-skipped { opacity: .6; border-style: dashed; }
+.fl-n-tool.run { outline: 2px solid rgba(47,111,237,.5); outline-offset: 2px; }
+.fl-n-mut {
+  margin-left: 8px; font-size: 9.5px; font-weight: 700; color: #fff; background: #b3561f;
+  border-radius: 999px; padding: 0 6px;
+}
+.fl-n-err {
+  margin-top: 6px; font-size: 10px; line-height: 1.5; color: #b32d33;
+  background: #fdecec; border: 1px solid #f3c4c7; border-radius: 6px; padding: 4px 7px;
+  max-height: 52px; overflow: auto; word-break: break-word;
+}
+.fl-form-row { margin-bottom: 10px; }
+.fl-form-row label { display: block; font-size: 11px; color: #6b7789; margin-bottom: 4px; }
+.fl-form-row .fl-req { color: #d23b42; margin-left: 3px; }
+.fl-form-row input, .fl-form-row textarea {
+  width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #d3dcea;
+  border-radius: 7px; font: inherit; font-size: 11.5px; color: #23304a; background: #f7f9fc;
+  outline: none; resize: vertical;
+}
+.fl-form-row input:focus, .fl-form-row textarea:focus { border-color: #2f6fed; background: #fff; }
+.fl-form-actions { display: flex; gap: 6px; margin: 4px 0 10px; }
+.fl-form-actions button {
+  flex: 1; border: 1px solid #d3dcea; background: #fff; color: #33455f; border-radius: 7px;
+  padding: 6px 0; font: inherit; font-size: 11.5px; cursor: pointer;
+}
+.fl-form-actions button:hover { border-color: #9fb0c6; background: #f5f8fc; }
+.fl-form-actions button.danger { color: #c0434a; }
+.fl-form-actions button.danger:hover { background: #fdecec; border-color: #f3c4c7; }
+.fl-d-warn {
+  margin: 0 0 10px; font-size: 11px; line-height: 1.6; color: #8a5a16;
+  background: #fdf2e0; border: 1px solid #f0d29a; border-radius: 7px; padding: 6px 8px;
 }
 </style>

@@ -3,7 +3,7 @@
 import { ref } from 'vue'
 // P4 收口：开发台内所有 /api/* 请求统一带上当前项目头（withProject）。健康探测本身与项目
 // 无关（后端 /api/health 不读项目上下文），但为一致性也走同一注入；未选项目时不带头（生命线）。
-import type { AssetItem } from '../api'
+import type { AssetItem, FlowDef } from '../api'
 import { withProject } from '../api'
 
 export const demoMode = ref(false)
@@ -368,3 +368,39 @@ export const demoRegionCards = [
     dirty_count: 0, own_repo: false, last_commit: null,
   },
 ]
+
+// ---------------------------------------------------------------- 阶段 3b：可执行 demo 流程
+// 一条完整的「定位 → 改 → 校验 → 提交 → 导出试玩 → 不满意回滚」流水线。
+// 演示态离线可跑：verify 步刻意「首次失败」以演示「红卡 → 单步重跑修复」，
+// 其余动作返回可信的中文结果（见 flowRunner.demoResult）。
+export const demoFlows: FlowDef[] = [
+  {
+    id: 'flow-demo-1',
+    name: '调平数值 → 校验 → 导出试玩 → 回滚',
+    desc: '改玩家生命值 → 分区校验 → 提交变更集 → Web 导出试玩 → 不满意回滚变更集。',
+    nodes: [
+      { id: 'n1', action: 'dev_list_regions', label: '定位分区', params: {} },
+      { id: 'n2', action: 'dev_region_edit', label: '改玩家生命值', params: {
+        region: 'values', path: 'balance.json',
+        old_text: '"player_hp": 100', new_text: '"player_hp": 120',
+      } },
+      { id: 'n3', action: 'dev_region_verify', label: '数值区校验', params: { region: 'values' } },
+      { id: 'n4', action: 'dev_commit_all', label: '提交变更集', params: { message: '调平玩家初始生命值为 120' } },
+      { id: 'n5', action: 'engine_web_export', label: 'Web 导出试玩', params: {} },
+      { id: 'n6', action: 'dev_rollback_changeset', label: '不满意就回滚', params: { changeset: '' } },
+    ],
+    edges: [
+      { source: 'n1', target: 'n2' },
+      { source: 'n2', target: 'n3' },
+      { source: 'n3', target: 'n4' },
+      { source: 'n4', target: 'n5' },
+      { source: 'n5', target: 'n6' },
+    ],
+  },
+]
+
+/** 演示态：这些节点「首次执行失败」，用于演示「失败停红 → 单步重跑修复 → 续跑」。 */
+export const demoFlowFlaky: Record<string, string[]> = {
+  'flow-demo-1': ['n3'],
+}
+
