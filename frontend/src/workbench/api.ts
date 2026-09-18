@@ -917,10 +917,27 @@ export interface ComfyWatchJob {
   progress?: { executed_nodes: number; total_nodes: number; percent: number }
 }
 
+export interface ComfyModelCheckTemplate {
+  id: string
+  name: string
+  present: boolean
+  missing: string[]
+  pending: boolean
+}
+export interface ComfyModelCheckResult {
+  ok: boolean
+  root?: string
+  found?: string[]
+  templates?: ComfyModelCheckTemplate[]
+  error?: string
+}
+
 export const comfyApi = {
   start(root?: string, port = 8188) { return postJson<{ok:boolean;running?:boolean;pid?:number;error?:string}>('/api/comfy/start', { root, port }) },
   stop() { return postJson<{ok:boolean;running?:boolean;stopped?:boolean;pid?:number;error?:string}>('/api/comfy/stop', {}) },
-  templates() { return request<{ ok: boolean; templates: { id:string; name:string; model:string; kind:string; workflow?:string; schema?:Record<string,string> }[] }>('/api/comfy/templates') },
+  templates() { return request<{ ok: boolean; templates: { id:string; name:string; model:string; kind:string; group?:'image'|'control'|'character'|'video'; vram_gb?:number; models?:string[]; pending?:boolean; hint?:string; source_url?:string; workflow?:string; schema?:Record<string,string> }[] }>('/api/comfy/templates') },
+  /** 只读检测各模板依赖的模型文件是否存在（不下载）。 */
+  modelCheck() { return request<ComfyModelCheckResult>('/api/comfy/model-check') },
   template(id: string) { return request<{ ok:boolean; workflow?:Record<string, unknown>; format?:string; error?:string }>(`/api/comfy/templates/${encodeURIComponent(id)}`) },
   apply(workflow: Record<string, unknown>, parameters: Record<string, unknown>) { return postJson<{ok:boolean; workflow?:Record<string, unknown>; error?:string}>('/api/comfy/templates/apply', {workflow, parameters}) },
   jobs(page=1, pageSize=20) { return request<{ok:boolean; total:number; items:Record<string, unknown>[]}>(`/api/comfy/jobs?page=${page}&page_size=${pageSize}`) },

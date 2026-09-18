@@ -1,13 +1,22 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { engineApi, taskApi, comfyApi, getProjectId, getActiveTask, setActiveTask } from '../api'
 import { useWorkbench } from '../composables/workbench'
 const { jumpToLine } = useWorkbench()
+type ComfyTemplate = { id:string; name:string; model:string; kind:string; group?:string; vram_gb?:number; models?:string[]; pending?:boolean; hint?:string; source_url?:string; workflow?:string; schema?:Record<string,string> }
+const comfyGroupLabels: Record<string,string> = { image:'生图', control:'控图', character:'角色一致', video:'视频', other:'其他' }
+const comfyGroupOrder = ['image','control','character','video','other']
 const panelProject = getProjectId()
 let disposed = false
 const activeTask = getActiveTask(panelProject)
 const open = ref(false), title = ref(''), region = ref(activeTask.region), files = ref(''), result = ref(''), impact = ref<string[]>([]), taskId = ref(activeTask.id), tasks = ref<Record<string, unknown>[]>([])
-const running = ref(false), busy = ref(false), logs = ref<string[]>([]), errors = ref<{path:string;line:number;message:string}[]>([]), comfyUrl = ref('http://127.0.0.1:8188'), comfyState = ref('未检测'), workflow = ref(''), comfyResult = ref(''), promptId = ref(''), outputs = ref<{filename?:string;subfolder?:string;type?:string;preview_url?:string;mime?:string;asset_kind?:string;preview_supported?:boolean}[]>([]), comfyTemplates = ref<{id:string;name:string;model:string;kind:string;workflow?:string;schema?:Record<string,string>}[]>([]), comfySelected = ref<{schema?:Record<string,string>}|null>(null), comfyParams = ref<Record<string,unknown>>({prompt:'',width:512,height:512,frames:16,steps:8,seed:42,filename_prefix:'docmind'}) , comfyHistory = ref<string[]>([]), comfyPage = ref(1), comfyTotal = ref(0)
+const running = ref(false), busy = ref(false), logs = ref<string[]>([]), errors = ref<{path:string;line:number;message:string}[]>([]), comfyUrl = ref('http://127.0.0.1:8188'), comfyState = ref('未检测'), workflow = ref(''), comfyResult = ref(''), promptId = ref(''), outputs = ref<{filename?:string;subfolder?:string;type?:string;preview_url?:string;mime?:string;asset_kind?:string;preview_supported?:boolean}[]>([]), comfyTemplates = ref<ComfyTemplate[]>([]), comfySelected = ref<ComfyTemplate | null>(null), comfyParams = ref<Record<string,unknown>>({prompt:'',width:512,height:512,frames:16,steps:8,seed:42,filename_prefix:'docmind'}) , comfyHistory = ref<string[]>([]), comfyPage = ref(1), comfyTotal = ref(0)
+// 模板按 group 分组展示（生图/控图/角色一致/视频），未知分组归入「其他」。
+const groupedTemplates = computed(() => {
+  const buckets: Record<string, ComfyTemplate[]> = {}
+  for (const t of comfyTemplates.value) { const g = t.group && comfyGroupOrder.includes(t.group) ? t.group : 'other'; (buckets[g] ||= []).push(t) }
+  return comfyGroupOrder.filter(g => buckets[g]?.length).map(g => ({ key: g, label: comfyGroupLabels[g], items: buckets[g] }))
+})
 const unrealState = ref('未连接'), unrealAssets = ref<string[]>([]), unrealActors = ref<{name:string;class:string}[]>([])
 async function loadTasks() { if (disposed || panelProject !== getProjectId()) return; try { tasks.value = (await taskApi.list()).tasks.slice(-5).reverse() } catch (e) { result.value = '任务列表加载失败：' + (e as Error).message } }
 async function refresh() { if (disposed || panelProject !== getProjectId()) return; try { running.value = (await engineApi.status()).running; const r = await engineApi.logs(); logs.value = r.lines.slice(-8); errors.value = r.errors } catch(e) { result.value='引擎状态读取失败：'+(e as Error).message } }
@@ -37,8 +46,32 @@ async function retryComfy() { if (!promptId.value) return; const r = await comfy
 async function selectComfyHistory(id: string) { promptId.value = id; await pollComfy() }
 async function refreshUnreal() { try { const s = await engineApi.unrealBridgeStatus(); unrealState.value = s.available ? '已连接' : '未连接'; if (s.available) { const [a,b] = await Promise.all([engineApi.unrealAssets(), engineApi.unrealActors()]); unrealAssets.value = a.assets || []; unrealActors.value = b.actors || [] } } catch { unrealState.value = '未连接' } }
 async function importOutput(o: Record<string, unknown>) { const v=await comfyApi.validateProvenance(o); if (!v.ok) { comfyResult.value=`来源信息无效：${(v.errors||[]).join('、')}`; return }; const x = await comfyApi.import(promptId.value, o, comfyUrl.value); comfyResult.value = x.ok ? (v.review_required ? `已导入 ${x.path}（许可证待人工审核）` : `已导入 ${x.path}`) : (x.error || '导入失败') }
-async function loadComfyTemplate(id: string) { const meta = comfyTemplates.value.find(x => x.id === id); comfySelected.value = meta || null; const r = await comfyApi.template(id); if (r.ok && r.workflow) { workflow.value = JSON.stringify(r.workflow, null, 2); comfyResult.value = `已加载模板（${r.format || 'api'}）` } else comfyResult.value = r.error || '模板加载失败' }
+async function loadComfyTemplate(id: string) { const meta = comfyTemplates.value.find(x => x.id === id); comfySelected.value = meta || null; if (meta?.pending) { comfyResult.value = meta.hint || '该模板待接入（需先安装依赖模型/自定义节点）'; return }; const r = await comfyApi.template(id); if (r.ok && r.workflow) { workflow.value = JSON.stringify(r.workflow, null, 2); comfyResult.value = `已加载模板（${r.format || 'api'}）` } else comfyResult.value = r.error || '模板加载失败' }
 async function applyComfyParams() { try { const r=await comfyApi.apply(JSON.parse(workflow.value), comfyParams.value); if (r.ok && r.workflow) { workflow.value=JSON.stringify(r.workflow,null,2); comfyResult.value='参数已应用并完成节点校验' } else comfyResult.value=r.error||'参数应用失败' } catch { comfyResult.value='Workflow JSON 无效' } }
+// 「检测模型」：只读扫描 ComfyUI models/ 目录；缺失模型只做引导（不下载）。
+const guideOpen = ref(false), guideRoot = ref(''), guideRows = ref<{ name:string; missing:string[]; url:string }[]>([])
+const comfyDownloadLinks: Record<string,string> = {
+  'z-image-turbo':'https://github.com/Tongyi-MAI/Z-Image',
+  'minimax-h3-i2v':'https://github.com/MiniMax-AI',
+  'flux1-dev-fp8':'https://huggingface.co/black-forest-labs/FLUX.1-dev',
+  'flux1-canny':'https://huggingface.co/black-forest-labs/FLUX.1-dev',
+  'flux1-depth':'https://huggingface.co/black-forest-labs/FLUX.1-dev',
+  'flux1-dev-gguf-q4':'https://huggingface.co/city96/FLUX.1-dev-gguf',
+  'uso-subject':'https://huggingface.co/ByteDance/USO',
+  'uso-style':'https://huggingface.co/ByteDance/USO',
+}
+async function checkModels() {
+  comfyResult.value = '正在检测模型…'
+  try {
+    const r = await comfyApi.modelCheck()
+    if (!r.ok) { comfyResult.value = r.error || '模型检测失败'; return }
+    const rows = (r.templates || []).filter(t => (t.missing || []).length > 0)
+      .map(t => ({ name: t.name, missing: t.missing, url: comfyDownloadLinks[t.id] || comfyTemplates.value.find(x => x.id === t.id)?.source_url || '' }))
+    if (!rows.length) { guideOpen.value = false; comfyResult.value = '模型检测完成：所有模板依赖均已就位'; return }
+    guideRows.value = rows; guideRoot.value = r.root || ''; guideOpen.value = true
+    comfyResult.value = `模型检测完成：${rows.length} 个模板缺依赖`
+  } catch (e) { comfyResult.value = '模型检测失败：' + (e as Error).message }
+}
 async function showFailure(action: () => Promise<unknown>) { try { await action() } catch(e) { comfyResult.value='操作失败：'+(e as Error).message } }
 </script>
 <template>
@@ -58,9 +91,10 @@ async function showFailure(action: () => Promise<unknown>) { try { await action(
       <div v-if="unrealAssets.length || unrealActors.length" class="te-unreal-list"><div v-for="a in unrealAssets.slice(0,8)" :key="a">BP · {{ a }}</div><div v-for="a in unrealActors.slice(0,8)" :key="a.name">Actor · {{ a.name }} ({{ a.class }})</div></div>
       <pre v-if="logs.length" class="te-logs">{{ logs.join('\n') }}</pre>
       <button v-for="e in errors" :key="`${e.path}:${e.line}`" class="te-error" @click="jumpToLine(e.path, e.line)">{{ e.path }}:{{ e.line }} · {{ e.message }}</button>
-      <div class="te-comfy"><b>AI 画图 / 视频（ComfyUI）</b><button @click="startComfy">启动</button><button @click="stopComfy">停止</button><button @click="loadComfyHistory()">刷新历史</button><input v-model="comfyUrl" @change="checkComfy" /><div class="te-templates"><button v-for="t in comfyTemplates" :key="t.id" @click="showFailure(() => loadComfyTemplate(t.id))">{{ t.name }}</button></div><div v-if="comfySelected?.schema" class="te-params"><label v-for="(_,key) in comfySelected.schema" :key="key">{{ key }}<input v-model="comfyParams[key]" /></label><button @click="applyComfyParams">应用参数</button></div><div class="te-history-pager"><button :disabled="comfyPage <= 1" @click="loadComfyHistory(comfyPage - 1)">上一页</button><span>{{ comfyPage }} / {{ Math.max(1, Math.ceil(comfyTotal / 20)) }}</span><button :disabled="comfyPage * 20 >= comfyTotal" @click="loadComfyHistory(comfyPage + 1)">下一页</button></div><div v-if="comfyHistory.length" class="te-history"><button v-for="id in comfyHistory" :key="id" @click="selectComfyHistory(id)">{{ id.slice(0,8) }}</button></div><textarea v-model="workflow" placeholder="粘贴 workflow JSON" /><button @click="queueComfy">提交生成</button><button v-if="promptId" @click="pollComfy">查询结果</button><button v-if="promptId" class="te-cancel" @click="showFailure(cancelComfy)">取消生成</button><button v-if="promptId" @click="showFailure(retryComfy)">失败重试</button><span>{{ comfyState }} {{ comfyResult }}</span></div>
+      <div class="te-comfy"><b>AI 画图 / 视频（ComfyUI）</b><button @click="startComfy">启动</button><button @click="stopComfy">停止</button><button @click="loadComfyHistory()">刷新历史</button><button @click="checkModels">检测模型</button><input v-model="comfyUrl" @change="checkComfy" /><div class="te-templates"><div v-for="g in groupedTemplates" :key="g.key" class="te-group"><span class="te-group-label">{{ g.label }}</span><button v-for="t in g.items" :key="t.id" :disabled="!!t.pending" :title="t.pending ? (t.hint || '待接入') : (t.vram_gb ? ('约 ' + t.vram_gb + 'G 显存') : '')" @click="t.pending ? undefined : showFailure(() => loadComfyTemplate(t.id))">{{ t.name }}<em v-if="t.vram_gb" class="te-vram">约 {{ t.vram_gb }}G</em><em v-if="t.pending" class="te-pending">待接入</em></button></div></div><div v-if="comfySelected?.schema" class="te-params"><label v-for="(_,key) in comfySelected.schema" :key="key">{{ key }}<input v-model="comfyParams[key]" /></label><button :disabled="!!comfySelected?.pending" @click="applyComfyParams">应用参数</button></div><div class="te-history-pager"><button :disabled="comfyPage <= 1" @click="loadComfyHistory(comfyPage - 1)">上一页</button><span>{{ comfyPage }} / {{ Math.max(1, Math.ceil(comfyTotal / 20)) }}</span><button :disabled="comfyPage * 20 >= comfyTotal" @click="loadComfyHistory(comfyPage + 1)">下一页</button></div><div v-if="comfyHistory.length" class="te-history"><button v-for="id in comfyHistory" :key="id" @click="selectComfyHistory(id)">{{ id.slice(0,8) }}</button></div><textarea v-model="workflow" placeholder="粘贴 workflow JSON" /><button :disabled="!!comfySelected?.pending" @click="queueComfy">提交生成</button><button v-if="promptId" @click="pollComfy">查询结果</button><button v-if="promptId" class="te-cancel" @click="showFailure(cancelComfy)">取消生成</button><button v-if="promptId" @click="showFailure(retryComfy)">失败重试</button><span>{{ comfyState }} {{ comfyResult }}</span></div>
       <div v-if="outputs.length" class="te-outputs"><div v-for="o in outputs" :key="o.filename" class="te-output"><img v-if="o.mime?.startsWith('image/')" :src="o.preview_url" :alt="o.filename" /><audio v-else-if="o.mime?.startsWith('audio/')" :src="o.preview_url" controls /><video v-else-if="o.mime?.startsWith('video/')" :src="o.preview_url" controls /><div v-else-if="o.asset_kind === '3d'" class="te-3d-placeholder">3D 资源<br/><small>格式识别成功，当前提供安全导入元数据</small></div><div v-else class="te-unknown-output">{{ o.mime || '未知格式' }}<br/><small>可下载或导入</small></div><span>{{ o.filename }}</span><button @click="showFailure(() => importOutput(o))">导入</button></div></div>
     </div></Teleport>
+    <Teleport to="body"><div v-if="guideOpen" class="te-guide-backdrop" @click="guideOpen=false"></div><div v-if="guideOpen" class="te-guide" role="dialog" aria-label="缺失模型引导"><div class="te-head"><b>缺失模型引导</b><button @click="guideOpen=false">×</button></div><p class="te-guide-note">检测根目录：{{ guideRoot || '未知' }}</p><p class="te-guide-note">以下模型文件未检测到。请前往官方 / HuggingFace 下载后放入对应 <code>models/</code> 子目录；国内可尝试 hf-mirror.com 镜像（请自行确认可用性）。自动拉取默认关闭，此处仅作引导，不会自动下载。</p><div v-for="row in guideRows" :key="row.name" class="te-guide-row"><b>{{ row.name }}</b><ul><li v-for="m in row.missing" :key="m">{{ m }}</li></ul><a v-if="row.url" :href="row.url" target="_blank" rel="noopener">打开下载指引 ↗</a></div><button class="te-guide-close" @click="guideOpen=false">知道了</button></div></Teleport>
   </div>
 </template>
 <style scoped>
@@ -71,8 +105,6 @@ async function showFailure(action: () => Promise<unknown>) { try { await action(
 .te-params{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin:5px 0}.te-params label{font-size:10px;color:var(--text-muted)}.te-params input{margin:2px 0!important;padding:3px!important;font-size:10px}.te-params button{grid-column:1/-1}
 .te-outputs{margin-top:6px;display:grid;grid-template-columns:repeat(auto-fill,minmax(125px,1fr));gap:6px;max-height:220px;overflow:auto}.te-output{display:flex;flex-direction:column;align-items:stretch;gap:4px;padding:5px;background:var(--bg);border:1px solid var(--border);border-radius:4px;font-size:10px}.te-output img{width:100%;height:86px;object-fit:cover;border-radius:3px}.te-output audio,.te-output video{width:100%;max-height:86px}.te-output span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono)}.te-output button{background:linear-gradient(180deg,#3b7ef2,#2f6fed);border:1px solid #2560d4;color:#fff;border-radius:4px;padding:3px 7px;cursor:pointer}
 .te-unreal{margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:11px;color:var(--text-muted);display:flex;gap:6px;align-items:center}.te-unreal small{margin-left:2px}.te-unreal button{margin-left:auto;background:linear-gradient(180deg,#3b7ef2,#2f6fed);border:1px solid #2560d4;color:#fff;border-radius:4px;padding:4px 7px;cursor:pointer}.te-unreal-list{max-height:110px;overflow:auto;margin-top:4px;padding:5px;background:var(--bg);font:10px var(--font-mono);color:var(--text-muted)}
+.te-group{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin:3px 0}.te-group-label{font-size:10px;color:var(--text-muted);min-width:52px}.te-templates button:disabled{opacity:.5;cursor:not-allowed}.te-vram{margin-left:4px;font-style:normal;font-size:9px;color:var(--text-muted)}.te-pending{margin-left:4px;font-style:normal;font-size:9px;padding:0 3px;border-radius:3px;background:#00000012;color:#c9762a}
+.te-guide-backdrop{position:fixed;inset:0;z-index:305;background:#0003}.te-guide{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:min(460px,calc(100vw - 40px));max-height:calc(100vh - 80px);overflow:auto;padding:14px;background:var(--bg-raised);border:1px solid var(--border-strong);border-radius:8px;box-shadow:0 14px 40px rgba(35,52,84,.24);z-index:306;font-size:12px}.te-guide-note{color:var(--text-muted);font-size:11px;margin:6px 0}.te-guide-row{padding:7px;margin:6px 0;background:var(--bg);border:1px solid var(--border);border-radius:5px}.te-guide-row ul{margin:4px 0;padding-left:18px;font:11px var(--font-mono);color:var(--text-muted)}.te-guide-row a{color:#2f6fed;font-size:11px}.te-guide-close{margin-top:8px;background:linear-gradient(180deg,#3b7ef2,#2f6fed);border:1px solid #2560d4;color:#fff;border-radius:4px;padding:5px 10px;cursor:pointer}
 </style>
-
-
-
-
