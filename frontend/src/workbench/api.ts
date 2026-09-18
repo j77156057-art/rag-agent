@@ -1363,7 +1363,13 @@ declare global { interface Window { DocMindSession: BrowserSession } }
 export function getSessionId(): string { return window.DocMindSession.get() }
 export function setSessionId(id: string): Promise<boolean> { return window.DocMindSession.set(id) }
 export function startNewSession(): Promise<string> { return window.DocMindSession.create() }
-function newSessionId(): string { return 'web-' + crypto.randomUUID().replaceAll('-', '').slice(0, 24) }
+function newSessionId(): string {
+  const c = globalThis.crypto as Crypto | undefined
+  const raw = c && typeof c.randomUUID === 'function'
+    ? c.randomUUID().replace(/-/g, '')
+    : Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2)
+  return 'web-' + raw.replace(/[^0-9a-fA-F]/g, '').slice(0, 24).padEnd(24, '0')
+}
 
 // ---------------------------------------------------------------- 标签页存活探测
 // 目的：判断「本标签页是否为当前唯一打开的 DocMind 标签」。该判断仅供「关掉重开自动续上
