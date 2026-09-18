@@ -18,6 +18,25 @@ export function inlineHtml(s: string): string {
   return t
 }
 
+export interface WebRef { url: string; title: string; score?: string }
+
+/** 从联网工具输出中提取来源卡片，避免把长 URL 淹没在正文里。 */
+export function extractWebRefs(text: string): WebRef[] {
+  const lines = (text || '').split(/\r?\n/)
+  const out: WebRef[] = []; const seen = new Set<string>(); let title = ''
+  for (const line of lines) {
+    const bullet = /^\s*[·•-]\s+(.+)$/.exec(line)
+    if (bullet && !/^https?:\/\//.test(bullet[1])) { title = bullet[1].trim(); continue }
+    const url = /(https?:\/\/[^\s)<>]+)/.exec(line)?.[1]?.replace(/[.,，。]+$/, '')
+    if (!url || seen.has(url)) continue
+    seen.add(url)
+    const score = /可信度参考：([0-9.]+)/.exec(line)?.[1]
+    out.push({ url, title: title || url, score })
+    title = ''
+  }
+  return out.slice(0, 8)
+}
+
 export function mdToHtml(md: string): string {
   const blocks: string[] = []
   const codeStore: string[] = []

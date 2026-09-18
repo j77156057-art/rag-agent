@@ -67,7 +67,8 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
 - calculate(expression): 计算数学表达式，如 '23*45+12'；也支持比较运算，如 '9.9 > 9.11'（结果为「成立/不成立」）。支持 + - * / % ** //、括号与 > < >= <= == !=。比较/差值类问题算出结果后，必须用自然语言给出结论（如「所以 9.9 更大」），不要只丢一个数字。
 - web_search(query): 联网搜索（DuckDuckGo/百度/Bing 自动故障转移，无需 Key）。当知识库不足、信息有时效性、或需要外部资料时使用。默认偏好近一年结果（自动追加 after:<去年>，可用 env WEB_SEARCH_PREFER_RECENT=0 关闭）。需要限定站点时，在输入里追加 `site: github.com` 或 `platform: github/b站/微博/贴吧`（自动映射域名），把结果收敛到指定站。
 - web_fetch(url): 读取搜索结果中的公开网页正文，保留来源 URL 和标题后再总结。
-- web_research(query): 一步完成搜索与最多 3 个来源正文读取，适合教程、GitHub、引擎文档和最新资料。
+- web_research(query): 一步完成搜索与最多 3 个来源正文读取，适合教程、GitHub、引擎文档和最新资料；会标记来源排序参考与明显数字冲突。
+- web_subtitles(url): 读取公开 B 站视频字幕（BV/av URL）；无公开字幕或需要登录时如实返回原因。
 - dev_http_request(url, method?, headers?, body?, timeout?): 调用你自己的外部业务 API（REST/JSON）。受 EXTERNAL_API_ALLOWLIST 域名白名单约束（防 SSRF），未配置白名单则拒绝。当用户要求"调用外部接口 / 查订单 / 调内部服务 / 打通某个 API"时使用。输入（多行 key: value）：第一行 `url: <完整URL>`，可选 `method: <GET/POST/...>`、`headers: <单行JSON对象>`、`body: <请求体，可多行>`、`timeout: <秒>`。
 - dev_list_connectors(): 列出已配置连接器（key/label/engine/能力标签/适用说明/启用状态）。调用游戏引擎类工具前先用它看清有哪些连接器可用、各自能干什么。
 - dev_route_connector(hint): 按任务语义（如 "Godot 里打开 Main 场景并运行"）挑选最合适的【已启用】连接器，返回排序候选与匹配理由。优先用它的 top.key 作为 dev_mcp_call 的 key；若某连接器不可用或调用失败，重新用它挑选其它已启用连接器。
@@ -307,7 +308,7 @@ _VERBATIM_TOOLS = {"python_exec", "gen_video_prompt"}
 _WRITE_TOOLS = {"apply_edit", "create_file", "dev_region_edit"}
 
 # 外网工具：只有用户显式打开「联网搜索」开关时才可用（默认关闭，代码问答不外联）。
-_WEB_TOOLS = {"web_search", "web_fetch", "web_research"}
+_WEB_TOOLS = {"web_search", "web_fetch", "web_research", "web_subtitles"}
 
 # 输入留空即合法的工具（无参调用 / 可选 path 调用）；
 # 其余工具在 Action Input 为空时一律拦截回填，不消耗工具步数——
@@ -341,6 +342,7 @@ _ARG_PREFIX_TOOLS = {
     "search_code": ("query", "q", "keyword"),
     "search_knowledge": ("query", "q", "keyword"),
     "web_search": ("query", "q", "keyword"),
+    "web_subtitles": ("url", "video", "bvid"),
     "search_assets": ("query", "q", "keyword"),
     "grep": ("pattern", "regex", "p"),
     "read_file": ("path", "file"),
@@ -472,7 +474,7 @@ def _is_failure(obs):
 _SUBAGENT_ROLES = {
     "researcher": {
         "tools": ["search_knowledge", "search_code", "read_file", "grep",
-                  "web_search", "web_fetch", "web_research"],
+                  "web_search", "web_fetch", "web_research", "web_subtitles"],
         "hint": "你是【检索专员】：只负责查证，产出带 文件:行号 或来源 URL 的要点清单；不要改任何文件。",
     },
     "coder": {
@@ -675,12 +677,12 @@ class Agent:
         # （原生通道已从 schema 里剔除，文本通道再用提示词堵一道）。
         if self.web_enabled:
             messages.append({"role": "system", "content": (
-                "【联网已开启】可使用 web_search / web_fetch / web_research 获取最新外部资料；"
+                "【联网已开启】可使用 web_search / web_fetch / web_research / web_subtitles 获取最新外部资料；"
                 "回答中引用网页结论时必须附来源 URL。"
             )})
         else:
             messages.append({"role": "system", "content": (
-                "【联网已关闭】本轮禁止使用 web_search / web_fetch / web_research，"
+                "【联网已关闭】本轮禁止使用 web_search / web_fetch / web_research / web_subtitles，"
                 "调用也会被拒绝；请仅依据本地代码库、知识库与已知信息回答，"
                 "需要最新外部资料时提示用户打开「联网」开关。"
             )})
@@ -1335,7 +1337,7 @@ class Agent:
                 # 联网开关关闭：web_* 一律不执行（原生通道已在 schema 剔除，
                 # 这里拦文本协议/开关切换瞬间残留的调用），不消耗工具步数。
                 if self._web_blocked(action_name):
-                    _obs = ("[联网未开启] web_search / web_fetch / web_research 已被用户关闭，本次未执行。"
+                    _obs = ("[联网未开启] web_search / web_fetch / web_research / web_subtitles 已被用户关闭，本次未执行。"
                             "请改用本地代码库/知识库工具回答；确需最新外部资料时，"
                             "提示用户在输入框上方打开「联网」开关后重试。")
                     trail.append({"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)})

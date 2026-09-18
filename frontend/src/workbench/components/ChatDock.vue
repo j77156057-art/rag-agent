@@ -8,7 +8,7 @@ import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
 import { aiApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, getProjectId, startTabProbe } from '../api'
 import type { McpServer, ModelConfigInfo, ContextUsage } from '../api'
 import type { SseEvent } from '../api'
-import { mdToHtml, extractFileRefs } from '../markdown'
+import { mdToHtml, extractFileRefs, extractWebRefs } from '../markdown'
 import type { FileRef } from '../markdown'
 import { demoMode } from '../composables/demo'
 import ModelSettingsDialog from './ModelSettingsDialog.vue'
@@ -444,6 +444,10 @@ function refsOf(msg: ChatMsg): FileRef[] {
   return extractFileRefs(msg.text).filter((r) => nodeExists(r.path))
 }
 
+function webRefsOf(msg: ChatMsg) {
+  return extractWebRefs(msg.text)
+}
+
 function answerHtml(msg: ChatMsg): string {
   return mdToHtml(msg.text || '')
 }
@@ -769,6 +773,14 @@ function connectorGuide(s: McpServer) {
               <div v-if="reasonOpen.has(m.id)" class="cd-reason-body">{{ m.reasoning }}</div>
             </div>
             <div v-if="m.text" class="ai-md cd-answer" v-html="answerHtml(m)" />
+            <details v-if="m.status === 'done' && webRefsOf(m).length" class="cd-web-sources">
+              <summary>联网来源（{{ webRefsOf(m).length }}）</summary>
+              <a v-for="(s, i) in webRefsOf(m)" :key="s.url + i" class="cd-web-source" :href="s.url" target="_blank" rel="noopener noreferrer">
+                <span class="cd-web-source-title">{{ s.title }}</span>
+                <span class="cd-web-source-url">{{ s.url }}</span>
+                <span v-if="s.score" class="cd-web-source-score">参考 {{ s.score }}</span>
+              </a>
+            </details>
             <div v-else-if="m.status === 'streaming'" class="cd-thinking">
               {{ m.reasoning ? '正在整理最终回答' : 'AI 正在翻代码、组织回答' }}<span class="cd-dots">…</span>
             </div>
@@ -1049,6 +1061,13 @@ function connectorGuide(s: McpServer) {
 }
 .cd-ref:hover { background: var(--bg-selected); border-color: var(--accent); }
 .cd-ref-line { color: var(--amber); }
+.cd-web-sources { margin-top: 8px; border-top: 1px solid var(--border); padding-top: 5px; max-width: 96%; }
+.cd-web-sources summary { cursor: pointer; color: var(--text-muted); font-size: 11px; }
+.cd-web-source { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; margin-top: 5px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 5px; color: var(--text); text-decoration: none; background: var(--bg); }
+.cd-web-source:hover { border-color: var(--accent); background: var(--bg-selected); }
+.cd-web-source-title { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cd-web-source-url { grid-column: 1 / -1; color: var(--accent); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cd-web-source-score { color: var(--text-faint); font-size: 10px; }
 
 /* 输入区 */
 .cd-inputbar { display: flex; flex-direction: column; gap: 6px; padding: 7px 12px 9px; }

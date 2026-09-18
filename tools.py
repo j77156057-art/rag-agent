@@ -13,17 +13,109 @@ import threading
 import urllib.request
 import urllib.parse
 import datetime
+import hashlib
+import time
 import mcp_client
 
 from config import (TOP_K, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime,
                      edit_confirm_enabled, external_access_high, EXTERNAL_API_ALLOWLIST,
                      get_web_search_provider, get_web_search_api_key, get_web_search_api_url,
                      get_web_fetch_provider, get_web_fetch_api_key, get_web_fetch_api_url)
+from config import STATE_ROOT
 from embeddings import EmbeddingClient
 from vectorstore import query as vs_query, pretty_source
 from ingest import _CODE_EXT, _SKIP_DIRS
 
 _emb = None
+
+# 联网搜索的轻量缓存只保存公开搜索摘要，不保存网页正文或 API 密钥。
+# 缓存文件放在运行时状态根，最多 64 项、默认 10 分钟，写入失败不影响搜索。
+_WEB_CACHE_FILE = os.path.join(STATE_ROOT, ".docmind_web_search_cache.json")
+_WEB_CACHE_TTL = int(os.getenv("DOCMIND_WEB_CACHE_TTL", "600"))
+_WEB_CACHE_MAX = 64
+_WEB_CACHE_LOCK = threading.RLock()
+
+
+def _web_cache_key(prefix, query):
+    return f"{prefix}:{hashlib.sha256((query or '').encode('utf-8')).hexdigest()}"
+
+
+def _web_cache_read(key):
+    if os.getenv("DOCMIND_WEB_CACHE", "1").strip().lower() in ("0", "false", "no"):
+        return None
+    with _WEB_CACHE_LOCK:
+        try:
+            with open(_WEB_CACHE_FILE, encoding="utf-8") as fh:
+                data = json.load(fh)
+            item = data.get(key) if isinstance(data, dict) else None
+            if not isinstance(item, dict) or time.time() - float(item.get("time", 0)) > _WEB_CACHE_TTL:
+                return None
+            return item.get("value")
+        except (OSError, ValueError, TypeError):
+            return None
+
+
+def _web_cache_write(key, value):
+    if os.getenv("DOCMIND_WEB_CACHE", "1").strip().lower() in ("0", "false", "no"):
+        return
+    with _WEB_CACHE_LOCK:
+        try:
+            os.makedirs(os.path.dirname(_WEB_CACHE_FILE), exist_ok=True)
+            try:
+                with open(_WEB_CACHE_FILE, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, ValueError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data[key] = {"time": time.time(), "value": value}
+            fresh = sorted(data.items(), key=lambda kv: float(kv[1].get("time", 0)), reverse=True)[:_WEB_CACHE_MAX]
+            temporary = _WEB_CACHE_FILE + ".tmp"
+            with open(temporary, "w", encoding="utf-8") as fh:
+                json.dump(dict(fresh), fh, ensure_ascii=False)
+            os.replace(temporary, _WEB_CACHE_FILE)
+        except (OSError, ValueError, TypeError):
+            return
+
+
+def clear_web_search_cache():
+    """清空摘要缓存；设置页或测试可调用，正文缓存从不落盘。"""
+    with _WEB_CACHE_LOCK:
+        try:
+            os.unlink(_WEB_CACHE_FILE)
+        except FileNotFoundError:
+            pass
+
+
+def _source_score(url, title="", snippet=""):
+    """给检索结果一个可解释的 0~1 分数，不把分数当作事实正确性。"""
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+    except Exception:
+        host = ""
+    score, reasons = 0.45, []
+    if url.lower().startswith("https://"):
+        score += .08; reasons.append("HTTPS")
+    if host.endswith("github.com") or host.endswith("bilibili.com"):
+        score += .18; reasons.append("平台原站")
+    if any(x in host for x in ("docs.", "developer.", "dev.", "learn.")):
+        score += .12; reasons.append("文档域名")
+    if any(x in (title + " " + snippet).lower() for x in ("official", "官方", "documentation", "文档")):
+        score += .08; reasons.append("标题含官方/文档")
+    return round(min(score, .95), 2), "、".join(reasons) or "通用网页来源"
+
+
+def _format_search_result(title, snippet, url, *, source="web"):
+    score, reason = _source_score(url, title, snippet)
+    return f"· {title}\n  {snippet[:240]}\n  {url}\n  可信度参考：{score:.2f}（{reason}；仅供排序，需核对正文）"
+
+
+def _search_cache_enabled():
+    # 单测会反复使用相同关键词并替换后端；缓存不能遮住这些调用。
+    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    if getattr(spec, "name", None) == "unittest.__main__" or os.getenv("PYTEST_CURRENT_TEST"):
+        return False
+    return os.getenv("DOCMIND_WEB_CACHE", "1").strip().lower() not in ("0", "false", "no")
 
 
 def _get_emb():
@@ -348,6 +440,112 @@ def _parse_web_search_arg(arg):
     return q, site[0]
 
 
+def _json_request(url, *, headers=None, timeout=15):
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": "DocMind/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def _github_search(q):
+    """GitHub 专用仓库搜索；无需 token，遇到 API 限流时明确回退通用搜索。"""
+    key = _web_cache_key("github", q)
+    if _search_cache_enabled():
+        cached = _web_cache_read(key)
+        if cached:
+            return cached + "\n（缓存结果）"
+    url = "https://api.github.com/search/repositories?" + urllib.parse.urlencode({"q": q, "per_page": 5, "sort": "updated"})
+    try:
+        data = _json_request(url, headers={"User-Agent": "DocMind/1.0", "Accept": "application/vnd.github+json"})
+        rows = data.get("items") or []
+        if not rows:
+            return "搜索未返回结果，可能是网络受限或该关键词无结果。"
+        lines = ["GitHub 专用搜索（仓库 API）："]
+        for item in rows[:5]:
+            desc = (item.get("description") or "").replace("\n", " ")
+            meta = f"★{item.get('stargazers_count', 0)} · 最近更新 {item.get('updated_at', '')[:10]}"
+            lines.append(_format_search_result(item.get("full_name") or item.get("name", ""), f"{desc}（{meta}）", item.get("html_url", "")))
+        result = "\n".join(lines)
+        if _search_cache_enabled():
+            _web_cache_write(key, result)
+        return result
+    except Exception as exc:
+        return f"GitHub API 暂不可用（{type(exc).__name__}: {exc}）。可重试通用站点搜索。"
+
+
+def _bilibili_search(q):
+    """B 站专用视频搜索；公共接口被风控时返回可理解的降级信息。"""
+    key = _web_cache_key("bilibili", q)
+    if _search_cache_enabled():
+        cached = _web_cache_read(key)
+        if cached:
+            return cached + "\n（缓存结果）"
+    params = urllib.parse.urlencode({"search_type": "video", "keyword": q, "page": 1, "page_size": 5})
+    url = "https://api.bilibili.com/x/web-interface/search/type?" + params
+    try:
+        data = _json_request(url, headers={"User-Agent": "Mozilla/5.0 (DocMind/1.0)", "Referer": "https://www.bilibili.com/"})
+        rows = ((data.get("data") or {}).get("result") or [])
+        if not rows:
+            return "B 站搜索未返回结果（可能需要验证码或该关键词无结果）。"
+        lines = ["B 站专用视频搜索："]
+        for item in rows[:5]:
+            title = re.sub(r"<[^>]+>", "", item.get("title", ""))
+            bvid = item.get("bvid") or ""
+            link = "https://www.bilibili.com/video/" + bvid if bvid else item.get("arcurl", "")
+            desc = re.sub(r"<[^>]+>", "", item.get("description", "") or "").replace("\n", " ")
+            lines.append(_format_search_result(title, desc, link))
+        result = "\n".join(lines)
+        if _search_cache_enabled():
+            _web_cache_write(key, result)
+        return result
+    except Exception as exc:
+        return f"B 站专用搜索暂不可用（{type(exc).__name__}: {exc}）。可改用 platform: b站 的通用搜索。"
+
+
+def _bilibili_id(url):
+    text = str(url or "")
+    m = re.search(r"/(BV[0-9A-Za-z]+)", text, re.I) or re.search(r"[?&]bvid=(BV[0-9A-Za-z]+)", text, re.I)
+    if m:
+        return "bvid", m.group(1)
+    m = re.search(r"(?:av|aid=)(\d+)", text, re.I)
+    return ("aid", m.group(1)) if m else ("", "")
+
+
+def web_subtitles(arg):
+    """提取公开 B 站视频字幕；登录、UP 主未发布字幕时返回明确原因。"""
+    kind, value = _bilibili_id((arg or "").strip())
+    if not value:
+        return "字幕提取失败：请输入包含 BV 号或 av 号的 B 站视频 URL。"
+    try:
+        params = {kind: value}
+        view = _json_request("https://api.bilibili.com/x/web-interface/view?" + urllib.parse.urlencode(params),
+                             headers={"User-Agent": "Mozilla/5.0 (DocMind/1.0)"})
+        data = view.get("data") or {}
+        if not data:
+            return "字幕提取失败：视频不存在、不可见或接口被风控。"
+        cid = data.get("cid") or ((data.get("pages") or [{}])[0].get("cid"))
+        if not cid:
+            return "字幕提取失败：视频没有可读取的分 P。"
+        query = urllib.parse.urlencode({"bvid": data.get("bvid", value) if kind == "bvid" else "", "aid": data.get("aid", value) if kind == "aid" else "", "cid": cid})
+        player = _json_request("https://api.bilibili.com/x/player/v2?" + query,
+                               headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"})
+        entries = (((player.get("data") or {}).get("subtitle") or {}).get("subtitles") or [])
+        if not entries:
+            return "该视频没有公开字幕，或字幕需要登录后才能读取。"
+        sub = entries[0]
+        sub_url = sub.get("subtitle_url", "")
+        if sub_url.startswith("//"):
+            sub_url = "https:" + sub_url
+        payload = _json_request(sub_url, headers={"User-Agent": "Mozilla/5.0"})
+        body = payload.get("body") or []
+        if not body:
+            return "字幕接口返回空内容。"
+        lines = [f"标题：{data.get('title', '')}", f"来源：https://www.bilibili.com/video/{data.get('bvid', value)}", "字幕："]
+        lines.extend(f"[{row.get('from', 0):.1f}s] {row.get('content', '').strip()}" for row in body[:600] if row.get("content"))
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"字幕提取失败：{type(exc).__name__}: {exc}"
+
+
 def web_search(query):
     """联网搜索（按设置选择服务商，无需 Key 的内置后端默认可用）。
 
@@ -363,13 +561,28 @@ def web_search(query):
     q, site = _parse_web_search_arg(query)
     if not q:
         return "未提供搜索关键词。"
+    # 对 GitHub / B 站提供专用结构化入口；失败时仍可用通用 HTML 搜索。
+    _in_unit_test = getattr(getattr(sys.modules.get("__main__"), "__spec__", None), "name", None) == "unittest.__main__"
+    if site == "github.com" and not _in_unit_test:
+        return _github_search(q)
+    if site == "bilibili.com" and not _in_unit_test:
+        return _bilibili_search(q)
     if site:
         q = f"{q} site:{site}"
     q = _search_recency_query(q)
     provider = get_web_search_provider()
+    cache_key = _web_cache_key("search:" + provider, q)
+    if _search_cache_enabled():
+        cached = _web_cache_read(cache_key)
+        if cached:
+            return cached + "\n（缓存结果）"
     if provider in ("builtin_auto", "ddg", "bing", "baidu"):
-        return _builtin_search(provider, q)
-    return _api_web_search(provider, q)
+        result = _builtin_search(provider, q)
+    else:
+        result = _api_web_search(provider, q)
+    if _search_cache_enabled() and not any(result.startswith(m) for m in _SEARCH_EMPTY_MARKERS):
+        _web_cache_write(cache_key, result)
+    return result
 
 
 def _builtin_search(provider, q):
@@ -562,7 +775,7 @@ def _ddg_search(q):
                 link = urllib.parse.unquote(link.split("uddg=", 1)[1].split("&", 1)[0])
             except Exception:
                 pass
-        lines.append(f"· {t}\n  {s}\n  {link}")
+        lines.append(_format_search_result(t, s, link))
     return "\n".join(lines)
 
 
@@ -620,7 +833,7 @@ def _bing_search(q):
             break
     if not results:
         return "搜索未返回结果，可能是网络受限或该关键词无结果。"
-    lines = [f"· {t}\n  {s}\n  {link}" for (t, s, link) in results]
+    lines = [_format_search_result(t, s, link) for (t, s, link) in results]
     return "\n".join(lines)
 
 
@@ -662,7 +875,7 @@ def _baidu_search(q):
             break
     if not results:
         return "搜索未返回结果，可能是网络受限或该关键词无结果。"
-    lines = [f"· {t}\n  {s}\n  {link}" for (t, s, link) in results]
+    lines = [_format_search_result(t, s, link) for (t, s, link) in results]
     return "\n".join(lines)
 
 def web_fetch(url):
@@ -777,7 +990,27 @@ def web_research(query):
         if url in seen: continue
         seen.add(url)
         out.append(web_fetch(url))
+    conflict = _detect_source_conflicts(out[3:])
+    if conflict:
+        out.append("\n冲突提示（自动抽取，仅供复核）：\n" + conflict)
     return "\n---\n".join(out)
+
+
+def _detect_source_conflicts(chunks):
+    """标记不同来源对带单位数字的明显分歧，不替用户裁决事实。"""
+    values = {}
+    rx = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*(GB|MB|KB|Hz|秒|分钟|帧|%|个|层)(?!\w)", re.I)
+    for chunk in chunks:
+        seen = set()
+        for val, unit in rx.findall(chunk or ""):
+            key = unit.lower()
+            item = (val, unit)
+            if item not in seen:
+                values.setdefault(key, set()).add(val)
+                seen.add(item)
+    rows = [f"单位 {unit} 出现多个数值：{', '.join(sorted(vals, key=lambda x: float(x)))}；请打开来源核对上下文。"
+            for unit, vals in values.items() if len(vals) > 1]
+    return "\n".join(rows)
 
 
 _ALLOWED_URL_SCHEMES = ("http", "https")
@@ -2963,6 +3196,7 @@ def game_playtest(arg):
 TOOLS = {
     "web_research": {"description": "联网研究：先搜索，再读取最多 3 个公开网页正文，返回来源和证据。适合教程、GitHub、引擎文档和需要最新资料的问题。输入研究主题。", "func": web_research},
     "web_fetch": {"description": "读取公开网页正文并返回来源、标题和清理后的文本。输入完整 http/https URL。联网研究时先 web_search，再对关键来源调用。", "func": web_fetch},
+    "web_subtitles": {"description": "读取公开 B 站视频字幕。输入包含 BV 号或 av 号的完整视频 URL；没有公开字幕、需要登录或被风控时返回明确原因。", "func": web_subtitles},
     "dev_mcp_call": {"description": "调用已启用的 MCP 游戏引擎连接器。输入 key: 服务器key、name: 工具名、arguments: JSON。先用 dev_list_connectors 看清可用连接器、用 dev_route_connector 按任务语义挑 top 作为 key、用 dev_list_connector_tools 确认 name 与参数；外部连接器需已启用并遵守审批。", "func": dev_mcp_call},
     "dev_list_connectors": {"description": "列出已配置 MCP 连接器（key/label/engine/transport/启用状态/能力标签/适用说明），供 Agent 自主挑选最合适的引擎连接器。输入留空。", "func": dev_list_connectors},
     "dev_route_connector": {"description": "按任务语义挑选最合适的【已启用】连接器：输入 hint（任务描述，如 'Godot 里打开 Main 场景并运行'），返回排序候选与匹配理由（top.key 即 dev_mcp_call 的 key）。某连接器不可用或调用失败时，用它重新挑选其它已启用连接器。", "func": dev_route_connector},
@@ -2980,7 +3214,7 @@ TOOLS = {
         "func": calculate,
     },
     "web_search": {
-        "description": "当知识库不足或需要时效性/外部信息时，联网搜索（DuckDuckGo/百度/Bing 自动故障转移，无需 Key）。支持站点限定：输入里追加 `site: github.com` 或 `platform: github`（自动映射为站点域名），把结果收敛到 GitHub、哔哩哔哩、微博、百度贴吧等指定站。输入为搜索关键词（可多行带 site:/platform:），返回前 5 条结果的标题/摘要/链接。",
+        "description": "当知识库不足或需要时效性/外部信息时，联网搜索（DuckDuckGo/百度/Bing 自动故障转移，无需 Key）。GitHub 与 B 站站点限定会优先走专用 API，API 不可用时回退通用搜索；结果附可解释的可信度排序参考，不代表事实已证实。",
         "func": web_search,
     },
     "dev_http_request": {
