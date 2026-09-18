@@ -248,7 +248,7 @@ _MAX_NUDGES = 2
 # 与各工具失败文案字面保持一致；新增工具失败文案时请同步补这里并更新 test_failure_markers。
 _FAILURE_MARKERS = (
     "未找到相关内容", "计算失败", "表达式包含非法字符",
-    "搜索失败", "搜索未返回结果", "网页读取失败",   # 联网类（web_search / web_fetch / web_research）
+    "搜索失败", "搜索未返回结果", "网页读取失败", "字幕提取失败", "没有公开字幕",   # 联网类（web_search / web_fetch / web_research / web_subtitles）
     "读取失败", "文件不存在", "拒绝访问",           # read_file 类（含路径越界拒绝）
     "未提供", "安全限制", "拒绝写入",
 )
