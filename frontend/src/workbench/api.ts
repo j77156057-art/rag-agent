@@ -1205,6 +1205,40 @@ export const gpuApi = {
   },
 }
 
+/** 本地模型驻留（显存占用）：GET /api/model_status + POST /api/model_power。
+ *  本地大模型默认长期驻留显存，切模型 / 跑 ComfyUI 生图前可一键卸载腾显存。 */
+export interface ModelResident {
+  name: string
+  size_vram_gb: number
+  size_gb: number
+  expires_minutes: number | null
+  processor: string
+}
+export interface ModelStatus {
+  reachable: boolean
+  loaded: ModelResident[]
+  vram_gb: number
+  needs_ollama: boolean
+  needed_models?: string[]
+  error?: string
+}
+export interface ModelPowerResult {
+  ok: boolean
+  action?: string
+  unloaded?: string[]
+  preloaded?: string[]
+  loaded?: ModelResident[]
+  vram_gb?: number
+  error?: string
+}
+export const modelResidencyApi = {
+  status() { return request<ModelStatus>('/api/model_status') },
+  /** off=立即卸载全部驻留模型（释放显存，下次对话自动重载）；on=预加载当前配置所需模型 */
+  power(action: 'off' | 'on') {
+    return postJson<ModelPowerResult>('/api/model_power', { action })
+  },
+}
+
 /** P3：分区状态（GET /api/regions → regions.list_regions） */
 export interface RegionInfo {
   key: string
