@@ -164,6 +164,13 @@ class StreamChat:
                 slot["name"] = nm
             frag = _fn_get(fn, "arguments", "")
             if frag:
+                # 个别 OpenAI 兼容服务端（含部分本地推理后端）把流式 function.arguments
+                # 直接给成对象而非 JSON 字符串；直接 `str += dict` 会抛
+                # TypeError: can only concatenate str (not "dict") to str。
+                # 与 normalize_tool_calls 保持同一归一：对象 → JSON 字符串。
+                if not isinstance(frag, str):
+                    frag = json.dumps(frag, ensure_ascii=False) if isinstance(
+                        frag, (dict, list)) else str(frag)
                 slot["arguments"] += frag
 
     def _flush_tools(self):

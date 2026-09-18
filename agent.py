@@ -242,6 +242,14 @@ def parse_response(text):
 
 # 工具未返回有效结果的判定（触发自我反思 / 换工具重试）
 _MAX_REFLECTIONS = 2
+# 同一工具连续失败达到该次数：即便模型换了参数也判为「无用重试」，强制其收尾。
+# 防的是弱模型对同一工具（尤其入参格式没吃透的 dev_* 工具）无限重试耗尽上下文。
+_TOOL_FAIL_LIMIT = 3
+# 连续失败总次数上限（跨工具的「交替失败」也兜住：A 失败→B 失败→A 失败… 同样强制收尾）。
+_TOTAL_FAIL_LIMIT = 5
+# 回合进行中实时刷新上下文用量指示的最小间隔（秒）。count_tokens 对本地 provider
+# 可能是真实网络请求，故限频；但仍要足够密，让长回合的进度条能跟着工具往返上浮。
+_CTX_EMIT_INTERVAL = 1.0
 # 回答被截断 / 为空 / 不合格式时的「自动续写纠偏」次数上限（不额外消耗工具步数）
 _MAX_NUDGES = 2
 # 工具失败文案白名单：工具观察里命中以下任一子串即判为失败（触发反思 / trace ok=False）。
@@ -251,6 +259,7 @@ _FAILURE_MARKERS = (
     "搜索失败", "搜索未返回结果", "网页读取失败", "字幕提取失败", "没有公开字幕",   # 联网类（web_search / web_fetch / web_research / web_subtitles）
     "读取失败", "文件不存在", "拒绝访问",           # read_file 类（含路径越界拒绝）
     "未提供", "安全限制", "拒绝写入",
+    "参数缺失",                                     # dev_* 等工具入参缺失/格式错（否则会被当成功→无限重试）
 )
 
 # 历史回放「整段计数」时的轮间分隔符：仅用于把候选轮拼成 1 条文本、只发 1 次
@@ -810,6 +819,30 @@ class Agent:
             "compact_percent": compact_percent,
         }
 
+    def _live_context(self, head, trail):
+        """回合进行中的实时上下文占用（含本轮已产生的工具往返 trail）。
+
+        `context_stats` 只算「开工前」的 head（系统提示 + 历史滑窗 + 当前问题），
+        旧实现也只在回合开工与压缩后各上报一次，于是长回合（多次 ReAct 工具往返）
+        里进度条会一直停在开工时的初始值——用户反馈的「上下文永远显示 5%」即由此而来。
+        这里按当前 head + trail 精算 used/percent，让指示随步数真实上浮；
+        history/compact 字段复用上一份快照（那是历史整段计数，不必每步重算）。
+        """
+        used = self._prompt_tokens(head, trail)
+        budget = self._prompt_budget()
+        percent = max(0, min(100, round(used * 100 / budget))) if budget else 0
+        out = dict(self.last_context or {})
+        out["used_tokens"] = used
+        out["context_window"] = self.context_window
+        out["prompt_budget"] = budget
+        out["percent"] = percent
+        # level 主口径仍是「历史压缩进度」；但本轮实时体积已触线时要能升级
+        if percent >= 100:
+            out["level"] = "high"
+        elif percent >= 80 and out.get("level") == "ok":
+            out["level"] = "warn"
+        return out
+
     def _prompt_tokens(self, head, trail):
         """整段待发送消息的 token 数（llamacpp 走 /tokenize 精算，失败走保守估算）。"""
         text = "\n".join((m.get("content") or "") for m in head + trail)
@@ -1039,6 +1072,9 @@ class Agent:
         tool_steps = 0
         iterations = 0
         repeats = 0  # 完全相同参数重复调用同一工具的次数
+        tool_fail_streak = {}  # 同一工具连续失败次数（换参数也算；防同工具反复失败死循环）
+        fail_total = 0  # 连续失败总次数（任一工具；成功即清零）
+        _last_ctx_at = 0.0  # 上次实时刷新上下文用量指示的时刻（限频用）
         executed = set()  # 本轮已执行过的 (工具, 参数)，用于防空转循环
         last_action = None
         last_obs = None
@@ -1381,30 +1417,79 @@ class Agent:
                         ok=not _is_failure(obs),
                     )
                 yield {"type": "observation", "text": obs}
+                # 实时刷新上下文用量指示：把本轮已产生的工具往返一并计入。旧实现只在
+                # 开工/压缩后各上报一次，长回合里进度条会一直停在初始值（用户反馈的
+                # 「上下文永远 5%」）。限频以免每步都触发网络计数。
+                if self.session_id and self.depth == 0:
+                    _now = time.monotonic()
+                    if _now - _last_ctx_at >= _CTX_EMIT_INTERVAL:
+                        _last_ctx_at = _now
+                        try:
+                            self.last_context = self._live_context(
+                                head, trail + [{"role": "user", "content": obs}])
+                            yield {"type": "context", **self.last_context}
+                        except Exception:  # noqa: BLE001 —— 用量统计失败绝不影响问答
+                            pass
                 last_action = parsed["action"]
                 last_obs = obs
 
-                # 自我反思：工具未返回有效结果时，标记反思并提示换思路重试
-                if _is_failure(obs) and failures < _MAX_REFLECTIONS:
-                    failures += 1
-                    yield {
-                        "type": "reflection",
-                        "text": f"工具 {parsed['action']} 未返回有效结果，正在换思路重试（改用其他工具或改写查询）。",
-                    }
-                    trail.append(
-                        {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
-                    )
-                    trail.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Reflection: 上一工具 {parsed['action']} 未得到有效结果，请换一种方式"
-                                f"（例如改用 web_search，或换关键词）。\n\nObservation was: "
-                                f"{_clip(obs, OBS_MAX_CHARS)}"
-                            ),
+                # 自我反思：工具未返回有效结果时，标记反思并提示换思路重试。
+                if _is_failure(obs):
+                    streak = tool_fail_streak.get(parsed["action"], 0) + 1
+                    tool_fail_streak[parsed["action"]] = streak
+                    fail_total += 1
+                    # 同一工具连续失败到上限（换参数也算），或连续失败总数越界：判为「无用重试」，
+                    # 强制收尾。否则弱模型会一直重试同一工具耗尽上下文——这正是
+                    # dev_apply_regions 入参格式没被识别时报「参数缺失」刷出死循环的成因。
+                    if streak >= _TOOL_FAIL_LIMIT or fail_total >= _TOTAL_FAIL_LIMIT:
+                        forced_finals = _MAX_FORCED_FINALS
+                        forced_final_reason = (
+                            f"（工具 {parsed['action']} 已连续失败 {streak} 次，"
+                            "模型未能换出可用的调用方式。）"
+                        )
+                        trail.append(
+                            {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
+                        )
+                        trail.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Nudge: 工具 {parsed['action']} 已反复失败（连续 {streak} 次），"
+                                    "禁止再用任何参数重试它。请立即基于上文全部 Observation 输出 "
+                                    "`Final Answer:`：如实说明该步骤未完成及原因，不要编造，"
+                                    "也不要再输出 Action。"
+                                ),
+                            }
+                        )
+                        yield {
+                            "type": "reflection",
+                            "text": f"工具 {parsed['action']} 反复失败，已要求模型停止重试并收尾。",
                         }
-                    )
-                    continue
+                        continue
+                    if failures < _MAX_REFLECTIONS:
+                        failures += 1
+                        yield {
+                            "type": "reflection",
+                            "text": f"工具 {parsed['action']} 未返回有效结果，正在换思路重试（改用其他工具或改写查询）。",
+                        }
+                        trail.append(
+                            {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
+                        )
+                        trail.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Reflection: 上一工具 {parsed['action']} 未得到有效结果，请换一种方式"
+                                    f"（例如改用 web_search，或换关键词）。\n\nObservation was: "
+                                    f"{_clip(obs, OBS_MAX_CHARS)}"
+                                ),
+                            }
+                        )
+                        continue
+                else:
+                    # 本次执行成功：清掉该工具的连续失败计数与全局连续失败计数
+                    tool_fail_streak.pop(parsed["action"], None)
+                    fail_total = 0
 
                 # 写操作改变了代码库状态：清空已执行记录，允许随后用【相同命令】
                 # 重新跑测试做验证（防重复护栏针对的是无意义空转，不是改后复验）。

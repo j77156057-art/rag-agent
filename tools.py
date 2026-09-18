@@ -2914,27 +2914,63 @@ def dev_propose_regions(arg):
     return "\n".join(lines)
 
 
+_APPLY_REGIONS_USAGE = (
+    "参数缺失：请提供分区清单。可传 JSON 数组（或 {\"regions\":[...]} 对象），"
+    "例如 regions: [{\"key\":\"values\",\"dir\":\"values\",\"name\":\"数值区\"}, ...]。"
+)
+
+
+def _parse_regions_payload(arg):
+    """从工具入参里解析出分区清单。返回 (regions_list, err)。
+
+    弱模型 / 原生 function-calling 给的入参格式很多样，这里全部兼容，避免因解析失败
+    反复重试同一工具（这会耗尽上下文）：
+      ① 整个 arg 就是 JSON：`{"regions":[...]}` 或裸数组 `[...]`（原生 tool_call 最常见）；
+      ② `regions: <JSON>` 的 keyed 文本；
+      ③ 上面都失败时用 ast.literal_eval 兜底 Python repr（单引号/True/None）形式。
+    """
+    whole = (arg or "").strip()
+    if not whole:
+        return None, _APPLY_REGIONS_USAGE
+    keyed = (_parse_keyed(whole, ["regions"]).get("regions") or "").strip()
+    # 先试 keyed 的值（`regions: [...]`），再试整段（裸 JSON），两者去重保序
+    candidates = [c for c in (keyed, whole) if c]
+    data, last_err = None, ""
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = str(e)
+    if data is None:
+        import ast
+        for cand in candidates:
+            try:
+                data = ast.literal_eval(cand)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+    if data is None:
+        return None, (f"regions 不是合法 JSON：{last_err}。请传入 JSON 数组"
+                      "（可用 dev_propose_regions 的产出再裁减）。")
+    if isinstance(data, dict) and isinstance(data.get("regions"), list):
+        data = data["regions"]
+    if not isinstance(data, list):
+        return None, "regions 格式应为 JSON 数组，或 {\"regions\":[...]} 对象。"
+    return data, ""
+
+
 def dev_apply_regions(arg):
     """应用 Agent 研判后的自定义分区方案：把给定分区清单写入 regions.json 并初始化（建目录/每区 git/导出桩/规则）。
-    输入：regions: <JSON 数组，或 {"regions":[...]} 对象>。每个分区至少含 key 与 dir；可选 name/desc/depends_on/exports/verify。
+    输入：regions: <JSON 数组，或 {"regions":[...]} 对象>；也可直接给 JSON 数组 / 对象的原文。
+    每个分区至少含 key 与 dir；可选 name/desc/depends_on/exports/verify。
     这是把「Agent 判断的分区」落地的关键一步；应用后 Agent 写操作即被约束到这些分区内。"""
     root = _get_code_root()
     if not root:
         return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
-    f = _parse_keyed(arg or "", ["regions"])
-    raw = (f.get("regions") or "").strip()
-    if not raw:
-        return "参数缺失：请提供 regions: <JSON 数组或 {\"regions\":[...]} 分区清单>。"
-    try:
-        data = json.loads(raw)
-    except Exception as e:  # noqa: BLE001
-        return f"regions 不是合法 JSON：{e}。请传入 JSON 数组（可用 dev_propose_regions 的产出再裁减）。"
-    if isinstance(data, dict) and isinstance(data.get("regions"), list):
-        regions_list = data["regions"]
-    elif isinstance(data, list):
-        regions_list = data
-    else:
-        return "regions 格式应为 JSON 数组，或 {\"regions\":[...]} 对象。"
+    regions_list, err = _parse_regions_payload(arg)
+    if regions_list is None:
+        return err
     from regions import init_regions
     ok, msg = init_regions(root, regions_list)
     if not ok:
