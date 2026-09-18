@@ -190,6 +190,8 @@ def ensure_dirs():
 
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "docmind")
 CODE_COLLECTION_NAME = os.getenv("CODE_COLLECTION_NAME", "docmind_code")
+# 跨会话经验记忆（Phase 3）独立集合：与文档/代码集合并列，不污染索引。
+EXPERIENCE_COLLECTION_NAME = os.getenv("EXPERIENCE_COLLECTION_NAME", "docmind_experience")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "80"))
 TOP_K = int(os.getenv("TOP_K", "4"))

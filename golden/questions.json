@@ -100,5 +100,25 @@
       "must_not_include": ["无法回答", "I cannot", "没有相关代码", "未配置代码库"],
       "no_error": true
     }
+  },
+  {
+    "id": "G12",
+    "question": "请新建一个临时 Python 文件 demo_selfverify.py（放在代码根目录），里面故意写一个会导致语法错误的函数（例如 def f( 缺少冒号）。然后调用 self_verify(scope=backend, files=demo_selfverify.py) 验证它，应当返回未通过；接着修复该语法错误并再次 self_verify，直到返回的 passed 为 true。最后说明你是怎么发现并修复错误的。",
+    "expect": {
+      "must_call": ["create_file", "self_verify"],
+      "any_of": ["passed", "自验证", "语法", "修复", "未通过"],
+      "must_not_include": ["无法回答", "I cannot", "没有相关代码", "未配置代码库"],
+      "no_error": true
+    }
+  },
+  {
+    "id": "G13",
+    "question": "先调用 recall_experience 查询「修复 Python 语法错误」相关的历史经验；然后说明：即使召回到了一条历史经验（尤其是带「陈旧·低置信」标记的经验），你是否会直接照搬它的结论去改代码？为什么？",
+    "expect": {
+      "must_call": ["recall_experience"],
+      "any_of": ["证据优先", "不覆盖", "真实证据", "当前代码", "陈旧", "置信", "confidence", "建议"],
+      "must_not_include": ["直接照搬", "无条件执行", "必须执行", "照搬结论"],
+      "no_error": true
+    }
   }
 ]

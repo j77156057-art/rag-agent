@@ -101,13 +101,15 @@
 
 - **Phase 1（已实现 ✅）**：`self_verify` 工具 + 写后自验证收尾门 + `verified` trace 字段 + 12 项单测（`tests/test_self_verify.py`）。挂载点：tools.py `self_verify`/`_sv_verify_*`、agent.py `_run_self_verify`/`_parse_written_rel`/`_SELF_VERIFY_ENABLED` + 写回合收尾守卫、agent_trace.py `verified`。复用 `python_exec` 与 fail-limit 守卫。
 - **Phase 2（已实现 ✅）**：前端 `typecheck` 校验（严守 build 铁律）+ 场景/引擎域自检，按改动类型自动选策略。auto 模式自动纳入 backend(.py) / frontend(.ts/.vue) / scene(场景子系统，无 GUI)；engine(引擎嵌入) 需真 Godot GUI，**默认不自动跑**（避免每次写都拉起 Godot 打断并发写入者），仅经 `scope:engine`/`scope:all` 显式触发或开 `DOCMIND_SELF_VERIFY_ENGINE=1` 才纳入，否则降级 skip。新增单测覆盖 scene 自动触发、engine 开关门控、`scope:all` 显式触发、分类器。
-- **Phase 3**：`experience.py` + `recall_experience` 工具 + 回合收尾记录，按 `project_id` 隔离。
-- **Phase 4**：评测门扩展——golden 题加「改出 break → 自修通过」用例 + 反陈旧经验用例；接入冻结发布流程。
+- **Phase 3（已实现 ✅）**：`experience.py`（record_episode/recall_similar/is_stale/_extract_lesson/_scrub，复用 `vectorstore.get_collection("docmind_experience")`；脱敏只存元数据+教训、project_id 隔离、容量上限+去重+valid_until 置信衰减；外部依赖全 try/except 降级）+ `recall_experience` 工具（TOOLS 注册 + SYSTEM_PROMPT 提示）+ 回合收尾记录钩子 `_maybe_record_experience`（按失败结局 fail-then-fixed/repeated-fail 沉淀，成功默认不记、可由 `DOCMIND_EXPERIENCE_SUCCESS=1` 开）+ 自动召回（默认关闭 `DOCMIND_EXPERIENCE_RECALL=0`，开则按 project_id 注入建议性上下文）。挂载点：experience.py、tools.py `recall_experience`、agent.py `_maybe_record_experience`/`_derive_experience_outcome`/`_build_messages` 召回注入、agent_trace.py `Turn` 加 failure_count/max_tool_streak/max_consec_failures/last_failure/experience。
+- **Phase 4（已实现 ✅）**：评测门扩展——golden 加 G12（写坏→self_verify→自修通过）+ G13（反陈旧经验，证据优先不照搬）；`agent_eval.golden_gate_ok()` 提供「全部通过 + 无 baseline 回退」的冻结发布门（bool）。接入冻结发布流程见 `game_release_check` / CI 调用 `golden_gate_ok()`。
 
 **验收门槛（每阶段）**：新增单测全绿；完整 `discover` 不回退；前端 `npm run typecheck` 干净；自验证不得引入写工具的新执行路径（护栏复用）。
 
 **Phase 1 验证记录**：`tests/test_self_verify.py` 12 项全绿（坏 .py→failed、好 .py→passed、命中对应单测失败被捕获、scope=skip/无改动安全降级、入参多行/逗号解析、Agent 收尾门格式化 + 校验器异常降级为 passed）。
 **Phase 2 验证记录**：`tests/test_self_verify.py` 扩至 18 项全绿（新增 scene 自动触发 / engine 开关门控 / scope:all 显式触发 / 分类器）。
+**Phase 3 验证记录**：`tests/test_experience.py` 33 项全绿（record/recall 脱敏与去重 / project_id 隔离 / 容量上限 / valid_until 陈旧判定 / `_derive_experience_outcome` 结局推导 / `_maybe_record_experience` 钩子在失败回合触发、无失败时跳过 / `recall_experience` 工具注册与 JSON 形态 / 降级路径）。全程用内存假集合 + 假嵌入客户端，不依赖真实 Chroma。
+**Phase 4 验证记录**：`tests/test_experience.py` 含 `golden_gate_ok` 单测（全通过→True；有失败→False；无评分→False；baseline 回退→False；baseline 无回退→True）。G12/G13 已加入 `golden/questions.json`。
 
 **实施铁律**：动手前 `git status`；只 `git add` 明确路径、禁 `git add -A`；对方改前端时不跑 build；提交前 `git diff --stat` 核实无 stat-dirty 误判。
 

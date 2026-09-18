@@ -79,6 +79,12 @@ class Turn:
         self.reflections = 0
         self.outcome = None      # 回合结局：completed/max_steps/truncated/evidence_fallback/...
         self.verified = False    # 写后自验证是否通过（Phase 1 闭环；仅当回合含写操作且校验通过才置 True）
+        # ---- Phase 3 经验记录辅助字段（均由 agent._run 在推理循环中写入）----
+        self.failure_count = 0       # 本回合失败总次数（单调累计，成功不清零）
+        self.max_tool_streak = 0     # 单工具连续失败的最大次数
+        self.max_consec_failures = 0 # 全局连续失败的最大长度（fail_total 的历史峰值）
+        self.last_failure = None     # 最近一次失败观察（已截断，脱敏后用于经验决策）
+        self.experience = None       # 回合收尾经验记录结果 {recorded, outcome}
         self.finish_reason = None
         self.final_chars = 0
         self.cost_cny = 0.0     # 本轮按 provider 计价的花费（元）
@@ -156,6 +162,9 @@ class Turn:
             "reflections": self.reflections,
             "outcome": self.outcome or self.finish_reason or "completed",
             "verified": self.verified,
+            "failure_count": self.failure_count,
+            "max_tool_streak": self.max_tool_streak,
+            "experience": self.experience,
             "finish_reason": self.finish_reason,
             "final_chars": self.final_chars,
             "aborted": self.aborted,

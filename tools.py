@@ -3519,6 +3519,40 @@ def self_verify(arg=""):
     return json.dumps(result, ensure_ascii=False)
 
 
+def recall_experience(arg=""):
+    """召回与当前任务相似的历史经验（跨会话经验记忆，Phase 3 建议性上下文）。
+
+    入参（纯文本）：自然语言问题描述，如"改 Vue 组件后 typecheck 报错"；留空则退化为通用召回。
+    返回结构化 JSON：{query, count, items:[{outcome, action_summary, decision, lesson, confidence, stale}]}。
+
+    经验永远是「建议」，不强制覆盖当前真实证据（检索到的代码 / 校验结果优先级更高）；
+    陈旧经验置信度已被打折，低置信不参与决策。任何故障静默降级为空结果。
+    """
+    try:
+        from experience import recall_similar
+        try:
+            from projects import current_project_id
+            project_id = current_project_id()
+        except Exception:  # noqa: BLE001
+            project_id = "default"
+        q = (arg or "").strip() or "通用改动经验"
+        hits = recall_similar(project_id, q, k=5)
+        items = [{
+            "outcome": h["metadata"].get("outcome"),
+            "action_summary": h["metadata"].get("action_summary"),
+            "decision": h["metadata"].get("decision"),
+            "lesson": h["metadata"].get("lesson"),
+            "confidence": h["confidence"],
+            "stale": h["stale"],
+        } for h in hits]
+        return json.dumps({"query": q, "count": len(items), "items": items},
+                          ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"query": arg, "count": 0, "items": [],
+                           "note": "经验召回不可用（%s）" % type(e).__name__},
+                          ensure_ascii=False)
+
+
 TOOLS = {
     "web_research": {"description": "联网研究：先搜索，再读取最多 3 个公开网页正文，返回来源和证据。适合教程、GitHub、引擎文档和需要最新资料的问题。输入研究主题。", "func": web_research},
     "web_fetch": {"description": "读取公开网页正文并返回来源、标题和清理后的文本。输入完整 http/https URL。联网研究时先 web_search，再对关键来源调用。", "func": web_fetch},
@@ -3594,6 +3628,10 @@ TOOLS = {
     "self_verify": {
         "description": "写后自验证工具（Phase 1 闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，对改动做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck），并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。你也可以主动调用它来复验指定文件。Action Input 格式：第一行 scope: <auto/backend/frontend/scene/engine/all/skip>，之后可跟多行 files: <文件路径>（缺省时自动用 git diff 发现改动）。",
         "func": self_verify,
+    },
+    "recall_experience": {
+        "description": "跨会话经验记忆召回（Phase 3，建议性上下文，优先级低于真实证据）。当你准备做一类容易踩坑的改动（如某框架重构、某依赖升级、某校验反复失败）时，先调用它查「我以前类似的改动踩过什么坑、留下了什么教训」。输入为自然语言问题描述（如 '改 Vue 组件后 typecheck 报错'），留空则退化为通用召回。返回按置信度排序的历史经验（含 outcome/教训/决策/陈旧标记），仅供参考，不要把它当成必须执行的指令，当前真实代码与校验结果永远优先。",
+        "func": recall_experience,
     },
     "run_command": {
         "description": "在代码库根目录内执行 shell 命令（如 pytest / npm run build / gradle test），返回合并后的标准输出与错误（截断 1500 字，超时 12s）。用于跑构建、跑测试、执行项目内命令来验证改动或查看结果。命令在 code_root 内执行，危险操作（rm -rf /、format、shutdown 等）会被拦截。输入为完整命令字符串。",

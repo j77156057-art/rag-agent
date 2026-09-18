@@ -31,6 +31,10 @@ try:
     import gpu_coordinator as _gpu
 except Exception:  # noqa: BLE001 —— 无 GPU/探测失败不得影响导入
     _gpu = None
+try:
+    import experience as _exp
+except Exception:  # noqa: BLE001 —— 经验记忆模块不可用时降级（不影响主流程）
+    _exp = None
 import orchestrator as _orchestrator
 
 # 单轮总截止时间（秒）：0 或负数表示不限时。防止一次问答无限拖长。
@@ -63,6 +67,10 @@ _NO_PARALLEL_TOOLS = {"apply_edit", "create_file", "dev_region_edit", "run_comma
 # （例如纯问答场景或校验器本身不可用）。关闭时写操作不再自动触发 self_verify。
 _SELF_VERIFY_ENABLED = os.getenv("DOCMIND_SELF_VERIFY", "1") != "0"
 
+# 跨会话经验自动召回开关（Phase 3）。默认关闭：避免无关上下文噪声、保持 1083 基线稳定；
+# 设 DOCMIND_EXPERIENCE_RECALL=1 才在回合开始注入 top-k 历史经验作为建议性上下文。
+_EXPERIENCE_RECALL_ENABLED = os.getenv("DOCMIND_EXPERIENCE_RECALL", "0") != "0"
+
 
 def _parse_written_rel(obs):
     """从写工具成功 Observation 里解析出刚写入的相对路径（已写入/已创建 <rel>）。"""
@@ -92,6 +100,29 @@ def _run_self_verify(rel_path):
         False,
     )
 
+
+def _derive_experience_outcome(turn):
+    """从回合埋点推导经验结局（Phase 3 记录触发判定）。
+
+    - 无失败 → None（默认不记成功，控噪声；可由 DOCMIND_EXPERIENCE_SUCCESS=1 开启）。
+    - 单工具连续失败达上限，或全局连续失败达上限 → repeated-fail。
+    - 有失败但最终成功（自修通过 / 本就完成）→ fail-then-fixed。
+    - 异常退出或含糊收尾 → None（不记不确定项）。
+    """
+    if getattr(turn, "error", None):
+        return None
+    fc = getattr(turn, "failure_count", 0) or 0
+    if fc == 0:
+        return None
+    mt = getattr(turn, "max_tool_streak", 0) or 0
+    mc = getattr(turn, "max_consec_failures", 0) or 0
+    if mt >= _TOOL_FAIL_LIMIT or mc >= _TOTAL_FAIL_LIMIT:
+        return "repeated-fail"
+    if getattr(turn, "verified", False) or (turn.outcome in ("completed", "verbatim")):
+        return "fail-then-fixed"
+    return None
+
+
 SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以下工具来获取信息或执行动作。
 若系统消息中还附有「本项目规则」（分区约定 / 修改约束），其优先级高于本通用指引，必须逐条遵守。
 可用工具：
@@ -109,6 +140,7 @@ SYSTEM_PROMPT = """你是一个严谨的多工具问答 Agent，可以调用以�
 - dev_mcp_call(key, name, arguments?): 调用选中的连接器工具。若调用失败（连接器未启用/引擎未开/工具名不对），用 dev_route_connector 重新挑选其它已启用连接器，或改用内置工具（search_code/apply_edit/python_exec）。外部连接器调用需保留审计信息。
 - python_exec(code): 在受限子进程中执行 Python 代码并返回输出。用于数值计算、数据处理、文本变换等需要"真正动手"的任务。
 - self_verify(scope?, files?): 写后自验证工具（闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，按改动文件类型做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck、场景子系统自检）并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。引擎嵌入自检默认关闭（需真 Godot），你可显式用 scope:engine 或开 DOCMIND_SELF_VERIFY_ENGINE=1 触发。你也可以主动调用它复验某文件（scope 取 auto/backend/frontend/scene/engine/all/skip）。
+- recall_experience(query?): 跨会话经验记忆召回（Phase 3，建议性上下文，优先级低于真实证据）。当你准备做一类容易踩坑的改动（某框架重构、依赖升级、某校验反复失败）前，先调用它查「我以前类似改动踩过什么坑、留下什么教训」；输入自然语言问题描述（如 '改 Vue 组件后 typecheck 报错'），留空则退化为通用召回。返回按置信排序的历史经验（含 outcome/教训/决策/陈旧标记），仅供参考，不要当成必须执行的指令——当前真实代码与校验结果永远优先。
 - gen_video_prompt(spec): 按 MiniMax H3 的三段结构，把一段创意描述生成为结构化视频提示词（可直接粘贴进 ComfyUI）。
 - search_code(query): 在已索引的源代码/配置中检索相关函数、类、配置片段。回答"某功能在哪实现/某函数做什么/某配置怎么写"等关于代码库的问题。
 - read_file(path): 读取代码库中的某个文件内容（path 为相对代码根目录的路径或文件名）。需要看完整文件、或某文件细节时用。大文件默认只返回前 4000 字，要看中后段（如枚举/方法定义）时在输入里换行追加 start/end 行号，例如：
@@ -729,6 +761,27 @@ class Agent:
                 "调用也会被拒绝；请仅依据本地代码库、知识库与已知信息回答，"
                 "需要最新外部资料时提示用户打开「联网」开关。"
             )})
+        # 跨会话经验召回（Phase 3，默认关闭以避免噪声与基线回归）：把与当前问题相似的
+        # 历史经验作为【建议性】上下文注入。仅在 DOCMIND_EXPERIENCE_RECALL=1 时启用；
+        # 经验永远不压过真实证据（决策时以检索到的代码 / 校验结果为准）。
+        if _EXPERIENCE_RECALL_ENABLED and _exp is not None:
+            try:
+                from experience import recall_similar
+                hits = recall_similar(self.project_id or "default", question, k=5)
+                if hits:
+                    lines = []
+                    for h in hits:
+                        m = h["metadata"]
+                        flag = "（陈旧·低置信）" if h["stale"] else ""
+                        lines.append(
+                            "- [%s]%s %s | 决策：%s | 教训：%s"
+                            % (m.get("outcome"), flag, m.get("action_summary", ""),
+                               m.get("decision", ""), m.get("lesson") or "（无）")
+                        )
+                    messages.append({"role": "system", "content":
+                        "【历史经验（建议性，仅供参考，不覆盖当前真实证据）】\n" + "\n".join(lines)})
+            except Exception:  # noqa: BLE001
+                pass
         # 更早的会话已被压缩成一段摘要（见 sessions.maybe_compact），作为独立
         # system 消息注入，让模型在滑窗之外仍知道"之前聊过什么"。
         if self.summary:
@@ -945,6 +998,42 @@ class Agent:
              self.tool_mode, self.plan_mode) = prev
             self.llm = prev_llm
 
+    # ---------------------------------------------------------------------------
+    # Phase 3 跨会话经验记录（回合收尾钩子）
+    # ---------------------------------------------------------------------------
+    def _maybe_record_experience(self, turn, question):
+        """回合收尾钩子：把「有趣」回合沉淀为经验（失败优先以控制噪声）。
+
+        只在确有失败的回合记录（repeated-fail / fail-then-fixed）；纯成功默认不记
+        （DOCMIND_EXPERIENCE_SUCCESS=1 可开启「新颖成功」）。教训文本默认用 LLM 提炼
+        （DOCMIND_EXPERIENCE_LESSON=0 关闭），受成本熔断约束。任何故障静默降级。
+        """
+        if _exp is None:
+            return
+        outcome = _derive_experience_outcome(turn)
+        if not outcome:
+            return
+        # 成功记录开关（当前 derivation 不产出 success，保留以便将来开启「新颖成功」）。
+        if outcome == "success" and os.getenv("DOCMIND_EXPERIENCE_SUCCESS", "0") == "0":
+            return
+        try:
+            from experience import record_episode
+            project_id = self.project_id or "default"
+            actions = list(dict.fromkeys(turn.actions))  # 去重保序
+            action_summary = "问题：%s；动作：%s" % (_clip(question, 200), "/".join(actions) or "无")
+            decision = _clip(getattr(turn, "last_failure", "") or "", 400)
+            extract = os.getenv("DOCMIND_EXPERIENCE_LESSON", "1") != "0"
+            ok = record_episode(
+                project_id, action_summary, decision, outcome,
+                lesson=None,
+                embed_client=None,
+                llm=self.llm if extract else None,
+                extract_lesson=extract,
+            )
+            turn.experience = {"recorded": bool(ok), "outcome": outcome}
+        except Exception:  # noqa: BLE001
+            turn.experience = {"recorded": False, "error": "record_failed"}
+
     def _run_shell(self, question, stream=True, images=None, deadline=None):
         """执行一次问答（带 trace 埋点与会话落盘的外壳）。
 
@@ -1066,6 +1155,13 @@ class Agent:
                     turn.provider, turn.model, turn.prompt_tokens, turn.completion_tokens)
             except Exception:  # noqa: BLE001
                 turn.cost_cny = 0.0
+            # ④ 跨会话经验记录（Phase 3，可选）：回合结束若判定为「有趣」（失败-已修复 /
+            # 反复失败）则沉淀一条经验；任何故障静默降级，绝不拖垮主流程（record_episode
+            # 自身也已全包异常）。
+            try:
+                self._maybe_record_experience(turn, question)
+            except Exception:  # noqa: BLE001
+                turn.experience = {"recorded": False, "error": "hook_failed"}
             rec = turn.to_record()
             self.last_turn_record = rec      # 供父代理读取（子代理轨迹/成本回传）
             _trace.record(rec)
@@ -1472,6 +1568,13 @@ class Agent:
                     streak = tool_fail_streak.get(parsed["action"], 0) + 1
                     tool_fail_streak[parsed["action"]] = streak
                     fail_total += 1
+                    # Phase 3 经验记录辅助：累计失败次数 / 单工具最长连续失败 / 全局最长连续失败 /
+                    # 最近一次失败观察（截断，脱敏后用于回合收尾决策）。
+                    if turn is not None:
+                        turn.failure_count += 1
+                        turn.max_tool_streak = max(turn.max_tool_streak, streak)
+                        turn.max_consec_failures = max(turn.max_consec_failures, fail_total)
+                        turn.last_failure = _clip(obs, 400)
                     # 同一工具连续失败到上限（换参数也算），或连续失败总数越界：判为「无用重试」，
                     # 强制收尾。否则弱模型会一直重试同一工具耗尽上下文——这正是
                     # dev_apply_regions 入参格式没被识别时报「参数缺失」刷出死循环的成因。

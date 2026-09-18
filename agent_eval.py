@@ -176,6 +176,31 @@ def compare_to_baseline(report, baseline_path):
     }
 
 
+def golden_gate_ok(results_path, baseline_path=None):
+    """冻结发布门：结果文件**全部通过**且无 baseline 回退才放行。
+
+    - 无 baseline：要求存在已评分题且 scored 题全部 passed。
+    - 有 baseline：在「全部通过」基础上额外要求无 pass→fail 回退、整体 pass_rate 不下滑。
+    返回 bool，供冻结发布流水线（game_release_check / CI）直接判定。
+    """
+    try:
+        report = score_file(results_path)
+    except Exception:  # noqa: BLE001
+        return False
+    if report["scored"] == 0:
+        return False
+    if report["failed"] > 0:
+        return False
+    if baseline_path:
+        try:
+            gate = compare_to_baseline(report, baseline_path)
+        except Exception:  # noqa: BLE001
+            return False
+        if gate.get("regressed"):
+            return False
+    return True
+
+
 def _print_report(report):
     print(f"结果文件：{report['file']}")
     print(f"  共 {report['total']} 题（已评分 {report['scored']}，无评分标准 {report['unscored']}）")
