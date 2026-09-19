@@ -1,0 +1,45 @@
+结果文件：golden/results_v2.jsonl
+  共 42 题（已评分 42，无评分标准 0）
+  通过 8 / 失败 34  通过率 19.1%  平均得分 0.64
+  FAIL G01  → must_include:MAX_AGENT_STEPS (未在最终答案中出现)；must_include:8 (未在最终答案中出现)
+  FAIL G02  → must_include:4 (未在最终答案中出现)
+  FAIL G03  → must_include:OBS_MAX_CHARS (未在最终答案中出现)；must_include:1200 (未在最终答案中出现)
+  FAIL G04  → must_include:11000 (未在最终答案中出现)；any_of (均未出现：['prompt', '预算', '上下文'])
+  FAIL G05  → must_include:mock (未在最终答案中出现)
+  FAIL G06  → must_include:CHUNK_SIZE (未在最终答案中出现)；must_include:CHUNK_OVERLAP (未在最终答案中出现)；must_include:500 (未在最终答案中出现)；must_include:80 (未在最终答案中出现)
+  ok G07
+  FAIL G08  → must_include:docmind_code (未在最终答案中出现)；must_include:CODE_COLLECTION_NAME (未在最终答案中出现)
+  FAIL G09  → any_of (均未出现：['docmind', 'docmind_knowledge'])
+  FAIL G10  → must_include:EXPERIENCE_COLLECTION_NAME (未在最终答案中出现)；must_include:docmind_experience (未在最终答案中出现)
+  FAIL G11  → must_include:AGENT_HISTORY_TURNS (未在最终答案中出现)；must_include:40 (未在最终答案中出现)
+  FAIL G12  → must_include:8 (未在最终答案中出现)；any_of (均未出现：['.docmind_traces.jsonl', 'DOCMIND_TRACE_FILE'])
+  FAIL G13  → must_include:DOCMIND_TRACE (未在最终答案中出现)
+  FAIL G14  → must_include:HISTORY_ANSWER_CHARS (未在最终答案中出现)；must_include:700 (未在最终答案中出现)
+  ok G15
+  FAIL G16  → must_include:api.py (未在最终答案中出现)；any_of (均未出现：['SSE', '流式', 'event-stream'])；must_call:grep (actions=['search_code(chat api route)'])；min_actions (实际 1)
+  FAIL G17  → any_of (均未出现：['Vue Flow', 'vue-flow', '@vue-flow/core'])；must_call:read_file (actions=['search_code(package.json)', 'search_knowledge(DocMind 前端框架 构建工具 节点图库)'])
+  FAIL G18  → must_include:system (未在最终答案中出现)；any_of (均未出现：['trail', '工具往返', '最早的'])；min_actions (实际 1)
+  FAIL G19  → any_of (均未出现：['密钥', '用户代码', '正文永不落盘'])
+  FAIL G20  → min_actions (实际 1)
+  ok G21
+  FAIL G23  → must_include:.docmind/hooks (未在最终答案中出现)
+  FAIL G24  → must_include:.docmind/skills (未在最终答案中出现)
+  FAIL G25  → min_actions (实际 0)
+  FAIL G26  → min_actions (实际 0)
+  FAIL G27  → min_actions (实际 0)
+  FAIL G28  → min_actions (实际 0)
+  FAIL G29  → must_include:256 (未在最终答案中出现)；any_of (均未出现：['非语义', 'LOCAL_EMBED_DIM', '兜底'])
+  ok G30
+  FAIL G31  → must_include:不支持 (未在最终答案中出现)
+  FAIL G22  → min_actions (实际 1)
+  FAIL G32  → must_include:Chroma (未在最终答案中出现)
+  FAIL G33  → must_include:8 (未在最终答案中出现)
+  ok G34
+  FAIL G35  → any_of (均未出现：['请问', '哪个', '指代'])
+  FAIL G36  → any_of (均未出现：['拒绝', '不允许', '越界'])
+  ok G37
+  FAIL G38  → any_of (均未出现：['没有', '未实现', '不支持'])
+  ok G39
+  ok G40
+  FAIL G41  → any_of (均未出现：['passed', '自验证', '语法'])；must_call:self_verify (actions=['create_file(path: demo_selfverify.py\nnew_text: def f(\n    return 1)', 'python_exec(import os, subprocess, json\n\n# 1. 创建包含语法错误的文件\ncontent_bad = """def f(\n    return 1\n"""\nwith open("demo_selfverify.py", "w") as f:\n    f.write(content_bad)\n\nprint("Created demo_selfverify.py with syntax error."))'])
+  FAIL G42  → must_not_include:直接照搬 (出现幻觉标记)

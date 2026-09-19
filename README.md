@@ -1,18 +1,37 @@
-# DocMind · 本地游戏开发 AI 工作台
+# DocMind · 面向工程代码的 Agent 运行时（Harness）
 
-一个**本地、单人、面向游戏 / Mod 工程**的轻量研发脚手架。它要解决的是 AI 写代码最常见的两个失败模式：
+一个**可离线运行的 Agent 运行时**：把「能跑的 agent」补齐成**可观测、可编排、可回归**的工程系统。
+上层落地为一个本地工程工作台（代码问答 / 受控改写 / 场景与运行时可视化）——**但项目主体是 Harness，工作台只是它的落地场景**。
+
+**要解决的两个失败模式**：
 
 1. **幻觉**——AI 凭印象说"伤害计算在 player.py"，其实没有这个文件；
-2. **代码堆叠**——数值、UI、行为逻辑全塞进少数文件，越改越乱，一改就崩、无法回滚。
+2. **失控**——改完不知道改了什么、烧了多少 token、下次会不会再犯。
 
-DocMind 的应对分两层：
+应对方式是把 agent 拆成六层，逐层补上工程护栏（逐项详解见「Harness 能力」章节）：
 
-- **本地 RAG + ReAct Agent**：让模型先**检索 / 定位真实代码与文档**（文件 + 行号 + 证据）再回答，而不是直接编代码。零 API Key 可跑（mock / 本地 Ollama / llama.cpp）。
-- **仓库级工作流（工作台）**：在 RAG 之上加**任务分区、每区独立 Git、契约方向校验、变更集回滚、选区 AI、符号 / 关系图、引擎嵌入、场景画布、运行时时间线、GPU 协调**。目标形态是能真正拿来改一个 Godot / Unity / Unreal 工程的脚手架，而不是通用 ALM 平台（不做多用户 / 数据库 / 鉴权）。
+| 层 | 职责 | 关键实现 |
+|---|---|---|
+| **E 执行循环** | ReAct + 反思重试、原生 function-calling、plan 模式、子代理委派、并行只读批次、DAG 多代理编排与失败重规划 | `agent.py` · `orchestrator.py` |
+| **T 工具注册** | 47 个工具；参数校验、域名白名单、**受控写**（先读后写 + 体积上限 + 语法校验 + 人工确认） | `tools.py` |
+| **C 上下文管理** | prompt token 预算、观察截断、轨迹裁剪（保 system 与当前问题）、历史滚动摘要 | `agent.py::_fit_budget` |
+| **S 状态存储** | 逐轮 trace 账本（**只记元数据不记正文**）、会话隔离与持久化、跨重启恢复 | `agent_trace.py` · `sessions.py` |
+| **L 生命周期钩子** | 钩子 / 技能热插拔、人工审批门、按 provider 计价的成本熔断 | `hooks.py` · `skills.py` · `pricing.py` |
+| **V 评估接口** | 黄金题规则打分 + 可选 LLM-judge + **baseline 回归门**（回归即退出码 1） | `agent_eval.py` · `run_golden.py` · `golden/` |
+
+**三条设计取向**：① **护栏复用**——原生 FC 与并行批次都不新开执行路径，直接走既有护栏，避免"两套语义"；② **有界**——轨迹、观察、历史、批次全部截断或摘要，不让上下文与提示词爆炸；③ **不越权**——编排器只改未执行任务、写工具绝不并发、钩子异常一律吞掉。
+
+零 API Key 可跑（mock / 本地 Ollama / llama.cpp），云端 Provider 可随时切换。
 
 ---
 
-## ✨ 工作台六件事（2026-09 当前形态）
+## 落地场景：本地工程工作台
+
+上层是一个**本地、单人**的工程工作台（以游戏 / Mod 工程作为验证场景）：任务分区、每区独立 Git、契约方向校验、变更集回滚、选区 AI、符号 / 关系图、引擎嵌入、场景画布、运行时时间线、GPU 协调。
+
+它存在的意义是给 Harness 提供一个**真实、复杂、有副作用**的落地环境——**不是通用 ALM 平台：不做多用户协作与角色权限**（本机默认免鉴权，可按需开启单 token 校验）。
+
+### 工作台六件事（2026-09 当前形态）
 
 | 能力 | 一句话 |
 |---|---|
@@ -23,15 +42,16 @@ DocMind 的应对分两层：
 | **场景画布** | Godot `.tscn` 的**可视化 + 可编辑**画布：层级树 / 空间坐标两种布局，节点父子层级、实例（instance）、position / transform、资源引用一目了然；新增 / 删除 / 改名 / 换父 / 复制 / 改属性 / 拖拽写回位置，**全部可撤销，且撤销能逐字节还原文件** |
 | **运行时时间线** | 把游戏跑起来产生的事件（掉血 / 死亡 / 生成 / 变量变化）画成多轨道时间轴：类型筛选、时间缩放、会话分组、数值曲线、导出 JSON、点事件跳代码行 |
 
-配套：**引擎嵌入**（Godot / Unity / Unreal 启停 + Win32 HWND 嵌进工作台）、**Web 试玩**（导出 WASM 在画布里边玩边改）、**MCP 桥接**、**GPU 租约队列**、**桌面打包**（PyInstaller onedir，双击即用），以及一套 **Agent 运行时（Harness）**——trace 账本 / 会话持久化 / LLM 弹性 / 评测门 / 原生 function-calling / 多代理编排器 / 成本熔断 / hooks 与技能热插拔，见下文「Harness 能力」。
+配套：**引擎嵌入**（Godot / Unity / Unreal 启停 + Win32 HWND 嵌进工作台）、**Web 试玩**（导出 WASM 在画布里边玩边改）、**MCP 桥接**、**GPU 租约队列**、**桌面打包**（PyInstaller onedir，双击即用）。
 
 > **MCP 引擎桥接** 与 **Web 试玩导出** 的产品级使用文档与边界说明（配置模型 / API 表 / 调用前置 / 能力边界）见 [`docs/integrations.md`](docs/integrations.md)。
 
 ## 🧱 技术栈
 
-- 后端：Python · FastAPI（HTTP + SSE）· Chroma 双集合（文档 / 代码）· OpenAI 兼容多 Provider（qwen / deepseek / ollama / llamacpp / mock）· PyInstaller + pywebview
+- 后端：Python · FastAPI（HTTP + SSE）· Chroma 多集合（文档 / 代码 / 经验）· OpenAI 兼容多 Provider（qwen / deepseek / ollama / llamacpp / mock）· PyInstaller + pywebview
 - 前端：Vue 3.5 · Vite 5 · TypeScript · CodeMirror 6 · Vue Flow · 手写深色设计系统
-- 验证：`unittest` **1065 项** · 场景画布自检 54 项 · 浏览器冒烟 27 项（Playwright + 系统 Edge）· 引擎嵌入实机自检 79 项
+- 验证：`unittest` **450 项** · 场景画布自检 54 项 · 浏览器冒烟 27 项（Playwright + 系统 Edge）· 引擎嵌入实机自检 79 项
+- 评测：黄金题库 40 题（单跳 / 多跳 / 抗干扰三档）+ baseline 回归门，跑题用 `run_golden.py`、打分用 `agent_eval.py`
 
 ## 📁 目录结构
 
@@ -60,8 +80,10 @@ rag-agent/
 ├── pricing.py             # 按 provider 计价 + 全局/会话预算熔断
 ├── hooks.py               # 工具/回合钩子热插拔（.docmind/hooks/*.py）
 ├── skills.py              # 技能热插拔（.docmind/skills/**/*.md + dev_use_skill）
-├── agent_eval.py          # 黄金题自动打分 + baseline 回归门
+├── agent_eval.py          # 黄金题自动打分 + baseline 回归门（回归即退出码 1）
+├── run_golden.py          # 黄金题库运行器：跑题产出 results.jsonl 供 agent_eval.py 打分
 ├── orchestrator.py        # 多代理编排：任务图 DAG + 并行 + 重规划 + 结果合成
+├── golden/                # 黄金题库与基线结果：questions_v2.json（40 题）/ results_baseline.jsonl
 ├── frontend/              # Vue 工作台（构建产物输出到 ../web）
 │   └── src/workbench/components/
 │       ├── SceneCanvas.vue / SceneNodeCard.vue / SceneFileCard.vue   # 场景画布
@@ -137,7 +159,7 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文
 | **逐轮 trace + token 账本** | 每个回合一条 JSONL：`turn_id / session_id / messages 哈希 / 工具调用序列 / tokens in-out / 各步延迟 / finish_reason / 结局 / cost_cny`。**只记元数据不记正文**（不落 prompt/回答原文），超 8 MB 自动轮转 | 页面 **`/trace`**（截图 `docs/screenshots/trace-ledger.png`）；`GET /api/trace`、`/api/trace/summary`、`POST /api/trace/clear` |
 | **会话隔离 + 持久化** | `Agent(session_id=)` 按会话隔离（传空=纯内存，行为与旧版一致）；历史落盘、超阈值把早期轮次**压成摘要**；不再共用单例导致历史串台 | `/api/chat` 的 `session_id`；`GET /api/sessions`、`DELETE /api/sessions/{id}` |
 | **LLM 弹性** | 重试 + 指数退避（429 / 5xx / 超时 / 网络可重试，**4xx 明确不重试**）+ 统一 `timeout`/`deadline`；SSE 客户端断连即关闭内层生成器中止回合并记账 | `DOCMIND_LLM_*`、`DOCMIND_TURN_DEADLINE_S` |
-| **评测自动化** | 黄金题规则打分（`must_include / any_of / must_not_include / regex / must_call / 动作边界 / no_error`）+ 可选 LLM-judge + **baseline 回归门**（pass→fail 即退出码 1） | `agent_eval.py`、`agent-golden-eval` skill 的 `gate.py`（已接入冻结发布流程） |
+| **评测自动化** | 黄金题 40 条（单跳 / 多跳 / 抗干扰三档）规则打分（`must_include / any_of / must_not_include / regex / must_call / 动作边界 / no_error`）+ 可选 LLM-judge + **baseline 回归门**（pass→fail 即退出码 1） | `run_golden.py` 跑题、`agent_eval.py` 打分、`agent-golden-eval` skill 的 `gate.py`（已接入冻结发布流程） |
 | **原生 function-calling** | 由工具表生成 OpenAI 风格 schema；`tool_calls` 归一进文本协议后**复用全部既有护栏**（写意图 / 防重复 / 步数 / 证据兜底），事件类型不变 | `DOCMIND_TOOL_MODE=react\|native\|auto` |
 | **多代理编排器** | 任务图 DAG（校验 + 拓扑分波 + 同波并行）+ **下游注入上游结论** + **失败自动重规划**（提案 `add / drop / replace`，只能改**尚未执行**的任务）+ 结果合成 + **子代理执行轨迹回传**给 replanner 做失败归因 | `orchestrate` 工具、`POST /api/orchestrate` |
 | **成本熔断** | 按 provider/model 计价（可 `.docmind_pricing.json` 覆盖；本地 provider 恒 0）+ 全局/会话累计预算；**回合前拒绝、回合后累计** | `GET/POST /api/budget` |

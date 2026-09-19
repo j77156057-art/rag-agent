@@ -1,14 +1,35 @@
-# DocMind · A Local AI Workbench for Game & Mod Engineering
+# DocMind · An Agent Runtime (Harness) for Engineering Codebases
 
-A **local, single-user, lightweight R&D scaffold** built for game / Mod engineering. It exists to fight the two most common failure modes of "AI writes my code":
+An **agent runtime that runs fully offline**: it turns "an agent that runs" into an **observable, orchestrable, regressable** system.
+On top of it sits a local engineering workbench (code Q&A / controlled rewrite / scene & runtime visualization) — **but the subject of this project is the Harness; the workbench is only its landing scenario**.
+
+**Two failure modes it targets**:
 
 1. **Hallucination** — the AI claims "damage is calculated in `player.py`" when no such file exists;
-2. **Code pile-up** — numbers, UI, and behavior logic all crammed into a few files, so things get messier with every edit, break on the slightest change, and can't be rolled back.
+2. **Loss of control** — after an edit you don't know what changed, how many tokens it burned, or whether it will happen again.
 
-DocMind answers with two layers:
+The answer is to split the agent into six layers and add engineering guardrails to each (details in the "Harness Capabilities" section):
 
-- **Local RAG + ReAct Agent**: make the model **retrieve / locate the real code and docs** (file + line number + evidence) *before* answering, instead of inventing code. Runs with zero API key (mock / local Ollama / llama.cpp).
-- **Repository-level workflow (the Workbench)**: on top of RAG it adds **task regions, per-region independent Git, contract-direction validation, changeset rollback, selection AI, symbol / relation graph, engine embedding, scene canvas, runtime timeline, and GPU coordination**. The goal is a scaffold you can actually use to modify a Godot / Unity / Unreal project — not a generic ALM/DevOps platform (no multi-user / database / auth).
+| Layer | Responsibility | Key implementation |
+|---|---|---|
+| **E Execution loop** | ReAct + reflection retry, native function-calling, plan mode, sub-agent delegation, parallel read-only batches, DAG multi-agent orchestration with failure re-planning | `agent.py` · `orchestrator.py` |
+| **T Tool registry** | 47 tools; argument validation, domain allowlist, **controlled writes** (read-before-write + size cap + syntax check + human approval) | `tools.py` |
+| **C Context management** | prompt token budget, observation truncation, trail pruning (system prompt and current question never dropped), rolling history summary | `agent.py::_fit_budget` |
+| **S State storage** | per-turn trace ledger (**metadata only, never prompt/answer text**), session isolation & persistence, survives restart | `agent_trace.py` · `sessions.py` |
+| **L Lifecycle hooks** | hot-pluggable hooks / skills, human approval gate, per-provider pricing with cost circuit breaker | `hooks.py` · `skills.py` · `pricing.py` |
+| **V Evaluation** | golden-set rule scoring + optional LLM-judge + **baseline regression gate** (exit code 1 on regression) | `agent_eval.py` · `run_golden.py` · `golden/` |
+
+**Three design commitments**: ① **reuse the guardrails** — native function-calling and parallel batches go through the existing guardrails instead of opening new execution paths; ② **bounded** — trails, observations, history and batches are all truncated or summarized; ③ **no overreach** — the orchestrator only rewrites *not-yet-executed* tasks, writes are never concurrent, hook exceptions are always swallowed.
+
+Runs with zero API key (mock / local Ollama / llama.cpp); cloud providers can be switched in at any time.
+
+---
+
+## Landing scenario: the local workbench
+
+On top sits a **local, single-user** engineering workbench (game / Mod projects as the validation scenario): task regions, per-region Git, contract-direction validation, changeset rollback, selection AI, symbol / relation graph, engine embedding, scene canvas, runtime timeline, GPU coordination.
+
+Its purpose is to give the Harness a **real, complex, side-effect-heavy** environment — **not a generic ALM platform: no multi-user collaboration or role permissions** (no auth by default on localhost; a single-token check can be enabled).
 
 ---
 
