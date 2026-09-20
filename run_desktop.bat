@@ -11,12 +11,22 @@ REM DocMind 桌面端一键启动：用项目 venv 运行 desktop.py
 REM 路径含单引号用户名时务必用双引号包裹（%~dp0 已自带结尾反斜杠）
 setlocal
 cd /d "%~dp0"
-if not exist ".venv\Scripts\python.exe" (
-  echo [错误] 找不到 .venv\Scripts\python.exe
-  echo 请先在本目录执行：python -m venv .venv ^&^& .venv\Scripts\pip install -r requirements.txt
-  pause
-  exit /b 1
-)
+if exist ".venv\Scripts\python.exe" goto run
+
+echo [错误] 找不到 .venv\Scripts\python.exe
+echo.
+echo 请先在本目录【依次】执行下面两行（cmd 与 PowerShell 都适用）：
+echo     python -m venv .venv
+echo     .venv\Scripts\pip install -r requirements.txt
+echo.
+echo 注意：不要写成一行用连接符串联（PowerShell 5.1 不支持）；也不要连同本行前面的冒号一起复制。
+echo.
+echo 或者直接用已打包的桌面版，无需 Python、无需联网：
+echo     https://github.com/j77156057-art/rag-agent/releases
+pause
+exit /b 1
+
+:run
 ".venv\Scripts\python.exe" desktop.py
 echo.
 echo [提示] desktop.py 已退出（退出码 %errorlevel%）。
