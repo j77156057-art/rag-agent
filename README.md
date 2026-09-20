@@ -142,12 +142,25 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文
 
 ## 🖥️ 桌面端（原生窗口一键启动）
 
-`desktop.py` 把后端服务与前端组装成原生桌面窗口（Windows 走 Edge WebView2），双击即用：
+`desktop.py` 把后端服务与前端组装成桌面窗口。**优先使用 pywebview 原生窗口（Windows 走 Edge WebView2）；若目标机器缺少 WebView2 运行时，会自动降级为「控制台窗口 + 打开默认浏览器」**——这条降级路径正是为「双击没反应」准备的（原生窗口在缺运行时会静默失败：不报错也不弹窗、进程却还活着），两种模式都能正常使用。启动时另有**单实例保护**：若 8000 端口已在提供 DocMind 服务，直接打开浏览器并退出，不会堆积进程。
+
+**两个启动脚本，按场景选**：
+
+| 脚本 | 跑什么 | 前置条件 | 用途 |
+|---|---|---|---|
+| `run_desktop.bat` | 用项目 venv 跑**源码** `desktop.py` | 先建好 `.venv` 并装完依赖 | 开发调试（改了代码立刻生效） |
+| `启动DocMind.bat` | 跑**打包产物** `dist\DocMind\DocMind.exe`，再等 6 秒探测 `/api/config` 并打印 `docmind_desktop.log` | **必须先构建**（见下文「打包成独立 exe」） | 演示 / 交付（目标机器无需 Python） |
 
 ```bash
+# 源码模式（开发）
 .venv\Scripts\python.exe -m pip install pywebview   # 仅需一次
 .venv\Scripts\python.exe desktop.py                 # 或双击 run_desktop.bat
+
+# 打包模式（演示 / 交付）：先构建，再双击 启动DocMind.bat
+.venv\Scripts\python.exe -m PyInstaller docmind.spec --noconfirm   # 产出 dist\DocMind\DocMind.exe
 ```
+
+> ⚠️ **`dist/` 不入库**（见 `.gitignore`），所以刚 `clone` 或下载 ZIP 得到的仓库里**没有 `DocMind.exe`**。此时直接双击 `启动DocMind.bat` 会提示「找不到 DocMind.exe」，属预期行为——请先按下面「打包成独立 exe」构建，或改用源码模式 `run_desktop.bat`。
 
 - **引擎嵌入**：Godot / Unity / Unreal 的窗口按 Win32 HWND 规则嵌进工作台（`desktop_bridge.py`）。
   **已在 Godot 4.7.2 + 真 Win32 宿主下实机验证**（`verify_engine_embed.py` 68 项全绿）：置父与样式摘除、按客户区（或前端指定的"引擎视窗"矩形）铺排、
