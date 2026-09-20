@@ -127,6 +127,9 @@ cp .env.example .env      # 改 LLM_PROVIDER=qwen 并填 DASHSCOPE_API_KEY
 .venv\Scripts\python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000
 
 # 4. 前端：开发用 vite dev，或构建一次产物给后端托管
+#    ⚠️ 必需：工作台页 /workbench 依赖这里的构建产物（web/workbench.html 与 web/assets/）。
+#    web/assets/ 与 web/workbench.html 被 .gitignore 排除，所以 clone / 下载 ZIP 后并不存在；
+#    不执行这一步，打开 /workbench 会提示「工作台前端未构建」（问答页 / 不受影响）。
 cd frontend && npm install && npm run build      # 产物 -> ../web
 
 # 5. 打开
