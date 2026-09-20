@@ -42,7 +42,7 @@ def _actions(rec):
 
 
 def _action_called(tool, actions):
-    return any(a.startswith(tool + "(") or a.startswith(tool) for a in actions)
+    return any(a == tool or a.startswith(tool + "(") for a in actions)
 
 
 def score_record(rec, llm=None, judge=False):
@@ -156,6 +156,8 @@ def compare_to_baseline(report, baseline_path):
     base = score_file(baseline_path)
     base_map = {i["id"]: i["passed"] for i in base["items"] if i["scored"]}
     regressions, improvements = [], []
+    current_ids = {i["id"] for i in report["items"] if i["scored"]}
+    missing = sorted(set(base_map) - current_ids)
     for i in report["items"]:
         if not i["scored"] or i["id"] not in base_map:
             continue
@@ -172,7 +174,8 @@ def compare_to_baseline(report, baseline_path):
         "rate_drop": rate_drop,
         "regressions": regressions,
         "improvements": improvements,
-        "regressed": bool(regressions) or rate_drop > 0,
+        "missing": missing,
+        "regressed": bool(regressions or missing) or rate_drop > 0,
     }
 
 
@@ -184,12 +187,19 @@ def golden_gate_ok(results_path, baseline_path=None):
     返回 bool，供冻结发布流水线（game_release_check / CI）直接判定。
     """
     try:
+        # The release gate is stricter than the exploratory scorer: malformed,
+        # duplicate or unscored records cannot disappear from acceptance evidence.
+        with open(results_path, encoding="utf-8") as stream:
+            rows = [json.loads(line) for line in stream if line.strip()]
+        ids = [row.get("id") for row in rows]
+        if any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids):
+            return False
         report = score_file(results_path)
     except Exception:  # noqa: BLE001
         return False
     if report["scored"] == 0:
         return False
-    if report["failed"] > 0:
+    if report["failed"] > 0 or report["unscored"] > 0:
         return False
     if baseline_path:
         try:

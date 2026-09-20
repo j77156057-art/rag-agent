@@ -80,6 +80,7 @@ class TraceRecordTests(_IsoBase):
         for i in range(3):
             t = agent_trace.Turn(session_id="s", provider="mock", model="m", question="q")
             t.add_usage({"prompt_tokens": 2, "completion_tokens": 1})
+            t.cost_cny = 0.125
             t.finish("completed")
             agent_trace.record(t.to_record())
         rows = agent_trace.recent(10)
@@ -88,6 +89,10 @@ class TraceRecordTests(_IsoBase):
         self.assertEqual(s["turns"], 3)
         self.assertEqual(s["total_tokens"], 9)
         self.assertEqual(s["by_provider"]["mock"]["turns"], 3)
+        self.assertEqual(s["by_provider"]["mock"]["prompt_tokens"], 6)
+        self.assertEqual(s["by_provider"]["mock"]["completion_tokens"], 3)
+        self.assertEqual(s["total_cost_cny"], 0.375)
+        self.assertEqual(s["by_provider"]["mock"]["cost_cny"], 0.375)
 
     def test_disabled_trace_writes_nothing(self):
         agent_trace.TRACE_ENABLED = False

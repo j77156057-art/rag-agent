@@ -1,5 +1,12 @@
 # DocMind 项目交接清单（给接手 AI）
 
+### 2026-09-19 双应用目标开始实施（进行中）
+
+- 用户已确定目标：稳定开发 Agent → 分离共享运行时与游戏工具 → 将问答页发展为 IT 支持助手（知识回答＋确认创建工单）。完整范围与验收清单见 `docs/agent-applications-roadmap.md`。
+- 本批新增 `agent_runtime` 共享工具结果/验证协议；顺序和并行执行异常隔离；校验跳过不再冒充通过；逐文件验证和确定性未完成收尾；黄金题发布门补齐缺题/重复/损坏记录拒绝。
+- 受影响专项 105 项通过；全量 1123 项运行、1122 通过、1 跳过、0 失败（53.795 秒），`git diff --check` 通过。完整目标尚未完成，IT 助手接口与页面尚未接入；未重跑真实模型黄金题。
+- 开始实施时存在其他迭代的未提交源码和评测结果；保留它们，不使用 `git add -A`，未将整批工作区提交或推送。
+
 ### 2026-09-18 当前交接检查点（会话/安装验收收口）
 
 - 当前分支：`main`；本轮修改尚未提交。提交前必须只加入明确文件清单，并确认 `HEAD == origin/main`。
@@ -865,3 +872,19 @@ node verify_scene_canvas_ui.mjs http://127.0.0.1:8011
 - 新增 `POST /api/engine/reload` 与运行台「↻ 热重载」按钮。桌面原生 Godot 运行实例会保存启动参数、GPU 绑定和嵌入矩形，停止旧进程后快速重启并恢复原嵌入位置；旧进程失败时不会直接启动第二个实例。
 - Web 试玩继续使用 `docmind_bridge.gd` 的进程内 `reload_current_scene()`，不刷新整个 iframe。原生桌面端采用进程重启是因为 Godot 没有跨版本、无需插件的统一进程内脚本热替换协议；这样会重新导入脚本/场景，但游戏内存状态会重置。
 - 仅允许 Godot 使用该端点；Unity/Unreal 返回明确提示。新增引擎重载回归测试和路由存在性检查。
+
+### 2026-09-19 双应用运行时与 IT 支持流程
+
+> 已被下方“最终改为两个独立项目”记录 supersede；保留作历史设计与测试证据。
+
+- 目录边界采用“同一仓库、不同应用目录”：`agent_runtime/` 是共享契约，`applications/developer/` 是既有开发/游戏能力的兼容边界，`applications/it_support/` 独占服务、演示知识资料和页面。没有拆成两个仓库，避免复制模型、trace、预算、验证和评测基础设施。
+- `Agent` 工具注册表与系统提示改为实例级绑定，子代理只能继承父注册表。IT 注册表只允许 `it_search_knowledge`、`it_create_ticket_draft`、`it_confirm_ticket`、`it_get_ticket`，提示词和请求参数不能引入开发/命令/游戏工具。
+- IT 状态固定写入 `<STATE_ROOT>/.docmind/applications/it_support/`，与开发会话隔离；流程包含带出处回答、证据不足提示、草稿、用户显式确认、草稿版本与随机令牌绑定、幂等创建、重启持久化和按会话查询。所有资料和工单均标记为本地演示。
+- HTTP：`POST /api/it/answer`、`POST /api/it/tickets/drafts`、`POST /api/it/tickets/confirm`、`GET /api/it/tickets`、`GET /api/it/tickets/{ticket_id}`；页面 `/it`，原 `/api/chat`、`/`、`/workbench` 保持兼容。`docmind.spec` 已包含 IT 页面与知识资料。
+- 验证：该历史方案的应用/协议/路由专项 25/25；浏览器确认流程 8/8；旧全量基线 1132 项。当前开发项目最终全量为 1123 项、1122 通过、1 跳过、0 失败。
+
+### 2026-09-19 最终改为两个独立项目
+
+- 用户随后明确要求分成两个文件夹和两个 GitHub 项目。`rag-agent` 只保留开发问答/游戏工作台，并移除 `/it`、`/api/it/*`、IT 页面、IT 数据与打包资源。
+- 新项目名为 `docmind-it-assistant`：`assistant/` 仅做只读知识查询，`backend/database.py` 负责 SQLite 传输，`backend/models.py` 负责模型调配；不含开发文件访问、命令、Git 或游戏工具。独立单测 2/2 通过。
+- GitHub CLI 的 `j77156057-art` 登录令牌已失效；本地项目可独立提交，远程仓库创建需重新登录 GitHub 后完成。

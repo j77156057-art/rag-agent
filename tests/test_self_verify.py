@@ -3,7 +3,7 @@
 覆盖：
   · 后端 .py 语法校验：坏文件→passed=False 且 failures 含 backend；好文件→passed=True
   · 命中对应单测：tests/test_<module>.py 存在且失败时→passed=False
-  · scope=skip / 无改动 → 安全降级为 passed=True（绝不阻断主流程）
+  · scope=skip / 无改动 → skipped，不能声明验证通过
   · 入参解析 _parse_self_verify_arg（scope/files 多行/逗号）
   · Agent 收尾门格式化 _run_self_verify：把校验结果包成 Observation 文本 + passed 布尔
 """
@@ -75,14 +75,16 @@ class SelfVerifyBackendTest(unittest.TestCase):
     def test_skip_scope_safe(self):
         raw = tools.self_verify("scope: skip")
         data = json.loads(raw)
-        self.assertTrue(data["passed"])
+        self.assertFalse(data["passed"])
+        self.assertEqual(data["status"], "skipped")
         self.assertIn("skip", data["note"])
 
     def test_no_changes_safe(self):
-        # 不传 files 且无 git → 视为无需校验，passed=True（降级不阻断）
+        # 没有执行检查，不能标记为验证通过。
         raw = tools.self_verify("scope: auto")
         data = json.loads(raw)
-        self.assertTrue(data["passed"])
+        self.assertFalse(data["passed"])
+        self.assertEqual(data["status"], "skipped")
 
 
 class SelfVerifyParseTest(unittest.TestCase):
@@ -126,10 +128,10 @@ class AgentGateFormatTest(unittest.TestCase):
         self.assertIn("自验证未通过", obs)
         self.assertIn("boom", obs)
 
-    def test_exception_degrades_to_passed(self):
+    def test_exception_is_unverified(self):
         with mock.patch.object(agent, "self_verify", side_effect=RuntimeError("kaboom")):
             obs, passed = agent._run_self_verify("x.py")
-        self.assertTrue(passed)  # 校验器故障必须降级为通过，不阻断主流程
+        self.assertFalse(passed)
         self.assertIn("跳过", obs)
 
 
@@ -154,7 +156,8 @@ class SelfVerifyScopeAutoTest(unittest.TestCase):
         self.proj.write("desktop_bridge.py", "X = 1\n")
         with mock.patch.dict(os.environ, {"DOCMIND_SELF_VERIFY_ENGINE": "0"}):
             data = json.loads(tools.self_verify("scope: auto\nfiles: desktop_bridge.py"))
-        self.assertTrue(data["passed"])
+        self.assertFalse(data["passed"])
+        self.assertEqual(data["status"], "partial")
         self.assertFalse(any("engine" in r for r in data["ran"]))
         self.assertIn("engine", data.get("note", ""))
 

@@ -237,7 +237,6 @@ def _agent_for(session_id, project_id=None):
 # 以便在请求上下文中命中「当前项目」的默认会话 Agent（见 P3 注释）。
 agent = _agent_for("default")
 
-
 def _resolve_request_project(request):
     """解析请求要绑定的项目：header `X-DocMind-Project` > 查询参数 `?project_id=`。
 

@@ -11,17 +11,23 @@ block_cipher = None
 # chromadb / webview 含大量运行时动态导入的子模块，用 collect_all 一网打尽最稳妥
 chromadb_datas, chromadb_binaries, chromadb_hiddenimports = collect_all("chromadb")
 webview_datas, webview_binaries, webview_hiddenimports = collect_all("webview")
+docx_datas, docx_binaries, docx_hiddenimports = collect_all("docx")
+reportlab_datas, reportlab_binaries, reportlab_hiddenimports = collect_all("reportlab")
+openpyxl_datas, openpyxl_binaries, openpyxl_hiddenimports = collect_all("openpyxl")
+pptx_datas, pptx_binaries, pptx_hiddenimports = collect_all("pptx")
 
 a = Analysis(
     ["desktop.py"],
     pathex=[],
-    binaries=chromadb_binaries + webview_binaries,
+    binaries=(chromadb_binaries + webview_binaries + docx_binaries +
+              reportlab_binaries + openpyxl_binaries + pptx_binaries),
     datas=[
         # 注意：不要打包 .chroma！它是用户本地代码索引库（含用户代码向量），
         # 随包分发会泄漏开发者的本地索引、徒增约 377MB 体积，且对用户自己的代码库毫无用处。
         # 冻结版首次启动由 chromadb 自动创建空 .chroma 目录，用户自行 /api/ingest_code 索引自己的代码。
         ("web", "web"),
-    ] + chromadb_datas + webview_datas,
+        ("agent_skills", "agent_skills"),
+    ] + chromadb_datas + webview_datas + docx_datas + reportlab_datas + openpyxl_datas + pptx_datas,
     hiddenimports=[
         "fastapi",
         "uvicorn",
@@ -51,7 +57,7 @@ a = Analysis(
         "opentelemetry",
         "opentelemetry.trace",
         "opentelemetry.sdk.trace",
-    ] + chromadb_hiddenimports + webview_hiddenimports,
+    ] + chromadb_hiddenimports + webview_hiddenimports + docx_hiddenimports + reportlab_hiddenimports + openpyxl_hiddenimports + pptx_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -27,7 +27,6 @@ interface ChatMsg {
   reasoning: string        // 深度思考模型的 reasoning_content 流
   notices: string[]        // 系统通知（如上下文自动压缩）
   plan: string[]           // 计划模式步骤
-  images?: string[]        // 用户消息附带的图片（dataURL，仅用于回显）
   error?: string
 }
 
@@ -42,60 +41,6 @@ const input = ref(readDraft())
 watch(input, v => { try { sessionStorage.setItem(draftKey(), v) } catch {} }, { flush: 'sync' })
 const sending = ref(false)
 let abortCtl: AbortController | null = null
-
-// ---------------------------------------------------------------- 图片输入（多模态）
-// 后端 /api/chat 接受 images 多文件字段（校验类型/大小/魔数），ollama 原生多模态格式。
-interface PendingImage { file: File; url: string }
-const pendingImages = ref<PendingImage[]>([])
-const fileInputEl = ref<HTMLInputElement | null>(null)
-const imgError = ref('')
-const IMG_MAX_FILES = 4
-const IMG_MAX_MB = 8
-
-function readAsDataUrl(f: File): Promise<string> {
-  return new Promise((resolve) => {
-    const r = new FileReader()
-    r.onload = () => resolve(String(r.result || ''))
-    r.onerror = () => resolve('')
-    r.readAsDataURL(f)
-  })
-}
-async function addImageFiles(files: FileList | File[] | null) {
-  imgError.value = ''
-  for (const f of Array.from(files || [])) {
-    if (!f.type.startsWith('image/')) continue
-    if (pendingImages.value.length >= IMG_MAX_FILES) {
-      imgError.value = `单条消息最多附加 ${IMG_MAX_FILES} 张图片`
-      break
-    }
-    if (f.size > IMG_MAX_MB * 1024 * 1024) {
-      imgError.value = `图片超过 ${IMG_MAX_MB}MB 上限：${f.name || '未命名'}`
-      continue
-    }
-    const url = await readAsDataUrl(f)
-    if (url) pendingImages.value.push({ file: f, url })
-  }
-}
-function removeImage(i: number) { pendingImages.value.splice(i, 1) }
-function clearImages() { pendingImages.value = []; imgError.value = '' }
-function onPickImages(ev: Event) {
-  const inp = ev.target as HTMLInputElement
-  void addImageFiles(inp.files)
-  inp.value = ''
-}
-/** 直接粘贴截图/图片到输入框也支持 */
-function onPasteImages(ev: ClipboardEvent) {
-  const items = ev.clipboardData?.items
-  if (!items) return
-  const files: File[] = []
-  for (const it of Array.from(items)) {
-    if (it.kind === 'file' && it.type.startsWith('image/')) {
-      const f = it.getAsFile()
-      if (f) files.push(f)
-    }
-  }
-  if (files.length) { ev.preventDefault(); void addImageFiles(files) }
-}
 
 const scroller = ref<HTMLElement | null>(null)
 /** 仅当用户已贴底时才自动滚；用户上滚看历史时暂停自动滚动，回到底部再恢复 */
@@ -199,16 +144,13 @@ function onModelSaved(info: ModelConfigInfo) {
 // ---------------------------------------------------------------- 发送 / 停止
 async function send(text?: string) {
   const q = (text ?? input.value).trim()
-  const imgs = pendingImages.value.map((p) => p.file)
-  const imgUrls = pendingImages.value.map((p) => p.url)
-  if ((!q && imgs.length === 0) || sending.value) return
+  if (!q || sending.value) return
   const epoch = ++chatEpoch
   historyError.value = ''
   try { sessionStorage.removeItem(recoveryKey()) } catch {}
   input.value = ''
-  clearImages()
   stickToBottom.value = true  // 用户主动发送，恢复贴底自动滚动
-  messages.value.push({ id: msgSeq++, role: 'user', text: q || '（图片）', status: 'done', trace: [], reasoning: '', notices: [], plan: [], images: imgUrls.length ? imgUrls : undefined })
+  messages.value.push({ id: msgSeq++, role: 'user', text: q, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
   const turn: ChatMsg = { id: msgSeq++, role: 'assistant', text: '', status: 'streaming', trace: [], reasoning: '', notices: [], plan: [] }
   messages.value.push(turn)
   sending.value = true
@@ -263,7 +205,6 @@ async function send(text?: string) {
     await aiApi.askGrounded(q, { onEvent, signal: ac.signal }, {
       web: webOn.value,
       thinking: thinkingOpt,
-      images: imgs.length ? imgs : undefined,
     })
     const t = live()
     if (t) t.status = t.text ? 'done' : 'stopped'
@@ -812,12 +753,7 @@ function connectorGuide(s: McpServer) {
       <div ref="scroller" class="cd-body" @scroll="onScroll">
         <p v-if="historyError" role="alert">{{ historyError }}</p>
         <div v-for="m in messages" :key="m.id" class="cd-msg" :class="`cd-msg-${m.role}`">
-          <div v-if="m.role === 'user'" class="cd-user-bubble">
-            <div v-if="m.images?.length" class="cd-user-imgs">
-              <img v-for="(src, i) in m.images" :key="i" :src="src" alt="附图" />
-            </div>
-            {{ m.text }}
-          </div>
+          <div v-if="m.role === 'user'" class="cd-user-bubble">{{ m.text }}</div>
           <template v-else>
             <div v-for="(n, i) in m.notices" :key="'n' + i" class="cd-notice">
               <svg width="11" height="11" viewBox="0 0 11 11"><circle cx="5.5" cy="5.5" r="4.6" fill="none" stroke="currentColor" stroke-width="1"/><path d="M5.5 4.6 V7.6" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><circle cx="5.5" cy="3" r=".75" fill="currentColor"/></svg>
@@ -947,34 +883,17 @@ function connectorGuide(s: McpServer) {
             <span class="cd-ctx-bar"><i :style="{ width: usage.percent + '%' }" /></span>
           </span>
         </div>
-        <div v-if="pendingImages.length || imgError" class="cd-imgs">
-          <div v-for="(p, i) in pendingImages" :key="i" class="cd-img">
-            <img :src="p.url" :alt="p.file.name" />
-            <button class="cd-img-x" title="移除" @click="removeImage(i)">×</button>
-          </div>
-          <span v-if="imgError" class="cd-img-err">{{ imgError }}</span>
-        </div>
         <div class="cd-input-row">
-          <button class="cd-attach" title="附加图片（也可直接粘贴截图）" :disabled="sending" @click="fileInputEl?.click()">
-            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.1">
-              <rect x="1.6" y="2.6" width="12.8" height="10.8" rx="1.6" />
-              <circle cx="5.6" cy="6.6" r="1.1" fill="currentColor" stroke="none" />
-              <path d="M2.4 12.2l3.4-3.1 2.2 2.1 2.4-2.6 3.2 3.6" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-          </button>
-          <input ref="fileInputEl" type="file" class="cd-file" multiple
-                 accept="image/png,image/jpeg,image/webp,image/gif" @change="onPickImages" />
           <textarea
             ref="inputEl"
             v-model="input"
             class="cd-input"
             rows="2"
-            placeholder="提问：角色数值在哪 / 解释这段逻辑 / 这个报错怎么改…（Ctrl+Enter 发送，可粘贴截图）"
+            placeholder="提问：角色数值在哪 / 解释这段逻辑 / 这个报错怎么改…（Ctrl+Enter 发送）"
             @keydown="onKeydown"
-            @paste="onPasteImages"
           />
           <button v-if="sending" class="cd-send cd-stop" @click="stop">停止</button>
-          <button v-else class="cd-send" :disabled="!input.trim() && !pendingImages.length" @click="send()">发送</button>
+          <button v-else class="cd-send" :disabled="!input.trim()" @click="send()">发送</button>
         </div>
       </footer>
     </template>
@@ -1153,25 +1072,6 @@ function connectorGuide(s: McpServer) {
 /* 输入区 */
 .cd-inputbar { display: flex; flex-direction: column; gap: 6px; padding: 7px 12px 9px; }
 .cd-input-row { display: flex; gap: 8px; align-items: flex-end; }
-/* 图片输入（多模态） */
-.cd-file { display: none; }
-.cd-attach {
-  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
-  width: 30px; height: 30px; background: transparent; border: 1px solid var(--border-strong);
-  border-radius: 6px; color: var(--text-muted); cursor: pointer;
-}
-.cd-attach:hover:not(:disabled) { color: var(--text); border-color: #2f6fed; }
-.cd-imgs { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0; align-items: center; }
-.cd-img { position: relative; }
-.cd-img img { width: 44px; height: 44px; object-fit: cover; border-radius: 5px; border: 1px solid var(--border-strong); display: block; }
-.cd-img-x {
-  position: absolute; top: -5px; right: -5px; width: 15px; height: 15px; border-radius: 50%;
-  border: none; background: rgba(0, 0, 0, .62); color: #fff; font-size: 11px; line-height: 1;
-  cursor: pointer; padding: 0;
-}
-.cd-img-err { color: #c23a40; font-size: 11px; }
-.cd-user-imgs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
-.cd-user-imgs img { max-width: 120px; max-height: 120px; border-radius: 5px; border: 1px solid var(--border); display: block; }
 .cd-input {
   flex: 1; resize: none;
   background: var(--bg); color: var(--text);

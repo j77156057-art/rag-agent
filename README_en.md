@@ -85,7 +85,9 @@ rag-agent/
 ├── sessions.py            # session isolation + persistence + rolling summary
 ├── pricing.py             # per-provider pricing + global/session budget fuse
 ├── hooks.py               # hot-pluggable tool/turn hooks (.docmind/hooks/*.py)
-├── skills.py              # hot-pluggable skills (.docmind/skills/**/*.md + dev_use_skill)
+├── skills.py              # built-in + user skill loading (agent_skills / .docmind/skills)
+├── artifact_tools.py      # structured DOCX / PDF / PPTX / XLSX generation and validation
+├── agent_skills/          # bundled document, PDF, presentation, and spreadsheet skills
 ├── agent_eval.py          # golden-question auto-scoring + baseline regression gate
 ├── orchestrator.py        # multi-agent orchestration: task DAG + parallel + re-plan + synthesis
 ├── frontend/              # Vue workbench (build output → ../web)
@@ -153,7 +155,7 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=What file formats does 
   The playtester has an "embed into workbench" toggle: with it on, clicking "launch desktop window" drops the game画面 onto the engine viewport in the popup while the workbench UI stays usable; there are also "focus / detach / stop desktop window" controls; closing the popup or switching tabs auto-detaches. In browser mode the toggle is auto-disabled with a "needs desktop" hint.
   Not yet covered: real-machine data at 100% / 125% scaling (this display is 150%; the script prints DPI and asserts by actual coordinates).
 - **Package as a standalone exe (onedir distribution)**: `docmind.spec` produces `dist\DocMind\DocMind.exe` in one command; ship the whole `dist\DocMind` folder, the target machine needs no Python. Full flow in [DocMind_BUILD.md](DocMind_BUILD.md) and `.trae/skills/docmind-frozen-release/SKILL.md`.
-- **Packaged build capability boundary**: the bundled `builtin:py` does in-process syntax checks (exe behaves like source); but playtest auto-test, cProfile, and `python_exec` need a real Python environment — use them in the source `.venv`. Region git operations require Git on the target machine.
+- **Packaged build capability boundary**: the bundled `builtin:py` syntax checker and `create_artifact` DOCX / PDF / PPTX / XLSX renderer run in-process (the exe behaves like source); playtest auto-test, cProfile, and `python_exec` still need a real Python environment in the source `.venv`. Region git operations require Git on the target machine.
 
 ## 🧭 Harness (the agent runtime)
 
@@ -168,7 +170,8 @@ Turns "an agent that runs" into "an agent runtime you can **observe, orchestrate
 | **Native function-calling** | OpenAI-style schemas generated from the tool registry; `tool_calls` are normalised into the text protocol so **every existing guardrail still applies** and event types are unchanged | `DOCMIND_TOOL_MODE=react\|native\|auto` |
 | **Multi-agent orchestrator** | Task-graph DAG (validated, topologically waved, same-wave parallel) + **downstream tasks receive upstream conclusions** + **automatic re-planning on failure** (proposals `add / drop / replace` — only tasks that have **not run yet** may change) + result synthesis + **sub-agent execution traces fed back** to the re-planner for failure attribution | `orchestrate` tool, `POST /api/orchestrate` |
 | **Cost fuse** | Prices per provider/model (overridable via `.docmind_pricing.json`; local providers are always 0) + global/session budgets; **refuses before the turn, charges after it** | `GET/POST /api/budget` |
-| **Hot-pluggable hooks & skills** | `pre/post_tool`, `pre/post_turn` hooks from `.docmind/hooks/*.py` (a broken hook is isolated); skill catalog from `.docmind/skills/**/*.md` injected into the system prompt with bodies fetched on demand via `dev_use_skill` | `POST /api/hooks/reload`, `POST /api/skills/reload` |
+| **Hot-pluggable hooks & skills** | `pre/post_tool`, `pre/post_turn` hooks from `.docmind/hooks/*.py` (a broken hook is isolated); `agent_skills/*/SKILL.md` provides bundled skills and same-name entries in `.docmind/skills` override them; bodies are fetched on demand via `dev_use_skill` | `POST /api/hooks/reload`, `POST /api/skills/reload` |
+| **Office artifacts** | Bundled `documents / pdf / presentations / spreadsheets` skills; `create_artifact` writes real DOCX, PDF, PPTX, and XLSX files to the active project's `artifacts/` directory and reopens each output for validation | `dev_use_skill`, `create_artifact` |
 | **Parallel tool batches** | Multiple **read-only** calls from one turn run concurrently (results re-ordered back into place); a batch containing any write/side-effecting tool falls back to sequential — **writes are never concurrent** | `DOCMIND_PARALLEL_TOOLS`, `DOCMIND_PARALLEL_MAX` |
 
 **Three design stances**: ① **guardrail reuse** — native FC and parallel batches do not open a second execution path, so semantics never fork; ② **bounded** — traces, observations, history and batches are all truncated or summarised so context/prompts cannot explode; ③ **no over-reach** — the orchestrator may only edit not-yet-executed tasks (side effects are never rolled back), writes are never parallel, hook exceptions are swallowed.
@@ -183,12 +186,12 @@ curl --noproxy '*' -X POST http://127.0.0.1:8000/api/orchestrate -H "Content-Typ
                 {"id":"b","role":"reviewer","task":"review the above","depends_on":["a"]}],"synth":true}'
 ```
 
-> **Honest boundaries**: sub-agents do **not** share the parent context (it is passed via upstream conclusions); re-planning only edits the **not-yet-executed** plan and **never rolls back** executed tasks; traces are **bounded summaries** (full text lives in `.docmind_traces.jsonl`); hooks have **no sandbox** (plain `.py` loaded in-process); skills are prompt injection only, with no executable scripts.
+> **Honest boundaries**: sub-agents do **not** share the parent context (it is passed via upstream conclusions); re-planning only edits the **not-yet-executed** plan and **never rolls back** executed tasks; traces are **bounded summaries** (full text lives in `.docmind_traces.jsonl`); hooks have **no sandbox** (plain `.py` loaded in-process); skills are prompt guidance, while office files are produced by the controlled `create_artifact` tool rather than arbitrary skill scripts.
 
 ## 🧪 Tests & Self-Checks
 
 ```bash
-# Full unit tests (450 items; git cases actually run when MinGit is on PATH)
+# Full unit tests (currently 1131 items; git cases actually run when MinGit is on PATH)
 .venv\Scripts\python.exe -B -m unittest discover -s tests
 
 # Scene canvas — backend self-check: in-process FastAPI + temp Godot project, real routes, no port

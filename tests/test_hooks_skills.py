@@ -107,10 +107,13 @@ class SkillRegistryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="dm_skill_")
         self._old = skills.SKILLS_DIR
+        self._old_builtin = skills.BUILTIN_SKILLS_DIR
         skills.SKILLS_DIR = self.tmp
+        skills.BUILTIN_SKILLS_DIR = os.path.join(self.tmp, "builtin")
 
     def tearDown(self):
         skills.SKILLS_DIR = self._old
+        skills.BUILTIN_SKILLS_DIR = self._old_builtin
         skills.reload()
 
     def test_loads_frontmatter_and_plain_markdown(self):
@@ -154,16 +157,32 @@ class SkillRegistryTests(unittest.TestCase):
         skills.reload()
         self.assertEqual(skills.list_skills()["count"], 1)
 
+    def test_user_skill_overrides_builtin_and_references_are_ignored(self):
+        builtin = os.path.join(skills.BUILTIN_SKILLS_DIR, "documents")
+        os.makedirs(builtin)
+        with open(os.path.join(builtin, "SKILL.md"), "w", encoding="utf-8") as f:
+            f.write("---\nname: documents\ndescription: built in\n---\nBUILTIN")
+        with open(os.path.join(builtin, "reference.md"), "w", encoding="utf-8") as f:
+            f.write("# Must not become a skill")
+        with open(os.path.join(skills.SKILLS_DIR, "documents.md"), "w", encoding="utf-8") as f:
+            f.write("---\nname: documents\ndescription: custom\n---\nCUSTOM")
+        result = skills.reload()
+        self.assertEqual(result["loaded"], 1)
+        self.assertIn("CUSTOM", skills.use_skill("documents"))
+        self.assertEqual(skills.list_skills()["items"][0]["source"], "user")
+
 
 class AgentIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="dm_hs_")
         self._hooks_dir = hooks.HOOKS_DIR
         self._skills_dir = skills.SKILLS_DIR
+        self._builtin_skills_dir = skills.BUILTIN_SKILLS_DIR
         self._trace = agent_trace.TRACE_FILE
         self._sess = sessions.SESSIONS_DIR
         hooks.HOOKS_DIR = os.path.join(self.tmp, "hooks")
         skills.SKILLS_DIR = os.path.join(self.tmp, "skills")
+        skills.BUILTIN_SKILLS_DIR = os.path.join(self.tmp, "builtin-skills")
         agent_trace.TRACE_FILE = os.path.join(self.tmp, "t.jsonl")
         sessions.SESSIONS_DIR = os.path.join(self.tmp, "s")
         os.makedirs(hooks.HOOKS_DIR)
@@ -172,6 +191,7 @@ class AgentIntegrationTests(unittest.TestCase):
     def tearDown(self):
         hooks.HOOKS_DIR = self._hooks_dir
         skills.SKILLS_DIR = self._skills_dir
+        skills.BUILTIN_SKILLS_DIR = self._builtin_skills_dir
         agent_trace.TRACE_FILE = self._trace
         sessions.SESSIONS_DIR = self._sess
         hooks.reload()

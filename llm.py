@@ -23,6 +23,9 @@ from config import (
 LLM_TIMEOUT = float(os.getenv("DOCMIND_LLM_TIMEOUT", "180"))
 LLM_RETRIES = int(os.getenv("DOCMIND_LLM_RETRIES", "3"))       # 总尝试次数（含首次）
 LLM_RETRY_BASE = float(os.getenv("DOCMIND_LLM_RETRY_BASE", "0.8"))  # 指数退避基数（秒）
+# 默认采样温度；golden 回归实验用 DOCMIND_LLM_TEMPERATURE=0 关闭随机性以测稳定性。
+# 默认 0.3 与历史行为一致；仅在显式覆盖时改变，不影响其它调用方。
+LLM_TEMPERATURE = float(os.getenv("DOCMIND_LLM_TEMPERATURE", "0.3"))
 
 # 可重试的错误特征：限流 / 5xx / 网络与超时。鉴权/参数类（401/403/404）不重试。
 _RETRYABLE_HINTS = (
@@ -415,7 +418,7 @@ class LLMClient:
             return bool(enable_thinking)
         return False
 
-    def chat(self, messages, stream=False, temperature=0.3, timeout=None, deadline=None, tools=None,
+    def chat(self, messages, stream=False, temperature=LLM_TEMPERATURE, timeout=None, deadline=None, tools=None,
              enable_thinking=None, reasoning_sink=None):
         """统一的对话入口。stream=True 时返回一个 token 生成器。
 
@@ -554,7 +557,7 @@ class LLMClient:
         root = str(self.client.base_url).rstrip("/").removesuffix("/v1").rstrip("/")
         return root + path
 
-    def _ollama_chat(self, messages, stream=False, temperature=0.3, timeout=None,
+    def _ollama_chat(self, messages, stream=False, temperature=LLM_TEMPERATURE, timeout=None,
                      usage_sink=None, tool_sink=None, tools=None,
                      thinking_on=False, reasoning_sink=None):
         if not _gpu_acquire("ollama", 2): raise RuntimeError("GPU 正忙：ComfyUI 正在使用中，请稍后重试。")

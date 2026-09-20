@@ -1990,10 +1990,17 @@ export interface TraceSummary {
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
+  total_cost_cny: number
   avg_elapsed_ms: number
   aborted: number
   errors: number
-  by_provider: Record<string, { turns: number; tokens: number } | number>
+  by_provider: Record<string, {
+    turns: number
+    prompt_tokens: number
+    completion_tokens: number
+    tokens: number
+    cost_cny: number
+  }>
 }
 export interface SessionInfo {
   session_id: string
@@ -2014,6 +2021,18 @@ export const harnessApi = {
   },
   setBudgetLimit(limitCny: number): Promise<{ ok: boolean; check?: BudgetCheck; error?: string }> {
     return postJson('/api/budget', { limit_cny: limitCny })
+  },
+  setUsageLimits(limitCny: number, perMinuteCalls: number, perMinuteCost: number): Promise<{
+    ok: boolean
+    check?: BudgetCheck
+    rate?: { per_minute_calls_limit: number; per_minute_cost_limit: number }
+    error?: string
+  }> {
+    return postJson('/api/budget', {
+      limit_cny: limitCny,
+      per_minute_calls: perMinuteCalls,
+      per_minute_cost: perMinuteCost,
+    })
   },
   resetBudget(): Promise<{ ok: boolean; check?: BudgetCheck }> {
     return postJson('/api/budget', { reset: true })

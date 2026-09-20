@@ -79,6 +79,7 @@ class Turn:
         self.reflections = 0
         self.outcome = None      # 回合结局：completed/max_steps/truncated/evidence_fallback/...
         self.verified = False    # 写后自验证是否通过（Phase 1 闭环；仅当回合含写操作且校验通过才置 True）
+        self.verification_targets = {}  # In-memory only: latest evidence per written file.
         # ---- Phase 3 经验记录辅助字段（均由 agent._run 在推理循环中写入）----
         self.failure_count = 0       # 本回合失败总次数（单调累计，成功不清零）
         self.max_tool_streak = 0     # 单工具连续失败的最大次数
@@ -162,6 +163,12 @@ class Turn:
             "reflections": self.reflections,
             "outcome": self.outcome or self.finish_reason or "completed",
             "verified": self.verified,
+            "verification": {
+                "targets": len(self.verification_targets),
+                "passed": sum(bool(v) for v in self.verification_targets.values()),
+                "status": ("passed" if self.verified else "unverified")
+                          if self.verification_targets else "not_run",
+            },
             "failure_count": self.failure_count,
             "max_tool_streak": self.max_tool_streak,
             "experience": self.experience,
@@ -231,6 +238,7 @@ def summary():
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
+        "total_cost_cny": 0.0,
         "avg_elapsed_ms": 0,
         "aborted": 0,
         "errors": 0,
@@ -245,15 +253,26 @@ def summary():
         agg["prompt_tokens"] += p
         agg["completion_tokens"] += c
         agg["total_tokens"] += p + c
+        cost = float(r.get("cost_cny") or 0.0)
+        agg["total_cost_cny"] += cost
         elapsed += int(r.get("elapsed_ms") or 0)
         if r.get("aborted"):
             agg["aborted"] += 1
         if r.get("error"):
             agg["errors"] += 1
         key = r.get("provider") or "?"
-        slot = agg["by_provider"].setdefault(key, {"turns": 0, "tokens": 0})
+        slot = agg["by_provider"].setdefault(key, {
+            "turns": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "tokens": 0, "cost_cny": 0.0,
+        })
         slot["turns"] += 1
+        slot["prompt_tokens"] += p
+        slot["completion_tokens"] += c
         slot["tokens"] += p + c
+        slot["cost_cny"] += cost
+    agg["total_cost_cny"] = round(agg["total_cost_cny"], 8)
+    for slot in agg["by_provider"].values():
+        slot["cost_cny"] = round(slot["cost_cny"], 8)
     agg["avg_elapsed_ms"] = int(elapsed / len(rows))
     return agg
 

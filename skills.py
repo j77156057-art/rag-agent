@@ -1,7 +1,9 @@
-"""技能热插拔：从目录扫 SKILL.md，注入系统提示 + 提供 dev_use_skill 工具。
+"""技能热插拔：加载内置与用户 SKILL.md，注入提示并提供 dev_use_skill。
 
-技能目录：`<STATE_ROOT>/.docmind/skills/`（可用 `DOCMIND_SKILLS_DIR` 覆盖），
-支持 `<dir>/SKILL.md` 与直接 `<dir>/<name>.md` 两种布局。文件头可选 YAML frontmatter：
+内置技能位于 `<BASE_DIR>/agent_skills/`，会随源码和桌面包发布；用户技能位于
+`<STATE_ROOT>/.docmind/skills/`（可用 `DOCMIND_SKILLS_DIR` 覆盖），同名用户技能
+覆盖内置技能。支持 `<dir>/SKILL.md` 与技能根目录下的 `<name>.md` 两种布局。
+文件头可选 YAML frontmatter：
 
   ---
   name: 音频工程
@@ -20,9 +22,10 @@ from __future__ import annotations
 import os
 import threading
 
-from config import STATE_ROOT, state_path
+from config import BASE_DIR, STATE_ROOT, state_path
 
 SKILLS_DIR = state_path("DOCMIND_SKILLS_DIR", os.path.join(STATE_ROOT, ".docmind", "skills"))
+BUILTIN_SKILLS_DIR = os.path.join(BASE_DIR, "agent_skills")
 CATALOG_MAX = int(os.getenv("DOCMIND_SKILL_CATALOG_MAX", "20"))   # 注入目录最多几条
 BODY_MAX = int(os.getenv("DOCMIND_SKILL_BODY_MAX", "6000"))       # 单技能正文回传上限
 
@@ -46,52 +49,65 @@ def _parse_frontmatter(text):
     return meta, body
 
 
+def _candidate_files(root):
+    """Return root-level markdown and nested SKILL.md files only.
+
+    Supporting reference markdown inside a skill is intentionally excluded;
+    otherwise one installed skill can accidentally occupy the whole catalog.
+    """
+    if not os.path.isdir(root):
+        return []
+    candidates = []
+    for current, _dirs, files in os.walk(root):
+        for filename in files:
+            lower = filename.lower()
+            if lower == "skill.md" or (current == root and lower.endswith(".md")):
+                candidates.append(os.path.join(current, filename))
+    return sorted(candidates)
+
+
 def reload():
-    """重新扫描技能目录（热插拔）。返回 {loaded, errors, skills_dir}。"""
+    """重新扫描内置与用户技能；后加载的用户技能可覆盖同名内置技能。"""
     global _loaded
     with _lock:
         _skills.clear()
         _errors.clear()
-        if not os.path.isdir(SKILLS_DIR):
-            _loaded = True
-            return {"loaded": 0, "errors": [], "skills_dir": SKILLS_DIR}
-        candidates = []
-        for root, _dirs, files in os.walk(SKILLS_DIR):
-            for fn in files:
-                if fn.lower().endswith(".md"):
-                    candidates.append(os.path.join(root, fn))
-        for path in sorted(candidates):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    raw = f.read()
-                meta, body = _parse_frontmatter(raw)
-                # 技能名：frontmatter.name > 文件名（SKILL.md 用其父目录名）
-                if fn_is_skill(path):
-                    default_name = os.path.basename(os.path.dirname(path)) or "skill"
-                else:
-                    default_name = os.path.splitext(os.path.basename(path))[0]
-                name = (meta.get("name") or default_name).strip()
-                if not name or name in _skills:
-                    continue
-                # 首行标题可作 description 兜底
-                desc = meta.get("description", "").strip()
-                if not desc:
-                    for line in body.splitlines():
-                        line = line.strip()
-                        if line.startswith("#"):
-                            desc = line.lstrip("#").strip()
-                            break
-                _skills[name] = {
-                    "name": name,
-                    "description": desc[:200],
-                    "when_to_use": meta.get("when_to_use", "").strip()[:200],
-                    "path": os.path.relpath(path, SKILLS_DIR).replace("\\", "/"),
-                    "body": body[:BODY_MAX],
-                }
-            except (OSError, ValueError) as e:
-                _errors.append({"path": path, "error": f"{type(e).__name__}: {e}"})
+        sources = (("builtin", BUILTIN_SKILLS_DIR), ("user", SKILLS_DIR))
+        for source, root in sources:
+            for path in _candidate_files(root):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        raw = f.read()
+                    meta, body = _parse_frontmatter(raw)
+                    # 技能名：frontmatter.name > 文件名（SKILL.md 用其父目录名）
+                    if fn_is_skill(path):
+                        default_name = os.path.basename(os.path.dirname(path)) or "skill"
+                    else:
+                        default_name = os.path.splitext(os.path.basename(path))[0]
+                    name = (meta.get("name") or default_name).strip()
+                    if not name:
+                        continue
+                    # 首行标题可作 description 兜底
+                    desc = meta.get("description", "").strip()
+                    if not desc:
+                        for line in body.splitlines():
+                            line = line.strip()
+                            if line.startswith("#"):
+                                desc = line.lstrip("#").strip()
+                                break
+                    _skills[name] = {
+                        "name": name,
+                        "description": desc[:200],
+                        "when_to_use": meta.get("when_to_use", "").strip()[:200],
+                        "path": os.path.relpath(path, root).replace("\\", "/"),
+                        "source": source,
+                        "body": body[:BODY_MAX],
+                    }
+                except (OSError, ValueError) as e:
+                    _errors.append({"path": path, "error": f"{type(e).__name__}: {e}"})
         _loaded = True
-        return {"loaded": len(_skills), "errors": list(_errors), "skills_dir": SKILLS_DIR}
+        return {"loaded": len(_skills), "errors": list(_errors),
+                "skills_dir": SKILLS_DIR, "builtin_skills_dir": BUILTIN_SKILLS_DIR}
 
 
 def fn_is_skill(path):
@@ -113,11 +129,14 @@ def list_skills():
     _ensure()
     return {
         "skills_dir": SKILLS_DIR,
+        "builtin_skills_dir": BUILTIN_SKILLS_DIR,
         "exists": os.path.isdir(SKILLS_DIR),
+        "builtin_exists": os.path.isdir(BUILTIN_SKILLS_DIR),
         "count": len(_skills),
         "errors": list(_errors),
         "items": [{"name": s["name"], "description": s["description"],
-                   "when_to_use": s["when_to_use"], "path": s["path"]}
+                   "when_to_use": s["when_to_use"], "path": s["path"],
+                   "source": s["source"]}
                   for s in _skills.values()],
     }
 

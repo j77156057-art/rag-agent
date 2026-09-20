@@ -11,3 +11,7 @@ pywebview
 pillow
 imageio
 imageio-ffmpeg
+python-docx
+reportlab
+openpyxl
+python-pptx

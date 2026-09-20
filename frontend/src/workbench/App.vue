@@ -52,7 +52,7 @@ const {
 } = useWorkbench()
 
 const dirtyCount = computed(() => tabs.value.filter((t) => t.dirty).length)
-/** 统一设置页（网络搜索 / MCP / 智能体）显隐 */
+/** 统一设置页（用量费用 / 网络搜索 / MCP / 智能体）显隐 */
 const settingsVisible = ref(false)
 /** 当前标签可回滚：已纳入 git 且磁盘或编辑器存在改动 */
 const canRevertActive = computed(() => {
@@ -363,7 +363,7 @@ onBeforeUnmount(() => {
         <a class="wb-question-link" href="/" title="回到 AI 问答首页：用大白话提问，让 AI 在代码库里找答案">AI 问答</a>
         <button
           class="wb-save-btn wb-settings-btn"
-          title="设置：网络搜索、MCP 连接器、智能体预设"
+          title="设置：Token 用量与费用、网络搜索、MCP 连接器、智能体预设"
           @click="settingsVisible = true"
         >
           <svg width="13" height="13" viewBox="0 0 13 13">

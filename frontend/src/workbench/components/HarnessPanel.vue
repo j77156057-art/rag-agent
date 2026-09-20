@@ -262,7 +262,7 @@ onBeforeUnmount(() => { open.value = false })
             使用云端 API 时，这里按官方单价累计费用，防止 AI 跑超支。
           </p>
           <div class="hp-row">
-            <input v-model="limitInput" placeholder="输入每日预算上限（元），0 表示不限" />
+            <input v-model="limitInput" placeholder="输入累计预算上限（元），0 表示不限" />
             <button class="hp-btn primary" @click="saveLimit">保存预算</button>
             <button class="hp-btn" @click="resetSpent">计数清零</button>
           </div>

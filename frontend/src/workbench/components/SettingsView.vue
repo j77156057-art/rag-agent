@@ -1,23 +1,103 @@
 <script setup lang="ts">
-// 统一设置页：左侧分组导航（网络搜索 / MCP / 智能体），右侧对应面板。
+// 统一设置页：左侧分组导航（用量费用 / 网络搜索 / MCP / 智能体），右侧对应面板。
 // 网络搜索与 URL 获取走 settingsApi（复用 /api/config 的保存通道，密钥不回显）；
 // MCP 走 mcpApi；智能体为本地预设（localStorage），后续可升级为后端持久化。
 import { ref, watch, computed } from 'vue'
 import {
-  settingsApi, mcpApi,
+  settingsApi, mcpApi, harnessApi,
   WEB_SEARCH_PROVIDERS, WEB_FETCH_PROVIDERS,
   type SettingsConfigInfo, type ModelConfigInfo, type ProviderOption, type McpServer,
+  type BudgetStatus, type TraceSummary,
 } from '../api'
 
 const props = defineProps<{ visible: boolean }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
 
-type Tab = 'search' | 'mcp' | 'agent'
-const tab = ref<Tab>('search')
+type Tab = 'usage' | 'search' | 'mcp' | 'agent'
+const tab = ref<Tab>('usage')
 
 const loading = ref(false)
 const errorMsg = ref('')
 const savedMsg = ref('')
+
+// ---------------- Token 用量 / 费用控制 ----------------
+const usageLoading = ref(false)
+const usageSaving = ref(false)
+const usageError = ref('')
+const usageSaved = ref('')
+const budget = ref<BudgetStatus | null>(null)
+const traceSummary = ref<TraceSummary | null>(null)
+const budgetLimit = ref('0')
+const perMinuteCalls = ref('0')
+const perMinuteCost = ref('0')
+
+const budgetRemaining = computed(() => {
+  const limit = Number(budget.value?.global_limit || 0)
+  if (limit <= 0) return null
+  return Math.max(0, limit - Number(budget.value?.global_spent || 0))
+})
+const providerUsage = computed(() => Object.entries(traceSummary.value?.by_provider || {})
+  .map(([provider, item]) => ({ provider, ...item, ...providerMeta(provider) }))
+  .sort((a, b) => b.tokens - a.tokens))
+
+function providerMeta(provider: string): { label: string; kind: string; simulated: boolean } {
+  const key = (provider || '').toLowerCase()
+  if (key === 'mock') return { label: 'mock', kind: '离线估算', simulated: true }
+  if (key === 'fake') return { label: 'fake', kind: '自动化测试', simulated: true }
+  if (key === '?' || !key) return { label: '未知来源', kind: '无用量', simulated: true }
+  if (key === 'flow') return { label: '内部工作流', kind: '无模型调用', simulated: true }
+  if (key === 'ollama') return { label: 'Ollama', kind: '本地模型', simulated: false }
+  if (key === 'llamacpp') return { label: 'llama.cpp', kind: '本地模型', simulated: false }
+  return { label: provider, kind: '云端模型', simulated: false }
+}
+
+function money(value: number | null | undefined): string {
+  return `¥${Number(value || 0).toFixed(4)}`
+}
+function tokens(value: number | null | undefined): string {
+  return Number(value || 0).toLocaleString('zh-CN')
+}
+
+async function loadUsage() {
+  usageLoading.value = true
+  usageError.value = ''
+  try {
+    const [b, t] = await Promise.all([harnessApi.budget(), harnessApi.trace(1)])
+    budget.value = b.status
+    traceSummary.value = t.summary
+    budgetLimit.value = String(b.status.global_limit || 0)
+    perMinuteCalls.value = String(b.status.per_minute_calls_limit || 0)
+    perMinuteCost.value = String(b.status.per_minute_cost_limit || 0)
+  } catch (e) {
+    usageError.value = (e as { message?: string }).message || '读取用量失败'
+  } finally {
+    usageLoading.value = false
+  }
+}
+
+async function saveUsage() {
+  const values = [budgetLimit.value, perMinuteCalls.value, perMinuteCost.value].map(Number)
+  if (values.some(v => !Number.isFinite(v) || v < 0)) {
+    usageError.value = '预算和限流必须是不小于 0 的数字；0 表示不限。'
+    return
+  }
+  usageSaving.value = true
+  usageError.value = ''
+  usageSaved.value = ''
+  try {
+    const r = await harnessApi.setUsageLimits(values[0], values[1], values[2])
+    if (!r.ok) {
+      usageError.value = r.error || '保存失败'
+      return
+    }
+    usageSaved.value = '用量控制已保存'
+    await loadUsage()
+  } catch (e) {
+    usageError.value = (e as { message?: string }).message || '保存失败'
+  } finally {
+    usageSaving.value = false
+  }
+}
 
 // ---------------- 网络搜索 / URL 获取 ----------------
 const cfg = ref<SettingsConfigInfo & ModelConfigInfo | null>(null)
@@ -177,11 +257,11 @@ async function removeMcp(key: string) {
 
 watch(() => props.visible, async (v) => {
   if (!v) return
-  await loadConfig()
-  await loadMcp()
+  await Promise.all([loadConfig(), loadMcp(), loadUsage()])
   loadAgents()
-  tab.value = 'search'
+  tab.value = 'usage'
   savedMsg.value = ''
+  usageSaved.value = ''
 })
 
 function close() { emit('close') }
@@ -197,6 +277,7 @@ function close() { emit('close') }
       <div class="sv-body">
         <!-- 左侧分组导航 -->
         <nav class="sv-nav">
+          <button class="sv-nav-item" :class="{ on: tab === 'usage' }" @click="tab = 'usage'">用量与费用</button>
           <button class="sv-nav-item" :class="{ on: tab === 'search' }" @click="tab = 'search'">网络搜索</button>
           <button class="sv-nav-item" :class="{ on: tab === 'mcp' }" @click="tab = 'mcp'">MCP</button>
           <button class="sv-nav-item" :class="{ on: tab === 'agent' }" @click="tab = 'agent'">智能体</button>
@@ -204,6 +285,83 @@ function close() { emit('close') }
 
         <!-- 右侧内容 -->
         <div class="sv-content">
+          <!-- Token 用量与费用 -->
+          <section v-show="tab === 'usage'" class="sv-panel">
+            <div class="sv-section-head">
+              <div>
+                <h4 class="sv-h4">Token 用量与费用</h4>
+                <p class="sv-hint">统计来自逐轮运行账本，不保存对话正文。Token 表示上下文处理量，不等于费用；云端模型按配置单价估算，本地模型费用为 ¥0。</p>
+              </div>
+              <button class="sv-mini" :disabled="usageLoading" @click="loadUsage">刷新</button>
+            </div>
+
+            <div class="sv-meter-grid" aria-label="Token 用量概览">
+              <div class="sv-meter">
+                <span>输入 Token</span>
+                <b>{{ tokens(traceSummary?.prompt_tokens) }}</b>
+              </div>
+              <div class="sv-meter">
+                <span>输出 Token</span>
+                <b>{{ tokens(traceSummary?.completion_tokens) }}</b>
+              </div>
+              <div class="sv-meter">
+                <span>总 Token</span>
+                <b>{{ tokens(traceSummary?.total_tokens) }}</b>
+              </div>
+              <div class="sv-meter">
+                <span>今日费用</span>
+                <b>{{ money(budget?.day_spent) }}</b>
+              </div>
+              <div class="sv-meter">
+                <span>累计费用</span>
+                <b>{{ money(budget?.global_spent) }}</b>
+              </div>
+              <div class="sv-meter">
+                <span>预算余额</span>
+                <b>{{ budgetRemaining === null ? '不限' : money(budgetRemaining) }}</b>
+              </div>
+            </div>
+
+            <div v-if="providerUsage.length" class="sv-provider-list">
+              <div class="sv-provider-head"><span>模型供应商</span><span>类型</span><span>Token</span><span>费用</span></div>
+              <div v-for="item in providerUsage" :key="item.provider" class="sv-provider-row" :class="{ simulated: item.simulated }">
+                <b>{{ item.label }}</b>
+                <span class="sv-kind">{{ item.kind }}</span>
+                <span :title="`输入 ${tokens(item.prompt_tokens)} / 输出 ${tokens(item.completion_tokens)}`">{{ tokens(item.tokens) }}</span>
+                <span>{{ money(item.cost_cny) }}</span>
+              </div>
+            </div>
+            <p v-if="providerUsage.some(item => item.simulated && item.tokens > 0)" class="sv-note">
+              mock / fake 的 Token 是按文本估算的测试负载，用于验证上下文裁剪与性能，不代表 API 消耗，也不会计费。
+            </p>
+            <p v-else-if="!usageLoading" class="sv-hint">还没有模型调用记录。</p>
+
+            <div class="sv-sep"></div>
+            <h4 class="sv-h4">费用与调用上限</h4>
+            <p class="sv-hint">达到累计预算后停止新的模型回合；每分钟限制用于抑制突发调用。所有输入填 0 表示不限。</p>
+            <div class="sv-form-grid">
+              <label class="sv-field">
+                <span>累计预算上限（元）</span>
+                <input v-model="budgetLimit" class="sv-input" type="number" min="0" step="0.01" inputmode="decimal" />
+              </label>
+              <label class="sv-field">
+                <span>每分钟调用上限（次）</span>
+                <input v-model="perMinuteCalls" class="sv-input" type="number" min="0" step="1" inputmode="numeric" />
+              </label>
+              <label class="sv-field">
+                <span>每分钟费用上限（元）</span>
+                <input v-model="perMinuteCost" class="sv-input" type="number" min="0" step="0.01" inputmode="decimal" />
+              </label>
+            </div>
+            <p v-if="usageError" class="sv-err">{{ usageError }}</p>
+            <p v-if="usageSaved" class="sv-ok">{{ usageSaved }}</p>
+            <div class="sv-actions">
+              <button class="sv-btn sv-primary" :disabled="usageSaving || usageLoading" @click="saveUsage">
+                {{ usageSaving ? '保存中…' : '保存用量控制' }}
+              </button>
+            </div>
+          </section>
+
           <!-- 网络搜索 -->
           <section v-show="tab === 'search'" class="sv-panel">
             <h4 class="sv-h4">网络搜索</h4>
@@ -372,6 +530,8 @@ function close() { emit('close') }
 .sv-nav-item.on { background: var(--bg-input); border-color: var(--accent); color: var(--accent); font-weight: 600; }
 .sv-content { flex: 1; min-width: 0; overflow-y: auto; padding: 16px 20px; }
 .sv-panel { display: flex; flex-direction: column; gap: 4px; }
+.sv-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.sv-section-head .sv-hint { margin-bottom: 0; }
 .sv-h4 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
 .sv-hint { font-size: 12px; color: var(--text-faint); margin: 2px 0 6px; line-height: 1.5; }
 .sv-label {
@@ -387,6 +547,29 @@ function close() { emit('close') }
 }
 .sv-input:focus { border-color: var(--accent); }
 .sv-textarea { resize: vertical; font-family: inherit; }
+.sv-meter-grid {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 12px 0 8px; border-block: 1px solid var(--border);
+}
+.sv-meter { min-width: 0; padding: 12px 10px; border-right: 1px solid var(--border); }
+.sv-meter:nth-child(3n) { border-right: 0; }
+.sv-meter:nth-child(n+4) { border-top: 1px solid var(--border); }
+.sv-meter span { display: block; color: var(--text-faint); font-size: 11px; }
+.sv-meter b { display: block; margin-top: 3px; font-size: 17px; font-weight: 650; overflow-wrap: anywhere; }
+.sv-provider-list { margin-top: 8px; border-top: 1px solid var(--border); }
+.sv-provider-head, .sv-provider-row {
+  display: grid; grid-template-columns: minmax(90px, 1fr) 100px 110px 90px;
+  gap: 10px; align-items: center; padding: 7px 4px; font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.sv-provider-head { color: var(--text-faint); }
+.sv-provider-row span { text-align: right; color: var(--text-muted); }
+.sv-provider-head span:not(:first-child) { text-align: right; }
+.sv-provider-row .sv-kind { text-align: left; font-size: 11px; }
+.sv-provider-row.simulated { background: color-mix(in srgb, var(--bg-selected) 55%, transparent); }
+.sv-note { margin: 8px 0 0; padding-left: 9px; border-left: 2px solid var(--accent); color: var(--text-muted); font-size: 11px; line-height: 1.55; }
+.sv-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; }
+.sv-field { display: flex; flex-direction: column; gap: 5px; margin-top: 7px; font-size: 12px; color: var(--text-muted); }
 .sv-toggle-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; color: var(--text); cursor: pointer; }
 .sv-toggle-row input { width: 16px; height: 16px; }
 .sv-sep { height: 1px; background: var(--border); margin: 16px 0 4px; }
@@ -413,4 +596,14 @@ function close() { emit('close') }
   border: 1px solid var(--border); background: var(--bg); color: var(--text); cursor: pointer;
 }
 .sv-mini:hover { border-color: var(--accent); color: var(--accent); }
+.sv-mini:disabled { opacity: .5; cursor: default; }
+@media (max-width: 680px) {
+  .sv-box { height: calc(100vh - 20px); max-width: calc(100vw - 20px); }
+  .sv-nav { width: 128px; }
+  .sv-meter-grid, .sv-form-grid { grid-template-columns: 1fr 1fr; }
+  .sv-meter:nth-child(3n) { border-right: 1px solid var(--border); }
+  .sv-meter:nth-child(2n) { border-right: 0; }
+  .sv-meter:nth-child(n+3) { border-top: 1px solid var(--border); }
+  .sv-provider-head, .sv-provider-row { grid-template-columns: minmax(70px, 1fr) 74px 82px 68px; gap: 6px; }
+}
 </style>

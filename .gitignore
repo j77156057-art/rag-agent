@@ -56,3 +56,16 @@ web/favicon.ico
 # AI 工具目录 / 运行日志（2026-09-16 补）
 .trae/
 logs/
+
+# ===== 黄金题实验输出（一次性跑题结果，不入库；baseline 与正式基线保留）=====
+golden/_sessions_iso/
+golden/results_v*.jsonl
+golden/results_xm_*.jsonl
+golden/results_smoke_*.jsonl
+golden/results_trial.jsonl
+golden/results_pte.jsonl
+golden/results_*_verify*.jsonl
+
+# ===== 引擎工程导入元数据（Godot/Unity 自动生成，不入库）=====
+*.import
+*.uid

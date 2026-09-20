@@ -3,11 +3,10 @@
 // 持有者强制回收、FIFO 排队取消、Ollama 空闲卸载秒数设置。
 // 组件自管轮询（打开时 5s 一次），不进工作台全局状态。
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { gpuApi, modelResidencyApi, type GpuStatus, type ModelStatus } from '../api'
+import { gpuApi, type GpuStatus } from '../api'
 
 const open = ref(false)
 const st = ref<GpuStatus | null>(null)
-const models = ref<ModelStatus | null>(null)
 const error = ref('')
 const busy = ref(false)
 const idleInput = ref('')
@@ -79,12 +78,6 @@ async function refresh() {
   } catch (e) {
     error.value = (e as Error).message || 'GPU 状态获取失败'
   }
-  // 本地模型驻留单独取（Ollama 未连接不影响显存面板）
-  try {
-    models.value = await modelResidencyApi.status()
-  } catch {
-    models.value = { reachable: false, loaded: [], vram_gb: 0, needs_ollama: false }
-  }
 }
 
 async function withBusy(fn: () => Promise<void>) {
@@ -112,29 +105,6 @@ function forceRelease(owner?: string) {
   return withBusy(async () => {
     const r = await gpuApi.forceRelease(owner)
     if (!r.ok) error.value = r.error || '回收失败'
-  })
-}
-
-async function unloadModels() {
-  if (!window.confirm('立即卸载全部驻留的本地模型以释放显存？\n（下次对话会自动重载，首次会稍慢）')) return
-  await withBusy(async () => {
-    try {
-      const r = await modelResidencyApi.power('off')
-      if (!r.ok) error.value = r.error || '卸载失败'
-    } catch (e) {
-      error.value = (e as Error).message || '卸载失败'
-    }
-  })
-}
-
-async function preloadModels() {
-  await withBusy(async () => {
-    try {
-      const r = await modelResidencyApi.power('on')
-      if (!r.ok) error.value = r.error || '预加载失败'
-    } catch (e) {
-      error.value = (e as Error).message || '预加载失败'
-    }
   })
 }
 
@@ -264,27 +234,6 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <!-- 本地模型驻留（显存）：一键卸载 / 预加载 -->
-        <div class="gp-idle">
-          <div class="gp-idle-title">本地模型驻留
-            <span class="gp-faint" v-if="models">
-              （{{ !models.reachable ? 'Ollama 未连接'
-                  : (models.loaded.length ? models.loaded.length + ' 个 · ' + models.vram_gb + ' GB 显存' : '未加载') }}）
-            </span>
-          </div>
-          <div v-for="m in models?.loaded || []" :key="m.name" class="gp-faint gp-model-row">
-            <span class="gp-owner">{{ m.name }}</span>
-            <span>{{ m.size_vram_gb }} GB 显存</span>
-            <span v-if="m.processor"> · {{ m.processor }}</span>
-            <span v-if="m.expires_minutes !== null"> · {{ m.expires_minutes }} 分钟后自动卸载</span>
-          </div>
-          <div class="gp-idle-row">
-            <button class="gp-mini" :disabled="busy || !models?.loaded.length" @click="unloadModels">卸载全部（腾显存）</button>
-            <button class="gp-mini" :disabled="busy || !models?.needs_ollama" @click="preloadModels">预加载</button>
-          </div>
-          <div class="gp-faint gp-idle-meta">切换本地模型或跑 ComfyUI 生图/帧动画前，先卸载可避免显存不足。</div>
-        </div>
-
         <div class="gp-foot">
           <span class="gp-faint">排队 {{ st?.queue_length ?? 0 }} · 钩子 {{ st?.hooks.join(', ') || '无' }}</span>
           <span class="gp-spacer" />
@@ -354,7 +303,6 @@ button:disabled { opacity: 0.5; cursor: default; }
 .gp-idle-row { display: flex; align-items: center; gap: 7px; margin-top: 5px; }
 .gp-input { width: 72px; background: var(--bg); border: 1px solid var(--border-strong); border-radius: 4px; color: var(--text); padding: 3px 6px; font-size: 11px; }
 .gp-idle-meta { margin-top: 4px; }
-.gp-model-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 3px; }
 
 .gp-foot { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
 .gp-danger { background: transparent; border: 1px solid rgba(224, 72, 79, 0.5); color: #c23a40; border-radius: 5px; font-size: 11px; padding: 4px 10px; cursor: pointer; }

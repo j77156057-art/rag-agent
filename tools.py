@@ -16,6 +16,7 @@ import datetime
 import hashlib
 import time
 import mcp_client
+from artifact_tools import create_artifact
 
 from config import (TOP_K, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime,
                      edit_confirm_enabled, external_access_high, EXTERNAL_API_ALLOWLIST,
@@ -3293,14 +3294,14 @@ def _sv_changed_via_git(root):
             ["git", "diff", "--name-only", "HEAD", "--", root],
             capture_output=True, text=True, timeout=15, cwd=root,
         )
-        files = [os.path.abspath(l.strip()) for l in (out.stdout or "").splitlines() if l.strip()]
+        files = [os.path.abspath(os.path.join(root, l.strip())) for l in (out.stdout or "").splitlines() if l.strip()]
         out2 = subprocess.run(
             ["git", "diff", "--name-only", "--cached", "--", root],
             capture_output=True, text=True, timeout=15, cwd=root,
         )
         for l in (out2.stdout or "").splitlines():
             if l.strip():
-                ap = os.path.abspath(l.strip())
+                ap = os.path.abspath(os.path.join(root, l.strip()))
                 if ap not in files:
                     files.append(ap)
         return files
@@ -3330,6 +3331,14 @@ def _sv_verify_backend(py_files, root, result):
     """后端校验：py_compile 每个改动 .py；命中则跑对应单测（有界到改动模块）。"""
     import py_compile
     for f in py_files:
+        # 待校验文件不存在 → 记为失败（Agent 让校验一个不存在的文件，说明写/路径出错），
+        # 不能降级成 skip 假通过（否则 self_verify 永远 passed:true，失去校验意义）。
+        if not os.path.isfile(f):
+            result["failures"].append({
+                "scope": "backend", "file": f,
+                "error": "待校验文件不存在：" + f,
+            })
+            continue
         try:
             py_compile.compile(f, doraise=True)
             result["ran"].append("py_compile:" + (os.path.relpath(f, root) if root else f))
@@ -3446,15 +3455,16 @@ def self_verify(arg=""):
       scope: auto(默认, 按改动文件自动选) / backend / frontend / scene / engine / all / skip
       files: 显式指定待校验文件（相对/绝对路径，可多行或逗号分隔）；缺省时用 git diff 自动发现
     返回 JSON：{"scope","ran":[...],"passed":bool,"failures":[...],"note":""}
-      passed=true 表示全部已执行的校验通过（ran 为空也返回 true，即「无需校验」）。
+      status 区分 passed/failed/skipped/partial；无检查或跳过不视为通过。
     """
     scope, files = _parse_self_verify_arg(arg)
+    from agent_runtime.verification import finalize_verification
     root = _get_code_root()
     result = {"scope": scope, "ran": [], "passed": True, "failures": [], "note": ""}
 
     if scope == "skip":
         result["note"] = "已跳过自验证（scope=skip）。"
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps(finalize_verification(result), ensure_ascii=False)
 
     # 1) 决定待校验文件集合
     if files:
@@ -3470,7 +3480,23 @@ def self_verify(arg=""):
         targets = _sv_changed_via_git(root) if root else []
     if not targets:
         result["note"] = "未发现可校验的改动（无 git 改动或显式文件）。"
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps(finalize_verification(result), ensure_ascii=False)
+
+    # Resolve symlinks before checks: verification must not read/compile outside the project.
+    safe_targets = []
+    for target in targets:
+        try:
+            real_root = os.path.realpath(root) if root else None
+            real_target = os.path.realpath(target)
+            inside = bool(real_root and os.path.commonpath([real_root, real_target]) == real_root)
+        except (ValueError, OSError):
+            inside = False
+        if inside:
+            safe_targets.append(real_target)
+        else:
+            result["failures"].append({"scope": "permission", "file": target,
+                                       "error": "校验目标超出当前项目范围"})
+    targets = safe_targets
 
     py_files, fe_files, scene_files, engine_files = _sv_classify(targets)
 
@@ -3490,6 +3516,7 @@ def self_verify(arg=""):
         if engine_files and os.getenv("DOCMIND_SELF_VERIFY_ENGINE") == "1":
             scopes.append("engine")
         elif engine_files:
+            result.setdefault("skipped", []).append("engine:skip（自动引擎检查未启用）")
             result["note"] = ((result.get("note") or "") +
                               "（engine 域自检需真 Godot 且默认关闭，已跳过；"
                               "显式 scope:engine 或开 DOCMIND_SELF_VERIFY_ENGINE=1 可启用）")
@@ -3513,10 +3540,9 @@ def self_verify(arg=""):
         except Exception as e:  # noqa: BLE001 —— 单个 scope 校验器故障绝不阻断整体
             result["ran"].append("%s:skip（校验器异常 %s）" % (sc, type(e).__name__))
 
-    result["passed"] = (len(result["failures"]) == 0)
     if not result["ran"]:
         result["note"] = result["note"] or "无可执行的校验（改动文件类型无对应校验器）。"
-    return json.dumps(result, ensure_ascii=False)
+    return json.dumps(finalize_verification(result), ensure_ascii=False)
 
 
 def recall_experience(arg=""):
@@ -3584,6 +3610,10 @@ TOOLS = {
     "python_exec": {
         "description": "在受限子进程中执行 Python 代码并返回输出（超时 12s）。适合数值计算、数据处理、文本变换、小规模绘图数据生成等'让 agent 真正动手'的任务。输入为完整 Python 代码。",
         "func": python_exec,
+    },
+    "create_artifact": {
+        "description": "创建并校验 Word、PDF、PowerPoint 或 Excel 文件，源码和桌面分发版都可用。输入必须是 JSON 对象：format 为 docx/pdf/pptx/xlsx，filename 为文件名，title/subtitle 为标题；docx/pdf 使用 sections（每项可含 heading/level/paragraphs/bullets/table）；pptx 使用 slides（title/bullets）；xlsx 使用 sheets（name/headers/rows）。文件写入当前项目 artifacts 目录，返回实际路径和校验结果。调用前先用 dev_use_skill 读取对应技能。",
+        "func": create_artifact,
     },
     "gen_video_prompt": {
         "description": "按 MiniMax H3 的三段结构（integrated_multimodal_description / overall_soundscape / non_diegetic_music）把一段创意描述生成为结构化视频提示词，可直接粘贴进 ComfyUI 的 MiniMaxH3ImageToVideo 节点。输入为自然语言创意（主体/场景/动作/氛围）。",
@@ -3738,7 +3768,7 @@ TOOLS = {
 }
 
 
-def tool_schemas(names=None):
+def tool_schemas(names=None, registry=None):
     """把 TOOLS 注册表导出为 OpenAI 风格函数 schema（原生 function-calling 用）。
 
     所有工具统一暴露单个 `input` 字符串参数，与文本协议的 `Action Input` **同形**，
@@ -3746,7 +3776,8 @@ def tool_schemas(names=None):
     `names` 可限定子集（子代理的工具白名单就用它）。
     """
     out = []
-    for name, meta in TOOLS.items():
+    source = registry if registry is not None else TOOLS
+    for name, meta in source.items():
         if names and name not in names:
             continue
         desc = (meta.get("description") or "").strip()

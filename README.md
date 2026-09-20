@@ -3,6 +3,8 @@
 一个**可离线运行的 Agent 运行时**：把「能跑的 agent」补齐成**可观测、可编排、可回归**的工程系统。
 上层落地为一个本地工程工作台（代码问答 / 受控改写 / 场景与运行时可视化）——**但项目主体是 Harness，工作台只是它的落地场景**。
 
+IT 查询助手已经拆分为独立项目 `docmind-it-assistant`；本仓库只保留开发问答、开发工具与游戏工作台，不再提供 IT 页面或 IT API。
+
 **要解决的两个失败模式**：
 
 1. **幻觉**——AI 凭印象说"伤害计算在 player.py"，其实没有这个文件；
@@ -22,6 +24,8 @@
 **三条设计取向**：① **护栏复用**——原生 FC 与并行批次都不新开执行路径，直接走既有护栏，避免"两套语义"；② **有界**——轨迹、观察、历史、批次全部截断或摘要，不让上下文与提示词爆炸；③ **不越权**——编排器只改未执行任务、写工具绝不并发、钩子异常一律吞掉。
 
 零 API Key 可跑（mock / 本地 Ollama / llama.cpp），云端 Provider 可随时切换。
+
+![DocMind · Agent Harness 六层架构](docs/architecture.svg)
 
 ---
 
@@ -63,6 +67,9 @@ rag-agent/
 ├── agent.py               # ReAct 循环、反思重试、代码优先路由、证据护栏；run/_run 埋点外壳；
 │                          #   原生 function-calling、plan 模式、子代理委派、并行批次
 ├── tools.py               # 47 个工具：9 基础 + 受控写 + 分区/研发工具 + delegate/orchestrate/dev_use_skill
+├── agent_runtime/         # 跨应用工具结果、验证与应用权限/状态命名空间契约
+├── applications/
+│   └── developer/         # 开发问答/游戏工作台的应用边界
 ├── regions.py             # 分区 2.0：声明式配置、契约校验（DAG 无环 / 导出存在）、变更集与回滚
 ├── scene_runtime.py       # 场景画布内核：.tscn 行块解析 → 图模型 → 受控编辑（可回滚 + 可撤销）
 ├── workbench_fs.py        # 沙箱文件树、读写、git 状态 / 历史 / 回滚、符号地图、关系图
@@ -79,7 +86,9 @@ rag-agent/
 ├── sessions.py            # 会话隔离 + 持久化 + 滚动摘要
 ├── pricing.py             # 按 provider 计价 + 全局/会话预算熔断
 ├── hooks.py               # 工具/回合钩子热插拔（.docmind/hooks/*.py）
-├── skills.py              # 技能热插拔（.docmind/skills/**/*.md + dev_use_skill）
+├── skills.py              # 内置 + 用户技能热插拔（agent_skills / .docmind/skills）
+├── artifact_tools.py      # DOCX / PDF / PPTX / XLSX 结构化生成与回读校验
+├── agent_skills/          # 随源码和桌面包发布的文档、PDF、演示、表格技能
 ├── agent_eval.py          # 黄金题自动打分 + baseline 回归门（回归即退出码 1）
 ├── run_golden.py          # 黄金题库运行器：跑题产出 results.jsonl 供 agent_eval.py 打分
 ├── orchestrator.py        # 多代理编排：任务图 DAG + 并行 + 重规划 + 结果合成
@@ -148,7 +157,7 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文
   另有「聚焦 / 解除嵌入 / 停止桌面窗口」；关弹窗或切走 tab 会自动解除嵌入。浏览器模式下开关自动禁用并提示需要桌面端。
   未覆盖：100%/125% 缩放的实机数据（本机显示器当前是 150%，脚本会打印 DPI 并按实际坐标断言）。
 - **打包成独立 exe（onedir 目录分发）**：`docmind.spec` 一条命令产出 `dist\DocMind\DocMind.exe`，把整个 `dist\DocMind` 目录一起分发即可，目标机器无需安装 Python。完整流程见 [DocMind_BUILD.md](DocMind_BUILD.md) 与 `.trae/skills/docmind-frozen-release/SKILL.md`。
-- **分发版能力边界**：分包 `builtin:py` 校验在进程内做语法检查（exe 与源码行为一致）；但 playtest 自动测试、cProfile 剖析、`python_exec` 需要真实 Python 环境，请在源码 `.venv` 里用；分区的 git 操作要求目标机器装有 Git。
+- **分发版能力边界**：分包 `builtin:py` 校验以及 `create_artifact` 的 DOCX / PDF / PPTX / XLSX 生成均在进程内完成（exe 与源码行为一致）；但 playtest 自动测试、cProfile 剖析、`python_exec` 需要真实 Python 环境，请在源码 `.venv` 里用；分区的 git 操作要求目标机器装有 Git。
 
 ## 🧭 Harness 能力（Agent 运行时）
 
@@ -163,8 +172,10 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文
 | **原生 function-calling** | 由工具表生成 OpenAI 风格 schema；`tool_calls` 归一进文本协议后**复用全部既有护栏**（写意图 / 防重复 / 步数 / 证据兜底），事件类型不变 | `DOCMIND_TOOL_MODE=react\|native\|auto` |
 | **多代理编排器** | 任务图 DAG（校验 + 拓扑分波 + 同波并行）+ **下游注入上游结论** + **失败自动重规划**（提案 `add / drop / replace`，只能改**尚未执行**的任务）+ 结果合成 + **子代理执行轨迹回传**给 replanner 做失败归因 | `orchestrate` 工具、`POST /api/orchestrate` |
 | **成本熔断** | 按 provider/model 计价（可 `.docmind_pricing.json` 覆盖；本地 provider 恒 0）+ 全局/会话累计预算；**回合前拒绝、回合后累计** | `GET/POST /api/budget` |
-| **hooks / 技能热插拔** | `.docmind/hooks/*.py` 的 `pre/post_tool`、`pre/post_turn`（单个钩子异常被隔离）；`.docmind/skills/**/*.md` 目录注入系统提示、正文由 `dev_use_skill` 按需取 | `POST /api/hooks/reload`、`POST /api/skills/reload` |
+| **hooks / 技能热插拔** | `.docmind/hooks/*.py` 的 `pre/post_tool`、`pre/post_turn`（单个钩子异常被隔离）；`agent_skills/*/SKILL.md` 提供内置技能，`.docmind/skills` 可同名覆盖，正文由 `dev_use_skill` 按需取 | `POST /api/hooks/reload`、`POST /api/skills/reload` |
+| **办公文档产物** | 内置 `documents / pdf / presentations / spreadsheets` 四个技能；`create_artifact` 生成真实 DOCX、PDF、PPTX、XLSX，回读验证后写入当前项目 `artifacts/`，同名文件自动分配新名称 | `dev_use_skill`、`create_artifact` |
 | **并行工具批次** | 一轮多条**只读**调用并发执行（结果**保序**回填）；批内只要含写/副作用工具就整批退回顺序，**绝不并发写** | `DOCMIND_PARALLEL_TOOLS`、`DOCMIND_PARALLEL_MAX` |
+| **渐进式工具暴露** | 47 个工具的完整描述写进系统提示会撑爆 `PROMPT_TOKEN_BUDGET`（实测触发 `system prompt has been truncated` 并让模型输出格式崩溃）。改为默认只注入 13 个核心工具的完整用法，其余只给一行索引，按需用 `tool_search(工具名)` 取回（连同该工具的细则一起返回） | `DOCMIND_TOOL_EXPANSION=progressive`（默认 `full`，行为不变） |
 
 **三条设计取向**：① **护栏复用**——原生 FC 与并行批次都不新开执行路径，直接走既有护栏，避免"两套语义"；② **有界**——轨迹、观察、历史、批次全部截断或摘要，不让上下文与提示词爆炸；③ **不越权**——编排器只能改未执行任务（不回滚已产生的副作用）、写工具绝不并发、钩子异常一律吞掉。
 
@@ -186,12 +197,12 @@ curl --noproxy '*' -X POST http://127.0.0.1:8000/api/budget -H "Content-Type: ap
 
 新增环境变量全部列在 `.env.example`（`DOCMIND_TRACE*` / `DOCMIND_SESSION_*` / `DOCMIND_LLM_*` / `DOCMIND_TOOL_MODE` / `DOCMIND_ORCH_*` / `DOCMIND_BUDGET_CNY` / `DOCMIND_HOOKS_DIR` / `DOCMIND_SKILLS_DIR` / `DOCMIND_PARALLEL_*`）。
 
-> **能力边界（不夸大）**：子代理**不共享**父上下文（靠上游结论注入传递）；重规划只改**未执行**的计划、**不回滚**已执行任务；轨迹是**有界摘要**（全文在 `.docmind_traces.jsonl`）；hooks 无沙箱（`.py` 直载，权限等同本服务）；技能只是提示词注入、不带可执行脚本。
+> **能力边界（不夸大）**：子代理**不共享**父上下文（靠上游结论注入传递）；重规划只改**未执行**的计划、**不回滚**已执行任务；轨迹是**有界摘要**（全文在 `.docmind_traces.jsonl`）；hooks 无沙箱（`.py` 直载，权限等同本服务）；技能本身是提示词指引，办公文件由受控的 `create_artifact` 工具执行，不运行技能内任意脚本。
 
 ## 🧪 测试与自检
 
 ```bash
-# 全量单元测试（450 项；MinGit 在 PATH 时 git 用例会实际执行）
+# 全量单元测试（当前 1131 项；MinGit 在 PATH 时 git 用例会实际执行）
 .venv\Scripts\python.exe -B -m unittest discover -s tests
 
 # 场景画布 —— 后端自检：进程内起 FastAPI + 临时 Godot 工程，走真实路由，不占端口
