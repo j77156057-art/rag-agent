@@ -98,10 +98,7 @@ rag-agent/
 │       └── GpuPanel.vue                                              # GPU lease panel (P2-1)
 ├── tests/                 # unittest 450 items
 ├── verify_scene_canvas.py / verify_scene_canvas_ui.mjs   # scene-canvas self-check + browser smoke
-├── verify_engine_embed.py # engine-embed real-machine self-check
-├── HANDOFF.md             # ★ sole authority handoff doc (why / baseline / todos / pitfalls — read first)
-├── DocMind_BUILD.md       # frozen-build archive (release flow appends here, never creates new file)
-└── 分区开发设计.md         # Region 2.0 architecture design
+└── verify_engine_embed.py # engine-embed real-machine self-check
 ```
 
 ## 🚀 Quick Start
@@ -154,7 +151,7 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=What file formats does 
   Embedding is **reversible**: `detach` restores the original parent, window style, and screen position — without saving these, a bare `SetParent(NULL)` leaves the window invisible (still carrying `WS_CHILD`).
   The playtester has an "embed into workbench" toggle: with it on, clicking "launch desktop window" drops the game画面 onto the engine viewport in the popup while the workbench UI stays usable; there are also "focus / detach / stop desktop window" controls; closing the popup or switching tabs auto-detaches. In browser mode the toggle is auto-disabled with a "needs desktop" hint.
   Not yet covered: real-machine data at 100% / 125% scaling (this display is 150%; the script prints DPI and asserts by actual coordinates).
-- **Package as a standalone exe (onedir distribution)**: `docmind.spec` produces `dist\DocMind\DocMind.exe` in one command; ship the whole `dist\DocMind` folder, the target machine needs no Python. Full flow in [DocMind_BUILD.md](DocMind_BUILD.md) and `.trae/skills/docmind-frozen-release/SKILL.md`.
+- **Package as a standalone exe (onedir distribution)**: `docmind.spec` produces `dist\DocMind\DocMind.exe` in one command; ship the whole `dist\DocMind` folder, the target machine needs no Python. Build command: `.venv\Scripts\python.exe -m PyInstaller docmind.spec --noconfirm` (output in `dist\DocMind`).
 - **Packaged build capability boundary**: the bundled `builtin:py` syntax checker and `create_artifact` DOCX / PDF / PPTX / XLSX renderer run in-process (the exe behaves like source); playtest auto-test, cProfile, and `python_exec` still need a real Python environment in the source `.venv`. Region git operations require Git on the target machine.
 
 ## 🧭 Harness (the agent runtime)

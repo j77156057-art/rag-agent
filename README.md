@@ -98,10 +98,7 @@ rag-agent/
 │       ├── SceneCanvas.vue / SceneNodeCard.vue / SceneFileCard.vue   # 场景画布
 │       └── RuntimeTimeline.vue                                       # 运行时时间线
 ├── tests/                 # unittest 450 项
-├── verify_scene_canvas.py / verify_scene_canvas_ui.mjs   # 场景画布自检 + 浏览器冒烟
-├── HANDOFF.md             # ★ 唯一权威交接文档（原因 / 基线 / 待办 / 坑，接手先读它）
-├── DocMind_BUILD.md       # 冻结构建档案（发布流程强制在其中追加，不新建文件）
-└── 分区开发设计.md         # 分区 2.0 架构设计
+└── verify_scene_canvas.py / verify_scene_canvas_ui.mjs   # 场景画布自检 + 浏览器冒烟
 ```
 
 ## 🚀 快速开始
@@ -169,7 +166,7 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文
   试玩器里有「嵌入工作台」开关：勾上后点「桌面窗口启动」，游戏画面直接落在弹窗的引擎视窗上，工作台界面照常可用；
   另有「聚焦 / 解除嵌入 / 停止桌面窗口」；关弹窗或切走 tab 会自动解除嵌入。浏览器模式下开关自动禁用并提示需要桌面端。
   未覆盖：100%/125% 缩放的实机数据（本机显示器当前是 150%，脚本会打印 DPI 并按实际坐标断言）。
-- **打包成独立 exe（onedir 目录分发）**：`docmind.spec` 一条命令产出 `dist\DocMind\DocMind.exe`，把整个 `dist\DocMind` 目录一起分发即可，目标机器无需安装 Python。完整流程见 [DocMind_BUILD.md](DocMind_BUILD.md) 与 `.trae/skills/docmind-frozen-release/SKILL.md`。
+- **打包成独立 exe（onedir 目录分发）**：`docmind.spec` 一条命令产出 `dist\DocMind\DocMind.exe`，把整个 `dist\DocMind` 目录一起分发即可，目标机器无需安装 Python。构建命令：`.venv\Scripts\python.exe -m PyInstaller docmind.spec --noconfirm`（产物在 `dist\DocMind`）。
 - **分发版能力边界**：分包 `builtin:py` 校验以及 `create_artifact` 的 DOCX / PDF / PPTX / XLSX 生成均在进程内完成（exe 与源码行为一致）；但 playtest 自动测试、cProfile 剖析、`python_exec` 需要真实 Python 环境，请在源码 `.venv` 里用；分区的 git 操作要求目标机器装有 Git。
 
 ## 🧭 Harness 能力（Agent 运行时）

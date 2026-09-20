@@ -69,3 +69,14 @@ golden/results_*_verify*.jsonl
 # ===== 引擎工程导入元数据（Godot/Unity 自动生成，不入库）=====
 *.import
 *.uid
+
+# ===== 内部文档 / 过程记录（本地保留，不入库；2026-09-20 从公开仓库下架）=====
+# 这些是开发过程中的交接、构建与设计档案，对使用者无价值，且含大量内部细节。
+# 取消忽略（如需重新公开）：git add -f <file>
+HANDOFF.md
+DocMind_BUILD.md
+DEMO.md
+game_project_template.md
+分区开发设计.md
+docs/agent-self-verify-memory.md
+docs/agent-applications-roadmap.md
