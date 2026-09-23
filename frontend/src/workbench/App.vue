@@ -534,7 +534,9 @@ onBeforeUnmount(() => {
         <WorkspaceTabs />
         <!-- 阶段 4：运行面板常驻（docked）承载槽（主区，左侧文件树/示例保留，便于边玩边改） -->
         <div id="wb-playpane-slot" class="wb-playpane-slot" v-show="runtimeResident" />
-        <template v-if="!runtimeResident">
+        <!-- 页面切换只隐藏编辑区，不卸载 ChatDock。否则 ChatDock 的卸载钩子会
+             把正在进行的 SSE 当成用户主动停止，导致切到运行面板时回答被中断。 -->
+        <div class="wb-editor-shell" :style="{ display: runtimeResident ? 'none' : 'contents' }">
           <AssetCenterView v-if="workspace === 'assets'" />
           <template v-else-if="tree">
             <EditorTabs v-if="workspace === 'code'" />
@@ -566,7 +568,7 @@ onBeforeUnmount(() => {
               <span class="wb-status-faint">示例演示模式 · 未连接本地项目</span>
             </footer>
           </template>
-        </template>
+        </div>
       </main>
 
       <div v-if="!treeError && !tree && !demoMode" class="wb-booting">
