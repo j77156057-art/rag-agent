@@ -196,11 +196,16 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "80"))
 TOP_K = int(os.getenv("TOP_K", "4"))
 MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "8"))
+# 复杂代码审查需要多次定位、分段读文件和运行验证；保持普通问答的低成本，
+# 仅在识别为代码/项目缺陷审查时使用更大的有界预算。显式环境变量优先。
+AUDIT_MAX_AGENT_STEPS = int(os.getenv("DOCMIND_AUDIT_MAX_STEPS", "16"))
+CODE_MAX_AGENT_STEPS = int(os.getenv("DOCMIND_CODE_MAX_STEPS", "12"))
 # ---- Agent 上下文预算（防止长系统提示 + 多轮观察 + 思考模型 reasoning 撑爆 n_ctx）----
 # 多轮记忆回放的问答对【硬上限】：实际回放多少轮先按 token 窗口动态决定
 # （Agent._history_window，占 prompt 预算 COMPACT_KEEP_RATIO），此值只兜底防失控。
 AGENT_HISTORY_TURNS = int(os.getenv("AGENT_HISTORY_TURNS", "40"))
-OBS_MAX_CHARS = int(os.getenv("OBS_MAX_CHARS", "1200"))  # 单条工具观察回填给模型前的截断长度
+OBS_MAX_CHARS = int(os.getenv("OBS_MAX_CHARS", "1800"))  # 单条工具观察回填给模型前的截断长度
+AUDIT_OBS_MAX_CHARS = int(os.getenv("DOCMIND_AUDIT_OBS_MAX_CHARS", "2600"))
 HISTORY_ANSWER_CHARS = int(os.getenv("HISTORY_ANSWER_CHARS", "700"))  # 回放历史回答时的单条截断长度
 TRAIL_ASSISTANT_CHARS = int(os.getenv("TRAIL_ASSISTANT_CHARS", "1000"))  # trail 中保留的模型单轮决策上限
 # 每轮送模型前，整段 prompt 的 token 预算（llamacpp 走 /tokenize 精算）。

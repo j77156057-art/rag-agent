@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -223,6 +224,34 @@ class AgentGuardTests(unittest.TestCase):
         self.assertIn("obs-inp8", text)           # 最后真实观察
         self.assertNotIn("已确认结论", text)
 
+    def test_project_audit_uses_dynamic_step_budget_in_run_loop(self):
+        """项目缺陷审查的增量预算必须接入执行循环，而不只是停留在配置函数。"""
+        called = []
+
+        def fake_tool(arg):
+            called.append(arg)
+            return f"obs-{arg}"
+
+        agent_mod.TOOLS = {"fake_tool": {"func": fake_tool}}
+        scripts = [_act("fake_tool", f"audit{i}") for i in range(1, 5)]
+        scripts.append(_FINAL_OK)
+        with patch.object(agent_mod, "MAX_AGENT_STEPS", 2), \
+                patch.object(agent_mod, "AUDIT_MAX_AGENT_STEPS", 4):
+            a = agent_mod.Agent(llm=_ScriptedLLM(scripts))
+            events = list(a.run("你看看目前的游戏代码有什么 bug", stream=True))
+
+        self.assertEqual(called, ["audit1", "audit2", "audit3", "audit4"])
+        self.assertEqual([e["text"] for e in events if e["type"] == "final"], ["已确认结论。"])
+
+    def test_dynamic_budget_does_not_expand_ordinary_questions(self):
+        """动态预算只匹配代码/项目审查，不因普通问题里出现“问题”二字就放宽。"""
+        with patch.object(agent_mod, "MAX_AGENT_STEPS", 2), \
+                patch.object(agent_mod, "CODE_MAX_AGENT_STEPS", 4), \
+                patch.object(agent_mod, "AUDIT_MAX_AGENT_STEPS", 6):
+            self.assertEqual(agent_mod._step_budget("这个问题是什么意思？"), 2)
+            self.assertEqual(agent_mod._step_budget("请审查这个 Python 脚本"), 4)
+            self.assertEqual(agent_mod._step_budget("目前这个游戏有哪些 bug？"), 6)
+
     def test_python_exec_runs_within_code_root(self):
         """配置 code_root 后，python_exec 的相对路径按代码根解析。"""
         with tempfile.TemporaryDirectory() as d:
@@ -352,6 +381,7 @@ class AgentGuardTests(unittest.TestCase):
         self.assertEqual(norm, "a/b.java\nstart: 315\nend: 360")
         # 非关键字风格保持原样
         self.assertEqual(agent_mod._normalize_tool_arg("grep", "LOOP_ONE"), "LOOP_ONE")
+        self.assertEqual(agent_mod._normalize_tool_arg("list_dir", "(顶层)"), ".")
 
     def test_run_passes_normalized_arg_to_tool(self):
         """端到端：run() 派发给工具函数/事件展示的必须是归一化后的参数（接线回归）。"""

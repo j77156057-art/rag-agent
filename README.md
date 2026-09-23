@@ -220,6 +220,7 @@ CHAT_VIDEO_MAX_FRAMES=8
 | **LLM 弹性** | 重试 + 指数退避（429 / 5xx / 超时 / 网络可重试，**4xx 明确不重试**）+ 统一 `timeout`/`deadline`；SSE 客户端断连即关闭内层生成器中止回合并记账 | `DOCMIND_LLM_*`、`DOCMIND_TURN_DEADLINE_S` |
 | **评测自动化** | 黄金题 40 条（单跳 / 多跳 / 抗干扰三档）规则打分（`must_include / any_of / must_not_include / regex / must_call / 动作边界 / no_error`）+ 可选 LLM-judge + **baseline 回归门**（pass→fail 即退出码 1） | `run_golden.py` 跑题、`agent_eval.py` 打分、`agent-golden-eval` skill 的 `gate.py`（已接入冻结发布流程） |
 | **原生 function-calling** | 由工具表生成 OpenAI 风格 schema；`tool_calls` 归一进文本协议后**复用全部既有护栏**（写意图 / 防重复 / 步数 / 证据兜底），事件类型不变 | `DOCMIND_TOOL_MODE=react\|native\|auto` |
+| **按任务动态执行预算** | 普通问答保持较小上限；代码任务自动放宽，完整项目缺陷审查可继续核对脚本、场景、输入和 UI。观察长度同步扩展，并继续受重复调用、连续失败、总步数与 deadline 护栏约束 | `MAX_AGENT_STEPS`、`DOCMIND_CODE_MAX_STEPS`、`DOCMIND_AUDIT_MAX_STEPS`、`OBS_MAX_CHARS`、`DOCMIND_AUDIT_OBS_MAX_CHARS` |
 | **多代理编排器** | 任务图 DAG（校验 + 拓扑分波 + 同波并行）+ **dispatcher/planner 动态拆解并派发任务**（主 Agent 校验后加入 DAG）+ **下游注入上游结论** + **失败自动重规划**（提案 `add / drop / replace`，只能改**尚未执行**的任务）+ 结果合成 + **子代理执行轨迹回传**给 replanner 做失败归因 | `orchestrate` 工具、`POST /api/orchestrate` |
 | **成本熔断** | 按 provider/model 计价（可 `.docmind_pricing.json` 覆盖；本地 provider 恒 0）+ 全局/会话累计预算；**回合前拒绝、回合后累计** | `GET/POST /api/budget` |
 | **hooks / 技能热插拔** | `.docmind/hooks/*.py` 的 `pre/post_tool`、`pre/post_turn`（单个钩子异常被隔离）；`agent_skills/*/SKILL.md` 提供内置技能，`.docmind/skills` 可同名覆盖，正文由 `dev_use_skill` 按需取 | `POST /api/hooks/reload`、`POST /api/skills/reload` |

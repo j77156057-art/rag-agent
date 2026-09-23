@@ -12,8 +12,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 from config import (
     MAX_AGENT_STEPS,
+    AUDIT_MAX_AGENT_STEPS,
+    CODE_MAX_AGENT_STEPS,
     AGENT_HISTORY_TURNS,
     OBS_MAX_CHARS,
+    AUDIT_OBS_MAX_CHARS,
     HISTORY_ANSWER_CHARS,
     TRAIL_ASSISTANT_CHARS,
     PROMPT_TOKEN_BUDGET,
@@ -88,6 +91,38 @@ _PROJECT_AUDIT = re.compile(
 
 def _is_project_audit_question(question):
     return bool(_PROJECT_AUDIT.search(str(question or "")))
+
+
+_CODE_REVIEW = re.compile(
+    r"代码|源码|脚本|函数|方法|接口|调用链|配置文件|重构|代码审查|"
+    r"godot|unity|unreal|python|gdscript|"
+    r"(?:项目|游戏).{0,24}(?:报错|异常|故障|修复|检查)|"
+    r"(?:报错|异常|故障|修复|检查).{0,24}(?:项目|游戏)|"
+    r"\b(?:code|source|script|function|class|error|bug|review|debug)\b",
+    re.I,
+)
+
+
+def _step_budget(question):
+    """按任务复杂度给工具调用一个有界预算。
+
+    普通问题仍使用 MAX_AGENT_STEPS；当前项目缺陷审查需要读取多份源码并核对
+    场景/配置，给它独立上限，避免一次无效目录调用就把证据链截断。
+    """
+    base = max(1, int(MAX_AGENT_STEPS))
+    value = _user_question(question)
+    if _is_project_audit_question(value):
+        return max(base, int(AUDIT_MAX_AGENT_STEPS))
+    if _CODE_REVIEW.search(value):
+        return max(base, int(CODE_MAX_AGENT_STEPS))
+    return base
+
+
+def _observation_budget(question):
+    """代码审查保留更完整的工具观察，普通对话继续使用通用上限。"""
+    if _is_project_audit_question(_user_question(question)):
+        return max(int(OBS_MAX_CHARS), int(AUDIT_OBS_MAX_CHARS))
+    return max(256, int(OBS_MAX_CHARS))
 
 
 def _has_project_evidence(evidence):
@@ -751,6 +786,12 @@ def _normalize_grep_arg(arg):
 
 def _normalize_tool_arg(tool, arg):
     """把 `key: value` 风格的单值工具入参还原成纯 value；read_file 兼容同行逗号 start/end。"""
+    if tool == "list_dir" and arg:
+        # 弱模型常把“顶层目录”当成占位参数；list_dir 的空参语义本来就是
+        # 当前项目根目录，归一化后直接得到有效勘察结果，避免浪费一次失败重试。
+        value = str(arg).strip().strip("()（）[]【】 ")
+        if value in {"顶层", "顶层目录", "根目录", "root", "repo root"}:
+            return "."
     if not arg or tool not in _ARG_PREFIX_TOOLS:
         return arg
     if tool == "grep":
@@ -1794,6 +1835,10 @@ class Agent:
         nudges = 0
         tool_steps = 0
         iterations = 0
+        # 工具/观察预算按本轮真实用户问题动态选择。项目缺陷审查通常需要同时核对
+        # 脚本、场景、输入与 UI，不能与普通问答共用同一个很小的固定上限。
+        tool_step_limit = _step_budget(question)
+        observation_limit = _observation_budget(question)
         repeats = 0  # 完全相同参数重复调用同一工具的次数
         tool_fail_streak = {}  # 同一工具连续失败次数（换参数也算；防同工具反复失败死循环）
         fail_total = 0  # 连续失败总次数（任一工具；成功即清零）
@@ -1820,7 +1865,7 @@ class Agent:
             if turn is not None:
                 turn.outcome = "evidence_fallback"
             steps_used = "；".join(evidence) or "（无）"
-            last = _clip(last_obs or "", OBS_MAX_CHARS)
+            last = _clip(last_obs or "", observation_limit)
             return {
                 "type": "final",
                 "text": (
@@ -1842,7 +1887,7 @@ class Agent:
                     "text": "（本轮已超出时间上限，已中止。请缩小问题范围或拆成更具体的问题后重试。）",
                 }
                 return
-            if iterations > MAX_AGENT_STEPS + _MAX_NUDGES + _MAX_FORCED_FINALS + 4:
+            if iterations > tool_step_limit + _MAX_NUDGES + _MAX_FORCED_FINALS + 4:
                 if turn is not None:
                     turn.outcome = "max_steps"
                 yield {
@@ -1855,7 +1900,16 @@ class Agent:
             # 省掉逐条往返。批内只要含写/副作用工具（或超并发上限）就整体退回顺序路径。
             if self._pending_batch:
                 if PARALLEL_TOOLS and self._parallel_safe(self._pending_batch):
-                    batch, self._pending_batch = self._pending_batch[:PARALLEL_MAX], []
+                    remaining = max(0, tool_step_limit - tool_steps)
+                    if remaining == 0:
+                        # 交回顺序路径，让统一的步数耗尽逻辑生成强制收尾提示；
+                        # 不能在并行分支里越过本轮预算。
+                        self._native_queue = self._pending_batch
+                        self._pending_batch = []
+                        continue
+                    batch_size = min(PARALLEL_MAX, remaining)
+                    batch = self._pending_batch[:batch_size]
+                    self._pending_batch = self._pending_batch[batch_size:]
                     for nm, ar in batch:
                         executed.add((nm, ar))
                     results = self._run_batch(batch, turn)
@@ -1868,7 +1922,7 @@ class Agent:
                         "content": "（并行调用）" + "、".join(nm for nm, _a, _o, _k in results),
                     })
                     for nm, ar, obs, _ok in results:
-                        trail.append({"role": "user", "content": f"Observation: {_clip(obs, OBS_MAX_CHARS)}"})
+                        trail.append({"role": "user", "content": f"Observation: {_clip(obs, observation_limit)}"})
                     evidence.extend(f"{nm}({_clip(ar, 120)})" for nm, ar, _o, _k in results)
                     tool_steps += len(results)
                     last_action = results[-1][0]
@@ -2086,13 +2140,13 @@ class Agent:
                     }
                     continue
 
-                if tool_steps >= MAX_AGENT_STEPS:
+                if tool_steps >= tool_step_limit:
                     # 步数耗尽：先强制模型基于已有 Observation 收尾（不执行新工具、不计步），
                     # 给一次机会产出带证据的 Final Answer；仍要调工具则由前置拦截证据兜底。
                     if forced_finals < _MAX_FORCED_FINALS:
                         forced_finals += 1
                         forced_final_reason = (
-                            f"（已达到最大工具调用步数 {MAX_AGENT_STEPS}，模型未能自行收尾。）"
+                            f"（已达到最大工具调用步数 {tool_step_limit}（本轮动态上限），模型未能自行收尾。）"
                         )
                         trail.append(
                             {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
@@ -2101,7 +2155,7 @@ class Agent:
                             {
                                 "role": "user",
                                 "content": (
-                                    f"Nudge: 工具调用步数已达上限（{MAX_AGENT_STEPS} 步），"
+                                    f"Nudge: 工具调用步数已达上限（{tool_step_limit} 步），"
                                     "禁止再调用任何工具。请立即基于上文全部 Observation 输出 "
                                     "`Final Answer:`：用中文简洁总结已确认的结论并附文件:行号；"
                                     "证据不足的部分如实说明"
@@ -2216,7 +2270,7 @@ class Agent:
                     obs = (
                         "搜索结果相关性不足：当前候选与查询主题缺少足够共同信号，"
                         "请更换关键词、年份、平台或地区后继续搜索；不得把以下候选直接当作证据。\n"
-                        + _clip(obs, OBS_MAX_CHARS)
+                        + _clip(obs, observation_limit)
                     )
                     _tool_ok = False
                 _duration_ms = int((time.monotonic() - _t_tool) * 1000)
@@ -2322,7 +2376,7 @@ class Agent:
                                 "content": (
                                     f"Reflection: 上一工具 {parsed['action']} 未得到有效结果，请换一种方式"
                                     f"（例如改用 web_search，或换关键词）。\n\nObservation was: "
-                                    f"{_clip(obs, OBS_MAX_CHARS)}"
+                                    f"{_clip(obs, observation_limit)}"
                                 ),
                             }
                         )
@@ -2339,7 +2393,7 @@ class Agent:
 
                 # 写后自验证收尾门（Phase 1 闭环）：写成功即校验改动，失败把结果回填
                 # 模型触发 ReAct 自修；成功则在 trace 标记 verified=True。纯内部调用，
-                # 不占工具步数；自修循环由 MAX_AGENT_STEPS 与既有失败上限护栏封顶。
+                # 不占工具步数；自修循环由本轮动态工具预算与既有失败上限护栏封顶。
                 if (parsed["action"] in ("apply_edit", "create_file", "dev_region_edit")
                         and _tool_ok and turn is not None):
                     _written = _parse_written_rel(obs)
@@ -2353,7 +2407,7 @@ class Agent:
                             {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
                         )
                         trail.append(
-                            {"role": "user", "content": "Observation: " + _clip(_sv_obs, OBS_MAX_CHARS)}
+                            {"role": "user", "content": "Observation: " + _clip(_sv_obs, observation_limit)}
                         )
                         yield {"type": "observation", "text": _sv_obs}
                         turn.verification_targets[_target] = _sv_passed
@@ -2379,7 +2433,7 @@ class Agent:
                     {
                         "role": "user",
                         "content": (
-                            f"Observation: {_clip(obs, OBS_MAX_CHARS)}"
+                            f"Observation: {_clip(obs, observation_limit)}"
                             "\n\n（请基于观察继续，或给出 Final Answer）"
                         ),
                     }
