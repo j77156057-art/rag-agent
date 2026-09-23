@@ -30,6 +30,16 @@ interface ChatMsg {
   startedAt?: number
   finishedAt?: number
   error?: string
+  recoverable?: boolean
+}
+
+interface InterruptedRecovery {
+  user: string
+  assistant: string
+  trace: ChatMsg['trace']
+  reasoning: string
+  plan: string[]
+  startedAt?: number
 }
 
 let msgSeq = 1
@@ -39,6 +49,37 @@ const draftKey = () => 'docmind.workbenchChatDraft:' + chatProject + ':' + chatS
 const recoveryKey = () => 'docmind.interrupted:' + chatProject + ':' + chatSession
 const historyError = ref('')
 function readDraft() { try { return sessionStorage.getItem(draftKey()) || '' } catch { return '' } }
+function readInterruptedRecovery(): InterruptedRecovery | null {
+  try {
+    const row = JSON.parse(sessionStorage.getItem(recoveryKey()) || 'null') as Partial<InterruptedRecovery> | null
+    if (!row || typeof row.user !== 'string' || typeof row.assistant !== 'string') return null
+    return {
+      user: row.user,
+      assistant: row.assistant,
+      trace: Array.isArray(row.trace) ? row.trace.filter(item => item && typeof item.text === 'string').slice(-24) : [],
+      reasoning: typeof row.reasoning === 'string' ? row.reasoning : '',
+      plan: Array.isArray(row.plan) ? row.plan.filter(item => typeof item === 'string').slice(-12) : [],
+      startedAt: typeof row.startedAt === 'number' ? row.startedAt : undefined,
+    }
+  } catch { return null }
+}
+function isContinuationRequest(value: string): boolean {
+  const normalized = value.trim().replace(/[。！!？?，,、；;：:"“”‘’\s]/g, '')
+  return /^(继续|继续完成任务|继续上次任务|继续回答|继续执行|接着做|接着完成|恢复任务|恢复回答|从中断处继续)$/.test(normalized)
+}
+function continuationQuestion(request: string, recovery: InterruptedRecovery): string {
+  const trace = recovery.trace.map(item => `${item.type}: ${item.text}`).join('\n').slice(-5000)
+  const plan = recovery.plan.join('\n').slice(-1800)
+  return [
+    '这是上一个被页面切换或连接中断的回合的继续请求。不要把“继续”当成新的独立问题。',
+    `原始用户请求：${recovery.user.slice(0, 3000)}`,
+    `上次已收到的助手内容：${recovery.assistant.slice(-6000)}`,
+    trace ? `上次已记录的执行步骤：\n${trace}` : '',
+    plan ? `上次执行计划：\n${plan}` : '',
+    '请先依据以上上下文判断已经完成的步骤，再从中断处继续；不要重复已经确认完成的有副作用工具调用。若原始请求只是询问能力，请直接继续回答原始问题。',
+    `用户续接指令：${request}`,
+  ].filter(Boolean).join('\n\n')
+}
 // 兼容旧版会话：早期 API 曾把内部路由上下文拼在用户问题前并落盘。
 // 仅清理从字符串开头出现的完整旧前缀，正文中提到“系统提示”不受影响。
 const legacyPromptPrefix = /^\s*【系统提示】[\s\S]*?用户问题：\s*/
@@ -154,9 +195,16 @@ function onModelSaved(info: ModelConfigInfo) {
 async function send(text?: string) {
   const q = (text ?? input.value).trim()
   if (!q || sending.value) return
+  const recovery = readInterruptedRecovery()
+  const isResume = !!recovery && isContinuationRequest(q)
+  const request = isResume ? continuationQuestion(q, recovery!) : q
   const epoch = ++chatEpoch
   historyError.value = ''
   try { sessionStorage.removeItem(recoveryKey()) } catch {}
+  if (isResume) {
+    const previous = messages.value[messages.value.length - 1]
+    if (previous?.recoverable) previous.recoverable = false
+  }
   input.value = ''
   stickToBottom.value = true  // 用户主动发送，恢复贴底自动滚动
   messages.value.push({ id: msgSeq++, role: 'user', text: q, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
@@ -214,7 +262,7 @@ async function send(text?: string) {
     const thinkingOpt = thinkingSupported.value
       ? (thinkingNative.value ? null : thinkingOn.value)
       : null
-    await aiApi.askGrounded(q, { onEvent, signal: ac.signal }, {
+    await aiApi.askGrounded(request, { onEvent, signal: ac.signal }, {
       web: webOn.value,
       thinking: thinkingOpt,
     })
@@ -250,7 +298,13 @@ function preserveInterrupted() {
   if (!sending.value) return
   const assistant = messages.value[messages.value.length - 1]
   const user = messages.value[messages.value.length - 2]
-  try { sessionStorage.setItem(recoveryKey(), JSON.stringify({ user: user?.text || '', assistant: assistant?.text || '' })) } catch {}
+  try {
+    sessionStorage.setItem(recoveryKey(), JSON.stringify({
+      user: user?.text || '', assistant: assistant?.text || '',
+      trace: assistant?.trace?.slice(-24) || [], reasoning: assistant?.reasoning || '',
+      plan: assistant?.plan?.slice(-12) || [], startedAt: assistant?.startedAt,
+    } satisfies InterruptedRecovery))
+  } catch {}
 }
 function restoreInterrupted(turns: { user: string; assistant: string }[]) {
   try {
@@ -258,7 +312,9 @@ function restoreInterrupted(turns: { user: string; assistant: string }[]) {
     if (!row || typeof row.user !== 'string' || typeof row.assistant !== 'string') return
     if (turns.some(t => t.user === row.user && t.assistant)) { sessionStorage.removeItem(recoveryKey()); return }
     messages.value.push({ id: msgSeq++, role: 'user', text: cleanLegacyPrompt(row.user), status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
-    messages.value.push({ id: msgSeq++, role: 'assistant', text: cleanLegacyPrompt(row.assistant), status: 'stopped', trace: [], reasoning: '', notices: ['上次回答因离开页面或切换项目中断，以下仅为已收到的内容；不会自动重试或重复执行工具。'], plan: [] })
+    messages.value.push({ id: msgSeq++, role: 'assistant', text: cleanLegacyPrompt(row.assistant), status: 'stopped',
+      trace: row.trace || [], reasoning: row.reasoning || '', plan: row.plan || [], recoverable: true,
+      notices: ['上次回答因离开页面或切换项目中断，已保留原始问题和执行上下文；可以点击“继续上次任务”或输入“继续”。'] })
   } catch {}
 }
 function resetChatContext() {
@@ -865,6 +921,9 @@ function connectorGuide(s: McpServer) {
               <svg width="11" height="11" viewBox="0 0 11 11"><circle cx="5.5" cy="5.5" r="4.6" fill="none" stroke="currentColor" stroke-width="1"/><path d="M5.5 4.6 V7.6" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><circle cx="5.5" cy="3" r=".75" fill="currentColor"/></svg>
               <span>{{ n }}</span>
             </div>
+            <button v-if="m.recoverable" class="cd-resume" @click="send('继续完成任务')">
+              ↻ 继续上次任务
+            </button>
             <div v-if="m.plan.length" class="cd-plan">
               <div class="cd-plan-title">执行计划</div>
               <div v-for="(s, i) in m.plan" :key="'p' + i" class="cd-plan-step">
@@ -1340,6 +1399,14 @@ function connectorGuide(s: McpServer) {
   font-size: 10.5px; color: var(--text-dim); line-height: 1.5;
 }
 .cd-notice svg { flex: 0 0 auto; margin-top: 2px; color: var(--text-faint); }
+.cd-resume {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin: 1px 0 7px; padding: 5px 9px;
+  border: 1px solid var(--accent); border-radius: 5px;
+  background: rgba(47,111,237,.08); color: var(--accent);
+  font-size: 11px; cursor: pointer;
+}
+.cd-resume:hover { background: rgba(47,111,237,.15); }
 
 /* 计划步骤 */
 .cd-plan {
