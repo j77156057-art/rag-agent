@@ -124,7 +124,9 @@ let suppressScrollEvent = false
 
 // ---------------------------------------------------------------- 折叠
 const collapsed = ref(window.localStorage.getItem('docmind.chatDockCollapsed') === '1')
+const expanded = ref(window.localStorage.getItem('docmind.chatDockExpanded') === '1')
 watch(collapsed, (v) => window.localStorage.setItem('docmind.chatDockCollapsed', v ? '1' : '0'))
+watch(expanded, (v) => window.localStorage.setItem('docmind.chatDockExpanded', v ? '1' : '0'))
 function toggleDock() {
   collapsed.value = !collapsed.value
   if (!collapsed.value) nextTick(() => inputEl.value?.focus())
@@ -967,7 +969,7 @@ function connectorGuide(s: McpServer) {
 </script>
 
 <template>
-  <section class="cd-dock" :class="{ 'cd-collapsed': collapsed }">
+  <section class="cd-dock" :class="{ 'cd-collapsed': collapsed, 'cd-expanded': expanded && !collapsed }">
     <header class="cd-head" @click="toggleDock">
       <span class="cd-chevron" :class="{ rotated: !collapsed }">
         <svg width="9" height="9" viewBox="0 0 9 9"><path d="M2 1.5 L5.5 4.5 L2 7.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
@@ -1002,6 +1004,21 @@ function connectorGuide(s: McpServer) {
           <circle cx="7" cy="7" r="2.1" fill="none" stroke="currentColor" stroke-width="1.2"/>
         </svg>
         <span>引擎</span>
+      </button>
+      <button
+        class="cd-btn cd-size-btn"
+        :class="{ 'cd-btn-on': expanded }"
+        :aria-pressed="expanded"
+        :title="expanded ? '收窄对话区' : '展开对话区，查看更多回答内容'"
+        @click.stop="expanded = !expanded"
+      >
+        <svg v-if="!expanded" width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
+          <path d="M2 5 V2 H5 M8 2 H11 V5 M11 8 V11 H8 M5 11 H2 V8" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <svg v-else width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
+          <path d="M5 2 H2 V5 M8 2 H11 V5 M11 8 V11 H8 M5 11 H2 V8" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span>{{ expanded ? '收窄' : '展开' }}</span>
       </button>
       <button class="cd-btn" title="清空对话" @click.stop="clearConversation">
         <svg width="13" height="13" viewBox="0 0 13 13"><path d="M2.5 3.2 H10.5 M5.2 3.2 V2 Q5.2 1.5 5.7 1.5 H7.3 Q7.8 1.5 7.8 2 V3.2 M3.4 3.2 L3.8 11 Q3.8 11.6 4.4 11.6 H8.6 Q9.2 11.6 9.2 11 L9.6 3.2" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -1333,9 +1350,23 @@ function connectorGuide(s: McpServer) {
   background: var(--bg-raised);
   display: flex;
   flex-direction: column;
-  max-height: 46vh;
+  height: min(52vh, 680px);
+  min-height: 340px;
+  max-height: min(70vh, 760px);
 }
-.cd-collapsed { max-height: none; }
+.cd-dock.cd-expanded {
+  height: min(70vh, 820px);
+  max-height: calc(100vh - 86px);
+}
+.cd-collapsed { height: auto; min-height: 0; max-height: none; }
+@media (max-height: 620px) {
+  .cd-dock {
+    height: min(52vh, 340px);
+    min-height: 240px;
+    max-height: calc(100vh - 86px);
+  }
+  .cd-dock.cd-expanded { height: calc(100vh - 86px); }
+}
 
 .cd-head {
   display: flex;
