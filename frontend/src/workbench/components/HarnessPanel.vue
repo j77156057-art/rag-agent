@@ -7,7 +7,7 @@ import {
   type BudgetStatus, type BudgetCheck, type SessionInfo,
   type TraceItem, type TraceSummary, type SkillInfo,
   agentApi, type WorkflowState, type WorkflowBackendStatus, type LangSmithStatus, type WorkflowEvaluation,
-  type RetrievalTraceEvent,
+  type RetrievalTraceEvent, type RetrievalRuntimeStatus,
 } from '../api'
 import {
   demoMode,
@@ -57,6 +57,7 @@ const workflowBackend = ref<WorkflowBackendStatus | null>(null)
 const langsmith = ref<LangSmithStatus | null>(null)
 const workflowEvaluation = ref<WorkflowEvaluation | null>(null)
 const retrievalEvents = ref<RetrievalTraceEvent[]>([])
+const retrievalRuntime = ref<RetrievalRuntimeStatus['retrieval'] | null>(null)
 const selectedSubagentId = ref('')
 
 const TABS = [
@@ -430,6 +431,9 @@ async function refreshWorkflowDiagnostics() {
     langsmith.value = { ok: true, installed: false, key_configured: false, enabled: false, realtime: false, project: 'demo' }
     workflowEvaluation.value = null
     retrievalEvents.value = []
+    retrievalRuntime.value = { backend: 'demo', collection: 'demo', top_k: 5,
+      bm25: true, reranker: 'demo', lexical_persistence: true,
+      lexical_index: { state: 'ready', documents: 0 } }
     return
   }
   try {
@@ -438,6 +442,7 @@ async function refreshWorkflowDiagnostics() {
     ])
     workflowBackend.value = backend
     langsmith.value = smith
+    retrievalRuntime.value = retrieval.retrieval || null
     retrievalEvents.value = retrieval.retrieval?.recent_events || []
     if (workflow.value?.workflow_id && !demoMode.value) {
       const r = await agentApi.workflowEvaluation(workflow.value.workflow_id)
@@ -886,6 +891,7 @@ onBeforeUnmount(() => { stopWorkflowPolling(); open.value = false })
               <div><span>LangSmith</span><b>{{ langsmithText() }}</b><small v-if="traceId() !== '—'">根轨迹 {{ traceId() }} · 事件 {{ traceEventCount() }}</small><small v-for="(failure, i) in traceExportErrors().slice(-2)" :key="i" class="hp-wf-trace-error">{{ failure.name || '导出' }} {{ failure.error || '失败' }}</small></div>
               <div><span>质量评估</span><b :class="{ good: workflowEvaluation?.passed, bad: workflowEvaluation && !workflowEvaluation.passed }">{{ scoreText() }}</b></div>
               <div><span>五层上下文</span><b>{{ contextCompressionText() }}</b><small>route · project · task · subagent · output</small></div>
+              <div><span>生产检索</span><b :class="{ bad: retrievalRuntime && retrievalRuntime.lexical_persistence === false }">{{ retrievalRuntime?.backend || '未读取' }} · {{ retrievalRuntime?.collection || '—' }}</b><small>BM25 {{ retrievalRuntime?.bm25 ? '已启用' : '未启用' }} · 词法索引 {{ retrievalRuntime?.lexical_persistence ? '持久化' : '快照' }}<template v-if="retrievalRuntime?.reranker"> · 重排 {{ retrievalRuntime.reranker }}</template></small></div>
               <div><span>运行遥测</span><b>{{ fmtMs(Number(workflow.observability?.duration_ms || 0)) }} · {{ Number(workflow.observability?.total_tokens || 0).toLocaleString() }} token</b><small>工具 {{ workflow.observability?.tool_events || 0 }} · MCP {{ workflow.observability?.mcp_events || 0 }} · 失败 {{ workflow.observability?.failures || 0 }}</small></div>
             </div>
             <div v-if="retrievalEvents.length" class="hp-wf-retrieval">
