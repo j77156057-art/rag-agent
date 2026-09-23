@@ -11,5 +11,5 @@
 # 「Download ZIP」是按 blob 原样打包的 —— 下载解压后仍是 LF，脚本照样坏。
 # -text 让 blob 直接保存 CRLF，clone 与 ZIP 两条路径拿到的都是 CRLF。
 # ============================================================================
-*.bat -text
-*.cmd -text
+*.bat -text whitespace=cr-at-eol
+*.cmd -text whitespace=cr-at-eol

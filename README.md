@@ -185,19 +185,20 @@ CHAT_VIDEO_MAX_FRAMES=8
 
 | 脚本 | 跑什么 | 前置条件 | 用途 |
 |---|---|---|---|
-| `run_desktop.bat` | 用项目 venv 跑**源码** `desktop.py` | 先建好 `.venv` 并装完依赖 | 开发调试（改了代码立刻生效） |
-| `启动DocMind.bat` | 跑**打包产物** `dist\DocMind\DocMind.exe`，再等 6 秒探测 `/api/config` 并打印 `docmind_desktop.log` | **必须先构建**（见下文「打包成独立 exe」） | 演示 / 交付（目标机器无需 Python） |
+| `启动DocMind.bat` | **优先用项目 `.venv` 启动当前源码** `desktop.py`，并关闭仍占用中的旧 `DocMind.exe`；源码环境不存在时才回退 `dist\DocMind\DocMind.exe` | 推荐先建好 `.venv` 并装完依赖 | 仓库内日常启动（默认跟随最新源码） |
+| `run_desktop.bat` | 用项目 venv 跑**源码** `desktop.py` | 先建好 `.venv` 并装完依赖 | 兼容旧的源码启动入口 |
 
 ```bash
-# 源码模式（开发）
+# 默认启动当前源码
 .venv\Scripts\python.exe -m pip install pywebview   # 仅需一次
-.venv\Scripts\python.exe desktop.py                 # 或双击 run_desktop.bat
+.venv\Scripts\python.exe desktop.py                 # 或双击 启动DocMind.bat
 
-# 打包模式（演示 / 交付）：先构建，再双击 启动DocMind.bat
+# 打包模式（演示 / 交付）：先构建，再直接运行打包产物
 .venv\Scripts\python.exe -m PyInstaller docmind.spec --noconfirm   # 产出 dist\DocMind\DocMind.exe
+dist\DocMind\DocMind.exe
 ```
 
-> ⚠️ **`dist/` 不入库**（见 `.gitignore`），所以刚 `clone` 或下载 ZIP 得到的仓库里**没有 `DocMind.exe`**。此时直接双击 `启动DocMind.bat` 会提示「找不到 DocMind.exe」，属预期行为——请先按下面「打包成独立 exe」构建，或改用源码模式 `run_desktop.bat`。
+> ⚠️ **`dist/` 不入库**（见 `.gitignore`）。仓库内的 `启动DocMind.bat` 不再默认运行可能过期的打包快照，而是优先启动当前源码；只有 `.venv` 或 `desktop.py` 不可用时才回退到 `dist\DocMind\DocMind.exe`。独立交付给没有 Python 的机器时，仍需先按下面「打包成独立 exe」构建并分发整个 `dist\DocMind` 目录。
 
 - **引擎嵌入**：Godot / Unity / Unreal 的窗口按 Win32 HWND 规则嵌进工作台（`desktop_bridge.py`）。
   **已在 Godot 4.7.2 + 真 Win32 宿主下实机验证**（`verify_engine_embed.py` 68 项全绿）：置父与样式摘除、按客户区（或前端指定的"引擎视窗"矩形）铺排、

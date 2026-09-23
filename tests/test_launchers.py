@@ -49,6 +49,21 @@ def _has_non_ascii(text):
 
 
 class LauncherEncodingTests(unittest.TestCase):
+    def test_primary_launcher_prefers_current_source(self):
+        """仓库主启动器必须优先跑当前源码，不能再次默认命中过期 dist 快照。"""
+        path = os.path.join(ROOT, '启动DocMind.bat')
+        with open(path, 'rb') as f:
+            raw = f.read()
+        text = raw.decode('ascii')
+        self.assertNotIn(b'\n', raw.replace(b'\r\n', b''),
+                         'Windows 批处理必须使用 CRLF；仅 LF 会导致 cmd 找不到 goto 标签并闪退')
+        source_check = text.index('if exist "%DOCMIND_PYTHON%"')
+        packaged_check = text.index('if exist "%DOCMIND_PACKAGED%"')
+        self.assertLess(source_check, packaged_check)
+        self.assertIn('"%DOCMIND_PYTHON%" "%DOCMIND_ENTRY%"', text)
+        self.assertIn('taskkill /IM DocMind.exe /F', text)
+        self.assertIn('goto run_packaged', text)
+
     def test_bat_files_decode_as_cp936(self):
         for path in _launchers():
             with open(path, 'rb') as f:
