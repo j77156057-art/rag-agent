@@ -429,7 +429,8 @@ CHAT_VIDEO_MAX_BYTES = int(os.getenv("CHAT_VIDEO_MAX_BYTES", str(200 * 1024 * 10
 CHAT_VIDEO_MAX_FRAMES = int(os.getenv("CHAT_VIDEO_MAX_FRAMES", "8"))
 
 # ---- 运行时覆盖（由前端 /api/config 动态设置，优先级高于 .env）----
-# 模型类切换仅存于内存（重启恢复 .env）；code_root 例外，经 STATE_FILE 跨重启恢复。
+# 模型选择由 /api/config 写入 STATE_FILE，服务启动时恢复；密钥不写入这里，
+# 而是按项目存入 secrets_store 的受保护文件。code_root 等本地偏好也共用该状态文件。
 _RUNTIME = {}
 
 # ---- 请求级项目上下文（P3 端点项目化）----
@@ -471,7 +472,7 @@ def get_runtime(key, default=None):
     return _RUNTIME.get(key, default)
 
 
-# ---- 跨重启持久化的少量本地状态（当前仅 code_root）----
+# ---- 跨重启持久化的本地状态 ----
 # 与 .chroma 同目录（开发=源码根；冻结=_internal），只存路径类非敏感数据，
 # 避免重启后必须重新选择代码库。写入失败一律静默回落内存态，不影响主流程。
 STATE_FILE = os.path.join(STATE_ROOT, ".docmind_state.json")
@@ -571,7 +572,7 @@ def clear_model_capability_override(provider: str, model: str):
 
 
 def _apply_persisted_state():
-    """恢复上次持久化的本地选择（code_root / GPU 偏好 / 自定义窗口）。
+    """恢复上次持久化的本地选择（模型 / code_root / GPU 偏好 / 自定义窗口）。
 
     过去在 import config 时调用（导入期磁盘读）——现改由服务启动期显式调用
     （api.py 的 lifespan，紧接 ensure_dirs() 之后、gpu.init() 之前），
@@ -607,6 +608,25 @@ def _apply_persisted_state():
                     projects.set_current(pid)
         except Exception:  # noqa: BLE001 —— 迁移失败绝不能阻断启动
             pass
+    # 模型选择：显式 set_runtime（例如启动脚本或测试传入）优先于持久化状态，
+    # 持久化状态再优先于 .env 中的默认值。只接受已知 provider 和非空字符串，
+    # 损坏的状态不会阻断服务启动。
+    persisted_provider = data.get("llm_provider")
+    if ("llm_provider" not in _RUNTIME and isinstance(persisted_provider, str)
+            and persisted_provider in PROVIDERS):
+        _RUNTIME["llm_provider"] = persisted_provider
+    persisted_model = data.get("llm_model")
+    if ("llm_model" not in _RUNTIME and isinstance(persisted_model, str)
+            and persisted_model.strip()):
+        _RUNTIME["llm_model"] = persisted_model.strip()
+    persisted_base_url = data.get("llm_base_url")
+    if ("llm_base_url" not in _RUNTIME and isinstance(persisted_base_url, str)
+            and persisted_base_url.strip()):
+        _RUNTIME["llm_base_url"] = persisted_base_url.strip().rstrip("/")
+    persisted_embedding = data.get("embedding_provider")
+    if ("embedding_provider" not in _RUNTIME and isinstance(persisted_embedding, str)
+            and persisted_embedding in {"local", "ollama", "qwen"}):
+        _RUNTIME["embedding_provider"] = persisted_embedding
     # GPU 空闲卸载/采样间隔为用户在 GPU 面板设置的本机偏好，跟随状态文件恢复
     for key in ("gpu_idle_unload_seconds", "gpu_poll_interval"):
         val = data.get(key)

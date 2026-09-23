@@ -191,6 +191,9 @@ async def _app_lifespan(app):
     # import config 时（导入期磁盘读），现改到启动期显式调用，须在读取 GPU 偏好
     # （下方 get_runtime）与 gpu.init() 之前执行。
     _apply_persisted_state()
+    # 模块导入时默认 Agent 已经创建；模型选择是在启动期从状态文件恢复的，
+    # 因此这里需要重新构造客户端，确保首次请求就使用上次选择的 provider/model。
+    await _restore_persisted_llm()
     # GPU 协调：先恢复上次残留的租约/队列（转 recovered），再起后台线程。
     # 该恢复过去挂在 gpu_coordinator 导入期，现改为 lifespan 显式调用（gpu.init()）。
     gpu.init()
@@ -436,6 +439,49 @@ for _s in list_sources():
 def _project_root_or_error():
     root = get_runtime("code_root") or CODE_ROOT
     return root if root and os.path.isdir(root) else None
+
+
+async def _restore_persisted_llm():
+    """启动时恢复模型客户端和项目密钥；任何恢复失败都降级为当前客户端。
+
+    模型选择保存在 STATE_FILE，API key 只从当前项目的 secrets_store 读取，
+    绝不写入状态文件或接口响应。持久化配置来自用户此前成功保存的选择，
+    所以恢复失败不应阻断服务启动，而应在 /api/config 的 warnings 中提示修复。
+    """
+    provider = get_runtime("llm_provider") or LLM_PROVIDER
+    model = get_runtime("llm_model") or LLM_MODEL or PROVIDERS.get(provider, {}).get("default_model", "")
+    base_url = get_runtime("llm_base_url") or ""
+
+    # 仅在运行时没有显式 key 时尝试读取项目密钥；环境变量仍由 LLMClient 作为后备。
+    if not get_runtime("llm_api_key"):
+        root = _project_root_or_error()
+        if root:
+            stored_key = secrets_store.load(root, provider)
+            if stored_key:
+                set_runtime("llm_api_key", stored_key)
+
+    try:
+        restored = await run_in_threadpool(lambda: LLMClient(
+            provider=provider,
+            model=model or None,
+            api_key=get_runtime("llm_api_key") or None,
+            base_url=base_url or None,
+        ))
+    except Exception as exc:  # noqa: BLE001 - 坏配置不能阻断整个工作台启动
+        set_runtime("llm_startup_warning", f"模型配置恢复失败，已保留当前客户端：{exc}")
+        return False
+
+    # 目前启动期只会有导入时创建的默认 Agent；遍历注册表也兼容提前创建的会话。
+    default_agent = _SESSION_AGENTS.get("default")
+    for current in _SESSION_AGENTS.values():
+        # 测试桩或外部集成可能临时登记一个只读会话对象；启动恢复只触碰
+        # 真正的 Agent，避免覆盖其用于观测的 last_context 快照。
+        if not isinstance(current, Agent):
+            continue
+        current.llm = restored if current is default_agent else restored.clone()
+        current.history = []
+        current.last_context = None
+    return True
 
 
 class TaskReq(BaseModel):
@@ -2326,6 +2372,8 @@ async def get_config():
         "project_rules_loaded": bool(get_runtime("project_rules")),
         "edit_confirm": edit_confirm_enabled(),
         "build_time": _build_time(),
+        # 持久化配置损坏/服务暂不可达时不阻断启动，但把降级原因展示给用户。
+        "warnings": ([get_runtime("llm_startup_warning")] if get_runtime("llm_startup_warning") else []),
         # AI 越界访问模式：safe=仅项目内；high=允许受控越界读写（须配置白名单）
         "external_access_mode": get_external_access_mode(),
         # 网络搜索 / URL 获取服务商配置（密钥不回显，仅回 has_key）
@@ -2883,6 +2931,7 @@ async def set_config(req: ConfigReq):
         return JSONResponse({"ok": False, "error": f"未知 provider: {req.provider}"}, status_code=400)
 
     # 自定义 OpenAI 兼容端点：base_url / model 必填，且只允许 http(s)
+    previous_provider = get_runtime("llm_provider") or LLM_PROVIDER
     custom_base_url = ""
     if req.provider == "custom":
         custom_base_url = (req.base_url or get_runtime("llm_base_url") or "").strip().rstrip("/")
@@ -2895,6 +2944,9 @@ async def set_config(req: ConfigReq):
                 {"ok": False, "error": "自定义服务需要填写模型名称（如 gpt-4o-mini / qwen-plus）。"},
                 status_code=400)
         set_runtime("llm_base_url", custom_base_url)
+    elif req.provider != "custom":
+        # 不让上一次 custom 的地址污染后续配置回显或持久化。
+        _RUNTIME.pop("llm_base_url", None)
 
     target_model = req.model or PROVIDERS[req.provider]["default_model"]
 
@@ -2937,20 +2989,28 @@ async def set_config(req: ConfigReq):
 
     warnings = []
     set_runtime("llm_provider", req.provider)
-    if req.model:
-        set_runtime("llm_model", req.model)
+    # 空模型表示选择该 provider 的默认模型，不能继续沿用上一个 provider 的模型。
+    set_runtime("llm_model", target_model)
     if req.api_key:
         set_runtime("llm_api_key", req.api_key)
         root_for_secret = _project_root_or_error()
         if root_for_secret:
             secrets_store.save(root_for_secret, req.provider, req.api_key)
+    elif previous_provider != req.provider:
+        # 切换厂商时优先恢复该厂商已保存的项目密钥，避免误用上一个厂商的 key。
+        root_for_secret = _project_root_or_error()
+        stored_key = secrets_store.load(root_for_secret, req.provider) if root_for_secret else ""
+        if stored_key:
+            set_runtime("llm_api_key", stored_key)
+        else:
+            _RUNTIME.pop("llm_api_key", None)
 
     # 重建 Agent 的 LLM 客户端（即时生效），并清空多轮上下文避免旧回答混淆
     try:
         # LLMClient 构造可能同步探活（≤3s）：放到线程池，避免阻塞事件循环
         new_llm = await run_in_threadpool(lambda: LLMClient(
             provider=req.provider,
-            model=req.model or None,
+            model=target_model or None,
             api_key=req.api_key or None,
             base_url=custom_base_url or None,
         ))
@@ -2970,6 +3030,13 @@ async def set_config(req: ConfigReq):
             set_embedding_provider(req.embedding_provider)
             reset_collection()
             warnings.append("已切换检索向量模型，旧文档向量已清空，请重新上传文档以保证检索准确。")
+
+    # 模型选择与自定义端点跨重启恢复；API key 只保存在项目 secrets_store，不进入状态 JSON。
+    save_state("llm_provider", req.provider)
+    save_state("llm_model", target_model)
+    save_state("llm_base_url", custom_base_url if req.provider == "custom" else "")
+    save_state("embedding_provider", get_runtime("embedding_provider") or EMBEDDING_PROVIDER)
+    _RUNTIME.pop("llm_startup_warning", None)
 
     # 写工具是否「人工确认」：可选开关（None 表示不改动）
     if req.edit_confirm is not None:

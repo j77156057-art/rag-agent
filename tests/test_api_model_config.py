@@ -5,8 +5,10 @@
 成功路径用例在 finally 中恢复运行时覆盖与全局 agent.llm。
 """
 import asyncio
+import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -224,7 +226,68 @@ class ContextWindowEndpointTests(unittest.TestCase):
                                                       "context_window": 0}).json()
                 self.assertEqual(cleared["context_window_override"], 0)
                 self.assertEqual(cleared["capability"]["context_window"], 32768)
-                self.assertIsNone(config.get_context_window_override("mock", self.MODEL))
+        self.assertIsNone(config.get_context_window_override("mock", self.MODEL))
+
+
+class ModelPersistenceTests(unittest.TestCase):
+    """模型选择跨进程恢复：状态文件保存选择，密钥不落入状态 JSON。"""
+
+    def setUp(self):
+        self._old_state = config.STATE_FILE
+        self._old_runtime = dict(config._RUNTIME)
+        self._old_llm = api.agent.llm
+        fd, self._state = tempfile.mkstemp(prefix="docmind_model_state_", suffix=".json")
+        os.close(fd)
+        os.unlink(self._state)
+        config.STATE_FILE = self._state
+
+    def tearDown(self):
+        config.STATE_FILE = self._old_state
+        config._RUNTIME.clear()
+        config._RUNTIME.update(self._old_runtime)
+        api.agent.llm = self._old_llm
+        try:
+            os.unlink(self._state)
+        except OSError:
+            pass
+
+    def test_model_selection_is_saved_and_restored(self):
+        response = _call(provider="mock", model="mock-persisted")
+        self.assertTrue(response["ok"])
+        with open(self._state, encoding="utf-8") as handle:
+            state = json.load(handle)
+        self.assertEqual(state["llm_provider"], "mock")
+        self.assertEqual(state["llm_model"], "mock-persisted")
+        self.assertEqual(state["llm_base_url"], "")
+        self.assertNotIn("llm_api_key", state)
+
+        # 模拟进程退出后模块运行时状态被清空，再由启动恢复。
+        for key in ("llm_provider", "llm_model", "llm_base_url", "embedding_provider"):
+            config._RUNTIME.pop(key, None)
+        config._apply_persisted_state()
+        self.assertEqual(config.get_runtime("llm_provider"), "mock")
+        self.assertEqual(config.get_runtime("llm_model"), "mock-persisted")
+
+    def test_startup_rebuilds_client_from_restored_selection(self):
+        config.save_state("llm_provider", "mock")
+        config.save_state("llm_model", "mock-restarted")
+        config._RUNTIME.clear()
+        config._apply_persisted_state()
+        asyncio.run(api._restore_persisted_llm())
+        self.assertEqual(api.agent.llm.provider, "mock")
+        self.assertEqual(api.agent.llm.model, "mock-restarted")
+
+    def test_custom_endpoint_and_embedding_are_restored(self):
+        response = _call(provider="custom", model="vision-local",
+                         base_url="https://example.test/v1",
+                         embedding_provider="ollama")
+        self.assertTrue(response["ok"])
+        config._RUNTIME.clear()
+        config._apply_persisted_state()
+        self.assertEqual(config.get_runtime("llm_provider"), "custom")
+        self.assertEqual(config.get_runtime("llm_model"), "vision-local")
+        self.assertEqual(config.get_runtime("llm_base_url"), "https://example.test/v1")
+        self.assertEqual(config.get_runtime("embedding_provider"), "ollama")
 
 
 if __name__ == "__main__":
