@@ -113,6 +113,8 @@ class SessionRestoreQATests(unittest.TestCase):
         found = [x for x in items if x["session_id"] == self.sid]
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0]["turns"], 2)
+        self.assertEqual(found[0]["title"], "u1")
+        self.assertEqual(found[0]["preview"], "u1")
 
         self.client.delete("/api/sessions/%s" % self.sid)
         items2 = self.client.get("/api/sessions").json()["items"]

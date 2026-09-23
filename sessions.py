@@ -300,11 +300,21 @@ def list_sessions(limit=50, project_id=None):
             sid = raw.get("session_id") or name[:-5]
             if sid in seen:
                 continue  # 项目桶先遍历 → 桶条目优先
+            turns = raw.get("turns") or []
+            first_user = ""
+            for turn in turns:
+                if isinstance(turn, dict) and str(turn.get("user") or "").strip():
+                    first_user = _clean_legacy_prompt(turn.get("user", "")).strip()
+                    break
+            preview = " ".join(first_user.split())
             seen[sid] = {
                 "session_id": sid,
-                "turns": len(raw.get("turns") or []),
+                "turns": len(turns),
                 "has_summary": bool(raw.get("summary")),
                 "updated_at": raw.get("updated_at") or "",
+                # 首条用户问题作为可读标题；不保存额外数据，兼容旧会话文件。
+                "title": preview[:72] or "未命名对话",
+                "preview": preview[:180],
             }
     rows = list(seen.values())
     rows.sort(key=lambda x: x.get("updated_at") or "", reverse=True)

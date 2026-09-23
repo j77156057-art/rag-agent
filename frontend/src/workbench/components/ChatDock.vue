@@ -5,8 +5,8 @@
 //   与 godot-ai 插件安装引导（安装前必须用户确认）。
 import { nextTick, ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
-import { aiApi, visionApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, getProjectId, startTabProbe } from '../api'
-import type { McpServer, ModelConfigInfo, ContextUsage } from '../api'
+import { aiApi, visionApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, getProjectId, setSessionId, startNewSession, startTabProbe } from '../api'
+import type { McpServer, ModelConfigInfo, ContextUsage, SessionInfo } from '../api'
 import type { SseEvent } from '../api'
 import { mdToHtml, extractFileRefs, extractWebRefs } from '../markdown'
 import type { FileRef } from '../markdown'
@@ -49,6 +49,10 @@ let chatProject = getProjectId(), chatSession = getSessionId(), chatEpoch = 0
 const draftKey = () => 'docmind.workbenchChatDraft:' + chatProject + ':' + chatSession
 const recoveryKey = () => 'docmind.interrupted:' + chatProject + ':' + chatSession
 const historyError = ref('')
+const sessionItems = ref<SessionInfo[]>([])
+const sessionOpen = ref(false)
+const sessionBusy = ref(false)
+const sessionError = ref('')
 function readDraft() { try { return sessionStorage.getItem(draftKey()) || '' } catch { return '' } }
 function readInterruptedRecovery(): InterruptedRecovery | null {
   try {
@@ -314,6 +318,7 @@ async function send(text?: string) {
     }
   } finally {
     if (epoch === chatEpoch) { sending.value = false; abortCtl = null }
+    void refreshSessionList()
     await nextTick(scrollToBottom)
   }
 }
@@ -428,6 +433,90 @@ async function clearConversation() {
     await harnessApi.deleteSession(getSessionId())
   } catch {
     /* 会话文件不存在或服务不可达：忽略，本地已清空 */
+  }
+  void refreshSessionList()
+}
+
+function sessionTitle(item: SessionInfo): string {
+  return (item.title || item.preview || '').trim() || '未命名对话'
+}
+function sessionTime(value: string): string {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  const delta = Math.max(0, Date.now() - date.getTime())
+  if (delta < 60_000) return '刚刚'
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟前`
+  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)} 小时前`
+  return date.toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })
+}
+async function refreshSessionList() {
+  if (demoMode.value) return
+  try {
+    const result = await harnessApi.sessions()
+    sessionItems.value = Array.isArray(result.items) ? result.items : []
+    sessionError.value = ''
+  } catch (e) {
+    sessionError.value = (e as Error).message || '会话历史加载失败'
+  }
+}
+async function prepareSessionChange(action: string): Promise<boolean> {
+  if (!sending.value && !messages.value.length) return true
+  return askConfirm({
+    title: action,
+    message: `当前对话会保留在会话历史中，${action}后将显示另一段对话。继续？`,
+    confirmText: '继续',
+  })
+}
+async function switchSession(id: string) {
+  const target = String(id || '').trim()
+  if (!target || target === chatSession || sessionBusy.value) {
+    sessionOpen.value = false
+    return
+  }
+  if (!(await prepareSessionChange('切换会话'))) return
+  sessionBusy.value = true
+  sessionError.value = ''
+  stop()
+  try {
+    const claimed = await setSessionId(target)
+    if (!claimed) throw new Error('这个会话正在其他标签页使用，无法在当前标签切换。')
+    chatProject = getProjectId()
+    chatSession = target
+    clearMessages()
+    try { sessionStorage.removeItem(recoveryKey()) } catch {}
+    input.value = readDraft()
+    sessionOpen.value = false
+    await restoreHistory(true)
+    await loadContextUsage()
+  } catch (e) {
+    sessionError.value = (e as Error).message || '切换会话失败'
+  } finally {
+    sessionBusy.value = false
+  }
+}
+async function createConversation() {
+  if (!(await prepareSessionChange('新建对话'))) return
+  sessionBusy.value = true
+  sessionError.value = ''
+  stop()
+  try {
+    const next = await startNewSession()
+    if (!next) throw new Error('无法创建新的独立会话，请刷新页面重试。')
+    chatProject = getProjectId()
+    chatSession = next
+    clearMessages()
+    input.value = ''
+    pendingImages.value = []
+    attachmentError.value = ''
+    try { sessionStorage.removeItem(recoveryKey()) } catch {}
+    sessionOpen.value = false
+    await refreshSessionList()
+    await nextTick(() => inputEl.value?.focus())
+  } catch (e) {
+    sessionError.value = (e as Error).message || '新建对话失败'
+  } finally {
+    sessionBusy.value = false
   }
 }
 
@@ -568,6 +657,7 @@ onMounted(() => {
   startTabProbe()   // 启动跨标签存活探测（供唯一性门禁判断）
   void loadModelConfig()
   void loadContextUsage()
+  void refreshSessionList()
   void restoreHistory()
 })
 onBeforeUnmount(() => {
@@ -888,6 +978,21 @@ function connectorGuide(s: McpServer) {
       <span class="cd-spacer" />
       <button
         class="cd-btn"
+        :class="{ 'cd-btn-on': sessionOpen }"
+        title="查看会话历史或开始新对话"
+        @click.stop="sessionOpen = !sessionOpen; sessionOpen && refreshSessionList()"
+      >
+        <svg width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
+          <path d="M2 2.2h9v6.4H6.4L3.2 11V8.6H2z" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
+          <path d="M4.1 4.4h4.8M4.1 6.2h3.5" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+        </svg>
+        <span>会话</span>
+      </button>
+      <button class="cd-btn cd-new-session" title="开始一段新的独立对话" @click.stop="createConversation">
+        <span aria-hidden="true">＋</span><span>新对话</span>
+      </button>
+      <button
+        class="cd-btn"
         :class="{ 'cd-btn-on': enginePopOpen }"
         title="连接游戏引擎（Godot / Unity / Unreal）：连上后 AI 能读场景和运行日志"
         @click.stop="enginePopOpen = !enginePopOpen"
@@ -902,6 +1007,34 @@ function connectorGuide(s: McpServer) {
         <svg width="13" height="13" viewBox="0 0 13 13"><path d="M2.5 3.2 H10.5 M5.2 3.2 V2 Q5.2 1.5 5.7 1.5 H7.3 Q7.8 1.5 7.8 2 V3.2 M3.4 3.2 L3.8 11 Q3.8 11.6 4.4 11.6 H8.6 Q9.2 11.6 9.2 11 L9.6 3.2" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
     </header>
+
+    <!-- 会话历史弹层 -->
+    <div v-if="sessionOpen" class="cd-pop-mask" @click="sessionOpen = false" />
+    <div v-if="sessionOpen" class="cd-session-pop" @click.stop>
+      <div class="cd-session-head">
+        <div>
+          <div class="cd-pop-title">会话历史</div>
+          <div class="cd-session-subtitle">当前项目的对话会单独保存，切换后会恢复完整问答。</div>
+        </div>
+        <button class="cd-mini" :disabled="sessionBusy" title="刷新会话列表" @click="refreshSessionList">刷新</button>
+      </div>
+      <button class="cd-session-new" :disabled="sessionBusy" @click="createConversation">
+        <span class="cd-session-new-icon">＋</span>
+        <span><b>新建对话</b><small>开启一段空白会话，不影响历史记录</small></span>
+      </button>
+      <div v-if="sessionError" class="cd-session-error">{{ sessionError }}</div>
+      <div v-if="!sessionItems.length && !sessionError" class="cd-session-empty">还没有已保存的对话</div>
+      <div v-for="item in sessionItems" :key="item.session_id" class="cd-session-item" :class="{ active: item.session_id === chatSession }">
+        <button class="cd-session-main" :disabled="sessionBusy" @click="switchSession(item.session_id)">
+          <span class="cd-session-current" aria-hidden="true">{{ item.session_id === chatSession ? '●' : '○' }}</span>
+          <span class="cd-session-copy">
+            <strong>{{ sessionTitle(item) }}</strong>
+            <small>{{ item.turns }} 轮<span v-if="sessionTime(item.updated_at)"> · {{ sessionTime(item.updated_at) }}</span></small>
+          </span>
+        </button>
+        <button v-if="item.session_id === chatSession" class="cd-session-delete" title="清空当前会话" @click="clearConversation(); sessionOpen = false">×</button>
+      </div>
+    </div>
 
     <!-- 引擎 / MCP 弹层 -->
     <!-- 点击外部关闭：透明遮罩截获弹层外点击 -->
@@ -1248,6 +1381,44 @@ function connectorGuide(s: McpServer) {
   padding: 10px 12px;
   z-index: 60;
 }
+.cd-session-pop {
+  position: absolute;
+  right: 10px; bottom: 38px;
+  width: 360px; max-width: calc(100vw - 24px);
+  max-height: min(62vh, 430px); overflow-y: auto;
+  background: var(--bg-raised); border: 1px solid var(--border-strong);
+  border-radius: 8px; box-shadow: 0 14px 38px rgba(35,52,84,.2);
+  padding: 10px; z-index: 60;
+}
+.cd-session-head { display: flex; align-items: flex-start; gap: 8px; justify-content: space-between; }
+.cd-session-subtitle { color: var(--text-faint); font-size: 10.5px; line-height: 1.45; margin-top: -4px; }
+.cd-session-new {
+  width: 100%; display: flex; align-items: center; gap: 9px; margin: 8px 0;
+  padding: 8px 9px; border: 1px solid #c8dcfa; border-radius: 6px;
+  background: #f3f8ff; color: var(--accent); text-align: left; cursor: pointer;
+}
+.cd-session-new:hover { background: var(--bg-selected); border-color: var(--accent); }
+.cd-session-new:disabled { opacity: .55; cursor: default; }
+.cd-session-new-icon { width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid currentColor; border-radius: 50%; font-size: 16px; line-height: 1; }
+.cd-session-new b, .cd-session-new small { display: block; }
+.cd-session-new b { font-size: 11.5px; }
+.cd-session-new small { margin-top: 2px; color: var(--text-muted); font-size: 10px; }
+.cd-session-error { padding: 6px 8px; color: var(--danger); background: #fff4f4; border: 1px solid #f2caca; border-radius: 5px; font-size: 10.5px; }
+.cd-session-empty { padding: 12px 5px; color: var(--text-faint); font-size: 11px; text-align: center; }
+.cd-session-item { display: flex; align-items: stretch; border-top: 1px solid var(--border); }
+.cd-session-item.active { background: var(--bg-selected); }
+.cd-session-main { flex: 1; min-width: 0; display: flex; gap: 7px; align-items: center; padding: 8px 5px; border: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.cd-session-main:hover { background: var(--bg-hover); }
+.cd-session-main:disabled { opacity: .6; cursor: default; }
+.cd-session-current { flex: 0 0 14px; color: var(--text-faint); font-size: 10px; }
+.cd-session-item.active .cd-session-current { color: var(--accent); }
+.cd-session-copy { min-width: 0; display: block; }
+.cd-session-copy strong, .cd-session-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cd-session-copy strong { font-size: 11.5px; font-weight: 600; }
+.cd-session-copy small { margin-top: 2px; color: var(--text-faint); font-size: 10px; }
+.cd-session-delete { align-self: center; margin-right: 5px; width: 22px; height: 22px; border: 0; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 16px; }
+.cd-session-delete:hover { color: var(--danger); }
+.cd-new-session { color: var(--accent); border-color: #c8dcfa; }
 .cd-pop-title { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
 .cd-pop-subtitle { font-size: 11px; color: var(--text-dim); line-height: 1.5; margin-bottom: 8px; }
 .cd-addon {

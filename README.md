@@ -159,6 +159,10 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文
 抽取关键帧，生成时间轴观察后填回对话输入，适合检查游戏启动画面、HUD 重叠、摄像机越界和
 长时间游玩中的可见异常。
 
+ChatDock 顶部的“会话”菜单提供当前项目的会话历史和一键切换；“新对话”会创建新的隔离
+`session_id`，旧对话仍保留。列表用首条用户问题作为标题，切换后会回灌完整问答；会话内容
+按项目持久化在 `.docmind_sessions/`，服务重启后仍可继续。
+
 ```dotenv
 # 可选：为不支持视觉的主模型配置本地视觉兜底（默认不出网）
 DOCMIND_VISION_PROVIDER=ollama

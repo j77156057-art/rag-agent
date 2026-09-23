@@ -2024,6 +2024,8 @@ export interface SessionInfo {
   turns: number
   has_summary: boolean
   updated_at: string
+  title?: string
+  preview?: string
 }
 export interface SkillInfo {
   name: string
