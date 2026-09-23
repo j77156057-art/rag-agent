@@ -9,7 +9,7 @@
 //       「层级布局」= DFS 前序的水平树；「空间布局」= 直接按场景坐标落点（可拖拽回写位置）。
 //   * 实例（instance）与脚本引用（ExtResource）另外画成"文件卡"，边用不同颜色区分，
 //     双击文件卡即在编辑器里打开该文件——场景图和代码因此连成一条线。
-import { computed, onMounted, ref, shallowRef, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import {
   VueFlow, applyNodeChanges, applyEdgeChanges, MarkerType,
 } from '@vue-flow/core'
@@ -75,6 +75,9 @@ const childMap = ref<Map<string, Set<string>>>(new Map())
 const fileIdSet = ref<Set<string>>(new Set())
 // Vue Flow 实例（聚焦选中 / 导出用）
 const vf = shallowRef<VueFlowStore | null>(null)
+const canvasEl = ref<HTMLElement | null>(null)
+let canvasResizeObserver: ResizeObserver | null = null
+let fitFrame = 0
 
 const scene = computed(() => graph.value)
 const nodeById = computed(() => new Map((graph.value?.nodes ?? []).map(n => [n.id, n])))
@@ -277,6 +280,26 @@ function rebuild() {
   decorate()
 }
 
+/**
+ * Vue Flow 的 fit-view-on-init 只在组件首次挂载时执行一次，而场景图是异步加载的：
+ * 组件挂载时 nodes 还是空数组，数据回来后视口不会自动重新适配，真实项目就会出现
+ * "接口已加载但画布一片空白"。等 Vue 完成两轮 DOM 更新并确认容器有尺寸后再适配，
+ * 同时覆盖弹窗/常驻面板切换时父容器从 0 尺寸恢复的情况。
+ */
+function scheduleFitView() {
+  if (fitFrame) window.cancelAnimationFrame(fitFrame)
+  void nextTick(async () => {
+    await nextTick()
+    fitFrame = window.requestAnimationFrame(() => {
+      fitFrame = 0
+      const store = vf.value
+      const el = canvasEl.value
+      if (!store || !el || !nodes.value.length || el.clientWidth < 2 || el.clientHeight < 2) return
+      try { store.fitView({ padding: 0.18, duration: 180 }) } catch { /* 节点尚未完成测量时由 ResizeObserver 重试 */ }
+    })
+  })
+}
+
 function onNodesChange(changes: NodeChange[]) {
   if (!vf.value) return
   nodes.value = applyNodeChanges(changes, vf.value.nodes.value)
@@ -344,6 +367,7 @@ async function reload() {
       scaleFixedFor.value = props.path.trim()
     }
     rebuild()
+    scheduleFitView()
     const warn = g.structure_errors?.length
       ? `（结构异常 ${g.structure_errors.length} 项，编辑已锁定）`
       : ''
@@ -351,6 +375,8 @@ async function reload() {
       g.structure_errors?.length ? 'err' : 'ok')
   } catch (e) {
     graph.value = null
+    nodes.value = []
+    edges.value = []
     say((e as Error).message, 'err')
   } finally {
     loading.value = false
@@ -574,10 +600,20 @@ function miniColor(n: Node) {
   return (n.data as { color?: string })?.color ?? '#3a424d'
 }
 
-watch(layoutMode, rebuild)
-watch([showScripts, showInstances, showResources], rebuild)
+watch(layoutMode, () => { rebuild(); scheduleFitView() })
+watch([showScripts, showInstances, showResources], () => { rebuild(); scheduleFitView() })
 watch(() => props.path, () => { undoStack.value = []; redoStack.value = []; void reload() })
-onMounted(reload)
+onMounted(() => {
+  canvasResizeObserver = new ResizeObserver(() => scheduleFitView())
+  if (canvasEl.value) canvasResizeObserver.observe(canvasEl.value)
+  void reload()
+  scheduleFitView()
+})
+onBeforeUnmount(() => {
+  canvasResizeObserver?.disconnect()
+  canvasResizeObserver = null
+  if (fitFrame) window.cancelAnimationFrame(fitFrame)
+})
 
 /* ------------------------------------------------------------------ 交互增强 */
 function setHover(id: string | null) { hoverId.value = id }
@@ -756,6 +792,7 @@ watch(selectedId, decorate)
 // 暴露给自动化探针（与 spike 一样留一个窄门面，避免探针依赖 Vue Flow store 形状）
 function onPaneReady(instance: VueFlowStore) {
   vf.value = instance
+  scheduleFitView()
   ;(window as unknown as { __sceneCanvas: unknown }).__sceneCanvas = {
     findNode: (id: string) => instance.findNode(id),
     nodeList: () => instance.nodes.value,
@@ -817,7 +854,7 @@ defineExpose({ reload, undo, redo, addChildNew })
     </div>
 
     <div v-else class="sc-body">
-      <div class="sc-canvas">
+      <div ref="canvasEl" class="sc-canvas">
         <VueFlow
           :nodes="nodes"
           :edges="edges"
@@ -840,6 +877,10 @@ defineExpose({ reload, undo, redo, addChildNew })
           <Controls />
           <MiniMap pannable zoomable :node-color="miniColor" />
         </VueFlow>
+        <div v-if="!nodes.length" class="sc-canvas-empty">
+          <b>场景解析成功，但没有可绘制节点</b>
+          <small>请确认当前文件是有效的 Godot .tscn，或点击“重新加载”重试。</small>
+        </div>
         <div v-if="layoutMode === 'space'" class="sc-hint">
           空间布局：拖动节点即写回 <code>position</code>（transform 定位的节点不会被拖动改写）
         </div>
@@ -994,6 +1035,9 @@ defineExpose({ reload, undo, redo, addChildNew })
 .sc-empty small { max-width: 380px; text-align: center; line-height: 1.7; }
 .sc-body { flex: 1; display: flex; min-height: 0; gap: 10px; }
 .sc-canvas { flex: 1; min-width: 0; position: relative; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: linear-gradient(180deg, #f7f9fd, #eef2f8); }
+.sc-canvas-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; color: var(--text-muted); background: rgba(247, 249, 253, .92); pointer-events: none; text-align: center; }
+.sc-canvas-empty b { font-size: 12px; font-weight: 600; }
+.sc-canvas-empty small { max-width: 330px; color: var(--text-faint); font-size: 11px; line-height: 1.6; }
 .sc-hint { position: absolute; left: 12px; bottom: 12px; background: rgba(255, 255, 255, 0.92); border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px; font-size: 11px; color: var(--text-muted); pointer-events: none; }
 .sc-hint code { color: var(--accent); font-family: var(--font-mono); }
 .sc-legend {
