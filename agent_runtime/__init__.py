@@ -7,9 +7,21 @@ from .applications import (
     ToolRegistry,
     application_state_dir,
 )
-from .tools import ToolResult, execute_tool
+from .tools import (
+    Capability,
+    SideEffect,
+    ToolResult,
+    ToolSpec,
+    coerce_tool_spec,
+    execute_tool,
+    tool_idempotency_scope,
+    upgrade_registry,
+)
+from .context_router import ContextPlan, ContextRouter, CompressionResult, compress_context, compress_text
 
 __all__ = [
     "APPLICATIONS", "DEVELOPER_APP", "ApplicationSpec",
-    "ToolRegistry", "ToolResult", "application_state_dir", "execute_tool",
+    "Capability", "ContextPlan", "ContextRouter", "CompressionResult", "compress_context", "compress_text",
+    "SideEffect", "ToolRegistry", "ToolResult", "ToolSpec",
+    "application_state_dir", "coerce_tool_spec", "execute_tool", "tool_idempotency_scope", "upgrade_registry",
 ]

@@ -35,6 +35,16 @@ DEFAULT_KEEP_TOKENS = int(os.getenv("DOCMIND_COMPACT_KEEP_TOKENS", "3500"))
 
 _lock = threading.Lock()
 
+# 早期 API 版本曾把路由上下文直接拼在用户问题前，并写入会话历史。
+# 读取时只清理这种“从开头开始的完整旧前缀”，不改动用户正文中的普通提及。
+_LEGACY_PROMPT_PREFIX = re.compile(r"^\s*【系统提示】.*?用户问题：\s*", re.S)
+
+
+def _clean_legacy_prompt(value) -> str:
+    text = str(value or "")
+    match = _LEGACY_PROMPT_PREFIX.match(text)
+    return text[match.end():].lstrip() if match else text
+
 
 def _slug(session_id) -> str:
     """把任意 session_id 归一成安全文件名（防目录穿越 / 非法字符）。"""
@@ -86,7 +96,14 @@ def _apply_raw(data: dict, raw) -> dict:
     if isinstance(raw, dict):
         turns = raw.get("turns")
         data["summary"] = raw.get("summary") or ""
-        data["turns"] = turns if isinstance(turns, list) else []
+        data["turns"] = [
+            {
+                **t,
+                "user": _clean_legacy_prompt(t.get("user", "")),
+                "assistant": _clean_legacy_prompt(t.get("assistant", "")),
+            }
+            for t in turns if isinstance(t, dict)
+        ] if isinstance(turns, list) else []
         data["updated_at"] = raw.get("updated_at") or ""
     return data
 

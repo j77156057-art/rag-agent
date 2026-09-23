@@ -1162,42 +1162,19 @@ def _gpu_busy_error(res):
     return msg
 
 # ---------------------------------------------------------------- ComfyUI 模板
-# 显存档位（vram_gb）与模型清单（models）用于 UI 引导与存在性检测：
-# vram_gb 为「估算档位」提示，非实机实测值；models 为检测用的模型文件名清单。
-_COMFY_PENDING_HINT = '需先在 ComfyUI 安装对应模型/自定义节点（见下载指引）'
-
-
-def _comfy_pending_template(tid, name, group, vram_gb, models, author, source_url, license):
-    """构造一条「引导条目」模板（pending）。
-
-    这些模板（FLUX / USO）尚未实机校验：workflow 置 None，pending=True，
-    不返回臆造节点图；用户需先在 ComfyUI 安装对应模型/自定义节点。
-    """
-    return {
-        'id': tid, 'name': name, 'model': models[0], 'kind': 'image', 'group': group,
-        'vram_gb': vram_gb, 'models': list(models), 'author': author,
-        'source_url': source_url, 'license': license,
-        'schema': {'prompt': 'string', 'negative_prompt': 'string', 'width': 'integer',
-                   'height': 'integer', 'steps': 'integer', 'seed': 'integer',
-                   'guidance': 'number', 'filename_prefix': 'string'},
-        'pending': True, 'hint': _COMFY_PENDING_HINT, 'workflow': None,
-    }
-
-
 def comfy_templates(root=None):
     # Resolve the portable installation root without baking a developer
     # machine into the runtime.  Explicit project/env configuration wins;
     # common Windows locations remain a backwards-compatible fallback.
     return {'ok': True, 'templates': [
-        {'id':'z-image-turbo','name':'Z-Image Turbo 图片','model':'z_image_turbo-Q8_0.gguf','kind':'image','group':'image','vram_gb':12,'models':['z_image_turbo-Q8_0.gguf','Qwen3-4B-Q8_0.gguf','ae.safetensors'],'author':'Tongyi-MAI','source_url':'https://github.com/Tongyi-MAI/Z-Image','license':'Apache-2.0','schema':{'prompt':'string','negative_prompt':'string','width':'integer','height':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}},
-        {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','group':'video','vram_gb':12,'models':['minimax_h3_fl2va_pruned_int8_convrot.safetensors'],'author':'MiniMax','source_url':'https://github.com/MiniMax-AI','license':'check-model-card','workflow':_comfy_workflow_path(root),'schema':{'prompt':'string','width':'integer','height':'integer','frames':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}},
-        # ---- 引导条目（pending，无 workflow，未实机校验）：需先安装依赖后由后续版本接入 ----
-        _comfy_pending_template('flux1-dev-fp8','FLUX.1-dev 文生图（fp8）','image',12,['flux1-dev-fp8.safetensors','t5xxl_fp8_e4m3fn.safetensors','clip_l.safetensors','ae.safetensors'],'Black Forest Labs','https://huggingface.co/black-forest-labs/FLUX.1-dev','FLUX.1-dev Non-Commercial License'),
-        _comfy_pending_template('flux1-dev-gguf-q4','FLUX.1-dev 文生图（GGUF Q4 低显存）','image',6,['flux1-dev-Q4_K_S.gguf','t5-v1_1-xxl-encoder-Q4_K_S.gguf','clip_l.safetensors','ae.safetensors'],'Black Forest Labs (GGUF: city96)','https://huggingface.co/city96/FLUX.1-dev-gguf','FLUX.1-dev Non-Commercial License'),
-        _comfy_pending_template('flux1-canny','FLUX Canny 线稿控图','control',12,['flux1-dev-fp8.safetensors','flux1-canny-dev.safetensors','t5xxl_fp8_e4m3fn.safetensors','clip_l.safetensors','ae.safetensors'],'Black Forest Labs','https://huggingface.co/black-forest-labs/FLUX.1-Canny-dev','FLUX.1-dev Non-Commercial License'),
-        _comfy_pending_template('flux1-depth','FLUX Depth 深度控图','control',12,['flux1-dev-fp8.safetensors','flux1-depth-dev.safetensors','t5xxl_fp8_e4m3fn.safetensors','clip_l.safetensors','ae.safetensors'],'Black Forest Labs','https://huggingface.co/black-forest-labs/FLUX.1-Depth-dev','FLUX.1-dev Non-Commercial License'),
-        _comfy_pending_template('uso-subject','USO 主体一致（角色立绘）','character',12,['flux1-dev-fp8.safetensors','uso-subject.safetensors','t5xxl_fp8_e4m3fn.safetensors','clip_l.safetensors','ae.safetensors'],'ByteDance','https://huggingface.co/ByteDance/USO','check-model-card'),
-        _comfy_pending_template('uso-style','USO 风格一致（同款画风）','character',12,['flux1-dev-fp8.safetensors','uso-style.safetensors','t5xxl_fp8_e4m3fn.safetensors','clip_l.safetensors','ae.safetensors'],'ByteDance','https://huggingface.co/ByteDance/USO','check-model-card'),
+        {'id':'z-image-turbo','name':'Z-Image Turbo 图片','model':'z_image_turbo-Q8_0.gguf','models':['z_image_turbo-Q8_0.gguf','Qwen3-4B-Q8_0.gguf','ae.safetensors'],'kind':'image','author':'Tongyi-MAI','source_url':'https://github.com/Tongyi-MAI/Z-Image','license':'Apache-2.0','schema':{'prompt':'string','negative_prompt':'string','width':'integer','height':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}},
+        {'id':'minimax-h3-i2v','name':'MiniMax H3 参考图视频','model':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','kind':'video','author':'MiniMax','source_url':'https://github.com/MiniMax-AI','license':'check-model-card','workflow':_comfy_workflow_path(root),'schema':{'prompt':'string','width':'integer','height':'integer','frames':'integer','steps':'integer','seed':'integer','filename_prefix':'string'}},
+        {'id':'flux1-dev-fp8','name':'FLUX.1-dev 文生图（fp8）','model':'flux1-dev-fp8.safetensors','kind':'image','models':['flux1-dev-fp8.safetensors','t5xxl_fp8_e4m3fn.safetensors','clip_l.safetensors','ae.safetensors'],'pending':True},
+        {'id':'flux1-dev-gguf-q4','name':'FLUX.1-dev 文生图（GGUF Q4 低显存）','model':'flux1-dev-Q4_K_S.gguf','kind':'image','models':['flux1-dev-Q4_K_S.gguf','t5-v1_1-xxl-encoder-Q4_K_S.gguf','clip_l.safetensors','ae.safetensors'],'pending':True},
+        {'id':'flux1-canny','name':'FLUX Canny 线稿控图','model':'flux1-canny-dev.safetensors','kind':'image','models':['flux1-dev-fp8.safetensors','flux1-canny-dev.safetensors','t5xxl_fp8_e4m3fn.safetensors','clip_l.safetensors','ae.safetensors'],'pending':True},
+        {'id':'flux1-depth','name':'FLUX Depth 深度控图','model':'flux1-depth-dev.safetensors','kind':'image','models':['flux1-dev-fp8.safetensors','flux1-depth-dev.safetensors','t5xxl_fp8_e4m3fn.safetensors','clip_l.safetensors','ae.safetensors'],'pending':True},
+        {'id':'uso-subject','name':'USO 主体一致（角色立绘）','model':'uso-subject.safetensors','kind':'image','models':['flux1-dev-fp8.safetensors','uso-subject.safetensors','t5xxl_fp8_e4m3fn.safetensors','clip_l.safetensors','ae.safetensors'],'pending':True},
+        {'id':'uso-style','name':'USO 风格一致（同款画风）','model':'uso-style.safetensors','kind':'image','models':['flux1-dev-fp8.safetensors','uso-style.safetensors','t5xxl_fp8_e4m3fn.safetensors','clip_l.safetensors','ae.safetensors'],'pending':True}
     ]}
 
 def _comfy_workflow_path(root=None):
@@ -1217,7 +1194,6 @@ def _comfy_workflow_path(root=None):
     return next((p for p in candidates if p), '')
 
 def comfy_template_workflow(template_id, root=None):
-    # 待接入（pending）模板：不返回臆造节点图，明确告知需先安装依赖模型/自定义节点。
     meta = next((t for t in comfy_templates(root).get('templates', []) if t.get('id') == template_id), None)
     if meta and meta.get('pending'):
         return {'ok': False, 'error': '该模板待接入（需先安装依赖模型/自定义节点）', 'pending': True}
@@ -1238,58 +1214,35 @@ def comfy_template_workflow(template_id, root=None):
             '7': {'class_type':'VAELoader','inputs':{'vae_name':'ae.safetensors'}}, '8': {'class_type':'VAEDecode','inputs':{'samples':['6',0],'vae':['7',0]}}, '9': {'class_type':'SaveImage','inputs':{'images':['8',0],'filename_prefix':'docmind_zimage'}}}}
     return {'ok': False, 'error': '未知模板。'}
 
-# ------------------------------------------------------- ComfyUI 模型存在性检测
-# 只读扫描 ComfyUI models/ 目录，按各模板声明的模型文件名比对；不下载、不修改。
+# 只读的 ComfyUI 模型依赖检查。保留在工作台服务层，API 仅做代理，避免把
+# 文件系统扫描逻辑重新塞回巨型入口；模板声明的 models 列表支持待接入模板。
 _COMFY_MODEL_SUBDIRS = ('unet', 'checkpoints', 'clip', 'vae', 'controlnet',
                         'diffusion_models', 'text_encoders', 'clip_vision',
                         'loras', 'style_models')
 
-
 def _comfy_root(root=None):
-    """解析 ComfyUI 安装根目录（含 models/ 的那一层）。
-
-    顺序与 `_comfy_workflow_path` 同款：项目 `.docmind_comfy.json` 的 `comfy_root`
-    → 环境变量 `DOCMIND_COMFY_ROOT` → `D:\\ComfyUI` → `C:\\ComfyUI`。
-    显式写在项目配置里的 `comfy_root` 视为权威（即便路径不存在也直接返回），
-    以保证行为确定、可脱离服务单测。
-    """
     project = _root(root) if root else os.getenv('DOCMIND_PROJECT_ROOT', os.getcwd())
     try:
         with open(os.path.join(project, '.docmind_comfy.json'), encoding='utf-8') as f:
             configured = str((json.load(f) or {}).get('comfy_root') or '').strip()
         if configured:
-            if not os.path.isabs(configured):
-                configured = os.path.join(project, configured)
-            return configured
+            return configured if os.path.isabs(configured) else os.path.join(project, configured)
     except Exception:
         pass
     env_root = str(os.getenv('DOCMIND_COMFY_ROOT', '')).strip()
     if env_root:
         return env_root
-    for fallback in (r'D:\ComfyUI', r'C:\ComfyUI'):
-        if os.path.isdir(fallback):
-            return fallback
-    return ''
-
+    return next((p for p in (r'D:\ComfyUI', r'C:\ComfyUI') if os.path.isdir(p)), '')
 
 def comfy_model_check(root=None):
-    """只读检测各 ComfyUI 模板声明的模型文件是否存在（不解压、不下载、不修改）。
-
-    返回结构：
-        {'ok': True, 'root': <comfy根>, 'found': [文件名...],
-         'templates': [{'id','name','present','missing':[...],'pending'}]}
-    根不存在 / 无 models 目录时返回 {'ok': False, 'error': '<中文说明>'}。
-    `found` 为扫描到的全部模型文件名（排序）；`missing` 保持模板声明顺序。
-    """
     comfy_root = _comfy_root(root)
     if not comfy_root:
-        return {'ok': False, 'error': '未找到 ComfyUI 安装目录，请设置 DOCMIND_COMFY_ROOT 或在项目 .docmind_comfy.json 中配置 comfy_root。'}
+        return {'ok': False, 'error': '未找到 ComfyUI 安装目录，请设置 DOCMIND_COMFY_ROOT 或配置 comfy_root。'}
     if not os.path.isdir(comfy_root):
         return {'ok': False, 'error': f'ComfyUI 根目录不存在：{comfy_root}'}
     models_dir = os.path.join(comfy_root, 'models')
     if not os.path.isdir(models_dir):
         return {'ok': False, 'error': f'ComfyUI 根目录下没有 models 目录：{models_dir}'}
-    # 收集所有模型子目录下的文件名（小写归一化做大小写不敏感比对，保留原始名）。
     found = {}
     for sub in _COMFY_MODEL_SUBDIRS:
         sub_dir = os.path.join(models_dir, sub)
@@ -1298,15 +1251,15 @@ def comfy_model_check(root=None):
         for name in os.listdir(sub_dir):
             if os.path.isfile(os.path.join(sub_dir, name)):
                 found.setdefault(name.lower(), name)
-    templates = []
-    for t in comfy_templates(root).get('templates', []):
-        declared = [str(m) for m in (t.get('models') or ([t['model']] if t.get('model') else []))]
-        missing = [m for m in declared if m.lower() not in found]
-        templates.append({'id': t.get('id', ''), 'name': t.get('name', ''),
-                          'present': not missing, 'missing': missing,
-                          'pending': bool(t.get('pending'))})
+    rows = []
+    for template in comfy_templates(root).get('templates', []):
+        declared = [str(x) for x in (template.get('models') or ([template.get('model')] if template.get('model') else []))]
+        missing = [x for x in declared if x.lower() not in found]
+        rows.append({'id': template.get('id', ''), 'name': template.get('name', ''),
+                     'present': not missing, 'missing': missing,
+                     'pending': bool(template.get('pending'))})
     return {'ok': True, 'root': os.path.abspath(comfy_root),
-            'found': sorted(found.values()), 'templates': templates}
+            'found': sorted(found.values()), 'templates': rows}
 
 # --------------------------------------------------------------------- ComfyUI UI→API
 # H3（及多数官方）工作流是 **子图（subgraph）UI 格式**：真正的生成链藏在
@@ -2528,6 +2481,29 @@ def _parse_test_summary(out):
     return s
 
 
+_PLAYTEST_ENGINE_ERROR_MARKERS = (
+    "SCRIPT ERROR",
+    "Parse Error",
+    "Failed to load script",
+)
+
+
+def _playtest_engine_error(output: str, command: str) -> str:
+    """Detect engine-level failures that can still exit with code 0.
+
+    Godot's headless process commonly returns zero after printing a script parse
+    error.  Treating only the process code as truth would let a broken project
+    pass the Harness review gate, so only apply these markers to an engine-like
+    command and return a bounded diagnostic for the caller.
+    """
+    command_lower = (command or "").lower()
+    if not any(token in command_lower for token in ("godot", "project.godot")):
+        return ""
+    lines = [line.strip() for line in (output or "").splitlines()
+             if any(marker.lower() in line.lower() for marker in _PLAYTEST_ENGINE_ERROR_MARKERS)]
+    return "\n".join(lines[-8:])
+
+
 def playtest(root, command, timeout=30):
     root_abs = _root(root)
     cmd = (command or "").strip()
@@ -2551,9 +2527,15 @@ def playtest(root, command, timeout=30):
             return {"ok": False, "error": f"命令被 Playtest 安全策略拦截（命中「{why}」）"}
     started = time.time()
     try:
-        p = subprocess.run(cmd, shell=True, cwd=root_abs, capture_output=True, text=True, timeout=min(int(timeout), 120))
-        out = (p.stdout + p.stderr)[-4000:]
-        return {"ok": p.returncode == 0, "code": p.returncode,
+        # Godot emits UTF-8 even when the Windows process locale is GBK.  An
+        # implicit ``text=True`` decode therefore raises in subprocess's
+        # reader thread and turns a valid playtest into a blank failure.
+        p = subprocess.run(cmd, shell=True, cwd=root_abs, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=min(int(timeout), 120))
+        out = ((p.stdout or "") + (p.stderr or ""))[-4000:]
+        engine_error = _playtest_engine_error(out, cmd)
+        return {"ok": p.returncode == 0 and not engine_error, "code": p.returncode,
                 "duration": round(time.time() - started, 2), "output": out, **_parse_test_summary(out)}
     except subprocess.TimeoutExpired as e:
         return {"ok": False, "error": "timeout", "output": str(e)}

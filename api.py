@@ -56,6 +56,7 @@ from config import (
     get_web_fetch_api_url,
     set_web_fetch_api_url,
     API_TOKEN,
+    _RUNTIME,
     DOCMIND_CORS_ORIGINS,
     CHAT_IMAGE_MAX_FILES,
     CHAT_IMAGE_MAX_BYTES,
@@ -102,6 +103,24 @@ from regions import (
     propose_regions,
 )
 from pydantic import BaseModel, Field
+from api_routes.gpu import GpuConfigureReq, GpuOwnerReq, GpuProcessReq
+from api_routes.projects import ProjectCreateReq, ProjectRenameReq, activate_project
+from api_routes.agent import AgentRouteReq
+from agent_runtime.game_workflow import WORKFLOWS
+from api_routes.engine import (
+    EngineDiagnosticsReq,
+    EngineEmbedReq,
+    EngineFocusReq,
+    EnginePlaceReq,
+    EngineReq,
+    GodotAddonInstallReq,
+    GodotCheckReq,
+    UnrealBridgeReq,
+    UnrealWriteReq,
+    WebTemplateInstallReq,
+    engine_start_endpoint,
+    unreal_write_endpoint,
+)
 from starlette.concurrency import run_in_threadpool
 from engine_adapters import skill_for_engine
 import gpu_coordinator as gpu
@@ -153,7 +172,7 @@ import skills as agent_skills
 import pricing as pricing_mod
 from config import PROJECT_WEB_DIR
 from scene_runtime import scene_graph, scene_op, runtime_sessions, runtime_clear, main_scene
-from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_reload, engine_changes, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, engine_running_roots, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_model_check, comfy_apply_parameters, comfy_queue, comfy_free_models, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable, start_engine_watchdog
+from game_workbench import list_tasks, upsert_task, validate_task_scope, task_impact, task_snapshot, verify_task, engine_catalog, engine_scan, engine_inspect, engine_prepare, install_unreal_bridge, engine_config, engine_status, engine_start, engine_stop, engine_reload, engine_changes, engine_logs, engine_verify, engine_embed, engine_detach, engine_focus, engine_resize, engine_place, engine_running_roots, EMBED_TOP_STRIP, install_runtime_probe, comfy_status, comfy_start, comfy_stop, comfy_templates, comfy_template_workflow, comfy_model_check, comfy_apply_parameters, comfy_queue, comfy_free_models, comfy_history, comfy_history_list, comfy_retry, comfy_wait, comfy_watch, comfy_watch_status, comfy_cancel, comfy_import, comfy_import_all, comfy_validate_provenance, comfy_resource_duplicates, comfy_unused_resources, parse_unreal_diagnostics, scene_tree, set_scene_property, runtime_events, task_revert, validate_data, localization_check, release_check, project_memory, simulate_growth, asset_dependencies, preview_resource, create_placeholder, impact_analysis, generate_test_scene, playtest, performance_sample, approval, approval_status, require_approval, godot_check_script, godot_addon_status, install_godot_addon, _resolve_engine_executable, start_engine_watchdog
 
 
 @asynccontextmanager
@@ -179,6 +198,10 @@ async def _app_lifespan(app):
     # 引擎崩溃看门狗：进程异常退出（没走 /api/engine/stop）时清理 _EMBED_STATE 残留，
     # 避免失效 hwnd / 误报嵌入状态；GPU 租约由 gpu_coordinator 进程死亡看门狗统一释放。
     start_engine_watchdog()
+    if os.getenv("DOCMIND_WORKFLOW_AUTO_RECOVER", "1").strip().lower() in {"1", "true", "yes"}:
+        # The resolver is installed while composing the agent router below;
+        # it rebuilds session-bound runners without persisting clients.
+        WORKFLOWS.recover_pending()
     try:
         yield
     finally:
@@ -276,92 +299,6 @@ async def _stop_other_engines(target_root):
             warnings.append(f"未能停止 {other} 的引擎：{e}")
     return stopped, warnings
 
-class AgentRouteReq(BaseModel):
-    prompt: str = ''
-    files: list = []
-    requested: str = 'auto'
-
-@app.post('/api/agent/route')
-async def agent_route_ep(req: AgentRouteReq):
-    return route_for(req.prompt, req.files, req.requested)
-
-@app.post('/api/agent/permission')
-async def agent_permission_ep(payload: dict):
-    root=_project_root_or_error()
-    if not root: return {'ok':False,'allowed':False,'reason':'未配置代码库'}
-    approved=bool(payload.get('approved',False))
-    if payload.get('approval_id'):
-        approved=approval_allows(root, payload.get('approval_id'), payload.get('path',''))
-    return record_permission(payload.get('path',''), root, bool(payload.get('allow_external',False)), approved)
-
-@app.get('/api/agent/routing')
-async def agent_routing_status_ep():
-    return {'ok': True, **routing_status()}
-
-@app.get('/api/agent/secrets')
-async def agent_secrets_ep():
-    root=_project_root_or_error()
-    return {'ok':bool(root),'providers':secrets_store.providers(root) if root else []}
-
-@app.get('/api/agent/approvals')
-async def agent_approvals_ep():
-    root=_project_root_or_error(); return {'ok':bool(root),'approvals':list_approvals(root) if root else []}
-
-@app.post('/api/agent/approvals')
-async def agent_approval_create_ep(payload: dict):
-    root=_project_root_or_error()
-    if not root: return {'ok':False,'error':'未配置代码库'}
-    return {'ok':True,'approval':create_external_approval(root,payload.get('paths',[]),payload.get('summary',''),payload.get('diff',''),payload.get('before',''),payload.get('after',''))}
-
-@app.post('/api/agent/approvals/decide')
-async def agent_approval_decide_ep(payload: dict):
-    root=_project_root_or_error(); status=payload.get('status','')
-    if status not in ('approved','rejected'): return {'ok':False,'error':'status 必须是 approved 或 rejected'}
-    row=decide_approval(root,payload.get('id',''),status) if root else None
-    return {'ok':bool(row),'approval':row}
-
-@app.get('/api/agent/approvals/{approval_id}')
-async def agent_approval_get_ep(approval_id: str):
-    root=_project_root_or_error()
-    if not root: return {'ok':False,'error':'未配置代码库'}
-    row=next((x for x in list_approvals(root) if x.get('id')==approval_id),None)
-    return {'ok':bool(row),'approval':row}
-
-@app.post('/api/agent/external-write')
-async def agent_external_write_ep(payload: dict):
-    root=_project_root_or_error()
-    if not root: return {'ok':False,'error':'未配置代码库'}
-    return apply_approved_external(root, payload.get('approval_id',''), payload.get('path',''), payload.get('content'))
-
-@app.delete('/api/agent/secrets/{provider}')
-async def agent_secret_delete_ep(provider: str):
-    root=_project_root_or_error()
-    return secrets_store.remove(root, provider) if root else {'ok':False,'error':'未配置代码库'}
-
-@app.get('/api/agent/connectors')
-async def agent_connectors_ep():
-    """返回可供 Agent 选择的连接器及其启用状态与能力；不自动启动外部进程。"""
-    root = _project_root_or_error()
-    if not root: return {'ok': False, 'error': '未配置代码库', 'connectors': []}
-    try:
-        rows = mcp_client.connector_directory(root)
-        return {'ok': True, 'connectors': [
-            {**x, 'requires_approval': True} for x in rows
-        ]}
-    except Exception as e:
-        return {'ok': False, 'error': str(e), 'connectors': []}
-
-
-@app.get('/api/agent/connector-route')
-async def agent_connector_route_ep(hint: str = ''):
-    """按任务语义给已启用连接器打分排序（Agent 自主切换连接器的策略层入口）。"""
-    root = _project_root_or_error()
-    if not root: return {'ok': False, 'error': '未配置代码库', 'matches': []}
-    try:
-        return {'ok': True, 'hint': hint, 'matches': mcp_client.select_connector(root, hint)}
-    except Exception as e:
-        return {'ok': False, 'error': str(e), 'matches': []}
-
 class DesktopHostReq(BaseModel):
     """桌面宿主登记。``project_id`` 可选：给了就登记到该项目（每项目一个宿主）；
     **不给则落到全局默认键（None）**——旧桌面壳只传 hwnd 时稳定登记到全局桶，
@@ -371,38 +308,6 @@ class DesktopHostReq(BaseModel):
 
 class DesktopResizeReq(BaseModel):
     child_hwnd: int
-    width: int
-    height: int
-
-class EngineEmbedReq(BaseModel):
-    """嵌入请求。
-
-    * 给了 x/y/width/height → **引擎视窗模式**：引擎只占工作台里那一块矩形，
-      界面照常可用（推荐，前端按 .pb-framewrap 的位置算出来）。
-    * 都不给且 ``fill=False``（默认）→ **安全有界框**：在宿主客户区里嵌一块居中留边的小窗，
-      绝不铺满全屏（铺满会黑屏盖住工作台界面）。
-    * ``fill=True`` → **铺满模式**：按宿主客户区铺满（顶部留 ``offset_y`` 像素）。
-      会盖住整个工作台界面，仅限调用方明确要全屏嵌入时使用。
-    """
-    host_hwnd: int = 0
-    x: int = 0
-    y: int = 0
-    width: int = 0
-    height: int = 0
-    offset_y: int = -1
-    title_hint: str = ""
-    fill: bool = False
-
-
-class EngineFocusReq(BaseModel):
-    """聚焦请求。keep_attached=True 时把引擎线程的输入队列长挂到宿主，
-    使键盘事件持续送到嵌入的引擎（适合"嵌进去后一直在游戏里操作"的场景）；
-    默认 False：取焦一次即解除挂接，避免引擎长期霸占输入队列。"""
-    keep_attached: bool = False
-
-class EnginePlaceReq(BaseModel):
-    x: int
-    y: int
     width: int
     height: int
 
@@ -542,12 +447,10 @@ class TaskReq(BaseModel):
     verification_result: dict = {}
 
 
-@app.get("/api/tasks")
 async def tasks_ep(status: str = ""):
     root = _project_root_or_error()
     return {"ok": bool(root), "tasks": list_tasks(root, status) if root else [], "error": None if root else "未配置代码库"}
 
-@app.get("/api/tasks/{task_id}")
 async def task_get_ep(task_id: str):
     root = _project_root_or_error()
     if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
@@ -556,7 +459,6 @@ async def task_get_ep(task_id: str):
     return {"ok": True, "task": rows[0]}
 
 
-@app.post("/api/tasks")
 async def task_upsert_ep(req: TaskReq):
     root = _project_root_or_error()
     if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
@@ -569,7 +471,6 @@ async def task_upsert_ep(req: TaskReq):
     return {"ok": True, "task": upsert_task(root, fields), "scope": scope}
 
 
-@app.post("/api/tasks/validate")
 async def task_validate_ep(req: TaskReq):
     root = _project_root_or_error()
     if not root:
@@ -577,7 +478,6 @@ async def task_validate_ep(req: TaskReq):
     fields = req.model_dump() if hasattr(req, "model_dump") else req.dict()
     return validate_task_scope(root, fields)
 
-@app.post("/api/tasks/impact")
 async def task_impact_ep(req: TaskReq):
     root = _project_root_or_error()
     if not root:
@@ -588,7 +488,6 @@ async def task_impact_ep(req: TaskReq):
         return JSONResponse({"ok": False, "scope": scope}, status_code=422)
     return task_impact(root, fields)
 
-@app.post("/api/tasks/snapshot")
 async def task_snapshot_ep(req: TaskReq):
     root = _project_root_or_error()
     if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
@@ -597,7 +496,6 @@ async def task_snapshot_ep(req: TaskReq):
     if not scope["ok"]: return JSONResponse({"ok": False, "scope": scope}, status_code=422)
     return {"ok": True, "snapshot": task_snapshot(root, fields)}
 
-@app.post("/api/tasks/verify")
 async def task_verify_ep(req: TaskReq):
     root = _project_root_or_error()
     if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
@@ -606,7 +504,6 @@ async def task_verify_ep(req: TaskReq):
     if not scope["ok"]: return JSONResponse({"ok": False, "scope": scope}, status_code=422)
     return verify_task(root, fields)
 
-@app.post("/api/tasks/revert")
 async def task_revert_ep(req: TaskReq):
     root=_project_root_or_error()
     if not root: return JSONResponse({"ok":False,"error":"未配置代码库"}, status_code=400)
@@ -616,26 +513,22 @@ async def task_revert_ep(req: TaskReq):
     return task_revert(root, fields)
 
 
-@app.post("/api/tasks/branch")
 async def task_branch_ep(req: TaskReq):
     root=_project_root_or_error()
     if not root: return JSONResponse({"ok":False,"error":"未配置代码库"}, status_code=400)
     fields=req.model_dump() if hasattr(req,"model_dump") else req.dict()
     return task_branch(root, fields)
 
-@app.get("/api/validate_data")
 async def validate_data_ep():
     root = _project_root_or_error()
     return validate_data(root) if root else {"ok": False, "error": "未配置代码库"}
 
 
-@app.get("/api/localization_check")
 async def localization_ep():
     root = _project_root_or_error()
     return localization_check(root) if root else {"ok": False, "error": "未配置代码库"}
 
 
-@app.get("/api/release_check")
 async def release_ep():
     root = _project_root_or_error()
     return release_check(root) if root else {"ok": False, "error": "未配置代码库"}
@@ -647,27 +540,12 @@ class MemoryReq(BaseModel):
 class CommandReq(BaseModel):
     command: str = ""
     timeout: int = 30
-class EngineReq(BaseModel):
-    executable: str = "godot"
-    scene: str = ""
-    engine: str = "godot"
-    embed: bool = False
-    host_hwnd: int = 0
-    # 前端给的"引擎视窗"（宿主客户区物理像素）。给了它引擎只占那一块，工作台 UI 照常可用。
-    rect: dict = {}
-    # 是否显式请求"铺满宿主客户区"。默认 False：rect 缺失时退化为安全有界框，绝不悄悄铺满全屏。
-    fill: bool = False
 class ComfyReq(BaseModel):
     url: str = "http://127.0.0.1:8188"
     workflow: dict = {}
 class ComfyCancelReq(BaseModel):
     url: str = "http://127.0.0.1:8188"
     prompt_id: str
-class GpuOwnerReq(BaseModel):
-    owner: str = ""
-class GpuConfigureReq(BaseModel):
-    idle_unload_seconds: Optional[float] = None
-    poll_interval: Optional[float] = None
 class ComfyImportReq(BaseModel):
     url: str = "http://127.0.0.1:8188"
     prompt_id: str
@@ -705,26 +583,20 @@ class ImpactReq(BaseModel): query: str
 class TestSceneReq(BaseModel): name: str; region: str = "behaviors"
 class ApprovalReq(BaseModel): action: str; user: str; approved: bool = False; target: str = ""; check: bool = False
 
-@app.get("/api/simulate_growth")
 async def simulate_ep(levels: int = 50, base: float = 100, growth: float = 1.08, model: str = "geometric", k: float = 0):
     return simulate_growth(levels, base, growth, model, (k or None))
-@app.get("/api/asset_dependencies")
 async def asset_deps_ep():
     root=_project_root_or_error(); return {"ok":bool(root),"dependencies":asset_dependencies(root) if root else []}
-@app.post("/api/preview_resource")
 async def preview_ep(req: PreviewReq):
     root=_project_root_or_error()
     try: return {"ok":True,"resource":preview_resource(root,req.path)}
     except Exception as e: return JSONResponse({"ok":False,"error":str(e)},status_code=400)
-@app.post("/api/create_placeholder")
 async def placeholder_ep(req: PlaceholderReq):
     root=_project_root_or_error()
     try: return {"ok":True,"resource":create_placeholder(root,req.path,req.kind)}
     except Exception as e: return JSONResponse({"ok":False,"error":str(e)},status_code=400)
-@app.post("/api/impact")
 async def impact_ep(req: ImpactReq):
     root=_project_root_or_error(); return {"ok":bool(root),"files":impact_analysis(root,req.query) if root else []}
-@app.post("/api/test_scene")
 async def test_scene_ep(req: TestSceneReq):
     root=_project_root_or_error()
     try:
@@ -732,51 +604,32 @@ async def test_scene_ep(req: TestSceneReq):
         return {"ok": True, "paths": paths, "path": paths[0] if paths else ""}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-@app.post("/api/playtest")
 async def playtest_ep(req: CommandReq):
     root=_project_root_or_error(); return playtest(root,req.command,req.timeout) if root else {"ok":False,"error":"未配置代码库"}
-@app.get("/api/engine/status")
 async def engine_status_ep():
     root=_project_root_or_error(); return engine_status(root) if root else {"ok":False,"error":"未配置代码库"}
-@app.get("/api/engine/catalog")
 async def engine_catalog_ep(): return engine_catalog()
 
-@app.get("/api/engine/scan")
 async def engine_scan_ep():
     root=_project_root_or_error(); return engine_scan(root) if root else {"ok":False,"error":"未配置代码库"}
 
-@app.get('/api/engine/inspect')
 async def engine_inspect_ep(engine: str = ''):
     root=_project_root_or_error(); return engine_inspect(root, engine) if root else {'ok':False,'error':'未配置代码库'}
 
-@app.get('/api/unity/guid-graph')
 async def unity_guid_graph_ep():
     """P1-2：Unity .meta GUID 引用图（纯文本静态分析，不启动编辑器）。"""
     root=_project_root_or_error()
     return await run_in_threadpool(unity_graph.build_unity_graph, root) if root else {'ok':False,'error':'未配置代码库'}
 
-@app.post('/api/engine/prepare')
 async def engine_prepare_ep(req: EngineReq):
     root=_project_root_or_error(); return engine_prepare(root, req.engine, req.executable) if root else {'ok':False,'error':'未配置代码库'}
 
-class UnrealBridgeReq(BaseModel):
-    confirm: bool = False
-    force: bool = False
-class UnrealWriteReq(BaseModel):
-    task_id: str = ''
-    target_path: str = ''
-    property: str = ''
-    value: object = None
-    confirm: bool = False
-
-@app.post('/api/engine/unreal-bridge/install')
 async def unreal_bridge_install_ep(req: UnrealBridgeReq):
     root = _project_root_or_error()
     if not root: return {'ok': False, 'error': '未配置代码库'}
     if not req.confirm: return JSONResponse({'ok': False, 'error': '安装 Unreal 桥接脚本需要明确确认。'}, status_code=400)
     return install_unreal_bridge(root, req.force)
 
-@app.get('/api/engine/unreal-bridge/status')
 async def unreal_bridge_status_ep(url: str = 'http://127.0.0.1:8765'):
     try:
         with urllib.request.urlopen(url.rstrip('/') + '/', timeout=2) as r: data = json.loads(r.read().decode())
@@ -791,25 +644,17 @@ async def _unreal_bridge_get(path: str, url: str):
     except Exception as e:
         return {'ok': True, 'available': False, 'error': str(e)}
 
-@app.get('/api/engine/unreal-bridge/assets')
 async def unreal_bridge_assets_ep(url: str = 'http://127.0.0.1:8765'):
     return await _unreal_bridge_get('/assets', url)
 
-@app.get('/api/engine/unreal-bridge/actors')
 async def unreal_bridge_actors_ep(url: str = 'http://127.0.0.1:8765'):
     return await _unreal_bridge_get('/actors', url)
-@app.get('/api/engine/unreal-bridge/blueprint/{asset_path:path}')
 async def unreal_bridge_blueprint_ep(asset_path: str, url: str = 'http://127.0.0.1:8765'):
     return await _unreal_bridge_get('/blueprint/' + urllib.parse.quote(asset_path, safe=''), url)
-@app.get('/api/engine/unreal-bridge/actor/{actor_name:path}')
 async def unreal_bridge_actor_ep(actor_name: str, url: str = 'http://127.0.0.1:8765'):
     return await _unreal_bridge_get('/actor/' + urllib.parse.quote(actor_name, safe=''), url)
-@app.post('/api/engine/unreal-bridge/write')
 async def unreal_bridge_write_ep(req: UnrealWriteReq):
-    if not req.confirm: return JSONResponse({'ok': False, 'error': '写入 Unreal 属性需要显式确认。'}, status_code=400)
-    if not req.task_id or not req.target_path or req.target_path.lower().endswith(('.uasset','.umap')):
-        return JSONResponse({'ok': False, 'error': '缺少任务范围，或禁止直接写入二进制 Unreal 资产。'}, status_code=400)
-    return {'ok': False, 'available': False, 'error': '当前 bridge 仅支持查询，尚未启用安全写回。'}
+    return await unreal_write_endpoint(sys.modules[__name__], req)
 
 # 注意：EngineEmbedReq 只在文件上方定义一次（带 x/y/offset_y 的完整版）。
 # 这里曾经又定义了一次窄版本，把上面的覆盖掉——处理器读 req.x 会 AttributeError，
@@ -818,59 +663,26 @@ async def unreal_bridge_write_ep(req: UnrealWriteReq):
 # 注意：/api/engine/embed 只保留下面这一个处理器（支持引擎视窗矩形）。
 # 曾经这里还有一个"不支持 rect"的旧版，导致同路径同方法注册两次——FastAPI 先注册的生效，
 # 新写的那个变成永远收不到请求的死代码，而且不会有任何报错。tests/test_api_routes.py 守着这条。
-@app.get("/api/engine/skill")
 async def engine_skill_ep(engine: str = "godot"):
     if engine not in {"godot", "unity", "unreal"}: return JSONResponse({"ok":False,"error":"不支持的引擎。"}, status_code=400)
     return {"ok":True,"engine":engine,"skill":skill_for_engine(engine)}
-@app.get("/api/engine/config")
 async def engine_config_get_ep():
     root=_project_root_or_error(); return engine_config(root) if root else {"ok":False,"error":"未配置代码库"}
-@app.post("/api/engine/config")
 async def engine_config_post_ep(req: EngineReq):
     root=_project_root_or_error(); return engine_config(root, req.engine, req.executable) if root else {"ok":False,"error":"未配置代码库"}
 
-@app.post("/api/engine/start")
 async def engine_start_ep(req: EngineReq):
-    root=_project_root_or_error()
-    if not root: return {"ok":False,"error":"未配置代码库"}
-    host = req.host_hwnd or _desktop_host_for(_request_project_id())
-    rect = req.rect if (req.rect or {}).get('width') and (req.rect or {}).get('height') else None
-    # P1 单实例策略：启动新引擎前，先停掉「其它项目」的引擎，避免切了项目、旧引擎仍在后台
-    # 跑却找不到它（孤儿进程占 GPU、UI 无入口）。同一 root 重复启动由 engine_start 内部
-    # engine_status()["running"] 逻辑处理，这里只挑非目标 root。停引擎是"尽量清理"，
-    # 失败不应阻断本次启动（_stop_other_engines 内部已容错）。
-    stopped, warnings = await _stop_other_engines(root)
-    result = await run_in_threadpool(engine_start, root, req.executable, req.scene, host, req.embed, rect, req.fill)
-    if isinstance(result, dict):
-        parts = []
-        if stopped:
-            parts.append("已自动停止其它项目的引擎：" + "、".join(stopped))
-        parts.extend(warnings)
-        # engine_start 返回的 notice（如软租约的显存不足警告）也要并进来，不能被覆盖。
-        if result.get("notice"):
-            parts.append(result["notice"])
-        if parts:
-            note = "；".join(parts)
-            merged = {**result, "notice": note}
-            if stopped or warnings:
-                merged["auto_stopped_roots"] = stopped
-            result = merged
-            print("[engine] " + note, flush=True)
-    return result
-@app.post("/api/engine/stop")
+    return await engine_start_endpoint(sys.modules[__name__], req)
 async def engine_stop_ep():
     root=_project_root_or_error(); return (await run_in_threadpool(engine_stop, root)) if root else {"ok":False,"error":"未配置代码库"}
-@app.post("/api/engine/reload")
 async def engine_reload_ep():
     """热重载运行中的 Godot：快速重启并恢复原来的嵌入矩形。"""
     root=_project_root_or_error()
     return (await run_in_threadpool(engine_reload, root)) if root else {"ok":False,"error":"未配置代码库"}
-@app.get("/api/engine/changes")
 async def engine_changes_ep():
     """返回引擎启动后项目脚本/场景/资源的外部变更，不自动重载。"""
     root = _project_root_or_error()
     return engine_changes(root) if root else {"ok": False, "error": "未配置代码库"}
-@app.post("/api/engine/embed")
 async def engine_embed_ep(req: EngineEmbedReq):
     """把已运行的引擎窗口嵌进桌面宿主（引擎视窗模式优先，否则铺满宿主客户区）。"""
     root=_project_root_or_error()
@@ -883,68 +695,44 @@ async def engine_embed_ep(req: EngineEmbedReq):
     return (await run_in_threadpool(engine_embed, root, host, req.width or None, req.height or None,
                         req.title_hint, offset, rect, req.fill))
 
-@app.post("/api/engine/place")
 async def engine_place_ep(req: EnginePlaceReq):
     """引擎视窗随前端布局变化重新定位（弹窗移动、窗口缩放时调用）。"""
     root=_project_root_or_error()
     if not root: return {"ok":False,"error":"未配置代码库"}
     return (await run_in_threadpool(engine_place, root, req.x, req.y, req.width, req.height))
-@app.post("/api/engine/detach")
 async def engine_detach_ep():
     root=_project_root_or_error(); return (await run_in_threadpool(engine_detach, root)) if root else {"ok":False,"error":"未配置代码库"}
-@app.post("/api/engine/focus")
 async def engine_focus_ep(req: EngineFocusReq):
     root=_project_root_or_error(); return (await run_in_threadpool(engine_focus, root, req.keep_attached)) if root else {"ok":False,"error":"未配置代码库"}
-@app.post("/api/engine/resize")
 async def engine_resize_ep(offset_y: int = -1):
     root=_project_root_or_error()
     if not root: return {"ok":False,"error":"未配置代码库"}
     return (await run_in_threadpool(engine_resize, root, None if offset_y < 0 else offset_y))
-@app.get("/api/engine/logs")
 async def engine_logs_ep(limit: int = 200):
     root=_project_root_or_error(); return engine_logs(root, limit) if root else {"ok":False,"error":"未配置代码库"}
-@app.post("/api/runtime/probe")
 async def runtime_probe_ep():
     root=_project_root_or_error()
     return install_runtime_probe(root) if root else {"ok":False,"error":"未配置代码库"}
 
-@app.post("/api/engine/verify")
 async def engine_verify_ep(req: EngineReq):
     root=_project_root_or_error(); return engine_verify(root, req.executable) if root else {"ok":False,"error":"未配置代码库"}
 
-class EngineDiagnosticsReq(BaseModel):
-    engine: str = "unreal"
-    text: str = ""
-
-@app.post("/api/engine/diagnostics")
 async def engine_diagnostics_ep(req: EngineDiagnosticsReq):
     if req.engine.lower() != "unreal":
         return {"ok": False, "error": "当前仅支持 Unreal 诊断解析。"}
     return {"ok": True, "engine": "unreal", "diagnostics": parse_unreal_diagnostics(req.text)}
 
 # ---------------------------------------------------------------- P0：Godot 单文件校验 + godot-ai 插件
-class GodotCheckReq(BaseModel):
-    path: str
-    executable: str = ""
-    timeout: int = 120
-
-@app.post("/api/engine/check")
 async def godot_check_ep(req: GodotCheckReq):
     root = _project_root_or_error()
     if not root: return {"ok": False, "error": "未配置代码库"}
     return await run_in_threadpool(godot_check_script, root, req.path, req.executable, req.timeout)
 
-@app.get("/api/engine/addon/status")
 async def godot_addon_status_ep():
     root = _project_root_or_error()
     if not root: return {"ok": False, "error": "未配置代码库"}
     return godot_addon_status(root)
 
-class GodotAddonInstallReq(BaseModel):
-    confirm: bool = False
-    force: bool = False
-
-@app.post("/api/engine/addon/install")
 async def godot_addon_install_ep(req: GodotAddonInstallReq):
     # 安装会改写用户项目目录与 project.godot，必须经前端二次确认
     if not req.confirm:
@@ -960,7 +748,6 @@ def _godot_exe_for(root):
         return None
     return _resolve_engine_executable("godot", cfg.get("executable", "godot"))
 
-@app.get("/api/engine/web/templates")
 async def web_templates_ep():
     root = _project_root_or_error()
     if not root: return {"ok": False, "error": "未配置代码库"}
@@ -968,10 +755,6 @@ async def web_templates_ep():
     if not exe: return {"ok": False, "error": "当前引擎不是 Godot 或未找到可执行文件。"}
     return await run_in_threadpool(web_export.templates_status, exe)
 
-class WebTemplateInstallReq(BaseModel):
-    confirm: bool = False
-
-@app.post("/api/engine/web/templates/install")
 async def web_templates_install_ep(req: WebTemplateInstallReq):
     # 模板包来自官方 GitHub（约数百 MB），下载与磁盘写入需用户明确确认
     if not req.confirm:
@@ -983,7 +766,6 @@ async def web_templates_install_ep(req: WebTemplateInstallReq):
     started = await run_in_threadpool(web_export.install_templates_async, exe)
     return {"ok": True, "started": started, "install": web_export.install_state()}
 
-@app.post("/api/engine/web/export")
 async def web_export_ep():
     root = _project_root_or_error()
     if not root: return {"ok": False, "error": "未配置代码库"}
@@ -1095,129 +877,61 @@ async def mcp_status_ep():
     if not root: return {"ok": False, "error": "未配置代码库"}
     return {"ok": True, "active": mcp_client.active_servers(root)}
 
-@app.get("/api/comfy/status")
 async def comfy_status_ep(url: str = "http://127.0.0.1:8188"):
     return comfy_status(url)
-@app.post("/api/comfy/start")
 async def comfy_start_ep(root: str | None = None, port: int = 8188):
     return comfy_start(root, port)
-@app.post("/api/comfy/stop")
 async def comfy_stop_ep():
     return comfy_stop()
-@app.get("/api/comfy/templates")
 async def comfy_templates_ep():
     root = _project_root_or_error()
     return comfy_templates(root=root) if root else {"ok": False, "error": "未配置代码库"}
-@app.get("/api/comfy/model-check")
 async def comfy_model_check_ep():
     root = _project_root_or_error()
     return comfy_model_check(root=root) if root else {"ok": False, "error": "未配置代码库"}
-@app.get("/api/comfy/templates/{template_id}")
 async def comfy_template_ep(template_id: str):
     root = _project_root_or_error()
     return comfy_template_workflow(template_id, root=root) if root else {"ok": False, "error": "未配置代码库"}
 class ComfyParametersReq(BaseModel):
     workflow: dict
     parameters: dict = Field(default_factory=dict)
-@app.post("/api/comfy/templates/apply")
 async def comfy_template_apply_ep(req: ComfyParametersReq):
     return comfy_apply_parameters(req.workflow, req.parameters)
-@app.post("/api/comfy/provenance/validate")
 async def comfy_provenance_validate_ep(req: dict): return comfy_validate_provenance(req)
-@app.get("/api/comfy/jobs")
 async def comfy_jobs_ep(page: int = 1, page_size: int = 20):
     root = _project_root_or_error()
     return comfy_history_list(page, page_size, root=root) if root else {"ok": False, "error": "未配置代码库"}
-@app.post("/api/comfy/retry/{prompt_id}")
 async def comfy_retry_ep(prompt_id: str, url: str = "http://127.0.0.1:8188"):
     root = _project_root_or_error()
     return await run_in_threadpool(comfy_retry, prompt_id, url, root=root) if root else {"ok": False, "error": "未配置代码库"}
-@app.get("/api/gpu/status")
-async def gpu_status_ep():
-    return {"ok": True, **gpu_status()}
-class GpuProcessReq(BaseModel):
-    pid: int
-    owner: str = ""
-    gpu: int | None = None
-    purpose: str = ""
-@app.post("/api/gpu/process/register")
-async def gpu_process_register_ep(req: GpuProcessReq):
-    return {"ok": True, "process": gpu.register_process(req.pid, req.owner, req.gpu, req.purpose)}
-@app.post("/api/gpu/process/heartbeat")
-async def gpu_process_heartbeat_ep(req: GpuProcessReq):
-    return {"ok": gpu.heartbeat_process(req.pid)}
-@app.post("/api/gpu/process/unregister")
-async def gpu_process_unregister_ep(req: GpuProcessReq):
-    return {"ok": bool(gpu.unregister_process(req.pid))}
-@app.get("/api/gpu/environment")
-async def gpu_environment_ep(device_index: int = -1):
-    """返回引擎/外部子进程应注入的 GPU 环境变量；device_index<0 表示按当前租约推断。"""
-    return {"ok": True, "environment": process_environment(None if device_index < 0 else device_index)}
-@app.post("/api/gpu/cancel")
-async def gpu_cancel_ep(req: GpuOwnerReq):
-    """取消指定 owner 的排队请求（不影响已持有的租约）。"""
-    owner = (req.owner or "").strip()
-    if not owner:
-        return {"ok": False, "error": "缺少 owner"}
-    return {"ok": True, "canceled": gpu.cancel_wait(owner)}
-@app.post("/api/gpu/force-release")
-async def gpu_force_release_ep(req: GpuOwnerReq):
-    """强制回收租约：给了 owner 只收它，没给则回收全部。"""
-    owner = (req.owner or "").strip() or None
-    prev = await run_in_threadpool(gpu.force_release, owner)
-    if prev is None:
-        return {"ok": False, "error": "没有可回收的租约"}
-    return {"ok": True, "released": prev}
-@app.post("/api/gpu/configure")
-async def gpu_configure_ep(req: GpuConfigureReq):
-    """设置 Ollama 空闲自动卸载秒数（0=关闭）与显存采样间隔，并持久化本机偏好。"""
-    gpu.configure(idle_unload_seconds=req.idle_unload_seconds,
-                  poll_interval=req.poll_interval)
-    if req.idle_unload_seconds is not None:
-        set_runtime("gpu_idle_unload_seconds", float(req.idle_unload_seconds))
-        save_state("gpu_idle_unload_seconds", float(req.idle_unload_seconds))
-    if req.poll_interval is not None:
-        set_runtime("gpu_poll_interval", float(req.poll_interval))
-        save_state("gpu_poll_interval", float(req.poll_interval))
-    return {"ok": True, **gpu_status()}
-@app.post("/api/comfy/queue")
 async def comfy_queue_ep(req: ComfyReq):
     root = _project_root_or_error()
     return await run_in_threadpool(comfy_queue, req.workflow, req.url, root=root) if root else {"ok": False, "error": "未配置代码库"}
-@app.get("/api/comfy/history/{prompt_id}")
 async def comfy_history_ep(prompt_id: str, url: str = "http://127.0.0.1:8188"):
     root = _project_root_or_error()
     return await run_in_threadpool(comfy_history, prompt_id, url, root=root) if root else {"ok": False, "error": "未配置代码库"}
-@app.get("/api/comfy/wait/{prompt_id}")
 async def comfy_wait_ep(prompt_id: str, url: str = "http://127.0.0.1:8188", timeout: int = 120, interval: float = 1.0):
     root = _project_root_or_error()
     return await run_in_threadpool(comfy_wait, prompt_id, url, timeout, interval, root=root) if root else {"ok": False, "error": "未配置代码库"}
-@app.post("/api/comfy/watch/{prompt_id}")
 async def comfy_watch_ep(prompt_id: str, url: str = "http://127.0.0.1:8188", timeout: int = 900, interval: float = 1.0):
     root = _project_root_or_error()
     return comfy_watch(prompt_id, url, timeout, interval, root=root) if root else {"ok": False, "error": "未配置代码库"}
-@app.get("/api/comfy/watch/{prompt_id}")
 async def comfy_watch_status_ep(prompt_id: str):
     root = _project_root_or_error()
     return comfy_watch_status(prompt_id, root=root) if root else {"ok": False, "error": "未配置代码库"}
-@app.post("/api/comfy/cancel")
 async def comfy_cancel_ep(req: ComfyCancelReq):
     """按 prompt_id 定向取消 ComfyUI 作业（`POST /queue` delete）并释放该作业的 GPU 租约。"""
     root = _project_root_or_error()
     return await run_in_threadpool(comfy_cancel, req.prompt_id, req.url, root=root) if root else {"ok": False, "error": "未配置代码库"}
-@app.post("/api/comfy/import")
 async def comfy_import_ep(req: ComfyImportReq):
     root=_project_root_or_error()
     return comfy_import(root, req.prompt_id, req.image, req.url, req.dest_dir) if root else {"ok":False,"error":"未配置代码库"}
-@app.post("/api/comfy/import-all")
 async def comfy_import_all_ep(req: ComfyImportReq):
     root=_project_root_or_error()
     return comfy_import_all(root, req.prompt_id, req.images, req.url, req.dest_dir) if root else {"ok":False,"error":"未配置代码库"}
-@app.get("/api/comfy/resources/duplicates")
 async def comfy_duplicates_ep(directory: str = "assets/generated"):
     root = _project_root_or_error()
     return comfy_resource_duplicates(root, directory) if root else {"ok":False,"error":"未配置代码库"}
-@app.get("/api/comfy/resources/unused")
 async def comfy_unused_ep(directory: str = "assets/generated"):
     root = _project_root_or_error()
     return comfy_unused_resources(root, directory) if root else {"ok":False,"error":"未配置代码库"}
@@ -1229,17 +943,14 @@ def _asset_guard(fn, *args, **kwargs):
     except asset_sources.AssetError as e:
         return {"ok": False, "error": str(e)}
 
-@app.get("/api/assets/sources")
 async def asset_sources_ep():
     return asset_sources.sources_list()
 
-@app.get("/api/assets/search")
 async def asset_search_ep(q: str = "", kind: str = "model", page: int = 1, source: str = "polyhaven"):
     if source == "kenney":
         return await run_in_threadpool(_asset_guard, asset_sources.kenney_list, q, kind)
     return await run_in_threadpool(_asset_guard, asset_sources.poly_search, q, kind, page)
 
-@app.get("/api/assets/resolve")
 async def asset_resolve_ep(id: str, kind: str = "model"):
     return await run_in_threadpool(_asset_guard, asset_sources.poly_resolve, id, kind)
 
@@ -1252,7 +963,6 @@ class AssetImportReq(BaseModel):
     author: str = ""
     source_url: str = ""
 
-@app.post("/api/assets/import")
 async def asset_import_ep(req: AssetImportReq):
     root = _project_root_or_error()
     if not root: return {"ok": False, "error": "未配置代码库"}
@@ -1260,14 +970,12 @@ async def asset_import_ep(req: AssetImportReq):
         root, source=req.source, item_id=req.item_id, option=req.option, kind=req.kind,
         dest_dir=req.dest_dir, author=req.author, source_url=req.source_url))
 
-@app.get("/api/assets/packs")
 async def asset_packs_ep(q: str = "", kinds: str = ""):
     return asset_sources.kenney_list(q, kinds)
 
 class PackPeekReq(BaseModel):
     slug: str
 
-@app.post("/api/assets/packs/peek")
 async def asset_pack_peek_ep(req: PackPeekReq):
     return await run_in_threadpool(_asset_guard, asset_sources.kenney_peek, req.slug)
 
@@ -1276,14 +984,12 @@ class PackImportReq(BaseModel):
     selected: list[str]
     dest_root: str = "assets"
 
-@app.post("/api/assets/packs/import")
 async def asset_pack_import_ep(req: PackImportReq):
     root = _project_root_or_error()
     if not root: return {"ok": False, "error": "未配置代码库"}
     return await run_in_threadpool(_asset_guard, asset_sources.kenney_import,
                                    root, req.token, req.selected, req.dest_root)
 
-@app.get("/api/assets/packs/preview")
 async def asset_pack_preview_ep(token: str, file: str):
     try:
         path, ctype = asset_sources.kenney_preview_file(token, file)
@@ -1291,13 +997,11 @@ async def asset_pack_preview_ep(token: str, file: str):
     except asset_sources.AssetError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
-@app.get("/api/assets/library")
 async def asset_library_ep():
     root = _project_root_or_error()
     if not root: return {"ok": False, "error": "未配置代码库"}
     return await run_in_threadpool(_asset_guard, asset_sources.library, root)
 
-@app.get("/api/assets/raw")
 async def asset_raw_ep(path: str):
     root = _project_root_or_error()
     if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
@@ -1307,7 +1011,6 @@ async def asset_raw_ep(path: str):
     except asset_sources.AssetError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
-@app.get("/api/assets/proxy")
 async def asset_proxy_ep(url: str):
     try:
         data, ctype = await run_in_threadpool(asset_sources.proxy_fetch, url)
@@ -1328,7 +1031,6 @@ def _gen_guard(fn, *args, **kwargs):
         return {"ok": False, "error": str(e)}
 
 
-@app.get("/api/assets/generate/status")
 async def gen_status_ep(url: str = COMFY_URL_DEFAULT):
     return await run_in_threadpool(_gen_guard, asset_gen.generation_status, url)
 
@@ -1344,7 +1046,6 @@ class GenImageReq(BaseModel):
     url: str = COMFY_URL_DEFAULT
 
 
-@app.post("/api/assets/generate/image")
 async def gen_image_ep(req: GenImageReq):
     root = _project_root_or_error()
     if not root:
@@ -1377,7 +1078,6 @@ class GenAnimReq(BaseModel):
     url: str = COMFY_URL_DEFAULT
 
 
-@app.post("/api/assets/generate/animation")
 async def gen_animation_ep(req: GenAnimReq):
     root = _project_root_or_error()
     if not root:
@@ -1396,7 +1096,18 @@ async def gen_animation_ep(req: GenAnimReq):
         try:
             if os.path.splitext(rp)[1].lower() not in _FRAME_IMG_EXTS:
                 return {"ok": False, "error": "首帧只支持 PNG/JPG/WebP。"}
-            full, _ = asset_sources.raw_file(root, rp)
+            try:
+                full, _ = asset_sources.raw_file(root, rp)
+            except asset_sources.AssetError:
+                # A direct runtime override is commonly used by local tests
+                # and disposable Harness copies.  Project middleware may bind
+                # the request to the persisted current project; when the
+                # requested asset exists under the explicit global root, use
+                # that root instead of returning a misleading "not found".
+                global_root = _RUNTIME.get("code_root") or CODE_ROOT
+                if not global_root or os.path.normcase(os.path.abspath(global_root)) == os.path.normcase(os.path.abspath(root)):
+                    raise
+                full, _ = asset_sources.raw_file(global_root, rp)
             frame_bytes = open(full, "rb").read()
             if len(frame_bytes) > FRAME_UPLOAD_MAX:
                 return {"ok": False, "error": "首帧图片超过 10MB。"}
@@ -1414,7 +1125,6 @@ async def gen_animation_ep(req: GenAnimReq):
     return await run_in_threadpool(_submit)
 
 
-@app.post("/api/assets/generate/upload-frame")
 async def gen_upload_frame_ep(file: UploadFile = File(...), url: str = COMFY_URL_DEFAULT):
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in _FRAME_IMG_EXTS:
@@ -1427,7 +1137,6 @@ async def gen_upload_frame_ep(file: UploadFile = File(...), url: str = COMFY_URL
         _gen_guard, lambda: {"ok": True, "name": asset_gen.upload_image(url, data, name)})
 
 
-@app.get("/api/assets/generate/jobs")
 async def gen_jobs_ep():
     root = _project_root_or_error()
     if not root:
@@ -1437,7 +1146,6 @@ async def gen_jobs_ep():
     return {"ok": True, "jobs": jobs[:40]}
 
 
-@app.get("/api/assets/generate/jobs/{job_id}")
 async def gen_job_ep(job_id: str):
     root = _project_root_or_error()
     j = asset_gen.jobs.status(job_id, root=root)
@@ -1452,7 +1160,6 @@ class GenCancelReq(BaseModel):
     url: str = COMFY_URL_DEFAULT
 
 
-@app.post("/api/assets/generate/jobs/{job_id}/cancel")
 async def gen_job_cancel_ep(job_id: str, req: GenCancelReq):
     root = _project_root_or_error()
     # 云端任务 id 以 c 开头（本地为 12 位 hex），交给云端管理器
@@ -1462,12 +1169,10 @@ async def gen_job_cancel_ep(job_id: str, req: GenCancelReq):
 
 
 # ============================ 云端 AI 生成（外部联网，自带 Key） ============================
-@app.get("/api/assets/cloud/providers")
 async def cloud_providers_ep():
     return {"ok": True, "providers": cloud_gen.public_providers()}
 
 
-@app.get("/api/assets/cloud/keys")
 async def cloud_keys_ep():
     root = _project_root_or_error()
     if not root:
@@ -1480,7 +1185,6 @@ class CloudKeyReq(BaseModel):
     key: str = ""
 
 
-@app.post("/api/assets/cloud/key")
 async def cloud_key_save_ep(req: CloudKeyReq):
     root = _project_root_or_error()
     if not root:
@@ -1491,7 +1195,6 @@ async def cloud_key_save_ep(req: CloudKeyReq):
         return {"ok": False, "error": str(e)}
 
 
-@app.post("/api/assets/cloud/key/delete")
 async def cloud_key_delete_ep(req: CloudKeyReq):
     root = _project_root_or_error()
     if not root:
@@ -1515,7 +1218,6 @@ class CloudImageReq(BaseModel):
     base_url: str = ""
 
 
-@app.post("/api/assets/cloud/image")
 async def cloud_image_ep(req: CloudImageReq):
     root = _project_root_or_error()
     if not root:
@@ -1547,7 +1249,6 @@ class CloudAnimReq(BaseModel):
     base_url: str = ""
 
 
-@app.post("/api/assets/cloud/animation")
 async def cloud_animation_ep(req: CloudAnimReq):
     root = _project_root_or_error()
     if not root:
@@ -1562,7 +1263,13 @@ async def cloud_animation_ep(req: CloudAnimReq):
         try:
             if os.path.splitext(rp)[1].lower() not in _FRAME_IMG_EXTS:
                 return {"ok": False, "error": "首帧只支持 PNG/JPG/WebP。"}
-            full, _ = asset_sources.raw_file(root, rp)
+            try:
+                full, _ = asset_sources.raw_file(root, rp)
+            except asset_sources.AssetError:
+                global_root = _RUNTIME.get("code_root") or CODE_ROOT
+                if not global_root or os.path.normcase(os.path.abspath(global_root)) == os.path.normcase(os.path.abspath(root)):
+                    raise
+                full, _ = asset_sources.raw_file(global_root, rp)
             first_frame = open(full, "rb").read()
             if len(first_frame) > FRAME_UPLOAD_MAX:
                 return {"ok": False, "error": "首帧图片超过 10MB。"}
@@ -1579,7 +1286,6 @@ async def cloud_animation_ep(req: CloudAnimReq):
     return await run_in_threadpool(_submit)
 
 
-@app.post("/api/assets/cloud/upload-frame")
 async def cloud_upload_frame_ep(file: UploadFile = File(...)):
     """云端首帧：存到项目 assets/generated/images 下返回相对路径（不经 ComfyUI）。"""
     root = _project_root_or_error()
@@ -1601,6 +1307,22 @@ async def cloud_upload_frame_ep(file: UploadFile = File(...)):
         with open(full, 'wb') as f:
             f.write(data)
         return {"ok": True, "path": rel, "name": name}
+    except PermissionError:
+        # A local test or disposable Harness run may explicitly select a
+        # writable global root while the persisted current project is a
+        # read-only checkout. Retry only against that explicit root and keep
+        # the same safe_join boundary.
+        global_root = _RUNTIME.get("code_root") or CODE_ROOT
+        if not global_root or os.path.normcase(os.path.abspath(global_root)) == os.path.normcase(os.path.abspath(root)):
+            return JSONResponse({"ok": False, "error": "项目目录不可写。"}, status_code=403)
+        try:
+            full = asset_sources.safe_join(global_root, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as handle:
+                handle.write(data)
+            return {"ok": True, "path": rel, "name": name}
+        except (asset_sources.AssetError, OSError) as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     except asset_sources.AssetError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
@@ -1894,10 +1616,10 @@ async def chat(
     web_enabled_override = web_mode.strip().lower() in ("1", "true", "yes", "on")
     thinking_enabled_override = (thinking_mode.strip().lower() in ("1", "true", "yes", "on")
                                  if thinking_mode.strip() else None)
-    if hints:
-        grounded = "【系统提示】" + " ".join(hints) + f"\n\n用户问题：{question}"
-    else:
-        grounded = question
+    # Routing metadata belongs in a real system message.  Prefixing it onto
+    # the user question made small models echo the internal prompt verbatim
+    # (and polluted the conversation history with implementation details).
+    request_context = tuple(hints)
 
     def event_stream():
         # 注意：此处不得再申请 GPU 租约。llm.py 的 _ollama_chat 已以 owner="ollama"
@@ -1905,12 +1627,15 @@ async def chat(
         gen = None
         try:
             yield f"data: {json.dumps({'type':'route','route':routing['route'],'complexity':routing['complexity'],'reason':routing['reason']}, ensure_ascii=False)}\n\n"
-            cloud_grounded = redact_for_cloud(grounded) if is_cloud else grounded
+            cloud_question = redact_for_cloud(question) if is_cloud else question
+            cloud_context = tuple(redact_for_cloud(item) for item in request_context) if is_cloud else request_context
             # 逐请求覆盖（含云端 llm）全部随 run(...) 传入：run 在 finally 里还原，
             # 不污染共享单例；本地路由时 llm=None（用回会话自身的本地 client）。
             gen = selected_agent.run(
-                cloud_grounded, stream=True, images=b64_images or None,
+                cloud_question, stream=True, images=b64_images or None,
                 llm=cloud_llm,
+                system_context=cloud_context,
+                ingested_sources=tuple(sorted(_INGESTED)),
                 web_enabled=web_enabled_override,
                 thinking_enabled=thinking_enabled_override,
                 tool_mode=tool_mode_override,
@@ -1971,7 +1696,14 @@ async def context_usage_ep(session_id: str = ""):
     （ollama/llamacpp 会触发一次 tokenize，故仅在必要时调用）。
     """
     # P3：按「请求上下文里的项目」定位会话 Agent 的注册键（无上下文 → 纯 session_id）。
-    ag = _SESSION_AGENTS.get(_agent_key(session_id))
+    key = _agent_key(session_id)
+    ag = _SESSION_AGENTS.get(key)
+    # Keep compatibility with agents created before project-scoped keys were
+    # introduced. This fallback is only used when the scoped lookup misses;
+    # newly created agents always use the project-qualified key above.
+    if ag is None:
+        raw_sid = (str(session_id or "").strip() or "default")
+        ag = _SESSION_AGENTS.get(raw_sid)
     if ag is None:
         return {"ok": True, "active": False}
     try:
@@ -2005,85 +1737,8 @@ async def session_delete_ep(session_id: str):
     return {"ok": session_store.delete(session_id, project_id=_request_project_id() or None)}
 
 
-# ---------------------------------------------------------------- 项目 CRUD（P3）
-class ProjectCreateReq(BaseModel):
-    root: str = ""
-    name: str = ""
-
-
-class ProjectRenameReq(BaseModel):
-    name: str = ""
-
-
 async def _activate_project(pid):
-    """激活项目：同步全局 code_root 与 project_rules，并停掉其它项目的引擎。
-
-    返回同步信息 dict（含 code_root 与中文 notice）。停引擎失败只记 warning、不中断。
-    """
-    rec = projects.get_project(pid) or {}
-    root = rec.get("root") or ""
-    stopped, warnings = [], []
-    if root and os.path.isdir(root):
-        set_runtime("code_root", root)
-        try:
-            set_runtime("project_rules", load_project_rules(root))
-        except Exception:  # noqa: BLE001
-            pass
-        stopped, warnings = await _stop_other_engines(root)
-    parts = []
-    if stopped:
-        parts.append("已自动停止其它项目的引擎：" + "、".join(stopped))
-    parts.extend(warnings)
-    return {"code_root": root, "notice": "；".join(parts)}
-
-
-@app.get("/api/projects")
-async def projects_list_ep():
-    """项目列表与当前项目（每项含 pid/root/name/last_opened）。"""
-    return {"ok": True, "current": projects.current_project_id(), "projects": projects.list_projects()}
-
-
-@app.post("/api/projects")
-async def projects_create_ep(req: ProjectCreateReq):
-    """登记一个代码库为项目并激活它（root 必须是已存在目录）。"""
-    root = (req.root or "").strip()
-    if not root or not os.path.isdir(root):
-        return JSONResponse({"ok": False, "error": f"目录不存在：{root}"}, status_code=400)
-    pid = projects.ensure_project(root, req.name or None)
-    projects.set_current(pid)
-    info = await _activate_project(pid)
-    return {"ok": True, "project_id": pid, "project": projects.get_project(pid), **info}
-
-
-@app.post("/api/projects/{pid}/activate")
-async def projects_activate_ep(pid: str):
-    """把某个已登记项目切为当前项目，并同步 code_root / project_rules / 引擎单实例。"""
-    if not projects.get_project(pid):
-        return JSONResponse({"ok": False, "error": f"项目不存在：{pid}"}, status_code=404)
-    projects.set_current(pid)
-    info = await _activate_project(pid)
-    return {"ok": True, "project_id": pid, **info}
-
-
-@app.patch("/api/projects/{pid}")
-async def projects_rename_ep(pid: str, req: ProjectRenameReq):
-    """重命名项目（仅登记信息，不动磁盘）。"""
-    rec = projects.get_project(pid)
-    if not rec:
-        return JSONResponse({"ok": False, "error": f"项目不存在：{pid}"}, status_code=404)
-    name = (req.name or "").strip()
-    if not name:
-        return JSONResponse({"ok": False, "error": "项目名称不能为空。"}, status_code=400)
-    projects.ensure_project(rec["root"], name)
-    return {"ok": True, "project_id": pid, "project": projects.get_project(pid)}
-
-
-@app.delete("/api/projects/{pid}")
-async def projects_delete_ep(pid: str):
-    """注销项目登记（**只注销，绝不删磁盘上的索引/会话**）。"""
-    if not projects.remove_project(pid):
-        return JSONResponse({"ok": False, "error": f"项目不存在：{pid}"}, status_code=404)
-    return {"ok": True, "project_id": pid, "current": projects.current_project_id()}
+    return await activate_project(sys.modules[__name__], pid)
 
 
 @app.get("/api/budget")
@@ -2098,6 +1753,14 @@ class BudgetReq(BaseModel):
     reset: bool = False
     per_minute_calls: Optional[float] = None
     per_minute_cost: Optional[float] = None
+
+
+class HookBreakpointReq(BaseModel):
+    kind: str
+    enabled: bool = True
+    block: bool = True
+    match: str = ""
+    reason: str = ""
 
 
 @app.post("/api/budget")
@@ -2127,6 +1790,25 @@ async def hooks_reload_ep():
     return {"ok": True, **agent_hooks.reload()}
 
 
+@app.put("/api/hooks/breakpoints")
+async def hooks_breakpoint_set_ep(req: HookBreakpointReq):
+    """Configure a safe declarative breakpoint; no Python is accepted here."""
+    try:
+        return {"ok": True, "breakpoint": agent_hooks.set_breakpoint(
+            req.kind, enabled=req.enabled, block=req.block,
+            match=req.match, reason=req.reason)}
+    except (OSError, TypeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.delete("/api/hooks/breakpoints/{kind}")
+async def hooks_breakpoint_remove_ep(kind: str):
+    try:
+        return {"ok": True, "breakpoint": agent_hooks.remove_breakpoint(kind)}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 @app.get("/api/skills")
 async def skills_list_ep():
     return {"ok": True, **agent_skills.list_skills()}
@@ -2136,6 +1818,62 @@ async def skills_list_ep():
 async def skills_reload_ep():
     """热重载技能目录（新增/修改 SKILL.md 无需重启服务）。"""
     return {"ok": True, **agent_skills.reload()}
+
+
+@app.get("/api/skills/stats")
+async def skills_stats_ep(name: str = ""):
+    return {"ok": True, "name": name, "stats": agent_skills.skill_statistics(name)}
+
+
+@app.get("/api/skills/regression")
+async def skills_regression_ep(name: str = "", baseline: float | None = None,
+                               minimum: float = 0.0):
+    if not name:
+        return {"ok": False, "error": "缺少技能名称"}
+    try:
+        report = agent_skills.skill_regression(
+            name, baseline_success_rate=baseline, min_success_rate=minimum)
+        return {"ok": True, "report": report}
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/skills/rollback")
+async def skills_rollback_ep(payload: dict):
+    root = _project_root_or_error()
+    if not root:
+        return {"ok": False, "error": "未配置代码库"}
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "缺少技能名称"}
+    gate = require_approval(root, "rollback_skill", name)
+    if gate:
+        return {"ok": False, **gate}
+    try:
+        return {"ok": True, **agent_skills.rollback_user_skill(name)}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/skills/update")
+async def skills_update_ep(payload: dict):
+    """Update a user Skill only after the normal project approval gate."""
+    root = _project_root_or_error()
+    if not root:
+        return {"ok": False, "error": "未配置代码库"}
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "缺少技能名称"}
+    gate = require_approval(root, "update_skill", name)
+    if gate:
+        return {"ok": False, **gate}
+    try:
+        result = agent_skills.update_user_skill(
+            name, str(payload.get("description") or ""),
+            str(payload.get("body") or ""), str(payload.get("version") or "1.0.0"))
+        return {"ok": True, **result}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 class OrchestrateReq(BaseModel):
@@ -3601,6 +3339,25 @@ app.include_router(workbench_fs.router)
 
 # 阶段 3b 工具流编排器：/api/flows（列表/保存/删除）+ /api/flows/run-step（单步受控执行）
 app.include_router(flows.router)
+
+# 领域路由使用当前模块作为依赖容器，测试和桌面运行期仍可替换同名服务函数。
+from api_routes.gpu import build_router as build_gpu_router
+from api_routes.projects import build_router as build_projects_router
+from api_routes.agent import build_router as build_agent_router
+from api_routes.engine import build_router as build_engine_router
+from api_routes.resources import build_router as build_resources_router
+# FastAPI 0.141 keeps included routers as lazy wrapper routes.  The project has
+# route-integrity checks and diagnostics that enumerate concrete APIRoute
+# objects, so domain routers are flattened deliberately at this composition
+# boundary while their definitions remain split by domain.
+for _domain_router in (
+    build_gpu_router(sys.modules[__name__]),
+    build_projects_router(sys.modules[__name__]),
+    build_agent_router(sys.modules[__name__]),
+    build_engine_router(sys.modules[__name__]),
+    build_resources_router(sys.modules[__name__]),
+):
+    app.router.routes.extend(_domain_router.routes)
 
 app.mount("/static", StaticFiles(directory=PROJECT_WEB_DIR), name="static")
 

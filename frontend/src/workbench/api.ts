@@ -2013,6 +2013,11 @@ export interface SkillInfo {
   description: string
   when_to_use: string
   path: string
+  source?: string
+  version?: string
+  checksum?: string
+  history_versions?: Array<{ version?: string; checksum?: string }>
+  stats?: { uses?: number; successes?: number; failures?: number; last_score?: number }
 }
 
 export const harnessApi = {
@@ -2065,11 +2070,20 @@ export const harnessApi = {
   reloadSkills(): Promise<{ ok: boolean; count?: number; errors?: string[] }> {
     return postJson('/api/skills/reload', {})
   },
-  hooks(): Promise<{ ok: boolean; hooks_dir: string; exists: boolean; counts: Record<string, number>; sources: Record<string, unknown>; errors: string[] }> {
+  rollbackSkill(name: string): Promise<{ ok: boolean; rolled_back?: boolean; restored_previous?: boolean; approval_required?: boolean; error?: string }> {
+    return postJson('/api/skills/rollback', { name })
+  },
+  hooks(): Promise<{ ok: boolean; hooks_dir: string; exists: boolean; counts: Record<string, number>; workflow_counts?: Record<string, number>; workflow_kinds?: string[]; breakpoints?: Record<string, { enabled?: boolean; block?: boolean; match?: string; reason?: string }>; sources: Record<string, unknown>; errors: string[] }> {
     return request('/api/hooks')
   },
   reloadHooks(): Promise<{ ok: boolean; errors?: string[] }> {
     return postJson('/api/hooks/reload', {})
+  },
+  setHookBreakpoint(payload: { kind: string; enabled?: boolean; block?: boolean; match?: string; reason?: string }): Promise<{ ok: boolean; breakpoint?: Record<string, unknown>; error?: string }> {
+    return request('/api/hooks/breakpoints', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+  },
+  removeHookBreakpoint(kind: string): Promise<{ ok: boolean; breakpoint?: Record<string, unknown>; error?: string }> {
+    return request(`/api/hooks/breakpoints/${encodeURIComponent(kind)}`, { method: 'DELETE' })
   },
 }
 
@@ -2084,6 +2098,117 @@ export interface AgentApproval { id: string; status: string; summary?: string; d
 export interface AgentApprovalsResp { ok?: boolean; approvals?: AgentApproval[] }
 export interface AgentPermissionResp { ok?: boolean; recorded?: boolean; reason?: string }
 export interface AgentApprovalCreateResp { ok?: boolean; approval?: AgentApproval; error?: string }
+
+export interface WorkflowOption {
+  id: string; title: string; summary: string; recommended?: boolean
+  source?: string; requires_web?: boolean
+}
+export interface WorkflowEvent { ts?: string; kind?: string; [key: string]: unknown }
+export interface WorkflowTraceStep {
+  action?: string; obs?: string; ok?: boolean; tool?: string; error?: string
+  [key: string]: unknown
+}
+export interface WorkflowBackendStatus {
+  ok?: boolean
+  backend?: string
+  langgraph_installed?: boolean
+  checkpoint_backend?: string
+  checkpoint_error?: string
+  persistent_checkpoint?: boolean
+  distributed_leases?: boolean
+  checkpoint_health?: {
+    backend?: string
+    configured?: boolean
+    required?: boolean
+    healthy?: boolean
+    state?: string
+    schema_version?: number | null
+    error?: string
+  }
+}
+export interface LangSmithStatus {
+  ok?: boolean
+  installed?: boolean
+  key_configured?: boolean
+  enabled?: boolean
+  realtime?: boolean
+  project?: string
+  endpoint?: string
+  pending_exports?: number
+  recent_export_errors?: Array<{ name?: string; error?: string }>
+}
+export interface WorkflowEvaluation {
+  workflow_id?: string
+  passed?: boolean
+  score?: number
+  checks?: Array<{ name?: string; ok?: boolean; detail?: string }>
+  task_count?: number
+  steps?: number
+  replans?: number
+  metrics?: Record<string, number | boolean>
+}
+export interface WorkflowState {
+  workflow_id: string; status: string; phase: string; request?: string
+  options?: WorkflowOption[]; selected_option?: WorkflowOption | null
+  tasks?: Array<Record<string, unknown>>; pending_tasks?: Array<Record<string, unknown>>
+  subagents?: Array<{
+    id?: string; role?: string; status?: string; persona?: string
+    tools?: string[]; mcp?: string; reflection?: boolean
+    task_thread?: string
+    reflection_result?: { ok?: boolean; source?: string; issues?: string[]; next_step?: string }
+    steps?: number; elapsed_ms?: number; error?: string
+    retry_count?: number
+  }>
+  results?: Record<string, Record<string, unknown>>; events?: WorkflowEvent[]
+  dispatches?: Array<{ planner?: string; added?: string[]; kind?: string }>
+  review?: Record<string, unknown>; interrupt_reason?: string
+  steps?: number; replans?: number; subagent_retries?: Record<string, number>; context_layers?: Record<string, unknown>
+  langsmith_trace?: Record<string, unknown>
+  observability?: {
+    duration_ms?: number; elapsed_ms?: number; events?: number
+    prompt_tokens?: number; completion_tokens?: number; total_tokens?: number
+    tool_events?: number; mcp_events?: number; failures?: number
+    subagents_started?: number; subagents_completed?: number
+  }
+}
+export interface WorkflowResp { ok?: boolean; workflow?: WorkflowState; error?: string }
+export interface RetrievalEvalCase {
+  id?: string; query: string; relevant_ids?: string[]
+  relevant_sources?: string[]; relevant_terms?: string[]
+}
+export interface RetrievalEvalReport {
+  metrics?: Record<string, number>
+  ks?: number[]
+  items?: Array<Record<string, unknown>>
+}
+export interface RetrievalEvalResp {
+  ok?: boolean; collection?: string; modes?: Record<string, RetrievalEvalReport>
+  metric?: string
+  comparison?: { metric?: string; best?: string; ranking?: Array<{ mode?: string; value?: number }> }
+  error?: string
+}
+export interface RetrievalRuntimeStatus {
+  ok?: boolean
+  retrieval?: {
+    backend?: string; collection?: string; top_k?: number
+    bm25?: boolean; reranker?: string; reranker_model?: string
+    lexical_persistence?: boolean; lexical_index?: Record<string, unknown>
+    recent_events?: RetrievalTraceEvent[]
+  }
+}
+export interface RetrievalTraceDocument {
+  id?: string; source?: string; snippet?: string
+  start_line?: number | string; end_line?: number | string
+  dense_rank?: number | null; bm25_score?: number; hybrid_score?: number
+  rerank_score?: number; distance?: number
+}
+export interface RetrievalTraceEvent {
+  ts?: number; query?: string; collection?: string; mode?: string
+  duration_ms?: number; candidates?: number; returned?: number
+  reranker?: string; lexical_index?: string
+  documents?: RetrievalTraceDocument[]
+  [key: string]: unknown
+}
 
 export const agentApi = {
   /** Agent 路由策略（本地/云端、自动转云开关）。 */
@@ -2109,6 +2234,68 @@ export const agentApi = {
   /** 审批决定：approved / rejected。 */
   decide(id: string, status: string): Promise<{ ok?: boolean }> {
     return rawJson<{ ok?: boolean }>('/api/agent/approvals/decide', { id, status })
+  },
+  workflowBackend(): Promise<WorkflowBackendStatus> {
+    return rawJson('/api/agent/workflow/backend')
+  },
+  retrievalEvaluate(payload: {
+    cases: RetrievalEvalCase[]; collection?: string; top_k?: number
+    modes?: string[]; metric?: string; ks?: number[]
+  }): Promise<RetrievalEvalResp> {
+    return rawJson('/api/agent/retrieval/evaluate', payload)
+  },
+  retrievalStatus(collection?: string, top_k = 5): Promise<RetrievalRuntimeStatus> {
+    const query = new URLSearchParams({ top_k: String(top_k) })
+    if (collection) query.set('collection', collection)
+    return rawJson(`/api/agent/retrieval/status?${query.toString()}`)
+  },
+  langsmith(): Promise<LangSmithStatus> {
+    return rawJson('/api/agent/langsmith')
+  },
+  workflowEvaluation(id: string): Promise<{ ok?: boolean; evaluation?: WorkflowEvaluation; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/evaluation`)
+  },
+  workflowStart(prompt: string, options: { use_llm?: boolean; web_enabled?: boolean } = {}): Promise<WorkflowResp> {
+    return rawJson('/api/agent/workflow/start', { prompt, ...options })
+  },
+  workflow(id: string): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}`)
+  },
+  workflowChoice(id: string, choice: string, custom_request = ''): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/choice`, { choice, custom_request })
+  },
+  workflowResearch(id: string, findings: string, source = 'web'): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/research`, { findings, source })
+  },
+  workflowResearchRun(id: string, query = ''): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/research/run`, { query })
+  },
+  workflowPlan(id: string, tasks?: Array<Record<string, unknown>>): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/plan`, { tasks })
+  },
+  workflowApprove(id: string, approved: boolean): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/approve`, { approved })
+  },
+  workflowCheckpoint(id: string, approved?: boolean): Promise<{ ok?: boolean; checkpoint?: Record<string, unknown>; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/checkpoint`, { approved })
+  },
+  workflowInterrupt(id: string, reason = '用户请求中断'): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/interrupt`, { reason })
+  },
+  workflowResume(id: string): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/resume`, {})
+  },
+  workflowRevise(id: string, tasks: Array<Record<string, unknown>>): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/revise`, { tasks })
+  },
+  workflowReviseApprove(id: string, approved: boolean): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/revise/approve`, { approved })
+  },
+  workflowExecute(id: string, session_id = 'workflow'): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/execute`, { session_id })
+  },
+  workflowSubagentRetry(id: string, taskId: string, session_id = 'workflow'): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/subagents/${encodeURIComponent(taskId)}/retry`, { session_id })
   },
 }
 

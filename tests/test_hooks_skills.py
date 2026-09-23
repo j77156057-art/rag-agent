@@ -3,6 +3,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import agent as agent_mod
 import agent_trace
@@ -53,6 +54,20 @@ class _HookBase(unittest.TestCase):
 
 
 class HookRegistryTests(_HookBase):
+    def test_fine_grained_workflow_hooks_cover_tools_mcp_and_subagents(self):
+        self._write("lifecycle.py", (
+            "def before_tool(payload):\n"
+            "    return {'block': payload.get('tool') == 'blocked', 'reason': 'manual'}\n"
+            "def before_mcp(payload):\n"
+            "    return {'block': True, 'reason': 'mcp review'}\n"
+            "def after_subagent(payload):\n"
+            "    return None\n"
+        ))
+        hooks.reload()
+        self.assertTrue(hooks.list_hooks()["workflow_counts"]["before_mcp"])
+        self.assertTrue(hooks.run_workflow("before_tool", {"tool": "blocked"})["blocked"])
+        self.assertTrue(hooks.run_workflow("before_mcp", {})["blocked"])
+
     def test_all_kinds_registered_and_run(self):
         self._write("h.py", (
             "def pre_tool(name, arg):\n"
@@ -101,6 +116,51 @@ class HookRegistryTests(_HookBase):
         hooks.HOOKS_DIR = os.path.join(self.tmp, "nope")
         self.assertEqual(hooks.reload()["loaded"], 0)
         self.assertFalse(hooks.has_any())
+
+    def test_declarative_breakpoint_persists_and_matches_payload(self):
+        hooks.reload()
+        saved = hooks.set_breakpoint("before_mcp", match="godot", reason="引擎调用审核")
+        self.assertTrue(saved["block"])
+        hooks.reload()
+        self.assertTrue(hooks.list_hooks()["breakpoints"]["before_mcp"]["enabled"])
+        self.assertFalse(hooks.run_workflow("before_mcp", {"connector": "web"})["blocked"])
+        blocked = hooks.run_workflow("before_mcp", {"connector": "godot"})
+        self.assertTrue(blocked["blocked"])
+        self.assertIn("引擎调用审核", blocked["reason"])
+        self.assertTrue(hooks.remove_breakpoint("before_mcp")["removed"])
+
+    def test_workflow_event_scope_captures_only_while_active(self):
+        hooks.reload()
+        events = []
+        sink = lambda kind, payload, result: events.append((kind, payload, result))
+        with hooks.workflow_event_scope(sink):
+            result = hooks.run_workflow("before_tool", {"tool": "calculate"})
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "before_tool")
+        self.assertEqual(events[0][1]["tool"], "calculate")
+        self.assertFalse(events[0][2]["blocked"])
+        hooks.run_workflow("after_tool", {"tool": "calculate"})
+        self.assertEqual(len(events), 1)
+
+    def test_workflow_event_observation_failure_does_not_break_workflow(self):
+        self._write("broken.py", (
+            "def before_tool(payload):\n"
+            "    raise RuntimeError('observe failed')\n"
+        ))
+        hooks.reload()
+        events = []
+        with hooks.workflow_event_scope(
+                lambda kind, payload, result: (_ for _ in ()).throw(RuntimeError("sink failed"))):
+            result = hooks.run_workflow("before_tool", {"tool": "calculate"})
+        self.assertFalse(result["blocked"])
+        self.assertEqual(len(result["errors"]), 1)
+
+        captured = []
+        with hooks.workflow_event_scope(lambda kind, payload, result: captured.append(result)):
+            result = hooks.run_workflow("before_tool", {"tool": "calculate"})
+        self.assertFalse(result["blocked"])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["errors"][0]["hook"], "before_tool")
 
 
 class SkillRegistryTests(unittest.TestCase):
@@ -171,6 +231,49 @@ class SkillRegistryTests(unittest.TestCase):
         self.assertIn("CUSTOM", skills.use_skill("documents"))
         self.assertEqual(skills.list_skills()["items"][0]["source"], "user")
 
+    def test_skill_version_conflict_stats_and_rollback(self):
+        os.makedirs(skills.BUILTIN_SKILLS_DIR)
+        with open(os.path.join(skills.BUILTIN_SKILLS_DIR, "s.md"), "w", encoding="utf-8") as f:
+            f.write("---\nname: S\nversion: 1.0.0\n---\nBUILTIN")
+        with open(os.path.join(skills.SKILLS_DIR, "s.md"), "w", encoding="utf-8") as f:
+            f.write("---\nname: S\nversion: 2.0.0\n---\nUSER")
+        skills.reload()
+        self.assertTrue(skills.list_skills()["conflicts"])
+        skills.use_skill("S")
+        skills.record_result("S", True, score=1.0)
+        stats = skills.skill_statistics("S")
+        self.assertEqual(stats["uses"], 1)
+        self.assertEqual(stats["successes"], 1)
+        self.assertFalse(skills.skill_regression("S", baseline_success_rate=0.9)["regressed"])
+        skills.record_result("S", False, score=0.0)
+        regression = skills.skill_regression("S", baseline_success_rate=0.9)
+        self.assertTrue(regression["scored"])
+        self.assertTrue(regression["regressed"])
+        saved = skills.save_user_skill("new-skill", "desc", "body", version="3.0.0")
+        self.assertEqual(saved["version"], "3.0.0")
+        self.assertTrue(skills.rollback_user_skill("new-skill")["rolled_back"])
+
+    def test_skill_update_preserves_history_and_rollback_restores_previous(self):
+        skills.save_user_skill("versioned", "desc", "旧正文", version="1.0.0")
+        updated = skills.update_user_skill("versioned", "desc2", "新正文", version="2.0.0")
+        self.assertTrue(updated["history_saved"])
+        listed = next(item for item in skills.list_skills()["items"] if item["name"] == "versioned")
+        self.assertEqual(listed["version"], "2.0.0")
+        self.assertEqual(listed["history_versions"][0]["version"], "1.0.0")
+        self.assertIn("新正文", skills.use_skill("versioned"))
+        rolled = skills.rollback_user_skill("versioned")
+        self.assertTrue(rolled["restored_previous"])
+        self.assertIn("旧正文", skills.use_skill("versioned"))
+        self.assertEqual(skills.list_skills()["count"], 1)
+
+    def test_skill_update_failure_restores_previous_file(self):
+        skills.save_user_skill("recoverable", "desc", "旧正文", version="1.0.0")
+        with patch.object(skills, "save_user_skill", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                skills.update_user_skill("recoverable", "desc", "新正文", version="2.0.0")
+        skills.reload()
+        self.assertIn("旧正文", skills.use_skill("recoverable"))
+
 
 class AgentIntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -235,6 +338,33 @@ class AgentIntegrationTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "final")
         self.assertIn("维护中", events[-1]["text"])
         self.assertEqual(agent_trace.recent(1)[0]["outcome"], "hook_blocked")
+
+    def test_network_timeout_hook_blocks_sequential_tool(self):
+        with open(os.path.join(hooks.HOOKS_DIR, "timeout.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "def network_timeout(payload):\n"
+                "    if payload.get('error_kind') == 'timeout':\n"
+                "        return {'block': True, 'reason': '网络超时需人工审核'}\n"
+            )
+        hooks.reload()
+
+        def timeout_probe(_arg):
+            raise TimeoutError("upstream timed out")
+
+        llm = _SeqLLM([
+            "Action: web_timeout_probe\nAction Input: ping",
+            "Final Answer: 已记录",
+        ])
+        agent = agent_mod.Agent(
+            llm=llm,
+            tool_registry={"web_timeout_probe": {
+                "description": "test network probe", "func": timeout_probe,
+            }},
+        )
+        events = list(agent.run("检查网络", stream=True, web_enabled=True))
+        observations = " ".join(e.get("text", "") for e in events if e["type"] == "observation")
+        self.assertIn("网络超时需人工审核", observations)
+        self.assertTrue(any(e["type"] == "reflection" for e in events))
 
 
 if __name__ == "__main__":

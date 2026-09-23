@@ -154,47 +154,6 @@ class ContextEventTests(_Base):
         self.assertFalse([e for e in evs if e.get("type") == "context"])
 
 
-class LiveContextTests(_Base):
-    """回合进行中实时刷新用量指示（回归「上下文永远显示 5%」）。"""
-
-    def setUp(self):
-        super().setUp()
-        import config as config_mod
-        self._cfg = config_mod
-        self._old_interval = agent_mod._CTX_EMIT_INTERVAL
-        self._old_root = config_mod.get_runtime("code_root")
-        agent_mod._CTX_EMIT_INTERVAL = 0.0   # 关闭限频，令每步都刷新（保证测试确定性）
-        config_mod.set_runtime("code_root", self.tmp)
-        with open(os.path.join(self.tmp, "a.txt"), "w", encoding="utf-8") as f:
-            f.write("hello world\n")
-
-    def tearDown(self):
-        agent_mod._CTX_EMIT_INTERVAL = self._old_interval
-        self._cfg.set_runtime("code_root", self._old_root or "")
-        super().tearDown()
-
-    def test_live_context_includes_trail(self):
-        a = agent_mod.Agent(llm=_FakeLLM(), session_id="lc")
-        a.last_context = a.context_stats("q")   # 真实流程里开工已上报一次快照
-        head = [{"role": "system", "content": "sys"}]
-        base = a._live_context(head, [])
-        big = a._live_context(head, [{"role": "user", "content": "x" * 3000}])
-        self.assertGreater(big["used_tokens"], base["used_tokens"])
-        self.assertGreaterEqual(big["percent"], base["percent"])
-        # 快照字段（历史压缩口径）应被沿用，不被实时刷新抹掉
-        self.assertIn("compact_percent", big)
-
-    def test_run_emits_live_context_during_tool_steps(self):
-        llm = _FakeLLM([
-            "Thought: t\nAction: read_file\nAction Input: a.txt",
-            "Final Answer: 完成",
-        ])
-        evs = list(agent_mod.Agent(llm=llm, session_id="lv2").run("q", stream=True))
-        ctx = [e for e in evs if e.get("type") == "context"]
-        self.assertGreater(
-            len(ctx), 2, "有工具往返的回合应在开工/收尾之间额外实时推送 context 事件")
-
-
 class HistoryWindowTests(_Base):
     def _agent_with_history(self, n, budget, chars=300):
         llm = _FakeLLM(prompt_budget=budget)

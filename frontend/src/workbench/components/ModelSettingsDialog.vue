@@ -55,9 +55,23 @@ function fmtK(v: number): string {
 }
 
 const ctxWindowK = computed(() => {
-  const n = Number(ctxWindow.value)
-  return ctxWindow.value && n > 0 ? `≈ ${fmtK(n)}` : ''
+  const raw = String(ctxWindow.value ?? '').trim()
+  const n = Number(raw)
+  return raw && n > 0 ? `≈ ${fmtK(n)}` : ''
 })
+
+// API responses from older backends may contain a number/object here; keep all
+// validation paths stable even before the next dialog-open watcher runs.
+function normalizedContextWindow(): string {
+  const value = ctxWindow.value as unknown
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'object') {
+    const candidate = (value as { value?: unknown; tokens?: unknown }).value
+      ?? (value as { value?: unknown; tokens?: unknown }).tokens
+    return candidate === null || candidate === undefined ? '' : String(candidate).trim()
+  }
+  return String(value).trim()
+}
 
 // 弹窗每次打开时用服务端最新配置回填表单
 watch(
@@ -143,7 +157,7 @@ async function save() {
   warnings.value = []
   // 窗口范围前端先拦一道（与后端 1024~2097152 保持一致）
   let ctxVal = 0
-  const rawCtx = ctxWindow.value.trim()
+  const rawCtx = normalizedContextWindow()
   if (rawCtx) {
     ctxVal = Number(rawCtx)
     if (!Number.isInteger(ctxVal) || ctxVal < 1024 || ctxVal > 2_097_152) {

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -68,12 +69,31 @@ def parse_plan(raw, known_ids=None):
         desc = str(t.get("task") or t.get("desc") or "").strip()
         if not desc:
             raise PlanError(f"任务 {tid} 缺少 task 描述")
+        # Preserve the bounded subagent policy fields through the generic
+        # orchestrator.  Previously parse_plan normalized them away, so a
+        # dynamic planner's persona/tool/MCP/reflection decisions were lost
+        # before LangGraph dispatched the child.
+        tools = t.get("tools") or []
+        if isinstance(tools, str):
+            tools = [item.strip() for item in tools.split(",") if item.strip()]
+        elif isinstance(tools, (list, tuple, set)):
+            tools = [str(item).strip()[:80] for item in list(tools)[:16] if str(item).strip()]
+        else:
+            tools = []
+        mcp = str(t.get("mcp") or "auto").strip().lower()
+        if mcp not in {"auto", "allow", "deny"}:
+            mcp = "auto"
         out.append({
             "id": tid,
             "role": str(t.get("role") or "researcher").strip().lower(),
             "task": desc,
             "depends_on": _as_deps(t.get("depends_on", t.get("after"))),
             "optional": bool(t.get("optional")),
+            "parallel_safe": bool(t.get("parallel_safe", True)),
+            "persona": str(t.get("persona") or "").strip()[:500],
+            "tools": tools,
+            "mcp": mcp,
+            "reflection": bool(t.get("reflection", True)),
         })
 
     ids = {t["id"] for t in out} | {str(k) for k in (known_ids or ())}
@@ -150,6 +170,61 @@ def dedup_tasks(tasks):
     return kept, dropped, remap
 
 
+def extract_dispatch_tasks(conclusion, *, planner_id=""):
+    """从 planner/dispatcher 的结论中提取后续派发任务。
+
+    规划代理通常会返回一段说明或 fenced JSON；这里仅接受明确的
+    ``tasks``/``dispatch_tasks`` 数组，避免把普通文字误判成任务。调用方
+    还会把规划代理作为默认依赖，保证“先拆解、后执行”。
+    """
+    text = str(conclusion or "").strip()
+    if not text:
+        return []
+    candidates = []
+    for match in re.finditer(r"```(?:json)?\s*(.*?)\s*```", text, re.I | re.S):
+        candidates.append(match.group(1).strip())
+    candidates.append(text)
+    # 兼容模型在解释文字中夹带 JSON：从每个 { / [ 起点尝试解析。
+    for start, char in enumerate(text):
+        if char in "[{":
+            candidates.append(text[start:])
+    seen = set()
+    for raw in candidates:
+        if not raw or raw in seen:
+            continue
+        seen.add(raw)
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, dict):
+            value = (value.get("dispatch_tasks") or value.get("tasks") or
+                     value.get("assignments"))
+        if not isinstance(value, list):
+            continue
+        out = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            if not str(item.get("task") or item.get("desc") or "").strip():
+                continue
+            task = dict(item)
+            deps = task.get("depends_on", task.get("after"))
+            if isinstance(deps, str):
+                deps = [x.strip() for x in deps.replace("，", ",").split(",") if x.strip()]
+            elif isinstance(deps, (list, tuple)):
+                deps = [str(x).strip() for x in deps if str(x).strip()]
+            else:
+                deps = []
+            if planner_id and planner_id not in deps:
+                deps.insert(0, planner_id)
+            task["depends_on"] = deps
+            out.append(task)
+        if out:
+            return out
+    return []
+
+
 def _replanner_accepts_ctx(fn):
     """探测 replanner 是否接受第 4 个 ctx 参数（支持 4 位置参或 **kwargs）。"""
     try:
@@ -219,8 +294,14 @@ def apply_proposal(proposal, by_id, tasks, results, max_tasks):
             if not _unexecuted(tid):
                 delta["ignored"].append(f"replace:{tid}(已执行或不存在)")
                 continue
-            by_id[tid].update({"role": t["role"], "task": t["task"],
-                               "depends_on": t["depends_on"], "optional": t["optional"]})
+            by_id[tid].update({
+                "role": t["role"], "task": t["task"],
+                "depends_on": t["depends_on"], "optional": t["optional"],
+                "parallel_safe": t.get("parallel_safe", True),
+                "persona": t.get("persona", ""), "tools": list(t.get("tools") or []),
+                "mcp": t.get("mcp", "auto"),
+                "reflection": bool(t.get("reflection", True)),
+            })
             delta["replaced"].append(tid)
 
     # ② drop：取消未执行任务；其下游会在调度时被判为 blocked
@@ -270,7 +351,8 @@ def apply_proposal(proposal, by_id, tasks, results, max_tasks):
 
 def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
              replanner=None, max_replans=0, max_tasks=None,
-             budget_session="", vram_provider=None, cost_aware=False):
+             budget_session="", vram_provider=None, cost_aware=False,
+             max_steps=None):
     """迭代调度任务图（支持**动态重规划**）。
 
     runner(task, context) -> {"status": "ok"|"failed", "conclusion": str,
@@ -295,6 +377,9 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
     rounds = []                       # 每轮实际执行的 id 列表（≈ 拓扑波）
     replans = 0
     revisions = []                    # 每次重规划做了什么（审计）
+    dispatches = []                   # planner/dispatcher 动态派发审计
+    step_limit = max(0, int(max_steps or 0))
+    steps_used = 0
 
     def _emit(kind, payload):
         if on_event:
@@ -329,6 +414,15 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
             else:
                 runnable.append(t)
         if not runnable:
+            break
+
+        if step_limit and steps_used >= step_limit:
+            for _t in runnable:
+                results[_t["id"]] = {"status": "blocked", "conclusion": "", "steps": 0,
+                                     "error": "达到工作流步数上限", "elapsed_ms": 0}
+                blocked[_t["id"]] = "达到工作流步数上限"
+            _emit("step_limit", {"limit": step_limit, "used": steps_used,
+                                  "blocked": [_t["id"] for _t in runnable]})
             break
 
         # 成本/显存感知：预算已用尽则停止本轮调度（不空跑烧钱）
@@ -370,8 +464,33 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
             for f in futures:
                 tid, out = f.result()
                 results[tid] = out
+                steps_used += int(out.get("steps") or 0)
                 _emit("task", {"id": tid, "status": out.get("status")})
         rounds.append([t["id"] for t in runnable])
+
+        # A planner/dispatcher is allowed to return a structured task list.
+        # Materialize it only after that agent completed, so the main Agent
+        # remains the authority that validates and dispatches the next wave.
+        # This keeps simple plans simple while enabling file decomposition to
+        # create the exact number of execution agents actually needed.
+        for planner_task in runnable:
+            if planner_task.get("role") not in {"planner", "dispatcher"}:
+                continue
+            planner_result = results.get(planner_task["id"]) or {}
+            if planner_result.get("status") != "ok":
+                continue
+            proposed = extract_dispatch_tasks(
+                planner_result.get("conclusion"), planner_id=planner_task["id"])
+            if not proposed:
+                continue
+            delta = apply_proposal({"add": proposed}, by_id, tasks, results, limit_tasks)
+            if delta["added"]:
+                item = {"kind": "dispatch", "planner": planner_task["id"],
+                        "added": list(delta["added"]),
+                        "ignored": list(delta.get("ignored") or [])}
+                dispatches.append(item)
+                revisions.append({"attempt": len(revisions) + 1, **item})
+                _emit("dispatch", item)
 
         failed = [t for t in runnable if (results.get(t["id"]) or {}).get("status") == "failed"]
         if failed and replanner is not None and replans < int(max_replans):
@@ -411,7 +530,9 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
         "blocked": sorted(blocked),
         "merged": merged,
         "replans": replans,
+        "steps_used": steps_used,
         "revisions": revisions,
+        "dispatches": dispatches,
         "deduped": {"dropped": _dropped, "remap": _remap},
         "dropped": [tid for r in revisions for tid in r.get("dropped", [])],
         "n_tasks": len(tasks),

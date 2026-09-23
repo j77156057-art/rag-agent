@@ -1,7 +1,7 @@
 import { defineConfig, type Plugin } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { resolve } from 'node:path'
-import { existsSync, rmSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
 
 /**
  * 构建前清掉 web/assets。
@@ -21,6 +21,24 @@ function cleanAssets(): Plugin {
   }
 }
 
+// The production FastAPI server mounts the web directory at /static, while
+// Vite exposes files from frontend/public at the root. Keep the shared session
+// bootstrap URL identical in both environments so the Vue app can mount in
+// dev as well as in the packaged desktop build.
+function serveSessionScript(): Plugin {
+  return {
+    name: 'docmind-session-script',
+    configureServer(server) {
+      server.middlewares.use('/static/session.js', (_req, res) => {
+        const file = resolve(__dirname, 'public/session.js')
+        res.statusCode = 200
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8')
+        res.end(readFileSync(file))
+      })
+    },
+  }
+}
+
 // DocMind 工作台前端工程配置
 // - 多页应用（MPA）：当前只有 workbench 一个入口，后续页面在 build.rollupOptions.input 追加
 // - 产物直接写入后端静态目录 ../web（PyInstaller 的 ("web","web") 会原样带走）
@@ -29,6 +47,7 @@ export default defineConfig({
   plugins: [
     vue({ template: { compilerOptions: { isCustomElement: (tag: string) => tag === 'model-viewer' } } }),
     cleanAssets(),
+    serveSessionScript(),
   ],
   build: {
     outDir: resolve(__dirname, '../web'),

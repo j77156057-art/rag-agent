@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 import agent as agent_mod
 import agent_trace
@@ -126,6 +127,29 @@ class ParallelBatchTests(_Iso):
             self.assertFalse(results[1][3])
         finally:
             TOOLS.pop("_boom_probe", None)
+
+    def test_parallel_network_timeout_hook_can_block_follow_up(self):
+        def timeout_probe(_arg):
+            raise TimeoutError("upstream timed out")
+
+        events = []
+
+        def observe(kind, payload):
+            events.append((kind, dict(payload)))
+            return {"blocked": kind == "network_timeout",
+                    "reason": "超时后需要审核", "errors": []}
+
+        registry = {"web_timeout_probe": {
+            "description": "test network probe", "func": timeout_probe,
+        }}
+        a = agent_mod.Agent(llm=_CloningLLM(), tool_registry=registry)
+        with patch.object(agent_mod._hooks, "run_workflow", side_effect=observe):
+            results = a._run_batch([("web_timeout_probe", "ping")], None)
+        self.assertFalse(results[0][3])
+        self.assertIn("超时后需要审核", results[0][2])
+        self.assertIn("network_timeout", [kind for kind, _payload in events])
+        after = [payload for kind, payload in events if kind == "after_tool"]
+        self.assertEqual(after[0]["error_kind"], "timeout")
 
     def test_native_multi_readonly_calls_use_batch(self):
         llm = _CloningLLM([

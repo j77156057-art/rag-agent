@@ -1,0 +1,2757 @@
+"""Game-development Harness workflow with an optional LangGraph backend.
+
+This module owns orchestration *state*, not the domain tools themselves.  The
+existing ToolSpec/sandbox/approval layer remains the only place allowed to
+perform side effects.  When LangGraph is installed ``build_langgraph`` creates
+an equivalent StateGraph; otherwise callers use the deterministic methods on
+``GameWorkflowManager`` directly.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import sys
+import threading
+import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Annotated, Any, Callable, Iterable, Mapping, TypedDict
+
+from config import STATE_ROOT
+from .context_router import (CONTEXT_LAYERS, ContextPlan, ContextRouter,
+                             allocate_layer_budgets, compress_context,
+                             compress_context_async, compress_layers,
+                             close_persistent_compression_worker, compress_layers_durable,
+                             layer_snapshot_digest,
+                             summarize_subagent_result)
+
+try:  # optional dependency: the harness remains usable without LangGraph
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command, Send, interrupt as graph_interrupt
+    try:
+        from langgraph.checkpoint.memory import MemorySaver
+    except Exception:  # pragma: no cover
+        MemorySaver = None
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+    except Exception:  # pragma: no cover
+        SqliteSaver = None
+    # psycopg loads a native libpq extension.  Import it only when a Postgres
+    # checkpoint DSN is explicitly configured; importing it on every local
+    # run made Python 3.13 intermittently crash during test/module discovery.
+    _postgres_dsn_configured = bool(
+        (os.getenv("DOCMIND_CHECKPOINT_POSTGRES_DSN") or
+         os.getenv("LANGGRAPH_CHECKPOINT_POSTGRES_DSN") or "").strip())
+    if _postgres_dsn_configured:
+        try:
+            from langgraph.checkpoint.postgres import PostgresSaver
+        except Exception:  # pragma: no cover
+            PostgresSaver = None
+        try:
+            from psycopg_pool import ConnectionPool
+        except Exception:  # pragma: no cover
+            ConnectionPool = None
+    else:
+        PostgresSaver = None
+        ConnectionPool = None
+except Exception:  # pragma: no cover - exercised when optional package absent
+    END = START = StateGraph = None
+    MemorySaver = None
+    SqliteSaver = None
+    PostgresSaver = None
+    ConnectionPool = None
+    Command = None
+    graph_interrupt = None
+    Send = None
+
+
+class WorkflowError(ValueError):
+    pass
+
+
+CHECKPOINT_SCHEMA_VERSION = 1
+
+
+class WorkflowGraphState(TypedDict, total=False):
+    workflow_id: str
+    request: str
+    options: list[dict[str, Any]]
+    phase: str
+    status: str
+    selected_option: dict[str, Any]
+    approved: bool
+    approval_decision: bool
+    interrupt_reason: str
+    research_findings: str
+    research_source: str
+    plan_source: str
+    event: str
+    step_count: int
+    replan_count: int
+    max_steps: int
+    max_replans: int
+    max_context_chars: int
+    max_provider_retries: int
+    provider_attempts: list[dict[str, Any]]
+    research_attempts: list[dict[str, Any]]
+    failed_tasks: list[dict[str, Any]]
+    review: dict[str, Any]
+    tasks: list[dict[str, Any]]
+    results: dict[str, Any]
+    current_report: dict[str, Any]
+    execution_ok: bool
+    replan_error: str
+    replan_history: list[dict[str, Any]]
+    task_threads: list[str]
+    sources: list[str]
+    research_error: str
+    option_source: str
+    option_generation_pending: bool
+    max_subagents: int
+    langsmith_trace: dict[str, Any]
+
+
+def _merge_result_maps(left: dict[str, Any] | None,
+                       right: dict[str, Any] | None) -> dict[str, Any]:
+    merged = dict(left or {})
+    merged.update(right or {})
+    return merged
+
+
+class TaskFanoutState(TypedDict, total=False):
+    tasks: list[dict[str, Any]]
+    task: dict[str, Any]
+    prior_results: dict[str, Any]
+    trace_parent_id: str
+    task_thread: str
+    task_results: Annotated[dict[str, Any], _merge_result_maps]
+
+
+@dataclass(frozen=True)
+class WorkflowPolicy:
+    max_steps: int = 24
+    max_replans: int = 2
+    max_subagent_retries: int = 2
+    max_subagents: int = 4
+    max_context_chars: int = 6000
+    approval_mode: str = "safe"  # safe | high
+    max_tool_failures: int = 3
+    provider_retries: int = 2
+    hook_failure: str = "continue"  # continue | block
+
+    def normalized(self) -> "WorkflowPolicy":
+        mode = self.approval_mode if self.approval_mode in {"safe", "high"} else "safe"
+        hook_failure = self.hook_failure if self.hook_failure in {"continue", "block"} else "continue"
+        return WorkflowPolicy(
+            max_steps=max(1, min(200, int(self.max_steps))),
+            max_replans=max(0, min(10, int(self.max_replans))),
+            max_subagent_retries=max(0, min(5, int(self.max_subagent_retries))),
+            max_subagents=max(1, min(16, int(self.max_subagents))),
+            max_context_chars=max(800, min(50000, int(self.max_context_chars))),
+            approval_mode=mode,
+            max_tool_failures=max(1, min(20, int(self.max_tool_failures))),
+            provider_retries=max(0, min(5, int(self.provider_retries))),
+            hook_failure=hook_failure,
+        )
+
+
+@dataclass(frozen=True)
+class WorkflowOption:
+    id: str
+    title: str
+    summary: str
+    recommended: bool = False
+    source: str = "local"
+    requires_web: bool = False
+
+
+@dataclass
+class WorkflowState:
+    workflow_id: str
+    project_id: str = ""
+    project_root: str = ""
+    request: str = ""
+    status: str = "awaiting_choice"
+    phase: str = "clarify"
+    sources: list[str] = field(default_factory=list)
+    route_messages: list[str] = field(default_factory=list)
+    options: list[dict[str, Any]] = field(default_factory=list)
+    selected_option: dict[str, Any] | None = None
+    tasks: list[dict[str, Any]] = field(default_factory=list)
+    pending_tasks: list[dict[str, Any]] = field(default_factory=list)
+    subagents: list[dict[str, Any]] = field(default_factory=list)
+    results: dict[str, Any] = field(default_factory=dict)
+    review: dict[str, Any] = field(default_factory=dict)
+    events: list[dict[str, Any]] = field(default_factory=list)
+    interrupt_reason: str = ""
+    error: str = ""
+    replans: int = 0
+    subagent_retries: dict[str, int] = field(default_factory=dict)
+    steps: int = 0
+    policy: dict[str, Any] = field(default_factory=dict)
+    experience_enabled: bool = False
+    skill_candidate: dict[str, Any] = field(default_factory=dict)
+    llm_enabled: bool = True
+    execution_session_id: str = ""
+    context_layers: dict[str, Any] = field(default_factory=dict)
+    graph_state: dict[str, Any] = field(default_factory=dict)
+    # Optional LangSmith realtime root/child correlation.  Only IDs and
+    # counters are persisted; prompts, tool arguments and outputs stay local.
+    langsmith_trace: dict[str, Any] = field(default_factory=dict)
+    # Bounded, content-free counters for the live workbench.  Keep this as a
+    # first-class projection so clients do not need to rescan/trust event
+    # payloads from concurrent Subagent waves.
+    observability: dict[str, Any] = field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
+
+    def public(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+_SENSITIVE = re.compile(
+    r"(?i)(?:api[_-]?key|token|password|passwd|secret|private[_-]?key)\s*[:=]\s*\S+"
+)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _clean_text(value: Any, limit: int = 4000) -> str:
+    text = str(value or "").replace("\x00", "").strip()
+    return _SENSITIVE.sub(lambda m: m.group(0).split("=", 1)[0] + "=[REDACTED]", text)[:limit]
+
+
+def review_output(result: Mapping[str, Any] | None, *, max_tool_failures: int = 3,
+                  question: str = "", code_root: str = "",
+                  require_evidence: bool | None = None) -> dict[str, Any]:
+    """Programmatic safety/quality gate for a subagent or aggregate result."""
+    from .output_audit import audit_final_output
+    report = audit_final_output(result, max_tool_failures=max_tool_failures,
+                                question=question, code_root=code_root,
+                                require_evidence=require_evidence)
+    report["failures"] = report.get("tool_failure_count", 0)
+    return report
+
+
+class GameWorkflowManager:
+    """Persistent workflow state manager used by HTTP/UI and tests."""
+
+    def __init__(self, state_root: str | None = None, router: ContextRouter | None = None,
+                 checkpoint_dsn: str | None = None):
+        self.state_root = Path(state_root or STATE_ROOT) / ".docmind" / "workflows"
+        self.router = router or ContextRouter()
+        self._states: dict[str, WorkflowState] = {}
+        # Callbacks are process-local by design (they may close over an Agent
+        # client and must never be persisted into workflow JSON).  Keeping the
+        # start-time option generator here lets a direct manager caller get
+        # the same post-research LLM refinement as the HTTP adapter.
+        self._option_generators: dict[str, Callable[[str, ContextPlan], Any]] = {}
+        # Research and plan callbacks are process-local adapters around the
+        # existing audited providers/LLM client.  The graph invokes them from
+        # durable nodes; only the callback itself is ephemeral.
+        self._research_runners: dict[str, Callable[[str], Any]] = {}
+        self._task_generators: dict[str, Callable[[str, Mapping[str, Any], ContextPlan], Any]] = {}
+        self._execution_callbacks: dict[str, dict[str, Any]] = {}
+        self._execution_resolver: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None
+        self._lock = threading.RLock()
+        self._checkpoint_conn: sqlite3.Connection | None = None
+        self._checkpoint_pool: Any | None = None
+        self._lease_owner = "wf-worker-" + uuid.uuid4().hex[:16]
+        self._lease_ttl_s = max(30, min(3600, int(os.getenv("DOCMIND_WORKFLOW_LEASE_S", "120"))))
+        self._leases: dict[str, tuple[int, int]] = {}
+        self._checkpoint_error = ""
+        self._checkpoint_backend = "native"
+        self._checkpoint_schema_version: int | None = None
+        self._checkpoint_health_state = "not_configured"
+        configured_dsn = (checkpoint_dsn or os.getenv("DOCMIND_CHECKPOINT_POSTGRES_DSN") or
+                          os.getenv("LANGGRAPH_CHECKPOINT_POSTGRES_DSN") or "").strip()
+        self._checkpoint_dsn_configured = bool(configured_dsn)
+        self._checkpoint_required = os.getenv(
+            "DOCMIND_CHECKPOINT_POSTGRES_REQUIRED", "0").strip().lower() in {
+                "1", "true", "yes", "on"}
+        if configured_dsn and PostgresSaver is not None and ConnectionPool is not None:
+            try:
+                pool_size = max(1, min(32, int(os.getenv("DOCMIND_CHECKPOINT_POOL_SIZE", "4"))))
+                try:
+                    pool_timeout = max(0.1, min(120.0, float(
+                        os.getenv("DOCMIND_CHECKPOINT_POOL_TIMEOUT_S", "30"))))
+                except (TypeError, ValueError):
+                    pool_timeout = 30.0
+                self._checkpoint_pool = ConnectionPool(
+                    conninfo=configured_dsn, min_size=1, max_size=pool_size,
+                    kwargs={"autocommit": True}, timeout=pool_timeout, open=True,
+                )
+                self._graph_checkpointer = PostgresSaver(self._checkpoint_pool)
+                # setup() is idempotent and creates the saver tables on a new
+                # database.  Existing schemas are left intact for migrations.
+                self._graph_checkpointer.setup()
+                with self._checkpoint_pool.connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            CREATE TABLE IF NOT EXISTS docmind_checkpoint_schema (
+                                component TEXT PRIMARY KEY,
+                                version INTEGER NOT NULL,
+                                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                            )
+                        """)
+                        cur.execute("""
+                            SELECT version FROM docmind_checkpoint_schema
+                            WHERE component = 'workflow'
+                        """)
+                        schema_row = cur.fetchone()
+                        if schema_row and int(schema_row[0]) > CHECKPOINT_SCHEMA_VERSION:
+                            raise RuntimeError(
+                                "checkpoint_schema_newer:%s" % int(schema_row[0]))
+                        cur.execute("""
+                            INSERT INTO docmind_checkpoint_schema
+                                (component, version, updated_at)
+                            VALUES ('workflow', %s, CURRENT_TIMESTAMP)
+                            ON CONFLICT (component) DO UPDATE SET
+                                version = EXCLUDED.version,
+                                updated_at = CURRENT_TIMESTAMP
+                        """, (CHECKPOINT_SCHEMA_VERSION,))
+                        cur.execute("""
+                            CREATE TABLE IF NOT EXISTS docmind_workflow_leases (
+                                workflow_id TEXT PRIMARY KEY,
+                                owner_id TEXT NOT NULL,
+                                fencing_token BIGINT NOT NULL DEFAULT 0,
+                                expires_at TIMESTAMPTZ NOT NULL,
+                                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                            )
+                        """)
+                self._checkpoint_backend = "langgraph-postgres"
+                self._checkpoint_schema_version = CHECKPOINT_SCHEMA_VERSION
+                self._checkpoint_health_state = "ok"
+            except Exception as exc:
+                self._checkpoint_error = type(exc).__name__
+                self._checkpoint_health_state = "error"
+                pool, self._checkpoint_pool = self._checkpoint_pool, None
+                if pool is not None:
+                    try:
+                        pool.close()
+                    except Exception:
+                        pass
+                if self._checkpoint_required:
+                    raise RuntimeError(
+                        "postgres_checkpoint_required:%s" % self._checkpoint_error) from exc
+        elif configured_dsn:
+            self._checkpoint_error = "postgres_dependencies_unavailable"
+            self._checkpoint_health_state = "error"
+            if self._checkpoint_required:
+                raise RuntimeError(
+                    "postgres_checkpoint_required:%s" % self._checkpoint_error)
+        # The bundled Python 3.13 runtime has shown intermittent native
+        # access violations while closing LangGraph's sqlite connection.
+        # Workflow state is already persisted as bounded JSON, so keep the
+        # in-process checkpointer in memory by default.  Deployments that
+        # explicitly need LangGraph's sqlite saver can opt in, and a caller
+        # that supplied a checkpoint DSN keeps the existing diagnostic path.
+        sqlite_checkpoint_enabled = os.getenv(
+            "DOCMIND_LANGGRAPH_SQLITE_CHECKPOINT", "1").strip().lower() in {
+                "1", "true", "yes", "on"}
+        if (self._checkpoint_backend == "native" and SqliteSaver is not None and
+                (sqlite_checkpoint_enabled or bool(configured_dsn))):
+            try:
+                self.state_root.mkdir(parents=True, exist_ok=True)
+                self._checkpoint_conn = sqlite3.connect(
+                    str(self.state_root / "langgraph_checkpoints.sqlite"),
+                    timeout=30, check_same_thread=False,
+                )
+                self._checkpoint_conn.execute("PRAGMA journal_mode=WAL")
+                self._checkpoint_conn.execute("PRAGMA synchronous=NORMAL")
+                self._graph_checkpointer = SqliteSaver(self._checkpoint_conn)
+                self._checkpoint_backend = "langgraph-sqlite"
+            except Exception as exc:
+                self._checkpoint_error = self._checkpoint_error or type(exc).__name__
+                if self._checkpoint_conn is not None:
+                    self._checkpoint_conn.close()
+                    self._checkpoint_conn = None
+                self._graph_checkpointer = MemorySaver() if MemorySaver is not None else None
+                if self._graph_checkpointer is not None:
+                    self._checkpoint_backend = "langgraph-memory"
+        else:
+            if self._checkpoint_backend == "native":
+                self._graph_checkpointer = MemorySaver() if MemorySaver is not None else None
+                if self._graph_checkpointer is not None:
+                    self._checkpoint_backend = "langgraph-memory"
+
+    def close(self) -> None:
+        """Close the persistent checkpoint connection (useful for tests/servers)."""
+        conn, self._checkpoint_conn = self._checkpoint_conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        pool, self._checkpoint_pool = self._checkpoint_pool, None
+        if pool is not None:
+            try:
+                pool.close()
+            except Exception:
+                pass
+        try:
+            close_persistent_compression_worker(str(self.state_root.parent / "context_compression.sqlite3"))
+        except Exception:
+            pass
+
+    @property
+    def checkpoint_backend(self) -> str:
+        return self._checkpoint_backend
+
+    @property
+    def checkpoint_error(self) -> str:
+        return self._checkpoint_error
+
+    @property
+    def persistent_checkpoint(self) -> bool:
+        return self._checkpoint_backend in {"langgraph-sqlite", "langgraph-postgres"}
+
+    @property
+    def distributed_leases(self) -> bool:
+        return self._checkpoint_backend == "langgraph-postgres" and self._checkpoint_pool is not None
+
+    def checkpoint_health(self, *, probe: bool = True) -> dict[str, Any]:
+        """Return safe checkpoint diagnostics and optionally probe Postgres."""
+        if self._checkpoint_backend == "langgraph-postgres" and probe and self._checkpoint_pool is not None:
+            try:
+                with self._checkpoint_pool.connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                self._checkpoint_health_state = "ok"
+            except Exception as exc:
+                self._checkpoint_health_state = "error"
+                self._checkpoint_error = "health_probe_%s" % type(exc).__name__
+        return {
+            "backend": self._checkpoint_backend,
+            "configured": self._checkpoint_dsn_configured,
+            "required": self._checkpoint_required,
+            "healthy": self._checkpoint_health_state == "ok" or (
+                self._checkpoint_backend in {"langgraph-sqlite", "langgraph-memory", "native"}
+                and not self._checkpoint_error),
+            "state": self._checkpoint_health_state,
+            "schema_version": self._checkpoint_schema_version,
+            "error": self._checkpoint_error,
+        }
+
+    def _acquire_workflow_lease(self, workflow_id: str) -> int:
+        if not self.distributed_leases:
+            return 0
+        with self._lock:
+            active = self._leases.get(workflow_id)
+            if active is not None:
+                count, token = active
+                self._leases[workflow_id] = (count + 1, token)
+                return token
+        try:
+            with self._checkpoint_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO docmind_workflow_leases
+                            (workflow_id, owner_id, fencing_token, expires_at)
+                        VALUES (%s, %s, 1,
+                                CURRENT_TIMESTAMP + (%s * INTERVAL '1 second'))
+                        ON CONFLICT (workflow_id) DO UPDATE SET
+                            owner_id = EXCLUDED.owner_id,
+                            fencing_token = docmind_workflow_leases.fencing_token + 1,
+                            expires_at = EXCLUDED.expires_at,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE docmind_workflow_leases.expires_at < CURRENT_TIMESTAMP
+                           OR docmind_workflow_leases.owner_id = EXCLUDED.owner_id
+                        RETURNING fencing_token
+                    """, (workflow_id, self._lease_owner, self._lease_ttl_s))
+                    row = cur.fetchone()
+            if not row:
+                raise WorkflowError("workflow_lease_unavailable:%s" % workflow_id)
+            token = int(row[0])
+            with self._lock:
+                self._leases[workflow_id] = (1, token)
+            return token
+        except WorkflowError:
+            raise
+        except Exception as exc:
+            raise WorkflowError("workflow_lease_error:%s" % type(exc).__name__) from exc
+
+    def _release_workflow_lease(self, workflow_id: str) -> None:
+        if not self.distributed_leases:
+            return
+        with self._lock:
+            active = self._leases.get(workflow_id)
+            if active is None:
+                return
+            count, token = active
+            if count > 1:
+                self._leases[workflow_id] = (count - 1, token)
+                return
+            self._leases.pop(workflow_id, None)
+        try:
+            with self._checkpoint_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        DELETE FROM docmind_workflow_leases
+                        WHERE workflow_id = %s AND owner_id = %s AND fencing_token = %s
+                    """, (workflow_id, self._lease_owner, token))
+        except Exception:
+            # The lease will expire if release cannot reach Postgres.
+            pass
+
+    def _refresh_workflow_lease(self, workflow_id: str) -> int:
+        if not self.distributed_leases:
+            return 0
+        with self._lock:
+            active = self._leases.get(workflow_id)
+        if active is None:
+            return self._acquire_workflow_lease(workflow_id)
+        token = active[1]
+        try:
+            with self._checkpoint_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE docmind_workflow_leases
+                        SET expires_at = CURRENT_TIMESTAMP + (%s * INTERVAL '1 second'),
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE workflow_id = %s AND owner_id = %s AND fencing_token = %s
+                        RETURNING fencing_token
+                    """, (self._lease_ttl_s, workflow_id, self._lease_owner, token))
+                    row = cur.fetchone()
+            if not row:
+                raise WorkflowError("workflow_lease_lost:%s" % workflow_id)
+            return int(row[0])
+        except WorkflowError:
+            raise
+        except Exception as exc:
+            raise WorkflowError("workflow_lease_refresh_error:%s" % type(exc).__name__) from exc
+
+    @contextmanager
+    def _workflow_lease(self, workflow_id: str):
+        self._acquire_workflow_lease(workflow_id)
+        try:
+            yield
+        finally:
+            self._release_workflow_lease(workflow_id)
+
+    def set_execution_resolver(self, resolver: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None) -> None:
+        """Register a process-local callback factory used after restart.
+
+        The resolver receives only persisted public state and may return the
+        same runner/synth/replanner callback mapping accepted by ``execute``.
+        It is intentionally never serialized into workflow state.
+        """
+        self._execution_resolver = resolver
+
+    def recover_pending(self) -> list[dict[str, Any]]:
+        """Resume approved executions after a process restart.
+
+        Only workflows that already recorded an execution session and were
+        approved are eligible.  The resolver rebuilds process-local callbacks;
+        failures stay durable and can be retried by the next scheduler pass.
+        """
+        if self._execution_resolver is None:
+            return []
+        recovered: list[dict[str, Any]] = []
+        with self._lock:
+            paths = list(self.state_root.glob("*.json")) if self.state_root.is_dir() else []
+        for path in paths:
+            workflow_id = path.stem
+            try:
+                state = self._load(workflow_id)
+            except WorkflowError:
+                continue
+            policy = state.policy or {}
+            if state.status not in {"planned", "executing"} or not state.execution_session_id \
+                    or policy.get("approval_mode") != "high" or not state.tasks:
+                continue
+            try:
+                with self._workflow_lease(workflow_id):
+                    self._workflow_hook(state, "recovery", recovered=False,
+                                        session_id=state.execution_session_id)
+                    resolved = self._execution_resolver(state.public())
+                    if not isinstance(resolved, Mapping) or not callable(resolved.get("runner")):
+                        raise WorkflowError("execution_resolver_unavailable")
+                    if state.status == "executing":
+                        # The previous process may have died after a side effect;
+                        # the tool idempotency ledger makes retrying this wave safe.
+                        state.status, state.phase = "planned", "execute"
+                        self._event(state, "recovery_requeue", session_id=state.execution_session_id)
+                        self._save(state)
+                    self._execution_callbacks[workflow_id] = dict(resolved)
+                    result = self.execute(workflow_id, **dict(resolved),
+                                          session_id=state.execution_session_id)
+                    self._workflow_hook(state, "recovery", recovered=True,
+                                        session_id=state.execution_session_id)
+                    recovered.append({"workflow_id": workflow_id,
+                                      "status": result.get("status", "unknown")})
+            except Exception as exc:
+                error_name = type(exc).__name__
+                if not str(exc).startswith("workflow_lease_"):
+                    self._event(state, "recovery_failed", error=error_name)
+                    self._save(state)
+                    recovered.append({"workflow_id": workflow_id, "status": "retry_pending",
+                                      "error": error_name})
+                else:
+                    recovered.append({"workflow_id": workflow_id, "status": "lease_busy",
+                                      "error": error_name})
+        return recovered
+
+    def __del__(self):  # pragma: no cover - interpreter shutdown ordering
+        # Avoid touching optional/native resources while CPython is tearing
+        # down modules.  The explicit close() path remains authoritative.
+        if getattr(sys, "is_finalizing", lambda: False)():
+            return
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _path(self, workflow_id: str) -> Path:
+        return self.state_root / (re.sub(r"[^A-Za-z0-9_-]", "", workflow_id) + ".json")
+
+    def _save(self, state: WorkflowState) -> WorkflowState:
+        state.updated_at = _now()
+        # Persist bounded content snapshots, not only layer counters. This is
+        # the cross-window handoff consumed after a process/checkpoint restart.
+        raw_layers = dict(state.context_layers or {})
+        raw_layers.update({
+            "route": {"sources": list(state.sources),
+                      "messages": list(state.route_messages[-8:])},
+            "project": {"project_id": state.project_id, "root": state.project_root},
+            "task": {"tasks": [dict(item) for item in state.tasks[:16]]},
+            "subagent": {"subagents": [dict(item) for item in state.subagents[:16]],
+                         "results": {str(key): summarize_subagent_result(value, 900)[0]
+                                     for key, value in list((state.results.get("results") or {}).items())[:16]}},
+            "output": {"review": state.review, "status": state.status,
+                       "merged": str((state.results or {}).get("merged") or "")},
+        })
+        snapshots, snapshot_meta = compress_layers_durable(
+            raw_layers, int((state.policy or {}).get("max_context_chars", 6000)),
+            db_path=str(self.state_root.parent / "context_compression.sqlite3"))
+        snapshot_meta["valid"] = True
+        state.context_layers["snapshots"] = snapshots
+        state.context_layers["snapshot_meta"] = snapshot_meta
+        state.context_layers["snapshot_digest"] = snapshot_meta["digest"]
+        state.context_layers["schema"] = "five-layer-v1"
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        try:
+            self._path(state.workflow_id).write_text(
+                json.dumps(state.public(), ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+        self._states[state.workflow_id] = state
+        if state.status in {"completed", "failed"}:
+            try:
+                from .langsmith import export_workflow, finish_workflow
+                finish_workflow(state.public())
+                # Keep the ledger export as a compatibility fallback for old
+                # LangSmith installations and for operators who explicitly
+                # want a second immutable summary run.
+                if not (state.langsmith_trace or {}).get("root_run_id") or \
+                        os.getenv("DOCMIND_LANGSMITH_EXPORT_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                    export_workflow(state.public())
+            except Exception:
+                pass
+            self._option_generators.pop(state.workflow_id, None)
+            self._research_runners.pop(state.workflow_id, None)
+            self._task_generators.pop(state.workflow_id, None)
+            self._execution_callbacks.pop(state.workflow_id, None)
+        return state
+
+    def _load(self, workflow_id: str) -> WorkflowState:
+        with self._lock:
+            if workflow_id in self._states:
+                return self._states[workflow_id]
+            path = self._path(workflow_id)
+            if not path.is_file():
+                raise WorkflowError("工作流不存在：%s" % workflow_id)
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                state = WorkflowState(**raw)
+            except Exception as exc:
+                raise WorkflowError("工作流状态损坏：%s" % type(exc).__name__) from exc
+            if self._rebuild_context_layers(state):
+                # A process/window restart must leave a usable snapshot, not
+                # merely rebuild counters.  Older states (and interrupted
+                # writes) may contain the logical five layers but no durable
+                # snapshot body or a stale digest.  Recreate it synchronously
+                # during recovery so the next window gets the same bounded
+                # context immediately, even if the background queue is still
+                # warming up.
+                logical_layers = {
+                    key: state.context_layers.get(key, {})
+                    for key in CONTEXT_LAYERS
+                }
+                snapshots, snapshot_meta = compress_layers(
+                    logical_layers,
+                    int((state.policy or {}).get("max_context_chars", 6000)),
+                )
+                snapshot_meta = dict(snapshot_meta, valid=True,
+                                     job_state="recovery_sync",
+                                     result_digest=layer_snapshot_digest(snapshots))
+                state.context_layers["snapshots"] = snapshots
+                state.context_layers["snapshot_meta"] = snapshot_meta
+                state.context_layers["snapshot_digest"] = snapshot_meta["digest"]
+                try:
+                    path.write_text(json.dumps(state.public(), ensure_ascii=False, indent=2),
+                                    encoding="utf-8")
+                except OSError:
+                    pass
+            self._states[workflow_id] = state
+            return state
+
+    @staticmethod
+    def _rebuild_context_layers(state: WorkflowState) -> bool:
+        """Reconstruct bounded five-layer metadata after process/checkpoint recovery."""
+        layers = dict(state.context_layers or {})
+        changed = False
+        route = dict(layers.get("route") or {})
+        if not route.get("messages") and state.route_messages:
+            route["messages"] = list(state.route_messages[-8:])
+            changed = True
+        if not route.get("sources") and state.sources:
+            route["sources"] = list(state.sources)
+            changed = True
+        if route != (layers.get("route") or {}):
+            layers["route"] = route
+            changed = True
+        project = dict(layers.get("project") or {})
+        for key, value in (("project_id", state.project_id), ("root", state.project_root)):
+            if key not in project and value:
+                project[key] = value
+                changed = True
+        if project != (layers.get("project") or {}):
+            layers["project"] = project
+            changed = True
+        task = dict(layers.get("task") or {})
+        if not task.get("ids") and state.tasks:
+            task.update({"count": len(state.tasks),
+                         "ids": [item.get("id") for item in state.tasks]})
+            changed = True
+        if task != (layers.get("task") or {}):
+            layers["task"] = task
+            changed = True
+        subagent = dict(layers.get("subagent") or {})
+        if not subagent.get("statuses") and state.subagents:
+            subagent["statuses"] = {str(item.get("id")): item.get("status")
+                                     for item in state.subagents if item.get("id")}
+            subagent["count"] = len(state.subagents)
+            changed = True
+        if subagent != (layers.get("subagent") or {}):
+            layers["subagent"] = subagent
+            changed = True
+        output = dict(layers.get("output") or {})
+        if "review_ok" not in output and state.review:
+            output.update({"review_ok": bool(state.review.get("ok")), "steps": state.steps})
+            changed = True
+        if output != (layers.get("output") or {}):
+            layers["output"] = output
+            changed = True
+        budgets = allocate_layer_budgets(int((state.policy or {}).get("max_context_chars", 6000)))
+        if layers.get("budgets") != budgets:
+            layers["budgets"] = budgets
+            changed = True
+        if layers.get("schema") != "five-layer-v1":
+            layers["schema"] = "five-layer-v1"
+            changed = True
+        snapshots = layers.get("snapshots")
+        snapshot_meta = dict(layers.get("snapshot_meta") or {})
+        if isinstance(snapshots, Mapping):
+            valid = layer_snapshot_digest(snapshots) == str(snapshot_meta.get("digest") or "")
+            if not valid or snapshot_meta.get("valid") != valid:
+                snapshot_meta["valid"] = valid
+                layers["snapshot_meta"] = snapshot_meta
+                changed = True
+        else:
+            # Missing snapshot bodies are recoverable, but must trigger the
+            # synchronous rebuild in _load rather than leaving only counters.
+            changed = True
+        if changed:
+            state.context_layers = layers
+        return changed
+
+    def _event(self, state: WorkflowState, kind: str, **payload: Any) -> None:
+        # LangGraph Send runs subagents concurrently. Serialize the bounded
+        # event ledger so live UI polling and durable snapshots never observe
+        # a torn list or lose an event during a parallel wave.
+        with self._lock:
+            state.events.append({"ts": _now(), "kind": kind, **payload})
+            state.events = state.events[-100:]
+            telemetry = dict(state.observability or {})
+            now_epoch = time.time()
+            telemetry.setdefault("started_epoch", now_epoch)
+            for counter in ("events", "subagents_started", "subagents_completed",
+                            "tool_events", "mcp_events", "failures", "elapsed_ms",
+                            "prompt_tokens", "completion_tokens", "total_tokens"):
+                telemetry.setdefault(counter, 0)
+            telemetry["last_event_at"] = _now()
+            telemetry["events"] = int(telemetry.get("events", 0)) + 1
+            if kind == "subagent_start":
+                telemetry["subagents_started"] = int(telemetry.get("subagents_started", 0)) + 1
+            # ``task_complete`` is the DAG bookkeeping echo emitted after the
+            # worker's ``subagent_complete`` event; count the worker event once.
+            if kind == "subagent_complete":
+                telemetry["subagents_completed"] = int(telemetry.get("subagents_completed", 0)) + 1
+            if kind in {"before_tool", "after_tool", "tool_call"}:
+                telemetry["tool_events"] = int(telemetry.get("tool_events", 0)) + 1
+            if kind in {"before_mcp", "after_mcp", "mcp_retry", "mcp_call"}:
+                telemetry["mcp_events"] = int(telemetry.get("mcp_events", 0)) + 1
+            if payload.get("status") in {"failed", "blocked"} or kind in {
+                    "task_blocked", "hook_error", "replan_failed", "auto_execute_reconstruct_failed"}:
+                telemetry["failures"] = int(telemetry.get("failures", 0)) + 1
+            elapsed = payload.get("elapsed_ms")
+            if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+                telemetry["elapsed_ms"] = int(telemetry.get("elapsed_ms", 0)) + max(0, int(elapsed))
+            usage = payload.get("tokens") or payload.get("token_usage")
+            if isinstance(usage, Mapping):
+                for source, target in (("in", "prompt_tokens"), ("input", "prompt_tokens"),
+                                       ("out", "completion_tokens"), ("output", "completion_tokens"),
+                                       ("total", "total_tokens")):
+                    value = usage.get(source)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        telemetry[target] = int(telemetry.get(target, 0)) + max(0, int(value))
+            telemetry["duration_ms"] = max(0, int((now_epoch - float(telemetry["started_epoch"])) * 1000))
+            state.observability = telemetry
+            try:
+                from .langsmith import record_workflow_event
+                record_workflow_event(state.public(), kind, payload)
+                if state.langsmith_trace:
+                    state.langsmith_trace["event_count"] = int(
+                        state.langsmith_trace.get("event_count", 0)) + 1
+            except Exception:
+                pass
+
+    def _workflow_hook(self, state: WorkflowState, kind: str, **payload: Any) -> None:
+        """Run a lifecycle hook with the workflow's explicit failure policy."""
+        try:
+            import hooks as workflow_hooks
+            result = workflow_hooks.run_workflow(kind, {
+                "workflow_id": state.workflow_id,
+                "phase": state.phase,
+                "status": state.status,
+                **{str(key): value for key, value in payload.items()
+                   if str(key) in {"node", "wave", "task_count", "attempt", "approved",
+                                   "session_id", "recovered", "error"}},
+            })
+        except Exception as exc:
+            result = {"blocked": False, "reason": "", "errors": [
+                {"hook": kind, "error": type(exc).__name__}]}
+        errors = list(result.get("errors") or [])
+        if errors:
+            self._event(state, "hook_error", hook=kind, error_count=len(errors))
+        blocked = bool(result.get("blocked"))
+        policy = (state.policy or {}).get("hook_failure", "continue")
+        if blocked or (errors and policy == "block"):
+            reason = str(result.get("reason") or "工作流钩子失败")[:300]
+            state.status = "interrupted"
+            state.interrupt_reason = reason
+            self._event(state, "hook_blocked", hook=kind, reason=reason)
+            self._save(state)
+            raise WorkflowError("workflow_hook_blocked:%s" % kind)
+
+    def _graph_config(self, state: WorkflowState) -> dict[str, Any]:
+        return {
+            "configurable": {"thread_id": state.workflow_id},
+            "recursion_limit": max(
+                32, int((state.policy or {}).get("max_replans", 2)) * 4 + 16),
+        }
+
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+    def _graph_payload(self, state: WorkflowState, **updates: Any) -> WorkflowGraphState:
+        payload: WorkflowGraphState = {
+            "workflow_id": state.workflow_id,
+            "request": state.request,
+            "sources": list(state.sources),
+            "options": list(state.options),
+            "phase": state.phase,
+            "status": state.status,
+            "selected_option": state.selected_option or {},
+            "approved": (state.policy or {}).get("approval_mode") == "high",
+            "interrupt_reason": state.interrupt_reason,
+            "tasks": [dict(task) for task in state.tasks],
+            "results": dict(state.results.get("results") or {}) if state.results else {},
+            "step_count": int(state.graph_state.get("step_count", state.steps or 0)),
+            "replan_count": int(state.graph_state.get("replan_count", state.replans or 0)),
+            "max_steps": int((state.policy or {}).get("max_steps", 24)),
+            "max_replans": int((state.policy or {}).get("max_replans", 2)),
+            "max_subagents": int((state.policy or {}).get("max_subagents", 4)),
+            "max_context_chars": int((state.policy or {}).get("max_context_chars", 6000)),
+            "max_provider_retries": int((state.policy or {}).get("provider_retries", 2)),
+            "langsmith_trace": dict(state.langsmith_trace or {}),
+        }
+        payload.update(updates)
+        return payload
+
+    def _graph_view(self, graph: Any, state: WorkflowState) -> dict[str, Any]:
+        snapshot = graph.get_state(self._graph_config(state))
+        values = dict(snapshot.values or {})
+        pending: list[dict[str, Any]] = []
+        for task in snapshot.tasks or ():
+            for item in getattr(task, "interrupts", ()) or ():
+                pending.append({
+                    "id": str(getattr(item, "id", "")),
+                    "value": self._json_safe(getattr(item, "value", None)),
+                })
+        values["pending_interrupts"] = pending
+        values["checkpoint_backend"] = self._checkpoint_backend
+        if self._checkpoint_error:
+            values["checkpoint_error"] = self._checkpoint_error
+        return self._json_safe(values)
+
+    def _invoke_graph(self, state: WorkflowState, value: Any, *, graph: Any | None = None) -> dict[str, Any]:
+        graph = graph or self.build_langgraph(workflow_id=state.workflow_id)
+        if graph is None:
+            return {}
+        with self._workflow_lease(state.workflow_id):
+            with self._lock:
+                self._workflow_hook(state, "before_node", node="graph")
+                graph.invoke(value, config=self._graph_config(state))
+                view = self._graph_view(graph, state)
+                state.graph_state = view
+                self._workflow_hook(state, "after_node", node="graph")
+                self._save(state)
+                return view
+
+    def _ensure_gate(self, state: WorkflowState, expected_kind: str) -> tuple[Any, dict[str, Any]]:
+        graph = self.build_langgraph(workflow_id=state.workflow_id)
+        if graph is None:
+            return None, {}
+        view = self._graph_view(graph, state)
+        pending = list(view.get("pending_interrupts") or [])
+        if not pending:
+            self._invoke_graph(state, self._graph_payload(state), graph=graph)
+            view = self._graph_view(graph, state)
+            pending = list(view.get("pending_interrupts") or [])
+        kind = (((pending[0] if pending else {}).get("value") or {}).get("kind"))
+        if kind != expected_kind:
+            raise WorkflowError("LangGraph 等待的是 %s，而不是 %s" % (kind or "无人工输入", expected_kind))
+        return graph, view
+
+    def _resume_gate(self, state: WorkflowState, expected_kind: str,
+                     response: Mapping[str, Any]) -> dict[str, Any]:
+        if Command is None:
+            return {}
+        graph, _view = self._ensure_gate(state, expected_kind)
+        if graph is None:
+            return {}
+        return self._invoke_graph(state, Command(resume=dict(response)), graph=graph)
+
+    def start(self, request: str, *, project_id: str = "", project_root: str = "",
+              web_enabled: bool = False, experience_enabled: bool = False,
+              llm_enabled: bool = True,
+              skill_items: Iterable[dict[str, Any]] = (),
+              policy: WorkflowPolicy | None = None,
+              option_generator: Callable[[str, ContextPlan], Any] | None = None,
+              research_runner: Callable[[str], Any] | None = None,
+              task_generator: Callable[[str, Mapping[str, Any], ContextPlan], Any] | None = None) -> dict[str, Any]:
+        request = _clean_text(request, 12000)
+        if not request:
+            raise WorkflowError("开发目标不能为空")
+        policy = (policy or WorkflowPolicy()).normalized()
+        plan = self.router.route(request, code_root=project_root, web_enabled=web_enabled,
+                                 experience_enabled=experience_enabled,
+                                 skill_items=skill_items, token_budget=policy.max_context_chars)
+        options = self._options(request, plan)
+        option_source = "deterministic"
+        # With LangGraph available, option generation is performed by the
+        # choice node and checkpointed alongside the first human gate.  Keep a
+        # native fallback for installations that intentionally omit LangGraph.
+        if StateGraph is None and llm_enabled and option_generator is not None:
+            try:
+                parsed = self._parse_generated_options(option_generator(request, plan), plan)
+                if parsed:
+                    options, option_source = parsed, "llm"
+            except Exception as exc:
+                plan = ContextPlan(sources=plan.sources, tool_groups=plan.tool_groups,
+                                   skill_names=plan.skill_names,
+                                   messages=tuple(plan.messages) + ("LLM 方案生成失败，已回退本地模板：" + type(exc).__name__,),
+                                   budget_chars=plan.budget_chars, used_chars=plan.used_chars)
+        wid = "wf-" + uuid.uuid4().hex[:12]
+        state = WorkflowState(
+            workflow_id=wid, project_id=project_id, project_root=project_root,
+            request=request, sources=list(plan.sources), route_messages=list(plan.messages),
+            options=[asdict(item) for item in options], policy=asdict(policy),
+            experience_enabled=bool(experience_enabled),
+            llm_enabled=bool(llm_enabled),
+            context_layers={"route": {"sources": list(plan.sources), "messages": list(plan.messages)},
+                            "project": {"project_id": project_id, "root": project_root},
+                            "task": {}, "subagent": {}, "output": {},
+                            "budgets": allocate_layer_budgets(policy.max_context_chars),
+                            "schema": "five-layer-v1"},
+            created_at=_now(), updated_at=_now())
+        try:
+            from .langsmith import start_workflow
+            state.langsmith_trace = start_workflow(state.public())
+        except Exception:
+            state.langsmith_trace = {}
+        self._event(state, "clarify", option_count=len(options), sources=list(plan.sources),
+                    option_source=option_source)
+        with self._lock:
+            if llm_enabled and option_generator is not None:
+                self._option_generators[wid] = option_generator
+            if research_runner is not None:
+                self._research_runners[wid] = research_runner
+            if task_generator is not None:
+                self._task_generators[wid] = task_generator
+            self._save(state)
+            if StateGraph is not None and graph_interrupt is not None:
+                graph_view = self._invoke_graph(state, self._graph_payload(
+                    state, option_generation_pending=bool(llm_enabled and option_generator is not None)))
+                pending_value = (((graph_view.get("pending_interrupts") or [{}])[0]).get("value") or {})
+                generated_options = pending_value.get("options") or graph_view.get("options")
+                if generated_options:
+                    state.options = [dict(item) for item in generated_options]
+                    self._event(state, "options_generated",
+                                option_source=pending_value.get("option_source") or
+                                graph_view.get("option_source") or "deterministic")
+        return state.public()
+
+    @staticmethod
+    def _options(request: str, plan: ContextPlan) -> list[WorkflowOption]:
+        lower = request.lower()
+        game_kind = "2D" if any(x in lower for x in ("2d", "横版", "像素", "俯视")) else "3D"
+        first = WorkflowOption("recommended", f"按 {game_kind} 游戏原型推进",
+                               "先建立最小可运行原型，再按验证结果迭代。", True,
+                               "、".join(plan.sources))
+        second = WorkflowOption("design_first", "先完成设计与技术方案",
+                                "先拆玩法、场景、数据和验证标准，再开始改文件。", False, "local")
+        options = [first, second]
+        if "web" not in plan.sources:
+            options.append(WorkflowOption("web_research", "联网补充资料后再选",
+                                           "搜索引擎/插件/最新资料，再重新生成方案选项。",
+                                           False, "web", True))
+        options.append(WorkflowOption("custom", "我自己描述目标",
+                                      "由用户补充更具体的效果、限制或参考作品。", False, "user"))
+        return options
+
+    @staticmethod
+    def _parse_generated_options(raw: Any, plan: ContextPlan) -> list[WorkflowOption]:
+        """Validate strict JSON-ish model output and keep a safe fallback contract."""
+        if isinstance(raw, str):
+            text = raw.strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
+            raw = json.loads(text)
+        if isinstance(raw, Mapping):
+            raw = raw.get("options")
+        if not isinstance(raw, list):
+            return []
+        out: list[WorkflowOption] = []
+        seen: set[str] = set()
+        for item in raw[:6]:
+            if not isinstance(item, Mapping):
+                continue
+            oid = re.sub(r"[^A-Za-z0-9_-]", "", str(item.get("id") or "option"))[:40]
+            title = _clean_text(item.get("title"), 180)
+            summary = _clean_text(item.get("summary"), 700)
+            if not oid or oid in seen or not title or not summary:
+                continue
+            seen.add(oid)
+            out.append(WorkflowOption(oid, title, summary, bool(item.get("recommended")),
+                                       _clean_text(item.get("source") or "llm", 80),
+                                       bool(item.get("requires_web"))))
+        if not out:
+            return []
+        # Normalize the model's recommendation flag to exactly one option.
+        # This keeps the UI contract deterministic even when a model marks
+        # several candidates as recommended.
+        recommended_seen = False
+        normalized: list[WorkflowOption] = []
+        for item in out:
+            mark = bool(item.recommended) and not recommended_seen
+            recommended_seen = recommended_seen or mark
+            normalized.append(WorkflowOption(item.id, item.title, item.summary, mark,
+                                              item.source, item.requires_web))
+        if not recommended_seen:
+            first = normalized[0]
+            normalized[0] = WorkflowOption(first.id, first.title, first.summary, True,
+                                            first.source, first.requires_web)
+        out = normalized
+        if not any(item.id == "custom" for item in out):
+            out.append(WorkflowOption("custom", "我自己描述目标", "由用户补充更具体的效果、限制或参考作品。", False, "user"))
+        if "web" not in plan.sources and not any(item.id == "web_research" for item in out):
+            out.append(WorkflowOption("web_research", "联网补充资料后再选", "搜索最新资料，再重新生成方案选项。", False, "web", True))
+        return out
+
+    def choose(self, workflow_id: str, choice: str, *, custom_request: str = "") -> dict[str, Any]:
+        state = self._load(workflow_id)
+        if state.status != "awaiting_choice":
+            raise WorkflowError("当前工作流不在等待方案选择：%s" % state.status)
+        choice = (choice or "").strip()
+        if choice == "web_research":
+            state.status, state.phase = "awaiting_research", "research"
+            state.interrupt_reason = "等待联网检索结果"
+            graph_view = self._resume_gate(state, "choice", {"choice": choice})
+            # A registered research runner completes inside the graph and the
+            # next durable interrupt is already the refreshed choice gate.
+            if graph_view.get("status") == "awaiting_choice" and graph_view.get("research_findings"):
+                state.status, state.phase = "awaiting_choice", "clarify"
+                state.interrupt_reason = ""
+                state.options = [dict(item) for item in graph_view.get("options") or state.options]
+                findings = _clean_text(graph_view.get("research_findings"), 8000)
+                source = _clean_text(graph_view.get("research_source") or "web", 80)
+                state.route_messages.append("【外部检索摘要】" + findings)
+                if source not in state.sources:
+                    state.sources.append(source)
+                self._event(state, "research", source=source,
+                            option_source=graph_view.get("option_source") or "deterministic",
+                            findings_chars=len(findings), graph_node=True,
+                            error=graph_view.get("research_error") or "")
+            else:
+                self._event(state, "interrupt", reason=state.interrupt_reason)
+        elif choice == "custom":
+            custom_request = _clean_text(custom_request, 12000)
+            if not custom_request:
+                raise WorkflowError("自定义方案需要补充描述")
+            state.request = custom_request
+            state.status, state.phase = "awaiting_choice", "clarify"
+            state.options = [asdict(item) for item in self._options(custom_request, ContextPlan(
+                sources=("direct",), tool_groups=frozenset({"general", "orchestration"}),
+                skill_names=(), messages=(), budget_chars=800, used_chars=0))]
+            self._resume_gate(state, "choice", {
+                "choice": choice, "request": custom_request, "options": state.options,
+            })
+            self._event(state, "clarify", reason="custom_request")
+        else:
+            selected = next((item for item in state.options if item.get("id") == choice), None)
+            if not selected:
+                raise WorkflowError("未知方案选项：%s" % choice)
+            state.selected_option = selected
+            state.status, state.phase = "planning", "plan"
+            state.interrupt_reason = ""
+            graph_view = self._resume_gate(state, "choice", {"choice": choice, "selected_option": selected})
+            # A registered graph plan generator may have completed the plan
+            # node during this resume. Mirror its durable result into the
+            # public workflow state so clients can proceed directly to
+            # approval/execute without a second planning request.
+            if graph_view.get("tasks") and graph_view.get("status") in {"planned", "awaiting_approval"}:
+                state.tasks = [dict(item) for item in graph_view.get("tasks") or []]
+                state.status = "planned"
+                state.phase = "execute"
+                state.interrupt_reason = ""
+                state.subagents = self._subagent_records(state.tasks)
+                state.context_layers["task"] = {"count": len(state.tasks),
+                                                 "ids": [t.get("id") for t in state.tasks]}
+                self._event(state, "plan", task_count=len(state.tasks),
+                            task_source=graph_view.get("plan_source") or "llm", graph_node=True)
+            self._event(state, "choice", option=selected)
+        return self._save(state).public()
+
+    def apply_research(self, workflow_id: str, findings: str, *, source: str = "web",
+                       option_generator: Callable[[str, ContextPlan], Any] | None = None) -> dict[str, Any]:
+        state = self._load(workflow_id)
+        if state.status != "awaiting_research":
+            raise WorkflowError("当前工作流不在等待联网检索")
+        findings = _clean_text(findings, 8000)
+        if not findings:
+            raise WorkflowError("联网检索结果为空")
+        if option_generator is None and state.llm_enabled:
+            option_generator = self._option_generators.get(workflow_id)
+        state.route_messages.append("【外部检索摘要】" + findings)
+        if source not in state.sources:
+            state.sources.append(source)
+        research_plan = ContextPlan(
+            sources=tuple(dict.fromkeys(state.sources)),
+            tool_groups=frozenset({"general", "web", "orchestration"}),
+            skill_names=(), messages=("【外部检索摘要】" + findings,),
+            budget_chars=800, used_chars=min(800, len(findings)),
+        )
+        options = self._options(state.request + "\n" + findings, research_plan)
+        option_source = "deterministic"
+        if state.llm_enabled and option_generator is not None:
+            try:
+                generated = option_generator(state.request + "\n" + findings, research_plan)
+                parsed = self._parse_generated_options(generated, research_plan)
+                if parsed:
+                    options, option_source = parsed, "llm"
+            except Exception as exc:
+                state.route_messages.append("LLM 检索后方案生成失败，已回退本地模板：" + type(exc).__name__)
+        state.options = [asdict(item) for item in options]
+        state.status, state.phase, state.interrupt_reason = "awaiting_choice", "clarify", ""
+        self._resume_gate(state, "research", {
+            "findings": findings, "source": source, "options": state.options,
+        })
+        self._event(state, "research", source=source, option_source=option_source,
+                    findings_chars=len(findings))
+        return self._save(state).public()
+
+    @staticmethod
+    def _parse_generated_tasks(raw: Any, *, max_tasks: int = 16) -> list[dict[str, Any]]:
+        """Parse and validate a model-produced task DAG.
+
+        The model is never trusted with executable fields.  Only a small,
+        auditable task contract is retained; malformed/ambiguous graphs return
+        an empty list so callers can use the deterministic fallback.
+        """
+        if isinstance(raw, str):
+            text = raw.strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
+            raw = json.loads(text)
+        if isinstance(raw, Mapping):
+            raw = raw.get("tasks") or (raw.get("plan") or {}).get("tasks")
+        if not isinstance(raw, list) or not raw:
+            return []
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in raw[:max(1, int(max_tasks))]:
+            if not isinstance(item, Mapping):
+                continue
+            task_id = re.sub(r"[^A-Za-z0-9_-]", "", str(item.get("id") or ""))[:48]
+            role = _clean_text(item.get("role") or "coder", 60)
+            description = _clean_text(item.get("task") or item.get("description"), 1200)
+            if not task_id or task_id in seen or not description:
+                continue
+            deps = item.get("depends_on", item.get("dependencies", []))
+            if isinstance(deps, str):
+                deps = [deps]
+            if not isinstance(deps, (list, tuple)):
+                deps = []
+            clean_deps = [re.sub(r"[^A-Za-z0-9_-]", "", str(dep))[:48]
+                          for dep in deps if str(dep).strip()]
+            if task_id in clean_deps or len(clean_deps) > max_tasks:
+                continue
+            seen.add(task_id)
+            task = {"id": task_id, "role": role, "task": description,
+                    "depends_on": list(dict.fromkeys(clean_deps))}
+            for key in ("optional", "parallel_safe", "tools", "persona", "mcp", "reflection"):
+                if key in item:
+                    value = item[key]
+                    if key in {"optional", "parallel_safe"}:
+                        value = bool(value)
+                    elif key == "reflection":
+                        value = bool(value)
+                    elif key == "mcp":
+                        value = str(value or "auto").strip().lower()
+                        if value not in {"auto", "allow", "deny"}:
+                            value = "auto"
+                    elif key == "persona":
+                        value = _clean_text(value, 500)
+                    elif isinstance(value, (list, tuple)):
+                        value = [str(x)[:80] for x in value[:16]]
+                    else:
+                        value = _clean_text(value, 300)
+                    task[key] = value
+            out.append(task)
+        if not out:
+            return []
+        valid_ids = {task["id"] for task in out}
+        # Unknown dependencies make the graph ambiguous; reject the entire
+        # generated graph instead of silently changing execution semantics.
+        if any(dep not in valid_ids for task in out for dep in task["depends_on"]):
+            return []
+        # A small Kahn pass catches cycles before they reach the executor.
+        remaining = {task["id"]: set(task["depends_on"]) for task in out}
+        done: set[str] = set()
+        while remaining:
+            ready = [tid for tid, deps in remaining.items() if deps <= done]
+            if not ready:
+                return []
+            done.update(ready)
+            for tid in ready:
+                remaining.pop(tid, None)
+        return out
+
+    @staticmethod
+    def _subagent_records(tasks: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Expose bounded persona/capability policy alongside each task."""
+        rows = []
+        for task in tasks or ():
+            tools = task.get("tools") or []
+            if isinstance(tools, str):
+                tools = [tools]
+            rows.append({
+                "id": task.get("id"),
+                "role": task.get("role", "coder"),
+                "persona": _clean_text(task.get("persona") or "", 500),
+                "tools": [str(item)[:80] for item in list(tools)[:16]],
+                "mcp": str(task.get("mcp") or "auto"),
+                "reflection": bool(task.get("reflection", True)),
+                "status": "pending",
+            })
+        return rows
+
+    def plan(self, workflow_id: str, tasks: Iterable[Mapping[str, Any]] | None = None,
+             task_generator: Callable[[str, Mapping[str, Any], ContextPlan], Any] | None = None) -> dict[str, Any]:
+        state = self._load(workflow_id)
+        if state.status == "planned" and tasks is None:
+            # The LangGraph plan node may already have generated and
+            # checkpointed the task DAG while resuming the user's choice.
+            return state.public()
+        if state.status not in {"planning", "planned", "awaiting_approval", "interrupted"}:
+            raise WorkflowError("当前工作流不能规划：%s" % state.status)
+        policy = WorkflowPolicy(**state.policy).normalized()
+        if task_generator is not None:
+            self._task_generators[workflow_id] = task_generator
+        task_source = "provided"
+        if tasks is None and task_generator is not None:
+            try:
+                route_plan = ContextPlan(
+                    sources=tuple(state.sources), tool_groups=frozenset({"general", "orchestration", "web"} if "web" in state.sources else {"general", "orchestration"}),
+                    skill_names=(), messages=tuple(state.route_messages[-8:]) +
+                    (("【项目上下文】project_id=%s root=%s" % (state.project_id, state.project_root)),),
+                    budget_chars=policy.max_context_chars,
+                    used_chars=sum(len(x) for x in state.route_messages[-8:]) +
+                    len(state.project_id) + len(state.project_root) + 26,
+                )
+                generated = task_generator(state.request, state.selected_option or {}, route_plan)
+                parsed = self._parse_generated_tasks(generated, max_tasks=policy.max_subagents)
+                if parsed:
+                    tasks, task_source = parsed, "llm"
+            except Exception as exc:
+                self._event(state, "plan_generation_failed", error=type(exc).__name__)
+        if tasks is None:
+            task_source = "deterministic"
+            tasks = [
+                {"id": "design", "role": "designer", "task": "明确玩法、场景、输入和验收标准", "depends_on": []},
+                {"id": "prototype", "role": "coder", "task": "创建最小可运行游戏原型", "depends_on": ["design"]},
+                {"id": "verify", "role": "tester", "task": "执行自测、Playtest 并反馈失败证据", "depends_on": ["prototype"]},
+            ]
+        state.tasks = [dict(t) for t in list(tasks)[:policy.max_subagents]]
+        state.subagents = self._subagent_records(state.tasks)
+        state.context_layers["task"] = {"count": len(state.tasks),
+                                        "ids": [t.get("id") for t in state.tasks]}
+        state.status, state.phase = "planned", "execute"
+        # The plan gate is a real LangGraph interrupt.  Resume it after the
+        # manager has validated the task DAG so the durable graph owns the
+        # transition into approval instead of merely mirroring a native flag.
+        if StateGraph is not None and graph_interrupt is not None:
+            self._resume_gate(state, "plan", {"tasks": state.tasks, "source": task_source})
+        self._event(state, "plan", task_count=len(state.tasks), max_subagents=policy.max_subagents,
+                    task_source=task_source)
+        return self._save(state).public()
+
+    @staticmethod
+    def _call_graph_replanner(replanner: Callable[..., Any], failed: list[dict[str, Any]],
+                              results: dict[str, Any], attempt: int,
+                              emit: Callable[[str, Mapping[str, Any]], Any]) -> Any:
+        emit("graph_replan_start", {"attempt": attempt,
+                                     "failed": [str(item.get("id")) for item in failed]})
+        proposal = replanner(failed, results, attempt)
+        if isinstance(proposal, Mapping):
+            count = sum(len(proposal.get(key) or []) for key in ("add", "tasks", "replace", "revise"))
+        else:
+            count = len(proposal) if isinstance(proposal, list) else 0
+        emit("graph_replan_proposal", {"attempt": attempt, "task_count": count,
+                                        "accepted": count > 0})
+        return proposal
+
+    def _run_task_dag_langgraph(
+        self,
+        tasks: list[dict[str, Any]],
+        runner: Callable[[dict[str, Any], dict[str, str]], Mapping[str, Any]],
+        *,
+        prior_results: Mapping[str, Any] | None = None,
+        max_steps: int = 0,
+        max_parallel: int = 4,
+        max_context_chars: int = 6000,
+        on_event: Callable[[str, Mapping[str, Any]], Any] | None = None,
+        thread_id: str = "task-wave",
+        trace_parent_id: str = "",
+    ) -> dict[str, Any]:
+        """Execute one task DAG with LangGraph ``Send`` fan-out per wave."""
+        from orchestrator import (dedup_tasks, extract_dispatch_tasks, parse_plan,
+                                  topological_waves)
+
+        started = time.monotonic()
+        original = {str(item.get("id")): dict(item) for item in tasks}
+        normalized, deduped_ids, dedup_remap = dedup_tasks(tasks)
+        for item in normalized:
+            item["context_from"] = list((original.get(item["id"]) or {}).get("context_from") or [])
+        waves = topological_waves(normalized)
+        by_id = {item["id"]: item for item in normalized}
+        external = dict(prior_results or {})
+        results: dict[str, Any] = {
+            task_id: {"status": "deduped", "conclusion": "", "steps": 0,
+                      "error": "", "elapsed_ms": 0, "kept": dedup_remap.get(task_id),
+                      "optional": True}
+            for task_id in deduped_ids
+        }
+        blocked: dict[str, str] = {}
+        executed_waves: list[list[str]] = []
+        task_threads: list[str] = []
+        steps_used = 0
+        dispatches: list[dict[str, Any]] = []
+
+        def emit(kind: str, payload: Mapping[str, Any]) -> None:
+            if on_event is not None:
+                try:
+                    on_event(kind, payload)
+                except Exception:
+                    pass
+
+        def dispatch_node(_state: TaskFanoutState) -> dict[str, Any]:
+            return {}
+
+        def dispatch_tasks(fanout_state: TaskFanoutState):
+            parent_thread = str(fanout_state.get("task_thread") or "task-wave")
+            return [Send("subagent", {"task": task,
+                                      "prior_results": fanout_state.get("prior_results") or {},
+                                      "trace_parent_id": fanout_state.get("trace_parent_id") or "",
+                                      "task_thread": "%s:%s" % (parent_thread, str(task.get("id") or "task"))})
+                    for task in fanout_state.get("tasks") or []]
+
+        def subagent_node(fanout_state: TaskFanoutState) -> dict[str, Any]:
+            task = dict(fanout_state.get("task") or {})
+            known = dict(fanout_state.get("prior_results") or {})
+            context = dict(task.pop("_prepared_context", {}) or {})
+            if not context:
+                dependency_ids = list(task.get("depends_on") or []) + list(task.get("context_from") or [])
+                for dep in dependency_ids:
+                    summary, _summary_meta = summarize_subagent_result(
+                        known.get(str(dep)) or {}, max_chars=1200)
+                    if summary:
+                        context[str(dep)] = summary
+            began = time.monotonic()
+            task_id = str(task.get("id") or "task")
+            emit("subagent_start", {
+                "task_id": task_id,
+                "role": str(task.get("role") or "coder")[:60],
+                "task": _clean_text(task.get("task") or task.get("description") or "", 1200),
+                "persona": _clean_text(task.get("persona") or "", 240),
+                "tools": list(task.get("tools") or [])[:16],
+                "mcp": str(task.get("mcp") or "auto"),
+                "reflection_required": bool(task.get("reflection", True)),
+                "context_keys": list(context)[:16],
+                "context_chars": sum(len(str(value)) for value in context.values()),
+                "task_thread": str(fanout_state.get("task_thread") or ""),
+            })
+            try:
+                from .langsmith import child_span
+                with child_span(
+                        str(fanout_state.get("trace_parent_id") or ""),
+                        "subagent.%s" % str(task.get("id") or "task"),
+                        run_type="chain",
+                        inputs={"task_id": str(task.get("id") or "")[:80],
+                        "role": str(task.get("role") or "")[:40]}):
+                    output = dict(runner(task, context) or {})
+            except Exception as exc:
+                output = {"status": "failed", "conclusion": "",
+                          "error": "%s: %s" % (type(exc).__name__, exc)}
+            output.setdefault("status", "ok")
+            output.setdefault("conclusion", "")
+            output.setdefault("steps", 0)
+            if task.get("_context_compression") is not None:
+                output["context_compression"] = dict(task.get("_context_compression") or {})
+            output["elapsed_ms"] = int((time.monotonic() - began) * 1000)
+            emit("subagent_complete", {
+                "task_id": task_id,
+                "role": str(task.get("role") or "coder")[:60],
+                "status": str(output.get("status") or "unknown"),
+                "steps": int(output.get("steps") or 0),
+                "elapsed_ms": int(output.get("elapsed_ms") or 0),
+                "reflection": dict(output.get("reflection") or {}),
+                "context_compression": dict(output.get("context_compression") or {}),
+                "task_thread": str(fanout_state.get("task_thread") or ""),
+            })
+            return {"task_results": {str(task.get("id")): output}}
+
+        fanout = StateGraph(TaskFanoutState)
+        fanout.add_node("dispatch", dispatch_node)
+        fanout.add_node("subagent", subagent_node)
+        fanout.add_edge(START, "dispatch")
+        fanout.add_conditional_edges("dispatch", dispatch_tasks)
+        fanout.add_edge("subagent", END)
+        compiled = fanout.compile(checkpointer=self._graph_checkpointer)
+
+        if deduped_ids:
+            emit("dedup", {"dropped": deduped_ids, "remap": dedup_remap,
+                           "backend": "langgraph_send"})
+
+        wave_index = 0
+        while True:
+            # Recompute waves after a dispatcher returns. This is what lets a
+            # read-only decomposition agent add exactly the execution tasks it
+            # judged necessary, instead of forcing a fixed team size.
+            waves = topological_waves(normalized)
+            pending = next((ids for ids in waves
+                            if any(task_id not in results for task_id in ids)), None)
+            if pending is None:
+                break
+            wave_ids = pending
+            runnable: list[dict[str, Any]] = []
+            for task_id in wave_ids:
+                if task_id in results:
+                    continue
+                task = by_id[task_id]
+                reason = ""
+                for dependency in task.get("depends_on") or []:
+                    dependency_result = results.get(dependency) or external.get(dependency)
+                    dependency_optional = bool((by_id.get(dependency) or {}).get("optional") or
+                                               (dependency_result or {}).get("optional"))
+                    if dependency_result is not None and dependency_result.get("status") != "ok" \
+                            and not dependency_optional:
+                        reason = "上游 %s %s" % (dependency, dependency_result.get("status"))
+                        break
+                if reason:
+                    blocked[task_id] = reason
+                    results[task_id] = {"status": "blocked", "conclusion": "", "steps": 0,
+                                        "error": reason, "elapsed_ms": 0}
+                    emit("task_blocked", {"task_id": task_id, "role": (by_id.get(task_id) or {}).get("role"),
+                                           "reason": reason, "status": "blocked"})
+                else:
+                    runnable.append(task)
+            if not runnable:
+                continue
+            if max_steps and steps_used >= max_steps:
+                for task in runnable:
+                    task_id = task["id"]
+                    blocked[task_id] = "达到工作流步数上限"
+                    results[task_id] = {"status": "blocked", "conclusion": "", "steps": 0,
+                                        "error": blocked[task_id], "elapsed_ms": 0}
+                    emit("task_blocked", {"task_id": task_id, "role": task.get("role"),
+                                           "reason": blocked[task_id], "status": "blocked"})
+                emit("step_limit", {"limit": max_steps, "used": steps_used,
+                                     "blocked": [task["id"] for task in runnable]})
+                break
+            known_results = {**external, **results}
+            compression_futures: dict[str, Any] = {}
+            for task in runnable:
+                dependency_ids = list(task.get("depends_on") or []) + list(task.get("context_from") or [])
+                dependency_context: dict[str, str] = {}
+                for dependency in dependency_ids:
+                    summary, _summary_meta = summarize_subagent_result(
+                        known_results.get(str(dependency)) or {}, max_chars=1200)
+                    if summary:
+                        dependency_context[str(dependency)] = summary
+                compression_futures[str(task.get("id"))] = compress_context_async(
+                    dependency_context, max(240, int(max_context_chars or 6000) // 3))
+            prepared_runnable: list[dict[str, Any]] = []
+            compression_meta: dict[str, Any] = {}
+            for task in runnable:
+                task_copy = dict(task)
+                bounded, metadata = compression_futures[str(task.get("id"))].result()
+                task_copy["_prepared_context"] = bounded
+                task_copy["_context_compression"] = metadata
+                compression_meta[str(task.get("id"))] = metadata
+                prepared_runnable.append(task_copy)
+            emit("context_prepared", {"wave": wave_index, "task_count": len(prepared_runnable),
+                                       "compression": compression_meta})
+            emit("wave", {"wave": wave_index, "tasks": [task["id"] for task in prepared_runnable],
+                          "backend": "langgraph_send"})
+            wave_thread = "%s:%s" % (thread_id, wave_index)
+            task_threads.append(wave_thread)
+            emit("wave_start", {"wave": wave_index,
+                                 "tasks": [task["id"] for task in prepared_runnable],
+                                 "task_thread": wave_thread,
+                                 "max_parallel": max(1, int(max_parallel)),
+                                 "context_compression": compression_meta})
+            snapshot = compiled.invoke(
+                {"tasks": prepared_runnable, "prior_results": known_results, "task_results": {},
+                 "trace_parent_id": trace_parent_id, "task_thread": wave_thread},
+                config={"configurable": {"thread_id": wave_thread},
+                        "max_concurrency": max(1, int(max_parallel)), "recursion_limit": 16},
+            )
+            batch = dict(snapshot.get("task_results") or {})
+            results.update(batch)
+            executed_waves.append([task["id"] for task in runnable])
+            emit("wave_complete", {"wave": wave_index,
+                                    "tasks": [task["id"] for task in prepared_runnable],
+                                    "task_thread": wave_thread,
+                                    "status": "ok" if all(
+                                        (item or {}).get("status") == "ok"
+                                        for item in batch.values()) else "failed"})
+            for task_id, output in batch.items():
+                steps_used += int((output or {}).get("steps") or 0)
+                task_meta = by_id.get(task_id) or {}
+                emit("task_complete", {"task_id": task_id, "role": task_meta.get("role"),
+                               "persona": _clean_text(task_meta.get("persona") or "", 240),
+                               "tools": list(task_meta.get("tools") or [])[:16],
+                               "mcp": str(task_meta.get("mcp") or "auto"),
+                               "reflection": dict((output or {}).get("reflection") or {}),
+                               "status": (output or {}).get("status"),
+                               "steps": (output or {}).get("steps"),
+                               "elapsed_ms": (output or {}).get("elapsed_ms"),
+                               "task_thread": wave_thread,
+                               "backend": "langgraph_send"})
+
+            # Materialize a dispatcher/planner's structured assignment only
+            # after its wave completed. The main Agent validates the proposal
+            # and owns the actual insertion into the DAG.
+            for task in runnable:
+                if task.get("role") not in {"dispatcher", "planner"}:
+                    continue
+                output = results.get(task["id"]) or {}
+                if output.get("status") != "ok":
+                    continue
+                proposed = extract_dispatch_tasks(output.get("conclusion"),
+                                                  planner_id=task["id"])
+                if not proposed:
+                    continue
+                room = max(0, 16 - len(normalized))
+                try:
+                    parsed = parse_plan(proposed, known_ids=set(by_id))[:room]
+                except Exception:
+                    parsed = []
+                added = []
+                for item in parsed:
+                    if item["id"] in by_id or item["id"] in results:
+                        continue
+                    by_id[item["id"]] = item
+                    normalized.append(item)
+                    added.append(item["id"])
+                if added:
+                    record = {"kind": "dispatch", "planner": task["id"],
+                              "added": added}
+                    dispatches.append(record)
+                    emit("dispatch", record)
+            wave_index += 1
+
+        ok = all((item.get("status") == "ok") or bool(item.get("optional")) or
+                 bool((by_id.get(task_id) or {}).get("optional"))
+                 for task_id, item in results.items())
+        return {
+            "ok": ok, "waves": executed_waves, "order": list(results), "results": results,
+            "tasks": [dict(item) for item in normalized],
+            "blocked": sorted(blocked), "merged": "", "replans": 0,
+            "steps_used": steps_used, "revisions": list(dispatches),
+            "dispatches": dispatches,
+            "deduped": {"dropped": deduped_ids, "remap": dedup_remap},
+            "dropped": [], "n_tasks": len(normalized),
+            "n_ok": sum(1 for item in results.values() if item.get("status") == "ok"),
+            "n_failed": sum(1 for item in results.values() if item.get("status") == "failed"),
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "backend": "langgraph_send", "task_threads": task_threads,
+            "context_compression": {
+                str(task_id): (results.get(task_id) or {}).get("context_compression")
+                for task_id in results if (results.get(task_id) or {}).get("context_compression")
+            },
+        }
+
+    def execute(self, workflow_id: str, runner: Callable[[dict[str, Any], dict[str, str]], Mapping[str, Any]],
+                *, synth_runner: Callable[[list[dict[str, Any]], dict[str, Any]], str] | None = None,
+                replanner: Callable[..., Any] | None = None, on_event: Callable[..., Any] | None = None,
+                session_id: str = "") -> dict[str, Any]:
+        with self._workflow_lease(workflow_id):
+            return self._execute_unleased(
+                workflow_id, runner, synth_runner=synth_runner,
+                replanner=replanner, on_event=on_event, session_id=session_id)
+
+    def retry_subagent(self, workflow_id: str, task_id: str,
+                       runner: Callable[[dict[str, Any], dict[str, str]], Mapping[str, Any]],
+                       *, synth_runner: Callable[[list[dict[str, Any]], dict[str, Any]], str] | None = None,
+                       on_event: Callable[..., Any] | None = None,
+                       session_id: str = "") -> dict[str, Any]:
+        """Retry exactly one failed/blocked Subagent.
+
+        Successful task results are kept as durable context.  The selected
+        task is executed in a one-task LangGraph wave, and the retry counter is
+        persisted per task so a UI retry button cannot create an unbounded
+        loop.  Downstream blocked tasks are intentionally not auto-rerun: the
+        user or the main Agent can retry them separately after inspecting the
+        repaired upstream result.
+        """
+        task_id = str(task_id or "").strip()
+        if not task_id:
+            raise WorkflowError("缺少要重试的 task_id")
+        with self._workflow_lease(workflow_id):
+            state = self._load(workflow_id)
+            task = next((dict(item) for item in state.tasks
+                         if str(item.get("id") or "") == task_id), None)
+            if task is None:
+                raise WorkflowError("不存在的 Subagent 任务：%s" % task_id)
+            result_map = dict((state.results or {}).get("results") or {})
+            previous = dict(result_map.get(task_id) or {})
+            previous_status = str(previous.get("status") or "pending")
+            if previous_status not in {"failed", "blocked"}:
+                raise WorkflowError("只有失败或阻塞的 Subagent 才能单独重试：%s" % task_id)
+            policy = WorkflowPolicy(**(state.policy or {})).normalized()
+            retries = dict(state.subagent_retries or {})
+            attempt = int(retries.get(task_id, 0)) + 1
+            if attempt > policy.max_subagent_retries:
+                raise WorkflowError("Subagent %s 已达到最大重试次数 %s" %
+                                    (task_id, policy.max_subagent_retries))
+
+            state.status, state.phase = "executing", "execute"
+            state.interrupt_reason = ""
+            state.execution_session_id = _clean_text(session_id or state.execution_session_id, 160)
+            self._event(state, "subagent_retry_start", task_id=task_id,
+                        attempt=attempt, previous_status=previous_status,
+                        max_retries=policy.max_subagent_retries)
+            self._save(state)
+
+            def emit(kind: str, payload: Mapping[str, Any]) -> None:
+                self._event(state, kind, **dict(payload or {}))
+                if on_event:
+                    try:
+                        on_event(kind, payload)
+                    except Exception:
+                        pass
+
+            def scoped_runner(retry_task: dict[str, Any], context: dict[str, str]):
+                from .tools import tool_idempotency_scope
+                with tool_idempotency_scope(
+                        "%s:%s:retry%s" % (workflow_id, task_id, attempt),
+                        self.state_root):
+                    return runner(retry_task, context)
+
+            if StateGraph is not None:
+                report = self._run_task_dag_langgraph(
+                    [task], scoped_runner, prior_results=result_map,
+                    max_steps=max(1, policy.max_steps - state.steps),
+                    max_parallel=1, max_context_chars=policy.max_context_chars,
+                    on_event=emit, thread_id="%s:retry%s" % (workflow_id, attempt),
+                    trace_parent_id=str((state.langsmith_trace or {}).get("root_run_id") or ""))
+            else:
+                # Native fallback: dependencies are already durable results;
+                # inject their bounded summaries directly into this one task.
+                from orchestrator import run_plan
+                task_copy = dict(task)
+                task_copy["depends_on"] = []
+                context = {}
+                for dep in task.get("depends_on") or []:
+                    summary, _meta = summarize_subagent_result(result_map.get(str(dep)) or {}, 1200)
+                    if summary:
+                        context[str(dep)] = summary
+                report = run_plan([task_copy],
+                                  lambda _task, _ctx: scoped_runner(task, context),
+                                  max_parallel=1, max_steps=max(1, policy.max_steps - state.steps),
+                                  on_event=emit)
+
+            retried = dict((report.get("results") or {}).get(task_id) or {})
+            if not retried:
+                retried = {"status": "failed", "conclusion": "",
+                           "error": "单任务重试未返回结果", "steps": 0}
+            result_map[task_id] = retried
+            retries[task_id] = attempt
+            state.subagent_retries = retries
+            merged_report = dict(state.results or {})
+            merged_report.update({"results": result_map, "retry_task": task_id,
+                                  "retry_attempt": attempt,
+                                  "retry_history": list(merged_report.get("retry_history") or []) + [{
+                                      "task_id": task_id, "attempt": attempt,
+                                      "previous_status": previous_status,
+                                      "status": retried.get("status"),
+                                      "elapsed_ms": retried.get("elapsed_ms", 0),
+                                  }]})
+            state.results = merged_report
+            state.steps += int(report.get("steps_used") or 0)
+            state.subagents = self._subagent_records(state.tasks)
+            for row in state.subagents:
+                item = result_map.get(str(row.get("id"))) or {}
+                row["status"] = item.get("status", row.get("status"))
+                row["steps"] = int(item.get("steps") or 0)
+                row["elapsed_ms"] = int(item.get("elapsed_ms") or 0)
+                row["retry_count"] = int(retries.get(str(row.get("id")), 0))
+                if item.get("error"):
+                    row["error"] = _clean_text(item.get("error"), 300)
+                if item.get("reflection"):
+                    row["reflection_result"] = dict(item.get("reflection") or {})
+            merged = str(merged_report.get("merged") or "") or "\n".join(
+                str((item or {}).get("conclusion") or "") for item in result_map.values())
+            state.review = review_output(
+                {"merged": merged,
+                 "status": "ok" if all((item or {}).get("status") in {"ok", "deduped"}
+                                         or bool((item or {}).get("optional"))
+                                         for item in result_map.values()) else "failed"},
+                max_tool_failures=policy.max_tool_failures,
+                question=state.request, code_root=state.project_root)
+            all_ok = all((item or {}).get("status") in {"ok", "deduped"}
+                         or bool((item or {}).get("optional"))
+                         for item in result_map.values())
+            state.status = "completed" if all_ok and state.review.get("ok") else "failed"
+            state.phase = "review"
+            self._event(state, "subagent_retry_complete", task_id=task_id,
+                        attempt=attempt, previous_status=previous_status,
+                        status=retried.get("status"), workflow_status=state.status,
+                        max_retries=policy.max_subagent_retries)
+            return self._save(state).public()
+
+    def _execute_unleased(self, workflow_id: str,
+                runner: Callable[[dict[str, Any], dict[str, str]], Mapping[str, Any]],
+                *, synth_runner: Callable[[list[dict[str, Any]], dict[str, Any]], str] | None = None,
+                replanner: Callable[..., Any] | None = None, on_event: Callable[..., Any] | None = None,
+                session_id: str = "") -> dict[str, Any]:
+        from orchestrator import run_plan
+        state = self._load(workflow_id)
+        if state.status != "planned":
+            raise WorkflowError("当前工作流不能执行：%s" % state.status)
+        policy = WorkflowPolicy(**state.policy).normalized()
+        # Keep callbacks process-local.  They may close over an Agent and are
+        # deliberately never persisted; after a restart the configured
+        # resolver rebuilds them from the durable session identifier.
+        self._execution_callbacks[workflow_id] = {
+            "runner": runner, "synth_runner": synth_runner,
+            "replanner": replanner, "on_event": on_event,
+        }
+        if session_id:
+            state.execution_session_id = _clean_text(session_id, 160)
+        if policy.approval_mode == "safe":
+            state.status, state.phase = "awaiting_approval", "execute"
+            state.interrupt_reason = "执行计划包含可能产生副作用的操作，等待用户审核"
+            if StateGraph is not None and graph_interrupt is not None:
+                self._invoke_graph(state, self._graph_payload(state, approved=False))
+            self._event(state, "approval_required", reason=state.interrupt_reason)
+            return self._save(state).public()
+        state.status = "executing"
+        self._event(state, "execute_start", task_count=len(state.tasks))
+        def emit(kind, payload):
+            payload = dict(payload or {})
+            # Keep the public subagent roster live while a wave is running.
+            # The event ledger remains the source of truth, while this bounded
+            # projection lets the UI render running/blocked/failed members
+            # before the whole LangGraph execution returns.
+            task_id = str(payload.get("task_id") or "")
+            if task_id and kind in {"subagent_start", "subagent_complete", "task_blocked", "task_complete"}:
+                with self._lock:
+                    row = next((item for item in state.subagents
+                                if str(item.get("id") or "") == task_id), None)
+                    if row is None and kind == "subagent_start":
+                        # A replanner can introduce a task that was not present
+                        # in the original plan. Register it immediately so the
+                        # live roster and durable task list show the re-dispatch.
+                        row = {
+                            "id": task_id,
+                            "role": str(payload.get("role") or "coder"),
+                            "persona": _clean_text(payload.get("persona") or "", 500),
+                            "tools": [str(item)[:80] for item in list(payload.get("tools") or [])[:16]],
+                            "mcp": str(payload.get("mcp") or "auto"),
+                            "reflection": bool(payload.get("reflection_required", True)),
+                            "status": "pending",
+                        }
+                        state.subagents.append(row)
+                        if not any(str(item.get("id") or "") == task_id for item in state.tasks):
+                            state.tasks.append({
+                                "id": task_id,
+                                "role": row["role"],
+                                "task": _clean_text(payload.get("task") or "", 1200),
+                                "persona": row["persona"],
+                                "tools": list(row["tools"]),
+                                "mcp": row["mcp"],
+                                "reflection": row["reflection"],
+                                "depends_on": [],
+                            })
+                    if row is not None:
+                        if kind == "subagent_start":
+                            row["status"] = "running"
+                            row["task_thread"] = payload.get("task_thread")
+                        else:
+                            row["status"] = payload.get("status") or ("blocked" if kind == "task_blocked" else row.get("status"))
+                            if payload.get("steps") is not None:
+                                row["steps"] = payload.get("steps")
+                            if payload.get("elapsed_ms") is not None:
+                                row["elapsed_ms"] = payload.get("elapsed_ms")
+                            if payload.get("reason"):
+                                row["error"] = _clean_text(payload.get("reason"), 300)
+                            if payload.get("error"):
+                                row["error"] = _clean_text(payload.get("error"), 300)
+                            if payload.get("reflection"):
+                                row["reflection_result"] = dict(payload.get("reflection") or {})
+            self._event(state, kind, **dict(payload or {}))
+            self._save(state)
+            if on_event:
+                try:
+                    on_event(kind, payload)
+                except Exception:
+                    pass
+        def scoped_runner(task, context):
+            # The durable ledger is keyed by workflow + task.  If the process
+            # dies after a mutating tool returns but before the graph writes its
+            # node checkpoint, recovery will replay the recorded result rather
+            # than perform the side effect a second time.
+            from .tools import tool_idempotency_scope
+            prepared = task.get("_prepared_context") if isinstance(task, Mapping) else None
+            if isinstance(prepared, Mapping):
+                bounded_context = {str(key): str(value) for key, value in prepared.items()}
+                compression = dict(task.get("_context_compression") or {})
+            else:
+                bounded_context, compression = compress_context(
+                    context, max(240, policy.max_context_chars // 3))
+            if compression.get("truncated"):
+                task = dict(task)
+                task["context_compression"] = compression
+            with tool_idempotency_scope(
+                    "%s:%s" % (workflow_id, str(task.get("id") or "task")),
+                    self.state_root):
+                return runner(task, bounded_context)
+        if StateGraph is not None:
+            # LangGraph owns the bounded review → replan → execute loop.
+            # The nested task graph uses ``Send`` for each parallel subagent;
+            # there is only one source of truth for replan counters.
+            graph_wave_index = 0
+            def execute_wave(tasks, prior_results, remaining_steps):
+                nonlocal graph_wave_index
+                self._refresh_workflow_lease(workflow_id)
+                if remaining_steps <= 0:
+                    return {"ok": False, "results": {}, "steps_used": 0,
+                            "blocked": [str(task.get("id")) for task in tasks],
+                            "error": "达到工作流步数上限"}
+                wave_thread = "%s:exec%s" % (workflow_id, graph_wave_index)
+                graph_wave_index += 1
+                self._workflow_hook(state, "before_wave", wave=graph_wave_index - 1,
+                                    task_count=len(tasks))
+                report = self._run_task_dag_langgraph(
+                    tasks, scoped_runner, prior_results=prior_results,
+                    max_steps=remaining_steps, max_parallel=policy.max_subagents,
+                    max_context_chars=policy.max_context_chars,
+                    on_event=emit, thread_id=wave_thread,
+                    trace_parent_id=str((state.langsmith_trace or {}).get("root_run_id") or ""),
+                )
+                self._workflow_hook(state, "after_wave", wave=graph_wave_index - 1,
+                                    task_count=len(tasks),
+                                    status="ok" if report.get("ok") else "failed")
+                return report
+
+            graph = self.build_langgraph(
+                checkpointer=self._graph_checkpointer,
+                execute_wave=execute_wave,
+                replan=(lambda failed, results, attempt: self._call_graph_replanner(
+                    replanner, failed, results, attempt, emit)) if replanner is not None else None)
+            payload: WorkflowGraphState = {
+                "workflow_id": workflow_id, "phase": "execute", "status": "executing",
+                "selected_option": state.selected_option or {}, "approved": True,
+                "tasks": [dict(task) for task in state.tasks], "results": {},
+                "step_count": int(state.steps or 0), "replan_count": 0,
+                "max_steps": policy.max_steps, "max_replans": policy.max_replans,
+                "langsmith_trace": dict(state.langsmith_trace or {}),
+            }
+            graph_state = graph.invoke(
+                payload,
+                config={"configurable": {"thread_id": workflow_id},
+                        "recursion_limit": max(32, policy.max_replans * 4 + 16)},
+            )
+            current_report = graph_state.get("current_report") or {}
+            report = {
+                "ok": graph_state.get("status") == "completed",
+                "tasks": list(graph_state.get("tasks") or current_report.get("tasks") or state.tasks),
+                "results": graph_state.get("results") or {},
+                "merged": "", "replans": int(graph_state.get("replan_count", 0)),
+                "task_backend": current_report.get("backend", "langgraph_send"),
+                "task_threads": list(graph_state.get("task_threads") or []),
+                "steps_used": int(graph_state.get("step_count", 0)) - int(state.steps or 0),
+                "waves": [], "blocked": [],
+                "revisions": list(graph_state.get("replan_history") or []),
+                "n_tasks": len(graph_state.get("results") or {}),
+                "n_ok": sum(1 for item in (graph_state.get("results") or {}).values()
+                            if (item or {}).get("status") == "ok"),
+                "n_failed": sum(1 for item in (graph_state.get("results") or {}).values()
+                                 if (item or {}).get("status") == "failed"),
+            }
+            state.graph_state = dict(graph_state)
+            self._event(state, "graph_loop", status=graph_state.get("status"),
+                        replans=graph_state.get("replan_count", 0),
+                        steps=graph_state.get("step_count", 0))
+        else:
+            report = run_plan(state.tasks, runner, synth_runner=synth_runner,
+                              max_parallel=policy.max_subagents, max_replans=policy.max_replans,
+                              max_steps=policy.max_steps, replanner=replanner, on_event=emit)
+        if StateGraph is not None and synth_runner and report.get("results"):
+            try:
+                report["merged"] = synth_runner(state.tasks, report["results"]) or ""
+            except Exception as exc:
+                report["merged"] = "（结果合成失败：%s）" % type(exc).__name__
+        state.results = report
+        # A dispatcher can expand the task graph during execution. Keep the
+        # durable workflow/task roster aligned with the effective graph so the
+        # workbench shows the actual members rather than the initial seed only.
+        if report.get("tasks"):
+            state.tasks = [dict(item) for item in report.get("tasks") or []]
+        state.steps += int(report.get("steps_used") or 0)
+        state.replans = int(report.get("replans") or 0)
+        result_map = dict(report.get("results") or {})
+        subagent_rows = self._subagent_records(state.tasks)
+        for row in subagent_rows:
+            result = dict(result_map.get(str(row.get("id"))) or {})
+            row["status"] = result.get("status", row.get("status"))
+            row["steps"] = int(result.get("steps") or 0)
+            row["elapsed_ms"] = int(result.get("elapsed_ms") or 0)
+            if result.get("error"):
+                row["error"] = _clean_text(result.get("error"), 300)
+            if result.get("reflection"):
+                row["reflection_result"] = dict(result.get("reflection") or {})
+        state.subagents = subagent_rows
+        merged = report.get("merged") or "\n".join(
+            str((item or {}).get("conclusion") or "")
+            for item in result_map.values())
+        state.review = review_output({"merged": merged, "status": "ok" if report.get("ok") else "failed",
+                                      "trace": {"steps": sum((r.get("trace", {}).get("steps", []) for r in report.get("results", {}).values()), [])}},
+                                     max_tool_failures=policy.max_tool_failures,
+                                     question=state.request, code_root=state.project_root)
+        state.context_layers["subagent"] = {
+            "count": len(report.get("results") or {}),
+            "statuses": {key: (value or {}).get("status")
+                         for key, value in result_map.items()},
+            "reflections": {key: dict((value or {}).get("reflection") or {})
+                            for key, value in result_map.items()
+                            if (value or {}).get("reflection")},
+            "compression": dict(report.get("context_compression") or {}),
+        }
+        state.context_layers["output"] = {
+            "chars": len(merged), "review_ok": bool(state.review.get("ok")),
+            "steps": report.get("steps_used", 0),
+        }
+        state.status = "completed" if state.review.get("ok") and report.get("ok") else "failed"
+        state.phase = "review"
+        self._event(state, "review", ok=state.review.get("ok"), status=state.status)
+        if state.experience_enabled and not any(e.get("kind") == "experience" for e in state.events):
+            try:
+                from experience import record_episode
+                outcome = "success" if state.status == "completed" else "repeated-fail"
+                recorded = record_episode(
+                    state.project_id or "default",
+                    "游戏工作流：" + state.request,
+                    "方案=%s；重规划=%s；复核=%s" % (
+                        (state.selected_option or {}).get("id", "未选择"),
+                        state.replans, state.review.get("ok", False)),
+                    outcome, lesson="仅保存脱敏的流程摘要；具体代码和凭据不入经验库")
+                self._event(state, "experience", recorded=bool(recorded), outcome=outcome)
+            except Exception:
+                self._event(state, "experience", recorded=False, outcome="unavailable")
+        if state.status == "completed" and state.experience_enabled and not state.skill_candidate:
+            from .workflow_eval import evaluate_workflow
+            skill_evaluation = evaluate_workflow(state.public())
+            option_id = str((state.selected_option or {}).get("id") or "workflow")
+            slug = re.sub(r"[^A-Za-z0-9_-]+", "-", option_id).strip("-") or "workflow"
+            state.skill_candidate = {
+                "id": "skill-candidate-" + uuid.uuid4().hex[:12],
+                "name": "game-workflow-" + slug,
+                "description": "经用户审批后可复用的游戏开发工作流：" + _clean_text(
+                    (state.selected_option or {}).get("title") or "原型开发与验证", 120),
+                "body": "# 游戏开发工作流\n\n"
+                        "适用于：先澄清目标与方案，再拆分设计、实现和验证任务；\n"
+                        "执行前经过审批，失败后依据复核结果重规划。\n\n"
+                        "## 脱敏流程摘要\n\n"
+                        "- 任务数：%s\n- 重规划次数：%s\n- 复核通过：是\n" % (
+                            len(state.tasks), state.replans),
+                "evaluation": {"passed": bool(skill_evaluation.get("passed")),
+                                "score": skill_evaluation.get("score"),
+                                "checks": [item.get("name") for item in skill_evaluation.get("checks", [])
+                                           if item.get("ok")]},
+                "status": "pending_approval",
+            }
+            self._event(state, "skill_candidate", candidate_id=state.skill_candidate["id"])
+        return self._save(state).public()
+
+    def approve(self, workflow_id: str, approved: bool, *, auto_execute: bool = False) -> dict[str, Any]:
+        state = self._load(workflow_id)
+        if state.status != "awaiting_approval":
+            raise WorkflowError("当前工作流没有待审核执行")
+        self._workflow_hook(state, "before_approval", approved=bool(approved),
+                            task_count=len(state.tasks))
+        if not approved:
+            state.status, state.phase = "interrupted", "execute"
+            state.interrupt_reason = "用户拒绝执行当前计划"
+            if StateGraph is not None and graph_interrupt is not None:
+                self._resume_gate(state, "approval", {"approved": False})
+            self._event(state, "approval_denied")
+        else:
+            state.status, state.phase = "planned", "execute"
+            state.policy["approval_mode"] = "high"
+            state.interrupt_reason = ""
+            if StateGraph is not None and graph_interrupt is not None:
+                self._resume_gate(state, "approval", {"approved": True})
+            self._event(state, "approval_granted")
+            if auto_execute:
+                callbacks = self._execution_callbacks.get(workflow_id)
+                if callbacks is None and self._execution_resolver is not None:
+                    try:
+                        resolved = self._execution_resolver(state.public())
+                        if isinstance(resolved, Mapping) and callable(resolved.get("runner")):
+                            callbacks = dict(resolved)
+                            self._execution_callbacks[workflow_id] = callbacks
+                            self._event(state, "auto_execute_reconstructed",
+                                        session_id=state.execution_session_id or "workflow")
+                    except Exception as exc:
+                        self._event(state, "auto_execute_reconstruct_failed",
+                                    error=type(exc).__name__)
+                if callbacks is None:
+                    self._event(state, "auto_execute_unavailable", reason="进程重启后执行回调不可恢复")
+                else:
+                    self._event(state, "auto_execute_start")
+                    self._workflow_hook(state, "after_approval", approved=True,
+                                        task_count=len(state.tasks))
+                    self._save(state)
+                    return self.execute(workflow_id, **callbacks)
+        self._workflow_hook(state, "after_approval", approved=bool(approved),
+                            task_count=len(state.tasks))
+        return self._save(state).public()
+
+    def interrupt(self, workflow_id: str, reason: str = "用户请求中断") -> dict[str, Any]:
+        state = self._load(workflow_id)
+        state.status, state.interrupt_reason = "interrupted", _clean_text(reason, 500)
+        self._event(state, "interrupt", reason=state.interrupt_reason)
+        return self._save(state).public()
+
+    def resume(self, workflow_id: str) -> dict[str, Any]:
+        state = self._load(workflow_id)
+        if state.status != "interrupted":
+            raise WorkflowError("当前工作流不是中断状态")
+        if state.pending_tasks:
+            raise WorkflowError("新的任务 DAG 仍在等待审核")
+        state.status = "planning" if not state.tasks else "planned"
+        state.interrupt_reason = ""
+        self._event(state, "resume")
+        return self._save(state).public()
+
+    def request_dag_revision(self, workflow_id: str,
+                             tasks: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+        """Stage a user DAG change without mutating an active execution wave."""
+        state = self._load(workflow_id)
+        if state.status not in {"planned", "awaiting_approval", "executing", "interrupted"}:
+            raise WorkflowError("当前工作流不能修改任务 DAG：%s" % state.status)
+        policy = WorkflowPolicy(**state.policy).normalized()
+        parsed = self._parse_generated_tasks(list(tasks or []), max_tasks=policy.max_subagents)
+        if not parsed:
+            raise WorkflowError("新的任务 DAG 无效：请检查唯一 id、依赖和环")
+        previous_status = state.status
+        state.pending_tasks = parsed
+        state.status = "interrupted"
+        state.phase = "execute"
+        state.interrupt_reason = "收到新的任务 DAG，等待用户审核后安全重排"
+        self._event(state, "dag_revision_requested", task_count=len(parsed),
+                    previous_status=previous_status)
+        return self._save(state).public()
+
+    def approve_dag_revision(self, workflow_id: str, approved: bool) -> dict[str, Any]:
+        state = self._load(workflow_id)
+        if not state.pending_tasks:
+            raise WorkflowError("当前工作流没有待审核的 DAG 修改")
+        self._workflow_hook(state, "before_approval", approved=bool(approved),
+                            task_count=len(state.pending_tasks), node="dag_revision")
+        if not approved:
+            state.pending_tasks = []
+            state.interrupt_reason = "用户拒绝新的任务 DAG"
+            self._event(state, "dag_revision_denied")
+        else:
+            state.tasks = [dict(item) for item in state.pending_tasks]
+            state.pending_tasks = []
+            state.results = {}
+            state.review = {}
+            state.subagents = self._subagent_records(state.tasks)
+            state.status, state.phase, state.interrupt_reason = "planned", "execute", ""
+            state.context_layers["task"] = {"count": len(state.tasks),
+                                             "ids": [item.get("id") for item in state.tasks],
+                                             "revision": True}
+            self._event(state, "dag_revision_approved", task_count=len(state.tasks))
+        self._workflow_hook(state, "after_approval", approved=bool(approved),
+                            task_count=len(state.tasks), node="dag_revision")
+        return self._save(state).public()
+
+    def get(self, workflow_id: str) -> dict[str, Any]:
+        return self._load(workflow_id).public()
+
+    def evaluate(self, workflow_id: str) -> dict[str, Any]:
+        from .workflow_eval import evaluate_workflow
+        state = self._load(workflow_id)
+        evaluation = evaluate_workflow(state.public())
+        try:
+            from .langsmith import record_workflow_event
+            record_workflow_event(state.public(), "evaluation", {
+                "score": evaluation.get("score"),
+                "passed": evaluation.get("passed"),
+                "failed_tasks": (evaluation.get("metrics") or {}).get("failed_tasks", 0),
+                "blocked_tasks": (evaluation.get("metrics") or {}).get("blocked_tasks", 0),
+                "idempotency_in_doubt": (evaluation.get("metrics") or {}).get("idempotency_in_doubt", 0),
+            })
+        except Exception:
+            pass
+        return evaluation
+
+    def approve_skill_candidate(self, workflow_id: str, approved: bool) -> dict[str, Any]:
+        state = self._load(workflow_id)
+        candidate = dict(state.skill_candidate or {})
+        if not candidate or candidate.get("status") != "pending_approval":
+            raise WorkflowError("当前工作流没有待审批的 Skill 候选")
+        if not approved:
+            candidate["status"] = "rejected"
+            state.skill_candidate = candidate
+            self._event(state, "skill_candidate_rejected")
+            return self._save(state).public()
+        try:
+            import skills
+            saved = skills.save_user_skill(candidate.get("name", ""),
+                                           candidate.get("description", ""),
+                                           candidate.get("body", ""))
+        except Exception as exc:
+            self._event(state, "skill_save_failed", error=type(exc).__name__)
+            raise WorkflowError("Skill 保存失败：%s" % type(exc).__name__) from exc
+        candidate.update(saved, status="saved")
+        try:
+            import skills
+            evaluation = candidate.get("evaluation") or {}
+            skills.record_result(candidate.get("name", ""), bool(evaluation.get("passed")),
+                                 score=evaluation.get("score"))
+        except Exception:
+            pass
+        state.skill_candidate = candidate
+        self._event(state, "skill_saved", name=saved.get("name"))
+        return self._save(state).public()
+
+    def checkpoint(self, workflow_id: str, *, approved: bool | None = None) -> dict[str, Any]:
+        """Return the durable LangGraph snapshot without advancing side effects."""
+        state = self._load(workflow_id)
+        if approved is not None and state.status == "awaiting_approval":
+            self.approve(workflow_id, bool(approved))
+            state = self._load(workflow_id)
+        graph = self.build_langgraph(workflow_id=state.workflow_id)
+        if graph is None:
+            return {"backend": "native", "state": {"phase": state.phase, "status": state.status}}
+        snapshot = self._graph_view(graph, state)
+        if not snapshot.get("workflow_id"):
+            self._invoke_graph(state, self._graph_payload(state), graph=graph)
+            snapshot = self._graph_view(graph, state)
+        state.graph_state = snapshot
+        self._save(state)
+        return {"backend": "langgraph", "state": snapshot}
+
+    def build_langgraph(self, *, checkpointer=None, workflow_id: str | None = None,
+                        execute_wave: Callable[[list[dict[str, Any]], dict[str, Any], int], Mapping[str, Any]] | None = None,
+                        replan: Callable[[list[dict[str, Any]], dict[str, Any], int], Any] | None = None,
+                        research_runner: Callable[[str], Any] | None = None,
+                        option_generator: Callable[[str, ContextPlan], Any] | None = None,
+                        task_generator: Callable[[str, Mapping[str, Any], ContextPlan], Any] | None = None):
+        """Build the bounded workflow graph when LangGraph is available.
+
+        Without callbacks it is a side-effect-free checkpoint/inspection
+        adapter.  With ``execute_wave`` it owns the real bounded
+        execute → review → replan loop; tools still run through the existing
+        runner and its ToolSpec/approval boundaries.
+        """
+        if StateGraph is None:
+            return None
+
+        # Resolve process-local adapters at graph construction time.  They are
+        # never serialized into checkpoint state, while their normalized
+        # outputs are written by the node that produced them.
+        if workflow_id:
+            research_runner = research_runner or self._research_runners.get(workflow_id)
+            option_generator = option_generator or self._option_generators.get(workflow_id)
+            task_generator = task_generator or self._task_generators.get(workflow_id)
+
+        graph = StateGraph(WorkflowGraphState)
+
+        def provider_call(state: Mapping[str, Any], name: str, callback: Callable[[], Any]) -> Any:
+            """Trace one provider call as a bounded LLM/tool child run."""
+            try:
+                from .langsmith import workflow_span
+            except Exception:
+                # Tracing must never alter provider behavior.
+                return callback()
+            with workflow_span(state, name, run_type="llm"):
+                return callback()
+
+        def route_node(state):
+            if state.get("status") == "awaiting_research" or state.get("phase") == "research":
+                if state.get("event") == "research_gate" or state.get("research_error"):
+                    return {"phase": "research", "status": "awaiting_research", "event": "route_research_gate"}
+                return {"phase": "research", "status": "awaiting_research", "event": "route_research"}
+            if state.get("option_generation_pending") and option_generator is not None:
+                return {"phase": "clarify", "status": "generating_options",
+                        "event": "route_options"}
+            if state.get("status") in {"planned", "awaiting_approval", "executing"} or \
+                    (state.get("selected_option") and state.get("approved")):
+                return {"phase": "execute", "status": "awaiting_approval" if not state.get("approved") else "executing",
+                        "event": "approval_required" if not state.get("approved") else "route_execute"}
+            return {"phase": "clarify", "status": "awaiting_choice", "event": "choice_gate"}
+
+        def options_node(state):
+            options = list(state.get("options") or [])
+            option_source = str(state.get("option_source") or "deterministic")
+            generation_error = ""
+            provider_attempts: list[dict[str, Any]] = []
+            if option_generator is not None:
+                plan = ContextPlan(
+                    sources=tuple(state.get("sources") or ("direct",)),
+                    tool_groups=frozenset({"general", "orchestration", "web"}
+                                          if "web" in (state.get("sources") or [])
+                                          else {"general", "orchestration"}),
+                    skill_names=(), messages=(),
+                    budget_chars=int(state.get("max_context_chars", 6000) or 6000), used_chars=0,
+                )
+                attempts = 1 + max(0, int(state.get("max_provider_retries", 2)))
+                for attempt in range(1, attempts + 1):
+                    try:
+                        parsed = self._parse_generated_options(
+                            provider_call(state, "llm.options", lambda: option_generator(
+                                str(state.get("request", "")), plan)), plan)
+                        if not parsed:
+                            raise ValueError("invalid_options_json")
+                        options, option_source = [asdict(item) for item in parsed], "llm"
+                        provider_attempts.append({"provider": "options", "attempt": attempt, "ok": True})
+                        break
+                    except Exception as exc:
+                        generation_error = type(exc).__name__
+                        provider_attempts.append({"provider": "options", "attempt": attempt,
+                                                  "ok": False, "error": generation_error})
+            return {"phase": "clarify", "status": "awaiting_choice", "event": "options_generated",
+                    "options": options, "option_source": option_source,
+                    "option_generation_pending": False,
+                    "provider_attempts": provider_attempts,
+                    "generation_error": generation_error}
+
+        def research_node(state):
+            # When a provider is registered, research is a real graph step:
+            # execute it, bound/clean the result, then regenerate options with
+            # strict JSON validation.  Any provider/model failure is recorded
+            # in the node output and falls back to deterministic options.
+            findings = ""
+            source = "web"
+            research_error = ""
+            research_attempts: list[dict[str, Any]] = []
+            provider_attempts: list[dict[str, Any]] = []
+            if research_runner is not None:
+                attempts = 1 + max(0, int(state.get("max_provider_retries", 2)))
+                for attempt in range(1, attempts + 1):
+                    try:
+                        raw = provider_call(state, "tool.research", lambda: research_runner(
+                            str(state.get("request", ""))))
+                        if isinstance(raw, Mapping):
+                            findings = _clean_text(raw.get("findings") or raw.get("text") or raw, 8000)
+                            source = _clean_text(raw.get("source") or "web", 80)
+                        else:
+                            findings = _clean_text(raw, 8000)
+                        if not findings:
+                            raise ValueError("empty_research_result")
+                        research_attempts.append({"attempt": attempt, "ok": True})
+                        break
+                    except Exception as exc:
+                        error = type(exc).__name__
+                        research_error = error
+                        research_attempts.append({"attempt": attempt, "ok": False, "error": error})
+            if not findings:
+                return {"phase": "research", "status": "awaiting_research",
+                        "event": "research_gate", "interrupt_reason": "等待联网检索结果",
+                        "research_error": research_error,
+                        "research_attempts": research_attempts}
+            research_plan = ContextPlan(
+                sources=tuple(dict.fromkeys([*(state.get("sources") or []), source, "web"])),
+                tool_groups=frozenset({"general", "web", "orchestration"}),
+                skill_names=(), messages=(("【外部检索摘要】" + findings,) if findings else ()),
+                budget_chars=800, used_chars=min(800, len(findings)),
+            )
+            options = [asdict(item) for item in self._options(
+                str(state.get("request", "")) + ("\n" + findings if findings else ""), research_plan)]
+            option_source = "deterministic"
+            if findings and option_generator is not None:
+                attempts = 1 + max(0, int(state.get("max_provider_retries", 2)))
+                for attempt in range(1, attempts + 1):
+                    try:
+                        parsed = self._parse_generated_options(
+                            provider_call(state, "llm.research_options", lambda: option_generator(
+                                str(state.get("request", "")) + "\n" + findings, research_plan)), research_plan)
+                        if not parsed:
+                            raise ValueError("invalid_options_json")
+                        options, option_source = [asdict(item) for item in parsed], "llm"
+                        provider_attempts.append({"provider": "research_options", "attempt": attempt, "ok": True})
+                        break
+                    except Exception as exc:
+                        research_error = research_error or type(exc).__name__
+                        provider_attempts.append({"provider": "research_options", "attempt": attempt,
+                                                  "ok": False, "error": type(exc).__name__})
+            return {
+                "phase": "clarify", "status": "awaiting_choice", "event": "research",
+                "research_findings": findings, "research_source": source,
+                "options": options, "interrupt_reason": research_error,
+                "research_error": research_error, "option_source": option_source,
+                "research_attempts": research_attempts,
+                "provider_attempts": provider_attempts,
+            }
+
+        def research_gate_node(state):
+            response = graph_interrupt({
+                "kind": "research", "request": state.get("request", ""),
+                "query": state.get("request", ""),
+            })
+            response = response if isinstance(response, Mapping) else {"findings": str(response)}
+            findings = _clean_text(response.get("findings") or "", 8000)
+            if not findings:
+                return {"phase": "research", "status": "awaiting_research",
+                        "event": "research_gate", "interrupt_reason": "联网检索结果为空"}
+            source = _clean_text(response.get("source") or "web", 80)
+            plan = ContextPlan(
+                sources=tuple(dict.fromkeys([*(state.get("sources") or []), source, "web"])),
+                tool_groups=frozenset({"general", "web", "orchestration"}),
+                skill_names=(), messages=("【外部检索摘要】" + findings,),
+                budget_chars=800, used_chars=min(800, len(findings)),
+            )
+            options = [asdict(item) for item in self._options(
+                str(state.get("request", "")) + "\n" + findings, plan)]
+            option_source = "deterministic"
+            error = ""
+            provider_attempts: list[dict[str, Any]] = []
+            if option_generator is not None:
+                attempts = 1 + max(0, int(state.get("max_provider_retries", 2)))
+                for attempt in range(1, attempts + 1):
+                    try:
+                        parsed = self._parse_generated_options(
+                            provider_call(state, "llm.research_options", lambda: option_generator(
+                                str(state.get("request", "")) + "\n" + findings, plan)), plan)
+                        if not parsed:
+                            raise ValueError("invalid_options_json")
+                        options, option_source = [asdict(item) for item in parsed], "llm"
+                        provider_attempts.append({"provider": "research_options", "attempt": attempt, "ok": True})
+                        break
+                    except Exception as exc:
+                        error = type(exc).__name__
+                        provider_attempts.append({"provider": "research_options", "attempt": attempt,
+                                                  "ok": False, "error": error})
+            return {"phase": "clarify", "status": "awaiting_choice", "event": "research",
+                    "research_findings": findings, "research_source": source,
+                    "options": options, "option_source": option_source,
+                    "research_error": error, "interrupt_reason": "",
+                    "provider_attempts": provider_attempts}
+
+        def choice_node(state):
+            options = list(state.get("options") or [])
+            option_source = str(state.get("option_source") or "deterministic")
+            generation_error = ""
+            provider_attempts: list[dict[str, Any]] = []
+            if state.get("option_generation_pending") and option_generator is not None:
+                plan = ContextPlan(
+                    sources=tuple(state.get("sources") or ("direct",)),
+                    tool_groups=frozenset({"general", "orchestration", "web"}
+                                          if "web" in (state.get("sources") or [])
+                                          else {"general", "orchestration"}),
+                    skill_names=(), messages=(),
+                    budget_chars=int(state.get("max_context_chars", 6000) or 6000), used_chars=0,
+                )
+                attempts = 1 + max(0, int(state.get("max_provider_retries", 2)))
+                for attempt in range(1, attempts + 1):
+                    try:
+                        parsed = self._parse_generated_options(
+                            provider_call(state, "llm.options", lambda: option_generator(
+                                str(state.get("request", "")), plan)), plan)
+                        if not parsed:
+                            raise ValueError("invalid_options_json")
+                        options, option_source = [asdict(item) for item in parsed], "llm"
+                        provider_attempts.append({"provider": "options", "attempt": attempt, "ok": True})
+                        break
+                    except Exception as exc:
+                        generation_error = type(exc).__name__
+                        provider_attempts.append({"provider": "options", "attempt": attempt,
+                                                  "ok": False, "error": generation_error})
+            response = graph_interrupt({
+                "kind": "choice", "request": state.get("request", ""),
+                "options": options,
+                "option_source": option_source,
+                "generation_error": generation_error,
+                "provider_attempts": provider_attempts,
+            })
+            response = response if isinstance(response, Mapping) else {"choice": str(response)}
+            choice = str(response.get("choice") or "").strip()
+            if choice == "web_research":
+                return {"phase": "research", "status": "awaiting_research",
+                        "event": "research_gate", "interrupt_reason": "等待联网检索结果",
+                        "options": options, "option_generation_pending": False,
+                        "option_source": option_source}
+            if choice == "custom":
+                return {"phase": "clarify", "status": "awaiting_choice", "event": "clarify",
+                        "request": str(response.get("request") or state.get("request") or ""),
+                        "options": list(response.get("options") or options),
+                        "option_generation_pending": False, "option_source": option_source}
+            selected = response.get("selected_option")
+            if not isinstance(selected, Mapping):
+                selected = next((item for item in options
+                                 if item.get("id") == choice), {})
+            return {"phase": "plan", "status": "planning", "event": "choice",
+                    "selected_option": dict(selected or {}), "interrupt_reason": "",
+                    "options": options, "option_generation_pending": False,
+                    "option_source": option_source}
+
+        def plan_node(state):
+            tasks = list(state.get("tasks") or [])
+            if not tasks:
+                source = "provided"
+                if task_generator is not None:
+                    plan = ContextPlan(
+                        sources=tuple(state.get("sources") or ("direct",)),
+                        tool_groups=frozenset({"general", "orchestration"}),
+                        skill_names=(), messages=(), budget_chars=int(state.get("max_context_chars", 6000) or 6000), used_chars=0)
+                    attempts = 1 + max(0, int(state.get("max_provider_retries", 2)))
+                    for attempt in range(1, attempts + 1):
+                        try:
+                            parsed = self._parse_generated_tasks(provider_call(
+                                state, "llm.plan", lambda: task_generator(
+                                str(state.get("request", "")), state.get("selected_option") or {}, plan)),
+                                max_tasks=int(state.get("max_subagents", 16) or 16))
+                            if not parsed:
+                                raise ValueError("invalid_task_dag")
+                            tasks, source = parsed, "llm"
+                            state.setdefault("provider_attempts", []).append({
+                                "provider": "plan", "attempt": attempt, "ok": True})
+                            break
+                        except Exception as exc:
+                            state.setdefault("provider_attempts", []).append({
+                                "provider": "plan", "attempt": attempt,
+                                "ok": False, "error": type(exc).__name__})
+                            tasks = []
+                if not tasks:
+                    if task_generator is not None:
+                        # An invalid model plan is recoverable inside the
+                        # graph.  Keep the same deterministic contract used
+                        # by the native manager and continue to approval.
+                        tasks = [
+                            {"id": "design", "role": "designer",
+                             "task": "明确玩法、场景、输入和验收标准", "depends_on": []},
+                            {"id": "prototype", "role": "coder",
+                             "task": "创建最小可运行游戏原型", "depends_on": ["design"]},
+                            {"id": "verify", "role": "tester",
+                             "task": "执行自测、Playtest 并反馈失败证据", "depends_on": ["prototype"]},
+                        ]
+                        source = "deterministic"
+                    else:
+                        response = graph_interrupt({
+                            "kind": "plan", "request": state.get("request", ""),
+                            "selected_option": state.get("selected_option") or {},
+                        })
+                        if isinstance(response, Mapping):
+                            tasks = [dict(item) for item in (response.get("tasks") or [])
+                                     if isinstance(item, Mapping)]
+                            source = str(response.get("source") or source)
+                        else:
+                            tasks = []
+                if not tasks:
+                    # A resumed plan gate without a valid task list remains
+                    # paused; callers can submit a corrected plan later.
+                    return {"phase": "plan", "status": "planning", "event": "plan_gate"}
+                return {"phase": "execute", "status": "planned", "event": "plan",
+                        "tasks": tasks, "plan_source": source,
+                        "provider_attempts": list(state.get("provider_attempts") or [])}
+            return {"phase": "execute", "status": "planned", "event": "plan"}
+
+        def approval_node(state):
+            if state.get("approved"):
+                return {"phase": "execute", "status": "executing" if execute_wave is not None else "planned",
+                        "event": "approval_granted", "interrupt_reason": ""}
+            response = graph_interrupt({
+                "kind": "approval", "request": state.get("request", ""),
+                "tasks": list(state.get("tasks") or []),
+                "reason": state.get("interrupt_reason") or "执行计划需要用户审核",
+            })
+            approved = bool(response.get("approved")) if isinstance(response, Mapping) else bool(response)
+            return {"phase": "execute", "status": "executing" if approved and execute_wave is not None else
+                    ("planned" if approved else "interrupted"),
+                    "approved": approved, "event": "approval_granted" if approved else "approval_denied",
+                    "interrupt_reason": "" if approved else "用户拒绝执行当前计划"}
+
+        def execute_wave_node(state):
+            """Run one execution wave in the real runtime.
+
+            The graph adapter remains side-effect free; the native manager
+            still performs the actual ``run_plan`` call.  Counters live in the
+            graph state so a future side-effectful node can use the same
+            bounded loop without introducing a second outer while-loop.
+            """
+            if execute_wave is None:
+                steps = int(state.get("step_count", 0)) + 1
+                return {"phase": "review", "status": "reviewing", "event": "execute_wave",
+                        "step_count": steps}
+            remaining = max(0, int(state.get("max_steps", 24)) - int(state.get("step_count", 0)))
+            report = dict(provider_call(
+                state, "execute.wave", lambda: execute_wave(
+                    list(state.get("tasks") or []),
+                    dict(state.get("results") or {}), remaining)) or {})
+            merged_results = dict(state.get("results") or {})
+            merged_results.update(report.get("results") or {})
+            current = report.get("results") or {}
+            effective_tasks = list(report.get("tasks") or state.get("tasks") or [])
+            failed = [dict(task) for task in effective_tasks
+                      if (current.get(str(task.get("id"))) or {}).get("status") == "failed"]
+            return {
+                "phase": "review", "status": "reviewing", "event": "execute_wave",
+                "step_count": int(state.get("step_count", 0)) + int(report.get("steps_used") or 0),
+                "results": merged_results, "current_report": report,
+                "tasks": effective_tasks,
+                "failed_tasks": failed, "execution_ok": bool(report.get("ok")),
+                "task_threads": list(state.get("task_threads") or []) +
+                list(report.get("task_threads") or []),
+            }
+
+        def review_node(state):
+            review = state.get("review") or {}
+            if execute_wave is not None:
+                if state.get("execution_ok"):
+                    return {"phase": "review", "status": "completed", "event": "review",
+                            "review": {"ok": True}}
+                failed = list(state.get("failed_tasks") or [])
+                if replan is not None and failed and int(state.get("replan_count", 0)) < int(state.get("max_replans", 2)) \
+                        and int(state.get("step_count", 0)) < int(state.get("max_steps", 24)):
+                    return {"phase": "review", "status": "replanning", "event": "review_replan",
+                            "review": {"ok": False}}
+                return {"phase": "review", "status": "failed", "event": "review_failed",
+                        "review": {"ok": False}}
+            if review.get("ok") is True:
+                return {"phase": "review", "status": "completed", "event": "review"}
+            failed = list(state.get("failed_tasks") or [])
+            if review.get("ok") is False or failed:
+                max_replans = int(state.get("max_replans", 2))
+                max_steps = int(state.get("max_steps", 24))
+                if failed and int(state.get("replan_count", 0)) < max_replans \
+                        and int(state.get("step_count", 0)) < max_steps:
+                    return {"phase": "review", "status": "replanning", "event": "review_replan"}
+                return {"phase": "review", "status": "failed", "event": "review_failed"}
+            # A checkpoint-only invocation has no execution result yet.  Keep
+            # the adapter inspectable and terminate this dry run cleanly.
+            return {"phase": "review", "status": "completed", "event": "review"}
+
+        def replan_node(state):
+            attempt = int(state.get("replan_count", 0)) + 1
+            history = list(state.get("replan_history") or [])
+            failed_ids = [str(item.get("id")) if isinstance(item, Mapping) else str(item)
+                          for item in (state.get("failed_tasks") or [])]
+            if replan is None:
+                history.append({"attempt": attempt, "failed": failed_ids,
+                                "status": "simulated"})
+                return {"phase": "execute", "status": "executing", "event": "replan",
+                        "replan_count": attempt, "failed_tasks": [],
+                        "replan_history": history}
+            try:
+                proposal = provider_call(
+                    state, "llm.replan", lambda: replan(
+                        list(state.get("failed_tasks") or []),
+                        dict(state.get("results") or {}), attempt))
+                if isinstance(proposal, Mapping):
+                    proposal = (proposal.get("add") or proposal.get("tasks") or
+                                proposal.get("replace") or proposal.get("revise") or [])
+                known_results = dict(state.get("results") or {})
+                raw_tasks = [dict(item) for item in proposal] if isinstance(proposal, list) else []
+                ids = {str(item.get("id") or "") for item in raw_tasks}
+                # Dependencies already settled in a previous graph wave become
+                # context inputs; only dependencies inside this wave remain as
+                # scheduler edges.
+                for item in raw_tasks:
+                    deps = item.get("depends_on", item.get("after", []))
+                    if isinstance(deps, str):
+                        deps = [deps]
+                    item["context_from"] = [str(dep) for dep in (deps or [])
+                                            if str(dep) in known_results]
+                    item["depends_on"] = [str(dep) for dep in (deps or []) if str(dep) in ids]
+                parsed = self._parse_generated_tasks(raw_tasks, max_tasks=16)
+            except Exception as exc:
+                parsed = []
+                error = type(exc).__name__
+            else:
+                error = "" if parsed else "empty_or_invalid_proposal"
+            if not parsed:
+                history.append({"attempt": attempt, "failed": failed_ids,
+                                "status": "rejected", "error": error})
+                return {"phase": "fail", "status": "failed", "event": "replan_failed",
+                        "replan_count": attempt, "replan_error": error, "tasks": [],
+                        "replan_history": history}
+            # _parse_generated_tasks intentionally drops unknown fields.  Add
+            # the cross-wave context references back after validation.
+            context_by_id = {str(item.get("id")): list(item.get("context_from") or [])
+                             for item in raw_tasks}
+            for item in parsed:
+                item["context_from"] = context_by_id.get(item["id"], [])
+            history.append({"attempt": attempt, "failed": failed_ids, "status": "applied",
+                            "tasks": [item["id"] for item in parsed]})
+            return {"phase": "execute", "status": "executing", "event": "replan",
+                    "replan_count": attempt, "failed_tasks": [], "tasks": parsed,
+                    "replan_error": "", "replan_history": history}
+
+        def complete_node(state):
+            return {"phase": "complete", "status": "completed", "event": "complete"}
+
+        def fail_node(state):
+            return {"phase": "fail", "status": "failed", "event": "fail"}
+
+        def hooked_node(name: str, callback: Callable[[Mapping[str, Any]], Mapping[str, Any]]):
+            """Attach lifecycle hooks to each concrete LangGraph node."""
+            def wrapped(state):
+                runtime_state = self._states.get(workflow_id) if workflow_id else None
+                if runtime_state is not None:
+                    self._workflow_hook(runtime_state, "before_node", node=name,
+                                        status=state.get("status"), phase=state.get("phase"))
+                try:
+                    value = dict(callback(state) or {})
+                except BaseException as exc:
+                    if runtime_state is not None:
+                        self._workflow_hook(runtime_state, "after_node", node=name,
+                                            status="error", error=type(exc).__name__)
+                    raise
+                if runtime_state is not None:
+                    self._workflow_hook(runtime_state, "after_node", node=name,
+                                        status=value.get("status") or state.get("status"))
+                return value
+            return wrapped
+
+        def after_choice(state):
+            if state.get("status") == "awaiting_research":
+                return "research"
+            if state.get("status") == "awaiting_choice":
+                return "choice"
+            if state.get("status") == "planning" and state.get("selected_option"):
+                return "plan"
+            return END
+
+        def after_research(state):
+            if state.get("status") == "awaiting_research":
+                return "research_gate"
+            if state.get("status") == "awaiting_choice":
+                return "choice"
+            return END
+
+        def after_route(state):
+            if state.get("status") == "awaiting_research":
+                return "research"
+            if state.get("status") == "generating_options":
+                return "options"
+            if state.get("status") in {"planned", "awaiting_approval", "executing"} or \
+                    (state.get("selected_option") and state.get("approved")):
+                return "approval"
+            return "choice"
+
+        def after_approval(state):
+            return "execute_wave" if state.get("approved") else END
+
+        def after_review(state):
+            event = state.get("event")
+            if event == "review_replan":
+                return "replan"
+            if state.get("status") == "completed":
+                return "complete"
+            return "fail"
+
+        def after_replan(state):
+            if execute_wave is None:
+                return "execute_wave" if state.get("event") == "replan" else "fail"
+            return "execute_wave" if state.get("event") == "replan" and state.get("tasks") else "fail"
+
+        graph.add_node("route", hooked_node("route", route_node))
+        graph.add_node("options", hooked_node("options", options_node))
+        graph.add_node("research", hooked_node("research", research_node))
+        graph.add_node("research_gate", hooked_node("research_gate", research_gate_node))
+        graph.add_node("choice", hooked_node("choice", choice_node))
+        graph.add_node("plan", hooked_node("plan", plan_node))
+        graph.add_node("approval", hooked_node("approval", approval_node))
+        graph.add_node("execute_wave", hooked_node("execute_wave", execute_wave_node))
+        graph.add_node("review", hooked_node("review", review_node))
+        graph.add_node("replan", hooked_node("replan", replan_node))
+        graph.add_node("complete", hooked_node("complete", complete_node))
+        graph.add_node("fail", hooked_node("fail", fail_node))
+        graph.add_edge(START, "route")
+        graph.add_conditional_edges("route", after_route,
+                                    {"research": "research", "options": "options",
+                                     "choice": "choice", "approval": "approval"})
+        graph.add_edge("options", "choice")
+        graph.add_conditional_edges("research", after_research,
+                                    {"research_gate": "research_gate", "choice": "choice", END: END})
+        graph.add_edge("research_gate", "choice")
+        graph.add_conditional_edges("choice", after_choice,
+                                    {"research": "research", "choice": "choice", "plan": "plan", END: END})
+        graph.add_edge("plan", "approval")
+        graph.add_conditional_edges("approval", after_approval, {"execute_wave": "execute_wave", END: END})
+        graph.add_edge("execute_wave", "review")
+        graph.add_conditional_edges("review", after_review,
+                                    {"replan": "replan", "complete": "complete", "fail": "fail"})
+        graph.add_conditional_edges("replan", after_replan,
+                                    {"execute_wave": "execute_wave", "fail": "fail"})
+        graph.add_edge("complete", END)
+        graph.add_edge("fail", END)
+        return graph.compile(checkpointer=checkpointer or self._graph_checkpointer)
+
+
+WORKFLOWS = GameWorkflowManager()
+
+__all__ = [
+    "GameWorkflowManager", "WorkflowError", "WorkflowOption", "WorkflowPolicy",
+    "WorkflowState", "WorkflowGraphState", "WORKFLOWS", "review_output",
+]

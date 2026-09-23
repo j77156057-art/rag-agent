@@ -13,6 +13,13 @@
   def post_tool(name, arg, obs): ...
   def pre_turn(question): ...
   def post_turn(record): ...
+  def before_node(payload): ...
+  def after_node(payload): ...
+  def before_wave(payload): ...
+  def after_wave(payload): ...
+  def before_approval(payload): ...
+  def after_approval(payload): ...
+  def recovery(payload): ...
 
 钩子契约（返回值可为 None）：
   pre_tool(name, arg) -> {"block": bool, "reason": str} | {"arg": new_arg}
@@ -25,19 +32,127 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from config import STATE_ROOT, state_path
 
 HOOKS_DIR = state_path("DOCMIND_HOOKS_DIR", os.path.join(STATE_ROOT, ".docmind", "hooks"))
 
 _lock = threading.Lock()
-_hooks = {"pre_tool": [], "post_tool": [], "pre_turn": [], "post_turn": []}
+_WORKFLOW_KINDS = ("before_node", "after_node", "before_wave", "after_wave",
+                   "before_approval", "after_approval", "recovery",
+                   "before_tool", "after_tool", "before_mcp", "after_mcp",
+                   "mcp_retry", "network_timeout", "before_subagent", "after_subagent")
+_hooks = {"pre_tool": [], "post_tool": [], "pre_turn": [], "post_turn": [],
+          **{kind: [] for kind in _WORKFLOW_KINDS}}
 _sources = {}     # kind -> [module_name]
 _errors = []      # 加载/执行错误（供 /api/hooks 查看）
 _loaded = False
 _seq = 0
+_breakpoints = {}
+_WORKFLOW_EVENT_SINK: ContextVar = ContextVar("docmind_workflow_event_sink", default=None)
+
+
+@contextmanager
+def workflow_event_scope(sink):
+    """Capture lifecycle hook outcomes for one Agent/Subagent execution.
+
+    The sink receives ``(kind, payload, result)`` and is intentionally scoped
+    with a ContextVar so concurrent subagents cannot mix their hook records.
+    Hooks continue to receive the same bounded metadata as before.
+    """
+    token = _WORKFLOW_EVENT_SINK.set(sink if callable(sink) else None)
+    try:
+        yield
+    finally:
+        _WORKFLOW_EVENT_SINK.reset(token)
+
+
+def _publish_workflow_event(kind, payload, result):
+    sink = _WORKFLOW_EVENT_SINK.get()
+    if not callable(sink):
+        return
+    try:
+        sink(str(kind), dict(payload or {}), dict(result or {}))
+    except Exception:
+        # Observability must never alter the hook/tool control path.
+        pass
+
+
+def _breakpoints_path():
+    return os.path.join(HOOKS_DIR, "breakpoints.json")
+
+
+def _load_breakpoints():
+    global _breakpoints
+    try:
+        with open(_breakpoints_path(), "r", encoding="utf-8") as stream:
+            raw = json.load(stream)
+        if not isinstance(raw, dict):
+            raise ValueError("breakpoints must be an object")
+        _breakpoints = {
+            str(kind): dict(value) for kind, value in raw.items()
+            if kind in _WORKFLOW_KINDS and isinstance(value, dict)
+        }
+    except FileNotFoundError:
+        _breakpoints = {}
+    except (OSError, TypeError, ValueError) as exc:
+        _breakpoints = {}
+        _errors.append({"module": "breakpoints.json", "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _save_breakpoints():
+    os.makedirs(HOOKS_DIR, exist_ok=True)
+    path = _breakpoints_path()
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as stream:
+        json.dump(_breakpoints, stream, ensure_ascii=False, indent=2)
+    os.replace(temp, path)
+
+
+def _breakpoint_hit(kind, payload):
+    config = dict(_breakpoints.get(kind) or {})
+    if not config.get("enabled", True):
+        return None
+    match = str(config.get("match") or "").strip().lower()
+    if match:
+        haystack = json.dumps(dict(payload or {}), ensure_ascii=False, sort_keys=True, default=str).lower()
+        if match not in haystack:
+            return None
+    return config
+
+
+def set_breakpoint(kind, *, enabled=True, block=True, match="", reason=""):
+    """Create or update one safe declarative workflow breakpoint."""
+    kind = str(kind or "").strip()
+    if kind not in _WORKFLOW_KINDS:
+        raise ValueError("unsupported_hook_kind")
+    config = {
+        "enabled": bool(enabled), "block": bool(block),
+        "match": str(match or "")[:200],
+        "reason": str(reason or "用户断点：%s" % kind)[:300],
+    }
+    with _lock:
+        _breakpoints[kind] = config
+        _save_breakpoints()
+    return {"kind": kind, **config}
+
+
+def remove_breakpoint(kind):
+    kind = str(kind or "").strip()
+    with _lock:
+        removed = _breakpoints.pop(kind, None) is not None
+        _save_breakpoints()
+    return {"kind": kind, "removed": removed}
+
+
+def list_breakpoints():
+    _ensure()
+    return {kind: dict(value) for kind, value in sorted(_breakpoints.items())}
 
 
 class _Api:
@@ -62,6 +177,51 @@ class _Api:
     def post_turn(self, fn):
         self._add("post_turn", fn)
 
+    def before_node(self, fn):
+        self._add("before_node", fn)
+
+    def after_node(self, fn):
+        self._add("after_node", fn)
+
+    def before_wave(self, fn):
+        self._add("before_wave", fn)
+
+    def after_wave(self, fn):
+        self._add("after_wave", fn)
+
+    def before_approval(self, fn):
+        self._add("before_approval", fn)
+
+    def after_approval(self, fn):
+        self._add("after_approval", fn)
+
+    def recovery(self, fn):
+        self._add("recovery", fn)
+
+    def before_tool(self, fn):
+        self._add("before_tool", fn)
+
+    def after_tool(self, fn):
+        self._add("after_tool", fn)
+
+    def before_mcp(self, fn):
+        self._add("before_mcp", fn)
+
+    def after_mcp(self, fn):
+        self._add("after_mcp", fn)
+
+    def mcp_retry(self, fn):
+        self._add("mcp_retry", fn)
+
+    def network_timeout(self, fn):
+        self._add("network_timeout", fn)
+
+    def before_subagent(self, fn):
+        self._add("before_subagent", fn)
+
+    def after_subagent(self, fn):
+        self._add("after_subagent", fn)
+
 
 def _reset():
     global _seq
@@ -77,6 +237,7 @@ def reload(force=True):
     global _loaded
     with _lock:
         _reset()
+        _load_breakpoints()
         if not os.path.isdir(HOOKS_DIR):
             _loaded = True
             return {"loaded": 0, "errors": [], "hooks_dir": HOOKS_DIR}
@@ -171,12 +332,53 @@ def run_post_turn(record):
             _errors.append({"hook": "post_turn", "error": f"{type(e).__name__}: {e}"})
 
 
+def run_workflow(kind, payload):
+    """Run a workflow lifecycle hook and return block/error metadata.
+
+    Hook exceptions are reported to the caller instead of escaping.  The
+    workflow policy decides whether those errors merely audit or block.
+    """
+    if kind not in _WORKFLOW_KINDS:
+        return {"blocked": False, "reason": "", "errors": []}
+    _ensure()
+    breakpoint = _breakpoint_hit(kind, payload)
+    if breakpoint and breakpoint.get("block", True):
+        result = {"blocked": True,
+                  "reason": str(breakpoint.get("reason") or "用户断点：%s" % kind),
+                  "errors": [], "breakpoint": {"kind": kind, **breakpoint}}
+        _publish_workflow_event(kind, payload, result)
+        return result
+    blocked, reason, errors = False, "", []
+    for fn in list(_hooks[kind]):
+        try:
+            out = fn(dict(payload or {}))
+        except Exception as e:  # noqa: BLE001
+            error = {"hook": kind, "error": f"{type(e).__name__}: {e}"}
+            _errors.append(error)
+            errors.append(error)
+            continue
+        if isinstance(out, dict):
+            if out.get("block"):
+                blocked = True
+                reason = str(out.get("reason") or "被工作流钩子拦截")
+    result = {"blocked": blocked, "reason": reason, "errors": errors,
+              "breakpoint": ({"kind": kind, **breakpoint} if breakpoint else None)}
+    _publish_workflow_event(kind, payload, result)
+    return result
+
+
 def list_hooks():
     _ensure()
+    legacy_kinds = ("pre_tool", "post_tool", "pre_turn", "post_turn")
     return {
         "hooks_dir": HOOKS_DIR,
         "exists": os.path.isdir(HOOKS_DIR),
-        "counts": {k: len(v) for k, v in _hooks.items()},
+        # Keep the original counts shape for existing clients; workflow
+        # lifecycle hooks are exposed separately.
+        "counts": {k: len(_hooks[k]) for k in legacy_kinds},
+        "workflow_counts": {k: len(_hooks[k]) for k in _WORKFLOW_KINDS},
+        "workflow_kinds": list(_WORKFLOW_KINDS),
+        "breakpoints": list_breakpoints(),
         "sources": {k: list(v) for k, v in _sources.items()},
         "errors": list(_errors),
     }

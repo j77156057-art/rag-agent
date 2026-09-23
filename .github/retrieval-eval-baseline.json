@@ -1,0 +1,10 @@
+{
+  "metrics": {
+    "queries": 4,
+    "mrr": 1.0,
+    "recall_at_1": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0,
+    "errors": 0
+  }
+}

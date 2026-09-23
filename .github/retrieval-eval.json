@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "ks": [1, 3, 5],
+  "documents": [
+    {
+      "id": "movement",
+      "source": "player.gd",
+      "content": "CharacterBody2D movement controller reads ui_left and ui_right, applies velocity, jump and move_and_slide."
+    },
+    {
+      "id": "scene",
+      "source": "main.tscn",
+      "content": "Godot main scene contains the Player CharacterBody2D node and loads player.gd as an external script."
+    },
+    {
+      "id": "inventory",
+      "source": "inventory.gd",
+      "content": "Inventory stores item stacks, crafting recipes and pickup events for collected resources."
+    },
+    {
+      "id": "workflow",
+      "source": "docs/game-harness-workflow.md",
+      "content": "The game workflow clarifies options, plans a task DAG, requests approval, executes waves and reviews failures."
+    },
+    {
+      "id": "mcp",
+      "source": "mcp_client.py",
+      "content": "MCP connector calls have bounded timeout, fallback attempts, side effect policy and retry audit records."
+    }
+  ],
+  "cases": [
+    {
+      "id": "movement-controller",
+      "query": "movement controller jump move_and_slide",
+      "relevant_sources": ["player.gd"],
+      "relevant_ids": ["movement"]
+    },
+    {
+      "id": "godot-scene",
+      "query": "Godot main scene CharacterBody2D player script",
+      "relevant_sources": ["main.tscn"],
+      "relevant_ids": ["scene"]
+    },
+    {
+      "id": "workflow-approval",
+      "query": "task DAG approval execute review failure",
+      "relevant_sources": ["docs/game-harness-workflow.md"],
+      "relevant_ids": ["workflow"]
+    },
+    {
+      "id": "mcp-timeout",
+      "query": "MCP timeout fallback side effect retry",
+      "relevant_sources": ["mcp_client.py"],
+      "relevant_ids": ["mcp"]
+    }
+  ]
+}

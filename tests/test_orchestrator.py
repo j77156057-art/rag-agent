@@ -483,6 +483,48 @@ class AgentOrchestrateTests(unittest.TestCase):
         self.assertFalse(rep["ok"])
         self.assertIn("任务图不合法", rep["error"])
 
+    def test_planner_role_can_decompose_before_execution_role(self):
+        a = agent_mod.Agent(llm=_CloningLLM())
+        rep = a.orchestrate({
+            "tasks": [
+                {"id": "decompose", "role": "planner",
+                 "task": "拆解项目文件边界并给出后续任务建议"},
+                {"id": "inspect", "role": "researcher",
+                 "task": "根据拆解结果核对相关文件", "depends_on": ["decompose"]},
+            ],
+            "synth": False,
+        })
+        self.assertTrue(rep["ok"])
+        self.assertEqual(rep["n_ok"], 2)
+        self.assertEqual(rep["results"]["decompose"]["status"], "ok")
+        self.assertIn("子代理结论", rep["results"]["decompose"]["conclusion"])
+
+    def test_dispatcher_can_materialize_dynamic_execution_tasks(self):
+        seen = []
+        contexts = {}
+
+        def runner(task, context):
+            seen.append(task["id"])
+            contexts[task["id"]] = dict(context or {})
+            if task["id"] == "dispatch":
+                return {"status": "ok", "conclusion": json.dumps({
+                    "tasks": [
+                        {"id": "code", "role": "coder", "task": "修改目标文件",
+                         "tools": ["read_file", "apply_edit"]},
+                        {"id": "verify", "role": "tester", "task": "验证修改结果",
+                         "depends_on": ["code"]},
+                    ]
+                }, ensure_ascii=False)}
+            return {"status": "ok", "conclusion": "完成 " + task["id"]}
+
+        rep = orch.run_plan(
+            [{"id": "dispatch", "role": "dispatcher", "task": "拆解文件并决定分工"}],
+            runner, max_parallel=2, max_tasks=4)
+        self.assertEqual(seen, ["dispatch", "code", "verify"])
+        self.assertEqual(rep["n_ok"], 3)
+        self.assertEqual(rep["dispatches"][0]["added"], ["code", "verify"])
+        self.assertIn("dispatch", contexts["code"])
+
     def test_orchestrate_tool_via_run(self):
         plan = {"tasks": [{"id": "a", "role": "researcher", "task": "查 A"}], "synth": True}
         llm = _CloningLLM([

@@ -165,11 +165,32 @@ Turns "an agent that runs" into "an agent runtime you can **observe, orchestrate
 | **LLM resilience** | Retry + exponential backoff (429 / 5xx / timeout / network are retryable, **4xx explicitly is not**) + unified `timeout`/`deadline`; an SSE client disconnect aborts the turn and is accounted for | `DOCMIND_LLM_*`, `DOCMIND_TURN_DEADLINE_S` |
 | **Eval automation** | Rule-based golden-question scoring (`must_include / any_of / must_not_include / regex / must_call / action bounds / no_error`) + optional LLM judge + a **baseline regression gate** (pass→fail exits non-zero) | `agent_eval.py`, `gate.py` in the `agent-golden-eval` skill (wired into the frozen-release pipeline) |
 | **Native function-calling** | OpenAI-style schemas generated from the tool registry; `tool_calls` are normalised into the text protocol so **every existing guardrail still applies** and event types are unchanged | `DOCMIND_TOOL_MODE=react\|native\|auto` |
-| **Multi-agent orchestrator** | Task-graph DAG (validated, topologically waved, same-wave parallel) + **downstream tasks receive upstream conclusions** + **automatic re-planning on failure** (proposals `add / drop / replace` — only tasks that have **not run yet** may change) + result synthesis + **sub-agent execution traces fed back** to the re-planner for failure attribution | `orchestrate` tool, `POST /api/orchestrate` |
+| **Multi-agent orchestrator** | Task-graph DAG (validated, topologically waved, same-wave parallel) + **dispatcher/planner dynamic decomposition and dispatch** (the main Agent validates and inserts tasks) + **downstream tasks receive upstream conclusions** + **automatic re-planning on failure** (proposals `add / drop / replace` — only tasks that have **not run yet** may change) + result synthesis + **sub-agent execution traces fed back** to the re-planner for failure attribution | `orchestrate` tool, `POST /api/orchestrate` |
 | **Cost fuse** | Prices per provider/model (overridable via `.docmind_pricing.json`; local providers are always 0) + global/session budgets; **refuses before the turn, charges after it** | `GET/POST /api/budget` |
 | **Hot-pluggable hooks & skills** | `pre/post_tool`, `pre/post_turn` hooks from `.docmind/hooks/*.py` (a broken hook is isolated); `agent_skills/*/SKILL.md` provides bundled skills and same-name entries in `.docmind/skills` override them; bodies are fetched on demand via `dev_use_skill` | `POST /api/hooks/reload`, `POST /api/skills/reload` |
 | **Office artifacts** | Bundled `documents / pdf / presentations / spreadsheets` skills; `create_artifact` writes real DOCX, PDF, PPTX, and XLSX files to the active project's `artifacts/` directory and reopens each output for validation | `dev_use_skill`, `create_artifact` |
 | **Parallel tool batches** | Multiple **read-only** calls from one turn run concurrently (results re-ordered back into place); a batch containing any write/side-effecting tool falls back to sequential — **writes are never concurrent** | `DOCMIND_PARALLEL_TOOLS`, `DOCMIND_PARALLEL_MAX` |
+
+### Game Harness acceptance loop (current state)
+
+The Harness can now run a complete acceptance loop against a real Godot project:
+
+`retrieve → clarify → dynamic delegation → approval → parallel sub-agents → controlled file edit → Godot headless playtest → evidence review`
+
+The acceptance runner copies the project to a temporary directory by default, keeping the source project read-only. Its JSON report records phases, task threads, tool calls, sub-agent status, context-compression summaries, failures, latency, and token counters. The entry point is [`agent_runtime/acceptance.py`](agent_runtime/acceptance.py); workflow state lives in [`agent_runtime/game_workflow.py`](agent_runtime/game_workflow.py), and the observability panel is [`frontend/src/workbench/components/HarnessPanel.vue`](frontend/src/workbench/components/HarnessPanel.vue).
+
+```powershell
+.\.venv\Scripts\python.exe -m agent_runtime.acceptance `
+  --project D:\WorkBuddy\godot_sample `
+  --godot D:\Tools\Godot\Godot_v4.7.2-stable_win64_console.exe `
+  --collection docmind_code `
+  --require-event player_ready `
+  --json
+```
+
+Context routing and five-layer compression are implemented in [`agent_runtime/context_router.py`](agent_runtime/context_router.py). Production retrieval and offline evaluation are in [`agent_runtime/retrieval.py`](agent_runtime/retrieval.py) and [`agent_runtime/retrieval_eval.py`](agent_runtime/retrieval_eval.py). CI runs workflow success-rate, Recall/MRR, and optional real-project acceptance gates from [`.github/workflows/harness.yml`](.github/workflows/harness.yml).
+
+The loop has been verified locally against a Godot sample project. Multi-project, multi-engine, large-scale concurrency, and long-running soak evaluation remain production-hardening work.
 
 **Three design stances**: ① **guardrail reuse** — native FC and parallel batches do not open a second execution path, so semantics never fork; ② **bounded** — traces, observations, history and batches are all truncated or summarised so context/prompts cannot explode; ③ **no over-reach** — the orchestrator may only edit not-yet-executed tasks (side effects are never rolled back), writes are never parallel, hook exceptions are swallowed.
 
@@ -188,8 +209,15 @@ curl --noproxy '*' -X POST http://127.0.0.1:8000/api/orchestrate -H "Content-Typ
 ## 🧪 Tests & Self-Checks
 
 ```bash
-# Full unit tests (currently 1131 items; git cases actually run when MinGit is on PATH)
+# Full regression (pytest currently collects about 1247 items; git cases actually run when MinGit is on PATH)
 .venv\Scripts\python.exe -B -m unittest discover -s tests
+
+# Harness workflow, retrieval, observability, and real-project contract tests
+.venv\Scripts\python.exe -m pytest tests/test_game_workflow.py tests/test_game_workflow_e2e.py tests/test_retrieval_adapter.py tests/test_retrieval_api.py tests/test_workflow_observability.py -q
+
+# Offline regression gates
+.venv\Scripts\python.exe -m agent_runtime.workflow_eval --self-check --baseline .github/workflow-eval-baseline.json --json
+.venv\Scripts\python.exe -m agent_runtime.retrieval_eval --dataset .github/retrieval-eval.json --baseline .github/retrieval-eval-baseline.json --minimum 0.75 --json
 
 # Scene canvas — backend self-check: in-process FastAPI + temp Godot project, real routes, no port
 .venv\Scripts\python.exe verify_scene_canvas.py

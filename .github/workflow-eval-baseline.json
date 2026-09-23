@@ -1,0 +1,52 @@
+{
+  "total": 3,
+  "scored": 3,
+  "passed": 3,
+  "failed": 0,
+  "pass_rate": 1.0,
+  "items": [
+    {
+      "case_id": "game-prototype-2d",
+      "passed": true,
+      "score": 1.0,
+      "checks": [
+        {"name": "dataset:completed", "ok": true, "detail": "required by game-prototype-2d"},
+        {"name": "dataset:review_ok", "ok": true, "detail": "required by game-prototype-2d"},
+        {"name": "dataset:no_failed_tasks", "ok": true, "detail": "required by game-prototype-2d"},
+        {"name": "dataset:no_in_doubt_tool", "ok": true, "detail": "required by game-prototype-2d"},
+        {"name": "dataset:max_steps", "ok": true, "detail": "2/24"},
+        {"name": "dataset:max_replans", "ok": true, "detail": "0/2"}
+      ],
+      "workflow": {"passed": true, "score": 1.0, "steps": 2, "replans": 0}
+    },
+    {
+      "case_id": "game-playtest-repair",
+      "passed": true,
+      "score": 1.0,
+      "checks": [
+        {"name": "dataset:completed", "ok": true, "detail": "required by game-playtest-repair"},
+        {"name": "dataset:review_ok", "ok": true, "detail": "required by game-playtest-repair"},
+        {"name": "dataset:no_failed_tasks", "ok": true, "detail": "required by game-playtest-repair"},
+        {"name": "dataset:steps_within_limit", "ok": true, "detail": "required by game-playtest-repair"},
+        {"name": "dataset:replans_within_limit", "ok": true, "detail": "required by game-playtest-repair"},
+        {"name": "dataset:max_steps", "ok": true, "detail": "2/24"},
+        {"name": "dataset:max_replans", "ok": true, "detail": "0/2"}
+      ],
+      "workflow": {"passed": true, "score": 1.0, "steps": 2, "replans": 0}
+    },
+    {
+      "case_id": "game-research-gated",
+      "passed": true,
+      "score": 1.0,
+      "checks": [
+        {"name": "dataset:completed", "ok": true, "detail": "required by game-research-gated"},
+        {"name": "dataset:review_ok", "ok": true, "detail": "required by game-research-gated"},
+        {"name": "dataset:no_failed_tasks", "ok": true, "detail": "required by game-research-gated"},
+        {"name": "dataset:no_in_doubt_tool", "ok": true, "detail": "required by game-research-gated"},
+        {"name": "dataset:max_steps", "ok": true, "detail": "2/24"},
+        {"name": "dataset:max_replans", "ok": true, "detail": "0/2"}
+      ],
+      "workflow": {"passed": true, "score": 1.0, "steps": 2, "replans": 0}
+    }
+  ]
+}

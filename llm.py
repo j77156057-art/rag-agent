@@ -18,6 +18,7 @@ from config import (
     LLM_MAX_TOKENS, LLM_ENABLE_THINKING, PROMPT_TOKEN_BUDGET, get_runtime,
     model_capability, prompt_token_budget, get_context_window_override,
 )
+from agent_runtime.local_runtime import local_llm_slot
 
 # 默认单次 LLM 调用超时（秒）与重试策略（可用环境变量覆盖）
 LLM_TIMEOUT = float(os.getenv("DOCMIND_LLM_TIMEOUT", "180"))
@@ -448,7 +449,7 @@ class LLMClient:
             # 被忽略、加载仍为 4096）和 chat_template_kwargs，长 prompt 会被截断。
             # 改走原生 /api/chat：num_ctx / think / num_predict 全部服务端生效。
             # 消息内的 images: [base64...] 也是 ollama 原生多模态格式，直接透传。
-            return retry_call(
+            call = lambda: retry_call(
                 lambda: self._ollama_chat(
                     messages, stream=stream, temperature=temperature,
                     timeout=timeout, usage_sink=self.last_usage,
@@ -457,6 +458,13 @@ class LLMClient:
                 ),
                 deadline=deadline, attempts=self.max_retries, base=self.retry_base,
             )
+            # Streaming ownership lasts beyond this function and is already
+            # guarded by Agent's child slot.  Non-stream requests can safely
+            # protect the whole HTTP generation here, including direct API use.
+            if stream:
+                return call()
+            with local_llm_slot(self.provider, self.model):
+                return call()
 
         # OpenAI 兼容路径：把 ollama 风格的 images 字段转成多模态 content parts，
         # 否则 SDK 的 pydantic 序列化会因未知字段报错。
@@ -493,13 +501,14 @@ class LLMClient:
                     raise
                 return _open(False)
 
-        resp = retry_call(
-            lambda: self.client.chat.completions.create(
-                model=self.model, messages=oai_messages, stream=False,
-                temperature=temperature, timeout=call_timeout, **kwargs
-            ),
-            deadline=deadline, attempts=self.max_retries, base=self.retry_base,
-        )
+        with local_llm_slot(self.provider, self.model):
+            resp = retry_call(
+                lambda: self.client.chat.completions.create(
+                    model=self.model, messages=oai_messages, stream=False,
+                    temperature=temperature, timeout=call_timeout, **kwargs
+                ),
+                deadline=deadline, attempts=self.max_retries, base=self.retry_base,
+            )
         u = getattr(resp, "usage", None)
         if u is not None:
             dump = u.model_dump() if hasattr(u, "model_dump") else (u if isinstance(u, dict) else {})

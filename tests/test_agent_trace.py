@@ -203,6 +203,20 @@ class SessionIsolationTests(_IsoBase):
         ids = [s["session_id"] for s in sessions.list_sessions()]
         self.assertIn("ls1", ids)
 
+    def test_load_cleans_legacy_system_prompt_prefix(self):
+        """旧版本写入的路由提示只在会话展示/回放边界清理。"""
+        sessions.save("legacy-prompt", [{
+            "user": "【系统提示】知识库中已上传以下文档：LICENSE。\n\n用户问题：你可以帮我修改文件吗",
+            "assistant": "【系统提示】代码库已索引。\n\n用户问题：可以，先确认目标。",
+        }])
+        row = sessions.load("legacy-prompt")["turns"][0]
+        self.assertEqual(row["user"], "你可以帮我修改文件吗")
+        self.assertEqual(row["assistant"], "可以，先确认目标。")
+        self.assertEqual(
+            sessions._clean_legacy_prompt("用户问：系统提示是正文"),
+            "用户问：系统提示是正文",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

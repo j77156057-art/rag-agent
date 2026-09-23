@@ -23,10 +23,12 @@ interface ChatMsg {
   role: 'user' | 'assistant'
   text: string
   status: 'streaming' | 'done' | 'error' | 'stopped'
-  trace: { type: string; text: string }[]
+  trace: { type: string; text: string; at?: number; elapsedMs?: number }[]
   reasoning: string        // 深度思考模型的 reasoning_content 流
   notices: string[]        // 系统通知（如上下文自动压缩）
   plan: string[]           // 计划模式步骤
+  startedAt?: number
+  finishedAt?: number
   error?: string
 }
 
@@ -37,6 +39,12 @@ const draftKey = () => 'docmind.workbenchChatDraft:' + chatProject + ':' + chatS
 const recoveryKey = () => 'docmind.interrupted:' + chatProject + ':' + chatSession
 const historyError = ref('')
 function readDraft() { try { return sessionStorage.getItem(draftKey()) || '' } catch { return '' } }
+// 兼容旧版会话：早期 API 曾把内部路由上下文拼在用户问题前并落盘。
+// 仅清理从字符串开头出现的完整旧前缀，正文中提到“系统提示”不受影响。
+const legacyPromptPrefix = /^\s*【系统提示】[\s\S]*?用户问题：\s*/
+function cleanLegacyPrompt(value: string): string {
+  return String(value || '').replace(legacyPromptPrefix, '').trimStart()
+}
 const input = ref(readDraft())
 watch(input, v => { try { sessionStorage.setItem(draftKey(), v) } catch {} }, { flush: 'sync' })
 const sending = ref(false)
@@ -46,6 +54,7 @@ const scroller = ref<HTMLElement | null>(null)
 /** 仅当用户已贴底时才自动滚；用户上滚看历史时暂停自动滚动，回到底部再恢复 */
 const stickToBottom = ref(true)
 const inputEl = ref<HTMLTextAreaElement | null>(null)
+let suppressScrollEvent = false
 
 // ---------------------------------------------------------------- 折叠
 const collapsed = ref(window.localStorage.getItem('docmind.chatDockCollapsed') === '1')
@@ -151,7 +160,10 @@ async function send(text?: string) {
   input.value = ''
   stickToBottom.value = true  // 用户主动发送，恢复贴底自动滚动
   messages.value.push({ id: msgSeq++, role: 'user', text: q, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
-  const turn: ChatMsg = { id: msgSeq++, role: 'assistant', text: '', status: 'streaming', trace: [], reasoning: '', notices: [], plan: [] }
+  const turn: ChatMsg = {
+    id: msgSeq++, role: 'assistant', text: '', status: 'streaming', trace: [], reasoning: '', notices: [], plan: [],
+    startedAt: Date.now(),
+  }
   messages.value.push(turn)
   sending.value = true
   if (demoMode.value) {
@@ -192,7 +204,7 @@ async function send(text?: string) {
       t.plan = ev.steps
     } else if (ev.type === 'thought' || ev.type === 'action' ||
                ev.type === 'observation' || ev.type === 'reflection') {
-      if (ev.text) t.trace.push({ type: ev.type, text: ev.text })
+      if (ev.text) appendTrace(t, ev.type, ev.text)
     }
     void nextTick(scrollToBottom)
   }
@@ -207,15 +219,17 @@ async function send(text?: string) {
       thinking: thinkingOpt,
     })
     const t = live()
-    if (t) t.status = t.text ? 'done' : 'stopped'
+    if (t) { t.status = t.text ? 'done' : 'stopped'; t.finishedAt = Date.now() }
   } catch (e) {
     const t = live()
     if (!t) return
     if ((e as Error).name === 'AbortError') {
       t.status = 'stopped'
+      t.finishedAt = Date.now()
       if (!t.text) t.text = '（已停止）'
     } else {
       t.status = 'error'
+      t.finishedAt = Date.now()
       t.error = (e as { message?: string }).message || '请求失败'
     }
   } finally {
@@ -243,8 +257,8 @@ function restoreInterrupted(turns: { user: string; assistant: string }[]) {
     const row = JSON.parse(sessionStorage.getItem(recoveryKey()) || 'null')
     if (!row || typeof row.user !== 'string' || typeof row.assistant !== 'string') return
     if (turns.some(t => t.user === row.user && t.assistant)) { sessionStorage.removeItem(recoveryKey()); return }
-    messages.value.push({ id: msgSeq++, role: 'user', text: row.user, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
-    messages.value.push({ id: msgSeq++, role: 'assistant', text: row.assistant, status: 'stopped', trace: [], reasoning: '', notices: ['上次回答因离开页面或切换项目中断，以下仅为已收到的内容；不会自动重试或重复执行工具。'], plan: [] })
+    messages.value.push({ id: msgSeq++, role: 'user', text: cleanLegacyPrompt(row.user), status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
+    messages.value.push({ id: msgSeq++, role: 'assistant', text: cleanLegacyPrompt(row.assistant), status: 'stopped', trace: [], reasoning: '', notices: ['上次回答因离开页面或切换项目中断，以下仅为已收到的内容；不会自动重试或重复执行工具。'], plan: [] })
   } catch {}
 }
 function resetChatContext() {
@@ -303,10 +317,10 @@ function rebuildFromTurns(turns: { user: string; assistant: string }[]) {
   for (const t of turns) {
     if (!t) continue
     if (t.user) {
-      rebuilt.push({ id: msgSeq++, role: 'user', text: t.user, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
+      rebuilt.push({ id: msgSeq++, role: 'user', text: cleanLegacyPrompt(t.user), status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
     }
     if (t.assistant) {
-      rebuilt.push({ id: msgSeq++, role: 'assistant', text: t.assistant, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
+      rebuilt.push({ id: msgSeq++, role: 'assistant', text: cleanLegacyPrompt(t.assistant), status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
     }
   }
   // msgSeq 已随分配递增，天然大于历史消息最大 id，后续新消息 id 不会冲突。
@@ -409,6 +423,7 @@ function onFocusChat(ev?: Event) {
   })
 }
 onMounted(() => {
+  elapsedTimer = window.setInterval(() => { nowTick.value = Date.now() }, 500)
   window.addEventListener('docmind:focus-chat', onFocusChat as EventListener)
   window.addEventListener('docmind:project-context-changed', resetChatContext)
   window.addEventListener('pagehide', onPageHide)
@@ -419,6 +434,7 @@ onMounted(() => {
   void restoreHistory()
 })
 onBeforeUnmount(() => {
+  if (elapsedTimer !== null) { window.clearInterval(elapsedTimer); elapsedTimer = null }
   onPageHide()
   window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener)
   window.removeEventListener('docmind:project-context-changed', resetChatContext)
@@ -430,12 +446,26 @@ function isNearBottom(el: HTMLElement) {
   return el.scrollHeight - el.scrollTop - el.clientHeight < 80
 }
 function onScroll() {
+  if (suppressScrollEvent) return
   const el = scroller.value
   if (el) stickToBottom.value = isNearBottom(el)
 }
+function onWheel(ev: WheelEvent) {
+  // A user scrolling upward is an explicit request to inspect history. Keep
+  // the stream running, but stop pulling the viewport back to the bottom.
+  if (ev.deltaY < 0) stickToBottom.value = false
+}
 function scrollToBottom() {
   const el = scroller.value
-  if (el && stickToBottom.value) el.scrollTop = el.scrollHeight
+  if (el && stickToBottom.value) {
+    suppressScrollEvent = true
+    el.scrollTop = el.scrollHeight
+    window.setTimeout(() => { suppressScrollEvent = false }, 0)
+  }
+}
+function resumeAutoScroll() {
+  stickToBottom.value = true
+  void nextTick(scrollToBottom)
 }
 
 // ---------------------------------------------------------------- 答案引用卡片
@@ -458,14 +488,82 @@ async function openRef(r: FileRef) {
 }
 
 const TRACE_LABEL: Record<string, string> = {
-  thought: '思考', action: '工具调用', observation: '观察', reflection: '反思',
+  thought: '分析摘要', action: '执行动作', observation: '返回结果', reflection: '复核与重试',
 }
-const traceOpen = ref<Set<number>>(new Set())
-function toggleTrace(id: number) {
-  const next = new Set(traceOpen.value)
-  if (next.has(id)) next.delete(id)
-  else next.add(id)
-  traceOpen.value = next
+const TRACE_GLYPH: Record<string, string> = {
+  thought: '◌', action: '↗', observation: '✓', reflection: '↻',
+}
+const activityOpen = ref<Set<string>>(new Set())
+const nowTick = ref(Date.now())
+let elapsedTimer: number | null = null
+
+function appendTrace(msg: ChatMsg, type: string, text: string) {
+  const at = Date.now()
+  // 观察/反思通常是前一个工具动作的返回，将两者之间的时间显示为动作耗时。
+  if (type === 'observation' || type === 'reflection') {
+    const pending = [...msg.trace].reverse().find((item) => item.type === 'action' && !item.elapsedMs)
+    if (pending?.at) pending.elapsedMs = Math.max(0, at - pending.at)
+  }
+  msg.trace.push({ type, text, at })
+}
+
+function activityKey(id: number, index: number) { return `${id}:${index}` }
+function toggleActivity(id: number, index: number) {
+  const key = activityKey(id, index)
+  const next = new Set(activityOpen.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  activityOpen.value = next
+}
+function activityIsOpen(id: number, index: number, msg: ChatMsg) {
+  return activityOpen.value.has(activityKey(id, index)) || (msg.status === 'streaming' && index === msg.trace.length - 1)
+}
+function traceTitle(item: { type: string; text: string }) {
+  const raw = item.text.trim()
+  const tool = raw.match(/^([\w.-]+)\s*\(/)?.[1]
+  if (item.type === 'action' && tool) {
+    const names: Record<string, string> = {
+      search_code: '检索代码', search_knowledge: '检索知识库', read_file: '读取文件',
+      grep: '定位代码', run_command: '运行命令', game_playtest: '运行校验',
+      web_search: '网页搜索', web_fetch: '读取网页', dev_mcp_call: '调用 MCP',
+      dev_list_connector_tools: '查看 MCP 工具', apply_edit: '修改文件', create_file: '创建文件',
+      delegate: '委派 Subagent', orchestrate: '编排任务',
+    }
+    return names[tool] || tool
+  }
+  return TRACE_LABEL[item.type] || item.type
+}
+function traceSummary(item: { type: string; text: string }) {
+  const raw = item.text.trim().replace(/\s+/g, ' ')
+  if (item.type === 'action') {
+    const open = raw.indexOf('(')
+    if (open > 0) return raw.slice(open).replace(/\s*\[已拦截.*$/, '')
+  }
+  if (raw.length <= 92) return raw
+  return raw.slice(0, 89) + '…'
+}
+function traceState(msg: ChatMsg, item: { type: string; text: string }, index: number): 'running' | 'ok' | 'warn' | 'error' {
+  const raw = item.text
+  if (/重复调用|重复空转/.test(raw)) return 'warn'
+  if (/失败|错误|超时|拦截|阻断|未执行|不可用|exception/i.test(raw)) return 'error'
+  if (item.type === 'reflection' && /重试|换思路|重新规划|注意/i.test(raw)) return 'warn'
+  if (msg.status === 'streaming' && index === msg.trace.length - 1) return 'running'
+  return 'ok'
+}
+function traceStateLabel(state: ReturnType<typeof traceState>, item?: { text: string }) {
+  if (state === 'warn' && item && /重复调用|重复空转/.test(item.text)) return '已拦截'
+  return state === 'running' ? '进行中' : state === 'error' ? '失败' : state === 'warn' ? '需关注' : '完成'
+}
+function traceElapsed(item: { elapsedMs?: number }) {
+  if (!item.elapsedMs) return ''
+  if (item.elapsedMs < 1000) return `${item.elapsedMs}ms`
+  return `${(item.elapsedMs / 1000).toFixed(1)}s`
+}
+function elapsedLabel(msg: ChatMsg) {
+  if (!msg.startedAt) return ''
+  const end = msg.finishedAt || nowTick.value
+  const seconds = Math.max(0, (end - msg.startedAt) / 1000)
+  return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`
 }
 
 // 深度思考面板折叠态（reasoning_content 独立窗口）
@@ -750,11 +848,19 @@ function connectorGuide(s: McpServer) {
     </div>
 
     <template v-if="!collapsed">
-      <div ref="scroller" class="cd-body" @scroll="onScroll">
+      <div ref="scroller" class="cd-body" @scroll="onScroll" @wheel="onWheel">
         <p v-if="historyError" role="alert">{{ historyError }}</p>
         <div v-for="m in messages" :key="m.id" class="cd-msg" :class="`cd-msg-${m.role}`">
           <div v-if="m.role === 'user'" class="cd-user-bubble">{{ m.text }}</div>
           <template v-else>
+            <div v-if="m.trace.length || m.reasoning || m.status === 'streaming'" class="cd-run-head">
+              <span class="cd-run-avatar">✦</span>
+              <span class="cd-run-role">交付代理</span>
+              <span class="cd-run-status" :class="`cd-run-${m.status}`">
+                {{ m.status === 'streaming' ? '正在执行' : m.status === 'done' ? '已完成' : m.status === 'error' ? '执行失败' : '已停止' }}
+              </span>
+              <span class="cd-run-time" v-if="elapsedLabel(m)">· {{ elapsedLabel(m) }}</span>
+            </div>
             <div v-for="(n, i) in m.notices" :key="'n' + i" class="cd-notice">
               <svg width="11" height="11" viewBox="0 0 11 11"><circle cx="5.5" cy="5.5" r="4.6" fill="none" stroke="currentColor" stroke-width="1"/><path d="M5.5 4.6 V7.6" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><circle cx="5.5" cy="3" r=".75" fill="currentColor"/></svg>
               <span>{{ n }}</span>
@@ -772,6 +878,26 @@ function connectorGuide(s: McpServer) {
               </button>
               <div v-if="reasonOpen.has(m.id)" class="cd-reason-body">{{ m.reasoning }}</div>
             </div>
+            <div v-if="m.trace.length" class="cd-activity">
+              <div v-for="(t, i) in m.trace" :key="i" class="cd-activity-item" :class="`cd-activity-${traceState(m, t, i)}`">
+                <button class="cd-activity-row" @click="toggleActivity(m.id, i)">
+                  <span class="cd-activity-glyph">{{ TRACE_GLYPH[t.type] || '·' }}</span>
+                  <span class="cd-activity-main">
+                    <span class="cd-activity-title">{{ traceTitle(t) }}</span>
+                    <span class="cd-activity-summary">{{ traceSummary(t) }}</span>
+                  </span>
+                  <span class="cd-activity-meta">
+                    <span class="cd-activity-state">{{ traceStateLabel(traceState(m, t, i), t) }}</span>
+                    <span v-if="traceElapsed(t)" class="cd-activity-time">{{ traceElapsed(t) }}</span>
+                    <span class="cd-activity-chevron">{{ activityIsOpen(m.id, i, m) ? '▾' : '▸' }}</span>
+                  </span>
+                </button>
+                <div v-if="activityIsOpen(m.id, i, m)" class="cd-activity-detail">{{ t.text }}</div>
+              </div>
+            </div>
+            <div v-if="m.status === 'streaming'" class="cd-thinking">
+              {{ m.reasoning ? '正在整理最终回答' : 'AI 正在翻代码、组织回答' }}<span class="cd-dots">…</span>
+            </div>
             <div v-if="m.text" class="ai-md cd-answer" v-html="answerHtml(m)" />
             <details v-if="m.status === 'done' && webRefsOf(m).length" class="cd-web-sources">
               <summary>联网来源（{{ webRefsOf(m).length }}）</summary>
@@ -781,21 +907,7 @@ function connectorGuide(s: McpServer) {
                 <span v-if="s.score" class="cd-web-source-score">参考 {{ s.score }}</span>
               </a>
             </details>
-            <div v-else-if="m.status === 'streaming'" class="cd-thinking">
-              {{ m.reasoning ? '正在整理最终回答' : 'AI 正在翻代码、组织回答' }}<span class="cd-dots">…</span>
-            </div>
             <div v-if="m.status === 'error'" class="cd-error">⚠ {{ m.error }}</div>
-            <div v-if="m.trace.length" class="cd-trace">
-              <button class="cd-trace-head" @click="toggleTrace(m.id)">
-                {{ traceOpen.has(m.id) ? '▾' : '▸' }} 检索轨迹（{{ m.trace.length }}）
-              </button>
-              <div v-if="traceOpen.has(m.id)" class="cd-trace-body">
-                <div v-for="(t, i) in m.trace" :key="i" class="cd-trace-item">
-                  <span class="cd-trace-tag">{{ TRACE_LABEL[t.type] || t.type }}</span>
-                  <span class="cd-trace-text">{{ t.text }}</span>
-                </div>
-              </div>
-            </div>
             <div v-if="m.status === 'done' && refsOf(m).length" class="cd-refs">
               <button
                 v-for="r in refsOf(m)"
@@ -812,6 +924,9 @@ function connectorGuide(s: McpServer) {
           </template>
         </div>
       </div>
+      <button v-if="sending && !stickToBottom" class="cd-jump-bottom" title="恢复跟随最新输出" @click="resumeAutoScroll">
+        ↓ 回到底部
+      </button>
 
       <footer class="cd-inputbar">
         <div class="cd-tools">
@@ -1016,6 +1131,13 @@ function connectorGuide(s: McpServer) {
 .cd-dot-off { background: var(--text-faint); }
 
 /* 消息区 */
+.cd-jump-bottom {
+  position: absolute; right: 14px; bottom: 58px; z-index: 3;
+  border: 1px solid #c8dcfa; border-radius: 999px; padding: 4px 9px;
+  background: var(--bg-raised); color: var(--accent); font-size: 10.5px;
+  box-shadow: 0 2px 8px rgba(30, 50, 90, .14); cursor: pointer;
+}
+.cd-jump-bottom:hover { background: var(--bg-selected); }
 .cd-body { flex: 1 1 auto; overflow-y: auto; padding: 8px 14px 4px; min-height: 90px; }
 .cd-empty { padding: 14px 6px; color: var(--text-muted); }
 .cd-empty-title { font-size: 12px; margin: 0 0 10px; color: var(--text-muted); }
@@ -1040,16 +1162,73 @@ function connectorGuide(s: McpServer) {
 .cd-thinking, .cd-error { font-size: 12px; color: var(--text-muted); padding: 4px 0; }
 .cd-error { color: var(--danger); }
 
-.cd-trace { margin-top: 5px; }
-.cd-trace-head {
-  border: none; background: none; padding: 0; cursor: pointer;
-  font-size: 11px; color: var(--text-faint);
+.cd-run-head {
+  display: flex; align-items: center; gap: 6px;
+  min-height: 22px; margin: 1px 0 5px;
+  color: var(--text-muted); font-size: 11px;
 }
-.cd-trace-head:hover { color: var(--text-muted); }
-.cd-trace-body { margin-top: 4px; border-left: 2px solid var(--border); padding-left: 8px; display: flex; flex-direction: column; gap: 3px; }
-.cd-trace-item { font-size: 11px; color: var(--text-faint); display: flex; gap: 6px; }
-.cd-trace-tag { flex: 0 0 52px; color: var(--text-muted); }
-.cd-trace-text { white-space: pre-wrap; word-break: break-all; max-height: 70px; overflow: hidden; }
+.cd-run-avatar {
+  width: 17px; height: 17px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: #fff; background: var(--accent); font-size: 10px;
+}
+.cd-run-role { color: var(--text); font-weight: 600; }
+.cd-run-status { color: var(--text-faint); }
+.cd-run-streaming { color: var(--accent); }
+.cd-run-done { color: var(--green); }
+.cd-run-error { color: var(--danger); }
+.cd-run-stopped { color: var(--amber); }
+.cd-run-time { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+
+/* 聊天内的纵向活动流：动作按 SSE 到达顺序实时追加，详情按行折叠。 */
+.cd-activity {
+  position: relative; margin: 4px 0 8px 8px;
+  padding-left: 16px; border-left: 1px solid var(--border);
+}
+.cd-activity-item { position: relative; margin: 0; }
+.cd-activity-item::before {
+  content: ''; position: absolute; left: -20px; top: 9px;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--text-faint); border: 2px solid var(--bg-raised);
+  box-sizing: content-box;
+}
+.cd-activity-running::before { background: var(--accent); box-shadow: 0 0 0 3px rgba(37,96,212,.12); }
+.cd-activity-ok::before { background: var(--green); }
+.cd-activity-warn::before { background: var(--amber); }
+.cd-activity-error::before { background: var(--danger); }
+.cd-activity-row {
+  width: 100%; min-width: 0; display: flex; align-items: center; gap: 7px;
+  border: 0; background: transparent; padding: 4px 0; text-align: left;
+  color: var(--text-muted); cursor: pointer;
+}
+.cd-activity-row:hover { color: var(--text); }
+.cd-activity-glyph {
+  flex: 0 0 15px; width: 15px; text-align: center;
+  color: var(--text-faint); font-size: 13px; line-height: 1;
+}
+.cd-activity-running .cd-activity-glyph { color: var(--accent); }
+.cd-activity-ok .cd-activity-glyph { color: var(--green); }
+.cd-activity-warn .cd-activity-glyph { color: var(--amber); }
+.cd-activity-error .cd-activity-glyph { color: var(--danger); }
+.cd-activity-main { min-width: 0; flex: 1; display: flex; align-items: baseline; gap: 7px; }
+.cd-activity-title { flex: 0 0 auto; color: var(--text); font-size: 11.5px; font-weight: 600; }
+.cd-activity-summary {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-faint); font-size: 10.5px;
+}
+.cd-activity-meta { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; font-size: 10px; }
+.cd-activity-state { color: var(--text-faint); }
+.cd-activity-running .cd-activity-state { color: var(--accent); }
+.cd-activity-warn .cd-activity-state { color: var(--amber); }
+.cd-activity-error .cd-activity-state { color: var(--danger); }
+.cd-activity-time { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.cd-activity-chevron { color: var(--text-faint); font-size: 10px; }
+.cd-activity-detail {
+  margin: 0 0 4px 22px; padding: 5px 8px;
+  border-left: 2px solid var(--border); background: var(--bg-hover);
+  color: var(--text-dim); font: 10.5px/1.5 var(--font-mono, monospace);
+  white-space: pre-wrap; overflow-wrap: anywhere; max-height: 130px; overflow: auto;
+}
 
 .cd-refs { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
 .cd-ref {

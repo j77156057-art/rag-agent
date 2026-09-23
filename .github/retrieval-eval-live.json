@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "collection": "docmind_code",
+  "ks": [1, 3, 5],
+  "cases": [
+    {
+      "id": "player-movement",
+      "query": "Godot player movement velocity jump physics",
+      "relevant_sources": ["behaviors/player.gd"],
+      "relevant_terms": ["move_and_slide", "velocity"]
+    },
+    {
+      "id": "main-scene",
+      "query": "Godot Main scene Player Enemy HUD PackedScene",
+      "relevant_sources": ["scenes/Main.tscn"],
+      "relevant_terms": ["PackedScene"]
+    },
+    {
+      "id": "enemy-behavior",
+      "query": "enemy chase player contact damage cooldown",
+      "relevant_sources": ["behaviors/enemy.gd"],
+      "relevant_terms": ["CONTACT_DAMAGE", "player"]
+    },
+    {
+      "id": "hud",
+      "query": "HUD show_hp HPLabel Margin VBox CanvasLayer",
+      "relevant_sources": ["ui/hud.gd"],
+      "relevant_terms": ["show_hp", "HPLabel"]
+    },
+    {
+      "id": "bridge-runtime",
+      "query": "JavaScriptBridge postMessage DOCMIND_EVENT ping reload",
+      "relevant_sources": ["addons/docmind_bridge/docmind_bridge.gd"]
+    },
+    {
+      "id": "regions",
+      "query": "regions version values behaviors ui directory",
+      "relevant_sources": ["regions.json"]
+    },
+    {
+      "id": "project-settings",
+      "query": "config/name StarVoyager run/main_scene display viewport input",
+      "relevant_sources": ["project.godot"]
+    },
+    {
+      "id": "enemy-scene",
+      "query": "CharacterBody3D Enemy CollisionShape3D enemy script",
+      "relevant_sources": ["behaviors/enemy.tscn"]
+    }
+  ]
+}

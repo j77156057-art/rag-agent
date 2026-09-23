@@ -18,14 +18,16 @@ import time
 import mcp_client
 from artifact_tools import create_artifact
 
-from config import (TOP_K, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime,
+from config import (TOP_K, COLLECTION_NAME, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime,
                      edit_confirm_enabled, external_access_high, EXTERNAL_API_ALLOWLIST,
                      get_web_search_provider, get_web_search_api_key, get_web_search_api_url,
                      get_web_fetch_provider, get_web_fetch_api_key, get_web_fetch_api_url)
 from config import STATE_ROOT
 from embeddings import EmbeddingClient
-from vectorstore import query as vs_query, pretty_source
+from vectorstore import pretty_source
+from agent_runtime.retrieval import get_retriever
 from ingest import _CODE_EXT, _SKIP_DIRS
+from agent_runtime.tools import ToolSpec, coerce_tool_spec, upgrade_registry
 
 _emb = None
 
@@ -126,6 +128,29 @@ def _get_emb():
     return _emb
 
 def dev_mcp_call(arg):
+    """MCP 调用外层审计：允许用户在连接器边界插入断点/拦截。"""
+    try:
+        import hooks as _workflow_hooks
+        before = _workflow_hooks.run_workflow("before_mcp", {
+            "argument_chars": len(str(arg or "")),
+        })
+        if before.get("blocked"):
+            return "MCP 调用已被钩子拦截：" + str(before.get("reason") or "需要人工审核")
+    except Exception:
+        _workflow_hooks = None
+    result = _dev_mcp_call_impl(arg)
+    if _workflow_hooks is not None:
+        try:
+            _workflow_hooks.run_workflow("after_mcp", {
+                "ok": not str(result or "").startswith("MCP 调用失败"),
+                "result_chars": len(str(result or "")),
+            })
+        except Exception:
+            pass
+    return result
+
+
+def _dev_mcp_call_impl(arg):
     """Agent 受控调用已启用 MCP 连接器。输入 key/name/arguments(JSON)。"""
     root = get_runtime('code_root') or CODE_ROOT
     if not root: return 'MCP 调用失败：未配置代码库。'
@@ -158,7 +183,23 @@ def dev_mcp_call(arg):
                 if not scope.get('ok'): return 'MCP 调用失败：参数路径超出任务分区。'
         args=data.get('arguments','{}')
         if isinstance(args,str): args=json.loads(args) if args else {}
-        return json.dumps(mcp_client.call_tool(root,key,name,args), ensure_ascii=False)[:6000]
+        fallback = data.get('fallback_keys') or data.get('fallback') or []
+        if isinstance(fallback, str):
+            fallback = [item.strip() for item in fallback.split(',') if item.strip()]
+        hint = data.get('hint') or data.get('task_hint') or ''
+        side_effect = str(data.get('side_effect', '')).strip().lower() in ('1', 'true', 'yes', 'on')
+        allow_side_effect_fallback = str(data.get('allow_side_effect_fallback', '')).strip().lower() in ('1', 'true', 'yes', 'on')
+        try:
+            result = mcp_client.call_tool_with_fallback(
+                root, key, name, args, fallback_keys=fallback,
+                task_hint=hint, timeout=mcp_client.CALL_TIMEOUT,
+                side_effect=side_effect,
+                allow_side_effect_fallback=allow_side_effect_fallback)
+        except mcp_client.MCPError as exc:
+            attempts = getattr(exc, 'attempts', [])
+            suffix = (' 尝试记录：' + json.dumps(attempts, ensure_ascii=False)) if attempts else ''
+            return f'MCP 调用失败：{exc}{suffix}（可改用内置工具或人工检查连接器）'
+        return json.dumps(result, ensure_ascii=False)[:6000]
     except Exception as e: return f'MCP 调用失败：{e}（若怀疑是连接器选择有误，可先调用 dev_route_connector 重新挑选已启用连接器）'
 
 
@@ -229,10 +270,10 @@ def _dedup_docs(docs, metas):
 
 def search_knowledge(query):
     """在已上传的知识库中检索与问题相关的文档片段。"""
-    emb = _get_emb().embed([query])[0]
-    res = vs_query(emb, k=TOP_K)
-    docs = (res.get("documents") or [[]])[0]
-    metas = (res.get("metadatas") or [[]])[0]
+    retrieved = get_retriever(collection=get_runtime("knowledge_collection") or COLLECTION_NAME,
+                               top_k=TOP_K, embedding_client=_get_emb()).invoke(query)
+    docs = [item.page_content for item in retrieved]
+    metas = [dict(item.metadata or {}) for item in retrieved]
     docs, metas = _dedup_docs(docs, metas)
     if not docs:
         return "知识库中未找到相关内容。"
@@ -1553,10 +1594,11 @@ def search_code(query):
     if not _get_code_root():
         return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录后再问代码相关问题。"
     query = _clean_search_query(query)
-    emb = _get_emb().embed([query])[0]
-    res = vs_query(emb, k=TOP_K, collection=CODE_COLLECTION_NAME)
-    docs = (res.get("documents") or [[]])[0]
-    metas = (res.get("metadatas") or [[]])[0]
+    collection = get_runtime("code_collection") or CODE_COLLECTION_NAME
+    retrieved = get_retriever(collection=collection, top_k=TOP_K,
+                               embedding_client=_get_emb()).invoke(query)
+    docs = [item.page_content for item in retrieved]
+    metas = [dict(item.metadata or {}) for item in retrieved]
     docs, metas = _dedup_docs(docs, metas)
     if not docs:
         return "代码库未找到相关内容，建议改用 grep 搜索关键词或 read_file 查看具体文件。"
@@ -3064,6 +3106,58 @@ def dev_approval_status(arg):
     return f"操作 {action}(target={target}) 审批状态：{'已通过' if st['approved'] else '未通过（需先调用 dev_approve）'}（有效期 {st['ttl_seconds'] // 60} 分钟）。"
 
 
+def _tool_install_request(arg):
+    text = str(arg or "").strip()
+    if text.startswith("{"):
+        try:
+            value = json.loads(text)
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+    fields = _parse_keyed(text, ["manager", "package", "name", "version", "fallback_tools", "fallback"])
+    if isinstance(fields.get("fallback_tools"), str):
+        fields["fallback_tools"] = [x.strip() for x in fields["fallback_tools"].split(",") if x.strip()]
+    if isinstance(fields.get("fallback"), str):
+        fields["fallback"] = [x.strip() for x in fields["fallback"].split(",") if x.strip()]
+    return fields
+
+
+def dev_install_tool(arg):
+    """在项目内隔离安装缺失工具；必须先通过 install_tool 审批。"""
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return json.dumps({"ok": False, "error": "未配置代码库"}, ensure_ascii=False)
+    from agent_runtime.tool_install import ToolInstallManager, ToolInstallError
+    request = _tool_install_request(arg)
+    try:
+        manager = ToolInstallManager(root)
+        plan = manager.plan(request)
+    except (ToolInstallError, TypeError, ValueError) as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+    from game_workbench import require_approval
+    gate = require_approval(root, "install_tool", plan["approval_target"])
+    if gate:
+        return json.dumps({**gate, "plan": plan,
+                           "alternatives": plan.get("alternatives", [])}, ensure_ascii=False)
+    result = manager.install(request, approved=True)
+    return json.dumps(result, ensure_ascii=False)[:6000]
+
+
+def dev_tool_install_audit(arg):
+    """查看项目内工具安装审计记录；不执行安装。"""
+    root = get_runtime("code_root") or CODE_ROOT
+    if not root:
+        return json.dumps({"ok": False, "error": "未配置代码库"}, ensure_ascii=False)
+    from agent_runtime.tool_install import ToolInstallManager
+    fields = _parse_keyed(str(arg or ""), ["limit"])
+    try:
+        limit = int(fields.get("limit") or 50)
+    except (TypeError, ValueError):
+        limit = 50
+    return json.dumps({"ok": True, "items": ToolInstallManager(root).audit(limit)},
+                      ensure_ascii=False)
+
+
 def _region_file(root, rmap, key, rel_path):
     """Resolve a file inside a configured region and reject symlink/path escapes."""
     if key not in rmap:
@@ -3583,7 +3677,7 @@ TOOLS = {
     "web_research": {"description": "联网研究：先搜索，再读取最多 3 个公开网页正文，返回来源和证据。适合教程、GitHub、引擎文档和需要最新资料的问题。输入研究主题。", "func": web_research},
     "web_fetch": {"description": "读取公开网页正文并返回来源、标题和清理后的文本。输入完整 http/https URL。联网研究时先 web_search，再对关键来源调用。", "func": web_fetch},
     "web_subtitles": {"description": "读取公开 B 站视频字幕。输入包含 BV 号或 av 号的完整视频 URL；没有公开字幕、需要登录或被风控时返回明确原因。", "func": web_subtitles},
-    "dev_mcp_call": {"description": "调用已启用的 MCP 游戏引擎连接器。输入 key: 服务器key、name: 工具名、arguments: JSON。先用 dev_list_connectors 看清可用连接器、用 dev_route_connector 按任务语义挑 top 作为 key、用 dev_list_connector_tools 确认 name 与参数；外部连接器需已启用并遵守审批。", "func": dev_mcp_call},
+    "dev_mcp_call": {"description": "调用已启用的 MCP 游戏引擎连接器。输入 key: 服务器key、name: 工具名、arguments: JSON；可选 fallback_keys 或 hint 触发有界故障转移。先用 dev_list_connectors 看清可用连接器、用 dev_route_connector 按任务语义挑 top 作为 key、用 dev_list_connector_tools 确认 name 与参数；外部连接器需已启用并遵守审批。涉及写入时传 side_effect: true，默认不会跨连接器重试；只有明确传 allow_side_effect_fallback: true 才允许。", "func": dev_mcp_call},
     "dev_list_connectors": {"description": "列出已配置 MCP 连接器（key/label/engine/transport/启用状态/能力标签/适用说明），供 Agent 自主挑选最合适的引擎连接器。输入留空。", "func": dev_list_connectors},
     "dev_route_connector": {"description": "按任务语义挑选最合适的【已启用】连接器：输入 hint（任务描述，如 'Godot 里打开 Main 场景并运行'），返回排序候选与匹配理由（top.key 即 dev_mcp_call 的 key）。某连接器不可用或调用失败时，用它重新挑选其它已启用连接器。", "func": dev_route_connector},
     "dev_list_connector_tools": {"description": "列出某连接器暴露的工具（name/description/input_schema），确定 dev_mcp_call 的 name 与参数。输入 key: <连接器key>；仅对打算调用的连接器使用（godot 等 stdio 需先建立会话）。", "func": dev_list_connector_tools},
@@ -3765,7 +3859,20 @@ TOOLS = {
         "description": "查询某敏感操作当前是否已通过审批。输入：action: <操作名> 换行 target: <对象>(默认 *)。返回已通过/未通过，用于决定是否需要先调用 dev_approve。",
         "func": dev_approval_status,
     },
+    "dev_install_tool": {
+        "description": "缺失工具的隔离安装：输入 manager: python|node 换行 package: 包名 换行 version: 可选版本 换行 fallback_tools: 失败时可替代的内置工具。只安装到项目 .docmind/tool_envs，必须先用 dev_approve 审批 action=install_tool、target=<manager>:<package[==version]>；安装后会验证实际版本和沙箱路径，失败会返回替代方案和审计记录。",
+        "func": dev_install_tool,
+    },
+    "dev_tool_install_audit": {
+        "description": "查看项目内工具安装审计记录。输入可选 limit: 50；不会执行安装。",
+        "func": dev_tool_install_audit,
+    },
 }
+
+# Convert the built-in registry once at import time.  Extensions and tests may
+# still add legacy dict entries later; consumers call ``coerce_tool_spec`` at
+# their boundary so those remain compatible.
+upgrade_registry(TOOLS)
 
 
 def tool_schemas(names=None, registry=None):
@@ -3777,26 +3884,24 @@ def tool_schemas(names=None, registry=None):
     """
     out = []
     source = registry if registry is not None else TOOLS
-    for name, meta in source.items():
+    for name, raw_meta in source.items():
         if names and name not in names:
             continue
-        desc = (meta.get("description") or "").strip()
+        meta = coerce_tool_spec(name, raw_meta)
+        desc = (meta.description or "").strip()
+        parameters = dict(meta.input_schema)
+        properties = dict(parameters.get("properties") or {})
+        properties.setdefault("input", {
+            "type": "string",
+            "description": "兼容旧调用的原始 Action Input；与结构化字段二选一。",
+        })
+        parameters["properties"] = properties
         out.append({
             "type": "function",
             "function": {
                 "name": name,
                 "description": desc[:1024],
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "input": {
-                            "type": "string",
-                            "description": "工具的输入，与文本协议 Action Input 同形"
-                                           "（多行 key: value，或纯文本参数）。",
-                        }
-                    },
-                    "required": ["input"],
-                },
+                "parameters": parameters,
             },
         })
     return out

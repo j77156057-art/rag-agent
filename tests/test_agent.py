@@ -70,6 +70,92 @@ class AgentGuardTests(unittest.TestCase):
         self.assertEqual(len(finals), 1)
         self.assertIn("已确认结论", finals[0])
 
+    def test_capability_question_does_not_authorize_file_write(self):
+        """询问能力时先澄清目标，不调用任何写工具或模型脚本。"""
+        called = []
+
+        def fake_write(arg):
+            called.append(arg)
+            return "不应执行"
+
+        agent_mod.TOOLS = {"apply_edit": {"func": fake_write}}
+        a = agent_mod.Agent(llm=_ScriptedLLM([_act("apply_edit", "path: x")]))
+        events = list(a.run("你可以帮我修改文件吗？", stream=True))
+        self.assertEqual(called, [])
+        self.assertEqual(len([e for e in events if e["type"] == "final"]), 1)
+        self.assertIn("当前还没有执行任何写操作", events[-1]["text"])
+
+    def test_location_answer_is_asked_to_read_source_before_final(self):
+        """search_code 摘要不足以交付定位答案，必须补一次 read_file。"""
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "behaviors", "enemy.gd")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("func _ready():\n\tadd_to_group(\"enemy\")\n")
+            set_runtime("code_root", root)
+            calls = []
+
+            def search(_arg):
+                calls.append("search_code")
+                return "[behaviors/enemy.gd:L2] add_to_group(\\\"enemy\\\")"
+
+            def read(_arg):
+                calls.append("read_file")
+                return "=== behaviors/enemy.gd（第 1-2 行，共 2 行）===\n1: func _ready()\n2: add_to_group(\\\"enemy\\\")"
+
+            agent_mod.TOOLS = {"search_code": {"func": search}, "read_file": {"func": read}}
+            a = agent_mod.Agent(llm=_ScriptedLLM([
+                _act("search_code", "enemy patrol"),
+                "Final Answer: 敌人分组在 behaviors/enemy.gd:2。",
+                "Thought: 读取原文\nAction: read_file\nAction Input: behaviors/enemy.gd",
+                "Final Answer: 敌人分组在 behaviors/enemy.gd:2。",
+            ]))
+            events = list(a.run("敌人的巡逻逻辑在哪个文件？", stream=True))
+            self.assertEqual(calls, ["search_code", "read_file"])
+            self.assertTrue(any("缺少原文核验" in e.get("text", "") for e in events
+                                if e["type"] == "reflection"))
+            self.assertIn("behaviors/enemy.gd:2", events[-1]["text"])
+
+    def test_request_context_stays_system_message(self):
+        captured = []
+
+        class CaptureLLM(_ScriptedLLM):
+            def chat(self, messages, stream=True, **kwargs):
+                captured.extend(messages)
+                return super().chat(messages, stream=stream, **kwargs)
+
+        a = agent_mod.Agent(llm=CaptureLLM([_FINAL_OK]))
+        list(a.run("请回答 hello", stream=True,
+                  system_context=["内部路由提示：仅供模型使用"], ingested_sources=["LICENSE.txt"]))
+        user_messages = [item["content"] for item in captured if item.get("role") == "user"]
+        self.assertEqual(user_messages[-1], "请回答 hello")
+        self.assertIn("内部路由提示", "\n".join(item["content"] for item in captured
+                                                  if item.get("role") == "system"))
+
+    def test_streaming_prompt_leak_is_removed_even_when_split_across_tokens(self):
+        """模型分片回显旧版系统前缀时，SSE token 与最终答案都不得泄漏。"""
+        class ChunkedLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, messages, stream=True, **kwargs):
+                self.calls += 1
+                return iter([
+                    "【系统",
+                    "提示】知识库中已上传以下文档：LICENSE。\n\n用户问",
+                    "题：Final Answer: 真实答案。",
+                ])
+
+            def count_tokens(self, text):
+                return 0
+
+        events = list(agent_mod.Agent(llm=ChunkedLLM()).run("请回答这个测试问题。", stream=True))
+        visible = "".join(e.get("text", "") for e in events if e.get("type") == "token")
+        finals = [e.get("text", "") for e in events if e.get("type") == "final"]
+        self.assertNotIn("系统提示", visible)
+        self.assertNotIn("知识库中已上传", visible)
+        self.assertEqual(finals, ["真实答案。"])
+
     def test_step_budget_forces_final_from_observations(self):
         """8 步后第 9 个动作先被强制收尾提示，模型据此给出 Final Answer。"""
         counter = {"n": 0}
@@ -358,6 +444,29 @@ class WebGateTests(unittest.TestCase):
         _run(a)
         self.assertEqual(calls, ["今天的新闻"])
 
+    def test_changed_web_query_is_allowed_after_unsatisfactory_result(self):
+        """改写查询是合法重试；只有同工具同参数才触发重复调用护栏。"""
+        calls = []
+
+        def fake_web(arg):
+            calls.append(arg)
+            if len(calls) == 1:
+                return "搜索未返回结果"
+            return "· 相关结果\n  https://example.test/useful"
+
+        agent_mod.TOOLS = {"web_search": {"func": fake_web}}
+        a = agent_mod.Agent(llm=_ScriptedLLM([
+            _act("web_search", "原始问题"),
+            _act("web_search", "原始问题 site:example.test"),
+            _FINAL_OK,
+        ]))
+        a.web_enabled = True
+        events = _run(a)
+        self.assertEqual(calls, ["原始问题", "原始问题 site:example.test"])
+        self.assertFalse(any("重复调用" in e.get("text", "") for e in events
+                             if e["type"] == "reflection"))
+        self.assertEqual([e["text"] for e in events if e["type"] == "final"], ["已确认结论。"])
+
     def test_offline_repeat_same_web_call_stops_early(self):
         """联网关闭时同参重复 web_search：既被拦截，又能触发防重复升级及时收尾。
 
@@ -403,6 +512,80 @@ class WebGateTests(unittest.TestCase):
         a.web_enabled = True
         joined_on = " ".join(str(m.get("content", "")) for m in a._build_messages("q"))
         self.assertIn("联网已开启", joined_on)
+
+
+class SubagentPlanningRoleTests(unittest.TestCase):
+    def test_dispatcher_role_is_read_only_and_available(self):
+        spec = agent_mod._SUBAGENT_ROLES["dispatcher"]
+        self.assertIn("search_code", spec["tools"])
+        self.assertIn("read_file", spec["tools"])
+        self.assertNotIn("apply_edit", spec["tools"])
+        self.assertIn("任务派发", spec["hint"])
+
+    def test_planner_role_is_available_and_read_only(self):
+        spec = agent_mod._SUBAGENT_ROLES["planner"]
+        self.assertIn("search_code", spec["tools"])
+        self.assertIn("read_file", spec["tools"])
+        self.assertNotIn("apply_edit", spec["tools"])
+        self.assertIn("任务拆解", spec["hint"])
+
+    def test_planner_cannot_widen_tools_or_enable_mcp(self):
+        class CaptureLLM(_ScriptedLLM):
+            def __init__(self):
+                super().__init__([_FINAL_OK])
+                self.messages = []
+
+            def clone(self):
+                return self
+
+            def chat(self, messages, stream=True, **kwargs):
+                self.messages.append(messages)
+                return super().chat(messages, stream=stream, **kwargs)
+
+        llm = CaptureLLM()
+        registry = {
+            "search_code": {"func": lambda _arg: "代码证据"},
+            "apply_edit": {"func": lambda _arg: "不应调用"},
+            "dev_mcp_call": {"func": lambda _arg: "不应调用"},
+        }
+        parent = agent_mod.Agent(llm=llm, tool_registry=registry)
+        result = parent._run_child(
+            "planner", "拆解文件和依赖", tool_allowlist=["apply_edit", "dev_mcp_call"],
+            mcp_policy="allow", reflect=False)
+        self.assertEqual(result["status"], "ok")
+        prompt = "\n".join(str(item.get("content") or "") for item in llm.messages[-1]
+                             if isinstance(item, dict))
+        self.assertIn("MCP=deny", prompt)
+        effective = prompt.rsplit("允许工具=", 1)[-1].split("\n", 1)[0]
+        self.assertIn("search_code", effective)
+        self.assertNotIn("apply_edit", effective)
+        self.assertNotIn("dev_mcp_call", effective)
+
+    def test_dispatcher_cannot_enable_mcp(self):
+        class CaptureLLM(_ScriptedLLM):
+            def __init__(self):
+                super().__init__([_FINAL_OK])
+                self.messages = []
+
+            def clone(self):
+                return self
+
+            def chat(self, messages, stream=True, **kwargs):
+                self.messages.append(messages)
+                return super().chat(messages, stream=stream, **kwargs)
+
+        llm = CaptureLLM()
+        registry = {"search_code": {"func": lambda _arg: "代码证据"},
+                    "dev_mcp_call": {"func": lambda _arg: "不应调用"}}
+        parent = agent_mod.Agent(llm=llm, tool_registry=registry)
+        result = parent._run_child("dispatcher", "拆解文件并分派任务",
+                                   tool_allowlist=["dev_mcp_call"],
+                                   mcp_policy="allow", reflect=False)
+        self.assertEqual(result["status"], "ok")
+        prompt = "\n".join(str(item.get("content") or "")
+                             for item in llm.messages[-1] if isinstance(item, dict))
+        self.assertIn("MCP=deny", prompt)
+        self.assertNotIn("dev_mcp_call", prompt.rsplit("允许工具=", 1)[-1].split("\n", 1)[0])
 
 
 class CalculateToolTests(unittest.TestCase):
@@ -469,6 +652,72 @@ class CalculateInterpretTests(unittest.TestCase):
         finals = [e["text"] for e in events if e["type"] == "final"]
         self.assertEqual(len(finals), 1)
         self.assertEqual(finals[0], "计算结果为：2")
+
+
+class DynamicOrchestrationContractTests(unittest.TestCase):
+    """真实 Agent 编排路径的离线契约：反思失败后由 LLM 给出补救任务。"""
+
+    class _PlannerLLM:
+        provider = "fake"
+        model = "contract"
+
+        def __init__(self):
+            self.prompts = []
+            self.reflections = 0
+            self.last_usage = {"prompt_tokens": 3, "completion_tokens": 2}
+
+        def clone(self):
+            # 保持同一份可观测账本，模拟真实 client 的独立 clone。
+            return self
+
+        def count_tokens(self, text):
+            return len(str(text or "")) // 4
+
+        def chat(self, messages, stream=True, **_kwargs):
+            prompt = "\n".join(str(item.get("content") or "")
+                                 for item in messages if isinstance(item, dict))
+            self.prompts.append(prompt)
+            if "子代理任务反思器" in prompt:
+                self.reflections += 1
+                if self.reflections == 1:
+                    return '{"ok":false,"issues":["证据不足"],"next_step":"换一种检索策略"}'
+                return '{"ok":true,"issues":[],"next_step":"交给主 Agent 复核"}'
+            if "第 1 次重规划" in prompt:
+                return ('{"add":[{"id":"recovery","role":"researcher",'
+                        '"task":"换一种检索策略并记录来源","depends_on":[],'
+                        '"persona":"谨慎的补救研究员","tools":[],"mcp":"deny",'
+                        '"reflection":true}]}')
+            return "Final Answer: 已完成受限检索并形成结论。"
+
+    def test_llm_reflection_failure_drives_bounded_replan(self):
+        llm = self._PlannerLLM()
+        planner = agent_mod.Agent(llm=llm, tool_registry={})
+        report = planner.orchestrate({
+            "tasks": [{"id": "initial", "role": "researcher",
+                       "task": "整理接口名称", "depends_on": [],
+                       "mcp": "deny", "reflection": True}],
+        }, synth=False, max_parallel=1, replan=True, max_replans=1)
+
+        self.assertEqual(report["replans"], 1)
+        self.assertEqual(report["revisions"][0]["added"], ["recovery"])
+        self.assertEqual(report["results"]["initial"]["reflection"]["source"], "llm")
+        self.assertFalse(report["results"]["initial"]["reflection"]["ok"])
+        self.assertEqual(report["results"]["recovery"]["status"], "ok")
+        self.assertTrue(report["results"]["recovery"]["reflection"]["ok"])
+        self.assertTrue(any("执行轨迹" in prompt for prompt in llm.prompts
+                            if "重规划" in prompt))
+
+    def test_subagent_context_is_isolated_from_parent_history(self):
+        llm = self._PlannerLLM()
+        parent = agent_mod.Agent(llm=llm, session_id="parent-session", tool_registry={})
+        parent.history = [{"user": "父会话私有内容", "assistant": "不要泄漏"}]
+        result = parent._run_child("researcher", "只返回独立结论", reflect=False)
+        self.assertEqual(result["status"], "ok")
+        child_prompt = "\n".join(llm.prompts[-1:])
+        self.assertIn("只返回独立结论", child_prompt)
+        self.assertNotIn("父会话私有内容", child_prompt)
+        self.assertNotIn("不要泄漏", child_prompt)
+        self.assertEqual(parent.history[0]["user"], "父会话私有内容")
 
 
 if __name__ == "__main__":

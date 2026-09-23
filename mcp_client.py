@@ -667,15 +667,130 @@ def call_tool(root, key, name, arguments=None, timeout=CALL_TIMEOUT):
     """调用 MCP 工具，统一抽取文本/结构化结果。"""
     item = _require_enabled(get_server_config(root, key))
     params = {"name": name, "arguments": arguments or {}}
-    if item["transport"] == "stdio":
-        sess = _session_for(root, item)
-        result = sess.request("tools/call", params, timeout=timeout) or {}
-    else:
-        _http_initialize(item)
-        result = _http_post(item["url"], {"jsonrpc": "2.0", "id": 3,
-                                          "method": "tools/call", "params": params},
-                            timeout=timeout) or {}
+    hook_payload = {
+        "connector": str(key)[:120],
+        "tool": str(name)[:160],
+        "transport": str(item.get("transport") or "")[:40],
+        "timeout_s": max(0.0, float(timeout)),
+        "argument_chars": len(json.dumps(arguments or {}, ensure_ascii=False, default=str)),
+    }
+    try:
+        import hooks as _workflow_hooks
+    except Exception:  # pragma: no cover - hooks are optional at runtime
+        _workflow_hooks = None
+    if _workflow_hooks is not None:
+        before = _workflow_hooks.run_workflow("before_mcp", hook_payload)
+        if before.get("blocked"):
+            reason = str(before.get("reason") or "MCP 生命周期钩子拦截")[:300]
+            raise MCPError("MCP 调用已被拦截：%s" % reason)
+    started = time.monotonic()
+    result = None
+    error_text = ""
+    try:
+        if item["transport"] == "stdio":
+            sess = _session_for(root, item)
+            result = sess.request("tools/call", params, timeout=timeout) or {}
+        else:
+            _http_initialize(item)
+            result = _http_post(item["url"], {"jsonrpc": "2.0", "id": 3,
+                                              "method": "tools/call", "params": params},
+                                timeout=timeout) or {}
+    except Exception as exc:
+        error_text = "%s: %s" % (type(exc).__name__, str(exc)[:240])
+        raise
+    finally:
+        if _workflow_hooks is not None:
+            after = _workflow_hooks.run_workflow("after_mcp", {
+                **hook_payload,
+                "ok": bool(isinstance(result, dict) and not result.get("isError", False)
+                           and not error_text),
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "error": error_text,
+            })
+            if after.get("blocked") and not error_text:
+                # A post-MCP block is a failed call from the caller's point of
+                # view, even though the remote server may have completed it.
+                raise MCPError("MCP 结果未放行：%s" %
+                               str(after.get("reason") or "需要人工审核")[:300])
     text, structured, blocks = extract_text(result)
     return {"ok": not result.get("isError", False), "server": key, "name": name,
             "is_error": bool(result.get("isError", False)),
             "text": text, "structured": structured, "other_blocks": blocks}
+
+
+def call_tool_with_fallback(root, key, name, arguments=None, *, fallback_keys=None,
+                            task_hint="", timeout=CALL_TIMEOUT, max_attempts=3,
+                            side_effect=False, allow_side_effect_fallback=False):
+    """Call an MCP tool and try bounded connector alternatives after failure.
+
+    Fallback is explicit and bounded because a second connector may have side
+    effects or expose a different tool set.  Callers can provide ordered
+    ``fallback_keys``; when omitted, the semantic router supplies candidates
+    for ``task_hint``.  A successful response returns the same shape as
+    :func:`call_tool` plus an ``attempts`` audit trail.  If every attempt
+    fails, the original :class:`MCPError` is raised with the diagnostics
+    attached to ``attempts`` on the exception for the caller to report.
+    """
+    primary = str(key or "").strip()
+    if not primary:
+        raise MCPError("MCP 调用失败：缺少连接器 key")
+    ordered = []
+    for candidate in (fallback_keys or []):
+        candidate = str(candidate or "").strip()
+        if candidate and candidate not in ordered and candidate != primary:
+            ordered.append(candidate)
+    if not ordered and task_hint:
+        for row in select_connector(root, task_hint):
+            candidate = str(row.get("key") or "").strip()
+            if candidate and candidate != primary and candidate not in ordered:
+                ordered.append(candidate)
+    # A lost response can mean a mutating tool already ran.  Never repeat a
+    # side effect across connectors unless the caller explicitly accepts that
+    # risk (for example, an idempotent create with a durable operation key).
+    fallback_allowed = not side_effect or bool(allow_side_effect_fallback)
+    limit = max(1, min(8, int(max_attempts))) if fallback_allowed else 1
+    candidates = [primary, *ordered[: max(0, limit - 1)]]
+    attempts = []
+    last_error = None
+    for candidate in candidates:
+        started = time.monotonic()
+        retry_hook = None
+        try:
+            import hooks as _workflow_hooks
+            retry_hook = _workflow_hooks.run_workflow("mcp_retry", {
+                "connector": candidate, "attempt": len(attempts) + 1,
+                "side_effect": bool(side_effect),
+            })
+        except Exception:
+            # Hook import/runtime errors are observational only.
+            _workflow_hooks = None
+            retry_hook = None
+        if retry_hook and retry_hook.get("blocked"):
+            attempts.append({"key": candidate, "ok": False,
+                             "blocked": True,
+                             "error": str(retry_hook.get("reason") or "MCP 重试被拦截")[:240],
+                             "elapsed_ms": int((time.monotonic() - started) * 1000)})
+            blocked = MCPError("MCP 重试已被拦截：%s" %
+                               str(retry_hook.get("reason") or "需要人工审核")[:300])
+            blocked.attempts = attempts
+            blocked.fallback_allowed = fallback_allowed
+            raise blocked
+        try:
+            response = call_tool(root, candidate, name, arguments, timeout=timeout)
+            attempts.append({"key": candidate, "ok": bool(response.get("ok")),
+                             "elapsed_ms": int((time.monotonic() - started) * 1000)})
+            if response.get("ok"):
+                response["attempts"] = attempts
+                response["fallback_allowed"] = fallback_allowed
+                return response
+            last_error = MCPError("MCP 工具返回 isError")
+        except MCPError as exc:
+            last_error = exc
+            attempts.append({"key": candidate, "ok": False,
+                             "error": str(exc)[:240],
+                             "elapsed_ms": int((time.monotonic() - started) * 1000)})
+    if last_error is None:
+        last_error = MCPError("没有可用的 MCP 连接器")
+    last_error.attempts = attempts
+    last_error.fallback_allowed = fallback_allowed
+    raise last_error

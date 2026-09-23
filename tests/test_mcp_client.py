@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -144,6 +145,45 @@ class TransportTest(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertEqual(r["text"], "pong:abc")
 
+    def test_mcp_lifecycle_hooks_wrap_real_call(self):
+        events = []
+
+        def observe(kind, payload):
+            events.append((kind, dict(payload)))
+            return {"blocked": False, "reason": "", "errors": []}
+
+        with patch("hooks.run_workflow", side_effect=observe):
+            result = mcp_client.call_tool(self.tmp, "fake_http", "ping", {"q": "hook"})
+        self.assertTrue(result["ok"])
+        self.assertEqual([kind for kind, _ in events], ["before_mcp", "after_mcp"])
+        self.assertEqual(events[0][1]["connector"], "fake_http")
+        self.assertEqual(events[0][1]["tool"], "ping")
+        self.assertTrue(events[1][1]["ok"])
+        self.assertGreaterEqual(events[1][1]["duration_ms"], 0)
+
+    def test_before_mcp_hook_can_block_without_connecting(self):
+        events = []
+
+        def block(kind, payload):
+            events.append(kind)
+            return {"blocked": kind == "before_mcp", "reason": "需要人工审核", "errors": []}
+
+        with patch("hooks.run_workflow", side_effect=block), \
+                patch.object(mcp_client, "_session_for", side_effect=AssertionError("must not connect")):
+            with self.assertRaises(mcp_client.MCPError) as ctx:
+                mcp_client.call_tool(self.tmp, "fake_stdio", "echo", {"text": "blocked"})
+        self.assertIn("人工审核", str(ctx.exception))
+        self.assertEqual(events, ["before_mcp"])
+
+    def test_after_mcp_hook_can_block_remote_result(self):
+        def block_after(kind, _payload):
+            return {"blocked": kind == "after_mcp", "reason": "结果需复核", "errors": []}
+
+        with patch("hooks.run_workflow", side_effect=block_after):
+            with self.assertRaises(mcp_client.MCPError) as ctx:
+                mcp_client.call_tool(self.tmp, "fake_http", "ping", {"q": "review"})
+        self.assertIn("结果未放行", str(ctx.exception))
+
     def test_default_servers_present_and_disabled_unreachable(self):
         configs = {s["key"]: s for s in mcp_client.server_configs(self.tmp)}
         self.assertIn("godot", configs)
@@ -162,6 +202,65 @@ class TransportTest(unittest.TestCase):
         mcp_client.remove_server(self.tmp, "unreal")
         user = mcp_client.load_user_servers(self.tmp)
         self.assertFalse(user["unreal"]["enabled"])
+
+    def test_call_tool_with_fallback_tries_next_connector(self):
+        def fake_call(_root, key, _name, _args, timeout=mcp_client.CALL_TIMEOUT):
+            if key == "primary":
+                raise mcp_client.MCPError("连接超时")
+            return {"ok": True, "server": key, "text": "ok"}
+
+        with patch.object(mcp_client, "call_tool", side_effect=fake_call):
+            result = mcp_client.call_tool_with_fallback(
+                self.tmp, "primary", "echo", {}, fallback_keys=["backup"])
+        self.assertEqual(result["server"], "backup")
+        self.assertEqual([item["key"] for item in result["attempts"]], ["primary", "backup"])
+
+    def test_call_tool_with_fallback_records_all_failures(self):
+        def fake_call(*_args, **_kwargs):
+            raise mcp_client.MCPError("offline")
+
+        with patch.object(mcp_client, "call_tool", side_effect=fake_call):
+            with self.assertRaises(mcp_client.MCPError) as ctx:
+                mcp_client.call_tool_with_fallback(
+                    self.tmp, "primary", "echo", {}, fallback_keys=["backup"])
+        self.assertEqual([item["key"] for item in ctx.exception.attempts],
+                         ["primary", "backup"])
+
+    def test_side_effect_fallback_is_opt_in(self):
+        calls = []
+
+        def fake_call(_root, key, _name, _args, timeout=mcp_client.CALL_TIMEOUT):
+            calls.append(key)
+            raise mcp_client.MCPError("timeout")
+
+        with patch.object(mcp_client, "call_tool", side_effect=fake_call):
+            with self.assertRaises(mcp_client.MCPError) as ctx:
+                mcp_client.call_tool_with_fallback(
+                    self.tmp, "primary", "write", {}, fallback_keys=["backup"],
+                    side_effect=True)
+        self.assertEqual(calls, ["primary"])
+        self.assertFalse(ctx.exception.fallback_allowed)
+
+    def test_mcp_retry_hook_block_stops_fallback_chain(self):
+        calls = []
+
+        def block_retry(kind, payload):
+            if kind == "mcp_retry":
+                return {"blocked": True, "reason": "网络变更需审核", "errors": []}
+            return {"blocked": False, "reason": "", "errors": []}
+
+        def fake_call(_root, key, _name, _args, timeout=mcp_client.CALL_TIMEOUT):
+            calls.append(key)
+            return {"ok": True, "server": key, "text": "should not run"}
+
+        with patch("hooks.run_workflow", side_effect=block_retry), \
+                patch.object(mcp_client, "call_tool", side_effect=fake_call):
+            with self.assertRaises(mcp_client.MCPError) as ctx:
+                mcp_client.call_tool_with_fallback(
+                    self.tmp, "primary", "echo", {}, fallback_keys=["backup"])
+        self.assertEqual(calls, [])
+        self.assertTrue(ctx.exception.attempts[0]["blocked"])
+        self.assertTrue(ctx.exception.fallback_allowed)
 
 
 if __name__ == "__main__":

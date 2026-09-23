@@ -6,6 +6,8 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -39,6 +41,25 @@ class DiagnosticsParseTest(unittest.TestCase):
     def test_empty_input(self):
         self.assertEqual(gw.parse_godot_diagnostics(""), [])
         self.assertEqual(gw.parse_godot_diagnostics(None), [])
+
+    def test_playtest_rejects_godot_script_error_with_zero_exit(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(
+                gw.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=0, stdout="Godot Engine\n",
+                    stderr="SCRIPT ERROR: Parse Error: broken.gd\n")):
+            result = gw.playtest(root, "godot --headless --path . --quit-after 1")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], 0)
+        self.assertIn("SCRIPT ERROR", result["output"])
+
+    def test_playtest_uses_utf8_replacement_on_windows_output(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(
+                gw.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=0, stdout="Godot ✓\n", stderr="")) as run:
+            result = gw.playtest(root, "godot --headless --path . --quit-after 1")
+        self.assertTrue(result["ok"])
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
 
 
 class EnablePluginTextTest(unittest.TestCase):

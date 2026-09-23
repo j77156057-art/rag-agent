@@ -194,12 +194,33 @@ curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文
 | **LLM 弹性** | 重试 + 指数退避（429 / 5xx / 超时 / 网络可重试，**4xx 明确不重试**）+ 统一 `timeout`/`deadline`；SSE 客户端断连即关闭内层生成器中止回合并记账 | `DOCMIND_LLM_*`、`DOCMIND_TURN_DEADLINE_S` |
 | **评测自动化** | 黄金题 40 条（单跳 / 多跳 / 抗干扰三档）规则打分（`must_include / any_of / must_not_include / regex / must_call / 动作边界 / no_error`）+ 可选 LLM-judge + **baseline 回归门**（pass→fail 即退出码 1） | `run_golden.py` 跑题、`agent_eval.py` 打分、`agent-golden-eval` skill 的 `gate.py`（已接入冻结发布流程） |
 | **原生 function-calling** | 由工具表生成 OpenAI 风格 schema；`tool_calls` 归一进文本协议后**复用全部既有护栏**（写意图 / 防重复 / 步数 / 证据兜底），事件类型不变 | `DOCMIND_TOOL_MODE=react\|native\|auto` |
-| **多代理编排器** | 任务图 DAG（校验 + 拓扑分波 + 同波并行）+ **下游注入上游结论** + **失败自动重规划**（提案 `add / drop / replace`，只能改**尚未执行**的任务）+ 结果合成 + **子代理执行轨迹回传**给 replanner 做失败归因 | `orchestrate` 工具、`POST /api/orchestrate` |
+| **多代理编排器** | 任务图 DAG（校验 + 拓扑分波 + 同波并行）+ **dispatcher/planner 动态拆解并派发任务**（主 Agent 校验后加入 DAG）+ **下游注入上游结论** + **失败自动重规划**（提案 `add / drop / replace`，只能改**尚未执行**的任务）+ 结果合成 + **子代理执行轨迹回传**给 replanner 做失败归因 | `orchestrate` 工具、`POST /api/orchestrate` |
 | **成本熔断** | 按 provider/model 计价（可 `.docmind_pricing.json` 覆盖；本地 provider 恒 0）+ 全局/会话累计预算；**回合前拒绝、回合后累计** | `GET/POST /api/budget` |
 | **hooks / 技能热插拔** | `.docmind/hooks/*.py` 的 `pre/post_tool`、`pre/post_turn`（单个钩子异常被隔离）；`agent_skills/*/SKILL.md` 提供内置技能，`.docmind/skills` 可同名覆盖，正文由 `dev_use_skill` 按需取 | `POST /api/hooks/reload`、`POST /api/skills/reload` |
 | **办公文档产物** | 内置 `documents / pdf / presentations / spreadsheets` 四个技能；`create_artifact` 生成真实 DOCX、PDF、PPTX、XLSX，回读验证后写入当前项目 `artifacts/`，同名文件自动分配新名称 | `dev_use_skill`、`create_artifact` |
 | **并行工具批次** | 一轮多条**只读**调用并发执行（结果**保序**回填）；批内只要含写/副作用工具就整批退回顺序，**绝不并发写** | `DOCMIND_PARALLEL_TOOLS`、`DOCMIND_PARALLEL_MAX` |
 | **渐进式工具暴露** | 47 个工具的完整描述写进系统提示会撑爆 `PROMPT_TOKEN_BUDGET`（实测触发 `system prompt has been truncated` 并让模型输出格式崩溃）。改为默认只注入 13 个核心工具的完整用法，其余只给一行索引，按需用 `tool_search(工具名)` 取回（连同该工具的细则一起返回） | `DOCMIND_TOOL_EXPANSION=progressive`（默认 `full`，行为不变） |
+
+### 游戏 Harness 验收闭环（当前状态）
+
+Harness 现在可以对真实 Godot 项目执行完整验收链路：
+
+`检索 → 需求澄清 → 动态分工 → 审批 → 并行 Subagent → 受控文件修改 → Godot headless Playtest → 证据复核`
+
+验收 runner 默认复制项目到临时目录，源项目保持只读；报告会记录每个阶段、任务线程、工具调用、Subagent 状态、上下文压缩摘要、失败原因、耗时和 token 计数。入口是 [`agent_runtime/acceptance.py`](agent_runtime/acceptance.py)，工作流实现见 [`agent_runtime/game_workflow.py`](agent_runtime/game_workflow.py)，前端观测面板见 [`frontend/src/workbench/components/HarnessPanel.vue`](frontend/src/workbench/components/HarnessPanel.vue)。
+
+```powershell
+.\.venv\Scripts\python.exe -m agent_runtime.acceptance `
+  --project D:\WorkBuddy\godot_sample `
+  --godot D:\Tools\Godot\Godot_v4.7.2-stable_win64_console.exe `
+  --collection docmind_code `
+  --require-event player_ready `
+  --json
+```
+
+上下文路由和五层压缩由 [`agent_runtime/context_router.py`](agent_runtime/context_router.py) 提供；检索生产化和离线评估分别见 [`agent_runtime/retrieval.py`](agent_runtime/retrieval.py)、[`agent_runtime/retrieval_eval.py`](agent_runtime/retrieval_eval.py)。CI 在 [`.github/workflows/harness.yml`](.github/workflows/harness.yml) 中执行工作流成功率、Recall/MRR 和可选真实项目验收门禁。
+
+当前已在本地 Godot 样例项目验证通过；多项目、多引擎、大规模并发和长期运行评估仍属于后续生产化工作。
 
 **三条设计取向**：① **护栏复用**——原生 FC 与并行批次都不新开执行路径，直接走既有护栏，避免"两套语义"；② **有界**——轨迹、观察、历史、批次全部截断或摘要，不让上下文与提示词爆炸；③ **不越权**——编排器只能改未执行任务（不回滚已产生的副作用）、写工具绝不并发、钩子异常一律吞掉。
 
@@ -226,8 +247,15 @@ curl --noproxy '*' -X POST http://127.0.0.1:8000/api/budget -H "Content-Type: ap
 ## 🧪 测试与自检
 
 ```bash
-# 全量单元测试（当前 1131 项；MinGit 在 PATH 时 git 用例会实际执行）
+# 全量回归（pytest 当前约 1247 项；MinGit 在 PATH 时 git 用例会实际执行）
 .venv\Scripts\python.exe -B -m unittest discover -s tests
+
+# Harness 工作流、检索、观测和真实项目契约测试
+.venv\Scripts\python.exe -m pytest tests/test_game_workflow.py tests/test_game_workflow_e2e.py tests/test_retrieval_adapter.py tests/test_retrieval_api.py tests/test_workflow_observability.py -q
+
+# 离线评估门禁
+.venv\Scripts\python.exe -m agent_runtime.workflow_eval --self-check --baseline .github/workflow-eval-baseline.json --json
+.venv\Scripts\python.exe -m agent_runtime.retrieval_eval --dataset .github/retrieval-eval.json --baseline .github/retrieval-eval-baseline.json --minimum 0.75 --json
 
 # 场景画布 —— 后端自检：进程内起 FastAPI + 临时 Godot 工程，走真实路由，不占端口
 .venv\Scripts\python.exe verify_scene_canvas.py

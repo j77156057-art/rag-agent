@@ -40,6 +40,7 @@ def add_documents(chunks, embeddings, metadatas, ids, collection=COLLECTION_NAME
     col = get_collection(collection)
     try:
         col.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
+        _invalidate_lexical(collection)
     except Exception as exc:  # noqa: BLE001
         # Chroma fixes a collection's dimension on first insert.  Make a
         # stale-provider mismatch actionable instead of leaking its opaque
@@ -53,10 +54,13 @@ def add_documents(chunks, embeddings, metadatas, ids, collection=COLLECTION_NAME
         raise
 
 
-def query(text_embedding, k=4, collection=COLLECTION_NAME):
+def query(text_embedding, k=4, collection=COLLECTION_NAME, where=None):
     col = get_collection(collection)
     try:
-        return col.query(query_embeddings=[text_embedding], n_results=k)
+        kwargs = {"query_embeddings": [text_embedding], "n_results": k}
+        if where:
+            kwargs["where"] = where
+        return col.query(**kwargs)
     except Exception as exc:  # noqa: BLE001
         if "dimension" in str(exc).lower():
             raise ValueError(
@@ -73,6 +77,7 @@ def reset_collection(name=COLLECTION_NAME):
         client.delete_collection(name)
     except Exception:  # noqa: BLE001
         pass
+    _invalidate_lexical(name)
     return get_collection(name)
 
 
@@ -84,9 +89,19 @@ def delete_by_source(source, collection=COLLECTION_NAME):
     try:
         col = get_collection(collection)
         col.delete(where={"source": source})
+        _invalidate_lexical(collection)
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def _invalidate_lexical(collection):
+    """Notify the optional lexical cache without creating an import cycle."""
+    try:
+        from agent_runtime.retrieval import invalidate_lexical_index
+        invalidate_lexical_index(collection)
+    except Exception:
+        pass
 
 
 def list_sources(collection=COLLECTION_NAME):
