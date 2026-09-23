@@ -437,7 +437,25 @@ for _s in list_sources():
 
 
 def _project_root_or_error():
-    root = get_runtime("code_root") or CODE_ROOT
+    """Return the project root that owns request-scoped secrets.
+
+    ``code_root`` is retained as a legacy compatibility pointer and can lag
+    behind ``current_project_id`` after the user switches projects.  That is
+    especially visible during application startup, where there is no request
+    context yet: using the stale pointer makes an existing per-project API key
+    appear to have disappeared after a restart.  Prefer the request/current
+    project registry and only fall back to the legacy pointer when there is no
+    registered project.
+    """
+    root = ""
+    try:
+        pid = _request_project_id()
+        project = projects.get_project(pid) if pid else None
+        if project:
+            root = project.get("root", "")
+    except Exception:  # noqa: BLE001 - corrupt registry falls back to legacy mode
+        root = ""
+    root = root or get_runtime("code_root") or CODE_ROOT
     return root if root and os.path.isdir(root) else None
 
 
@@ -459,6 +477,13 @@ async def _restore_persisted_llm():
             stored_key = secrets_store.load(root, provider)
             if stored_key:
                 set_runtime("llm_api_key", stored_key)
+            elif provider in secrets_store.providers(root):
+                # Keep startup non-fatal, but make an unreadable/mismatched
+                # protected secret visible instead of silently sending EMPTY.
+                set_runtime(
+                    "llm_startup_warning",
+                    "已找到该项目保存的 API Key，但当前启动环境无法解密；请在模型设置中重新保存一次 Key。",
+                )
 
     try:
         restored = await run_in_threadpool(lambda: LLMClient(

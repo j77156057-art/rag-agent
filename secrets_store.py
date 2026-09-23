@@ -44,13 +44,40 @@ def save(root, provider, value):
     data[str(provider)]={'ciphertext':token,'scheme':scheme}; p.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
     return {'ok':True,'provider':provider,'stored':True}
 def load(root, provider):
+    """Load a provider key, retaining compatibility with pre-project storage.
+
+    A migrated ``secrets.json`` can outlive the legacy file.  If its DPAPI
+    record cannot be opened (for example after switching from an old packaged
+    launcher), try the original project-local file before giving up.  This is
+    deliberately read-only: an explicit save is still required to rewrite a
+    key with the current user's protection context.
+    """
+    candidates = []
     try:
-        item=json.loads(Path(project_state.path(root, 'secrets.json', legacy='.docmind_secrets.json')).read_text(encoding='utf-8')).get(str(provider),{})
-        token=item.get('ciphertext','')
-        if item.get('scheme')=='dpapi': return _dpapi_decrypt(token) or ''
-        box=_box(root)
-        return box.decrypt(token.encode()).decode() if box else base64.b64decode(token).decode()
-    except Exception: return ''
+        candidates.append(Path(project_state.path(root, 'secrets.json', legacy='.docmind_secrets.json')))
+    except Exception:
+        pass
+    legacy = Path(os.path.abspath(root or '')) / '.docmind_secrets.json'
+    if legacy not in candidates:
+        candidates.append(legacy)
+
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+            item = data.get(str(provider), {})
+            token = item.get('ciphertext', '')
+            if not token:
+                continue
+            if item.get('scheme') == 'dpapi':
+                value = _dpapi_decrypt(token) or ''
+            else:
+                box = _box(root)
+                value = box.decrypt(token.encode()).decode() if box else base64.b64decode(token).decode()
+            if value:
+                return value
+        except Exception:
+            continue
+    return ''
 
 def providers(root):
     try: return sorted(json.loads(Path(project_state.path(root, 'secrets.json', legacy='.docmind_secrets.json')).read_text(encoding='utf-8')).keys())

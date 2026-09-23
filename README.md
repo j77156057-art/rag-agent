@@ -143,7 +143,7 @@ cd frontend && npm install && npm run build      # 产物 -> ../web
 
 两种方式任选其一：
 
-- **页面内切换（推荐，免重启）**：打开问答页点右上角「⚙ 模型设置」，选 provider、填 Key、点「保存并切换」即时生效；provider、模型、自定义接口地址和 embedding 选择会跨重启恢复。API Key 不写入普通状态文件，而是按项目存入本机受保护密钥库，启动时自动加载（切换项目后使用对应项目的密钥）。
+- **页面内切换（推荐，免重启）**：打开问答页点右上角「⚙ 模型设置」，选 provider、填 Key、点「保存并切换」即时生效；provider、模型、自定义接口地址和 embedding 选择会跨重启恢复。API Key 不写入普通状态文件，而是按项目存入本机受保护密钥库，启动时自动加载（切换项目后使用对应项目的密钥）。Key 输入框留空表示“不修改已有 Key”；如果升级/切换启动方式后提示“无法解密”，在当前用户下重新保存一次即可完成迁移。
 - **改 `.env`**：`LLM_PROVIDER=qwen` / `EMBEDDING_PROVIDER=qwen` / `DASHSCOPE_API_KEY=...`，改完重启服务。
 
 ```bash

@@ -16,6 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import api  # noqa: E402
 import config  # noqa: E402
+import projects  # noqa: E402
+import secrets_store  # noqa: E402
 
 
 _RUNTIME_KEYS = ("llm_provider", "llm_model", "llm_base_url", "llm_api_key")
@@ -288,6 +290,74 @@ class ModelPersistenceTests(unittest.TestCase):
         self.assertEqual(config.get_runtime("llm_model"), "vision-local")
         self.assertEqual(config.get_runtime("llm_base_url"), "https://example.test/v1")
         self.assertEqual(config.get_runtime("embedding_provider"), "ollama")
+
+
+class ProjectKeyPersistenceTests(unittest.TestCase):
+    """API Key follows the current project even if legacy code_root is stale."""
+
+    def setUp(self):
+        self._old_state_root = config.STATE_ROOT
+        self._old_state_file = config.STATE_FILE
+        self._old_runtime = dict(config._RUNTIME)
+        self._old_llm = api.agent.llm
+        self._tmp = tempfile.TemporaryDirectory(prefix="docmind_project_key_")
+        self._state_root = os.path.join(self._tmp.name, "state")
+        self._game_root = os.path.join(self._tmp.name, "game")
+        self._stale_root = os.path.join(self._tmp.name, "workbench")
+        os.makedirs(self._state_root)
+        os.makedirs(self._game_root)
+        os.makedirs(self._stale_root)
+        config.STATE_ROOT = self._state_root
+        config.STATE_FILE = os.path.join(self._state_root, ".docmind_state.json")
+        config._RUNTIME.clear()
+
+    def tearDown(self):
+        config.STATE_ROOT = self._old_state_root
+        config.STATE_FILE = self._old_state_file
+        config._RUNTIME.clear()
+        config._RUNTIME.update(self._old_runtime)
+        api.agent.llm = self._old_llm
+        self._tmp.cleanup()
+
+    def _persist_current_game(self):
+        pid = projects.ensure_project(self._game_root)
+        self.assertTrue(projects.set_current(pid))
+        # This is the real failure shape: the new project registry points at
+        # the game while the backward-compatible pointer still names the app.
+        config.save_state("code_root", self._stale_root)
+        config.save_state("llm_provider", "deepseek")
+        config.save_state("llm_model", "deepseek-chat")
+        return pid
+
+    def test_restart_loads_key_from_current_project_not_stale_code_root(self):
+        self._persist_current_game()
+        self.assertTrue(secrets_store.save(
+            self._game_root, "deepseek", "sk-restart-persisted"
+        )["ok"])
+
+        # Simulate a fresh process: only persisted state remains in memory.
+        config._RUNTIME.clear()
+        config._apply_persisted_state()
+        self.assertEqual(config.get_runtime("code_root"), self._stale_root)
+
+        asyncio.run(api._restore_persisted_llm())
+
+        self.assertEqual(config.get_runtime("llm_api_key"), "sk-restart-persisted")
+        self.assertEqual(api.agent.llm.api_key, "sk-restart-persisted")
+
+    def test_blank_key_update_does_not_overwrite_saved_key(self):
+        self._persist_current_game()
+        config._apply_persisted_state()
+        first = _call(provider="deepseek", model="deepseek-chat",
+                      api_key="sk-keep-existing")
+        self.assertTrue(first["ok"])
+        second = _call(provider="deepseek", model="deepseek-chat",
+                       api_key="", context_window=65536)
+        self.assertTrue(second["ok"])
+        self.assertEqual(
+            secrets_store.load(self._game_root, "deepseek"),
+            "sk-keep-existing",
+        )
 
 
 if __name__ == "__main__":
