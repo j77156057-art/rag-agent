@@ -29,6 +29,12 @@ _CODE = re.compile(
     r"\b(?:class|def|function|method|stack|trace|bug)\b",
     re.I,
 )
+_PROJECT_AUDIT = re.compile(
+    r"(?:当前|目前|现有|这个).*(?:游戏|项目).*(?:bug|问题|异常|故障)|"
+    r"(?:游戏|项目).*(?:有什么|有哪些|哪些).*(?:bug|问题|异常|故障)|"
+    r"(?:试玩|运行|跑起来).*(?:问题|异常|bug|故障)",
+    re.I,
+)
 _KNOWLEDGE = re.compile(r"知识库|文档|资料|规范|手册|说明书|上传|教程|定义|讲了什么", re.I)
 _WEB = re.compile(
     r"联网|网上|最新|近期|今天|当前版本|搜索|github|b站|哔哩哔哩|官方文档|下载地址|"
@@ -742,6 +748,13 @@ class ContextRouter:
         route_lines = ["【上下文路由】本轮证据来源：" + "、".join(sources) + "。"]
         if wants_code:
             route_lines.append("代码问题先调用 search_code 定位，再用 read_file/grep 核对原文；不得用知识库片段代替代码证据。")
+        if _PROJECT_AUDIT.search(query):
+            route_lines.append(
+                "【当前项目缺陷审查】用户要检查当前游戏/项目，不是查询 bugs/ 历史归档。"
+                "先用 search_code/grep/read_file 获取当前项目证据；项目正在运行且有引擎连接器时，"
+                "再用 dev_list_connectors/dev_route_connector/dev_mcp_call 或 game_playtest 获取运行证据。"
+                "dev_list_bugs 只能作为最后的历史记录补充，不能作为当前缺陷结论或唯一证据。"
+            )
         if wants_knowledge:
             route_lines.append("资料问题先调用 search_knowledge，回答时保留命中片段中的来源名称。")
         if wants_web:

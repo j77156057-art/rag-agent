@@ -3782,7 +3782,7 @@ TOOLS = {
         "func": dev_capture_bug,
     },
     "dev_list_bugs": {
-        "description": "列出 bugs 分区中的异常记录，返回 Bug ID、严重等级、来源和时间。",
+        "description": "列出 bugs 分区中已经归档的历史异常记录，返回 Bug ID、严重等级、来源和时间；不能替代当前项目代码审查或运行验证。",
         "func": dev_list_bugs,
     },
     "dev_update_bug": {

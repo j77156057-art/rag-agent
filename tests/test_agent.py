@@ -85,6 +85,33 @@ class AgentGuardTests(unittest.TestCase):
         self.assertEqual(len([e for e in events if e["type"] == "final"]), 1)
         self.assertIn("当前还没有执行任何写操作", events[-1]["text"])
 
+    def test_project_bug_audit_does_not_start_from_historical_bug_records(self):
+        """当前项目缺陷审查必须先取得代码/运行证据，再允许读取历史 bugs。"""
+        calls = []
+
+        def list_bugs(_arg):
+            calls.append("dev_list_bugs")
+            return '{"bugs":[{"title":"历史记录"}]}'
+
+        def search(_arg):
+            calls.append("search_code")
+            return "[scripts/player.gd:L4] suspicious damage handling"
+
+        agent_mod.TOOLS = {
+            "dev_list_bugs": {"func": list_bugs},
+            "search_code": {"func": search},
+        }
+        a = agent_mod.Agent(llm=_ScriptedLLM([
+            _act("dev_list_bugs", ""),
+            _act("search_code", "damage"),
+            "Final Answer: 已检查当前项目代码。",
+        ]))
+        events = list(a.run("你看看目前的游戏有什么bug吗", stream=True))
+        self.assertEqual(calls, ["search_code"])
+        self.assertTrue(any("只返回历史归档" in e.get("text", "") for e in events
+                            if e["type"] == "observation"))
+        self.assertIn("已检查当前项目代码", events[-1]["text"])
+
     def test_location_answer_is_asked_to_read_source_before_final(self):
         """search_code 摘要不足以交付定位答案，必须补一次 read_file。"""
         with tempfile.TemporaryDirectory() as root:

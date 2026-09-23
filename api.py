@@ -1645,6 +1645,24 @@ async def chat(
             f"代码库已索引，根目录：{code_root}。关于代码/实现/函数/类/配置/报错的问题，"
             f"请用 search_code / read_file / grep 工具。"
         )
+    # “当前游戏有什么 bug” is a project-audit request, not a request for the
+    # historical bugs/ archive. Keep this instruction in the per-request system
+    # context so it survives small-model prompt compression and tool selection.
+    project_audit = bool(re.search(
+        r"(?:当前|目前|现有|这个).*(?:游戏|项目).*(?:bug|问题|异常|故障)|"
+        r"(?:游戏|项目).*(?:有什么|有哪些|哪些).*(?:bug|问题|异常|故障)|"
+        r"(?:试玩|运行|跑起来).*(?:问题|异常|bug|故障)",
+        question,
+        re.IGNORECASE,
+    ))
+    if project_audit:
+        hints.append(
+            "【当前项目缺陷审查】本轮要找的是当前项目实际存在或可复现的问题。"
+            "必须先检查当前项目代码（search_code/grep，再用 read_file 核对原文），"
+            "项目已运行且有引擎连接器时再获取运行日志、场景树、截图或受控 playtest。"
+            "dev_list_bugs 只表示 bugs/ 中的历史归档，不能作为首个工具、当前问题结论或唯一证据。"
+            "最终用中文分成：已确认问题、可疑线索、未检查部分、建议；不要粘贴原始 JSON、完整日志或工具调用过程。"
+        )
     routing = route_for(question)
     # P3：会话 Agent 按「请求上下文里的项目」隔离（无上下文 → 纯 session_id，等价改动前）。
     selected_agent = _agent_for(session_id)

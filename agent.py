@@ -78,6 +78,25 @@ _SELF_VERIFY_ENABLED = os.getenv("DOCMIND_SELF_VERIFY", "1") != "0"
 # 设 DOCMIND_EXPERIENCE_RECALL=1 才在回合开始注入 top-k 历史经验作为建议性上下文。
 _EXPERIENCE_RECALL_ENABLED = os.getenv("DOCMIND_EXPERIENCE_RECALL", "0") != "0"
 
+_PROJECT_AUDIT = re.compile(
+    r"(?:当前|目前|现有|这个).*(?:游戏|项目).*(?:bug|问题|异常|故障)|"
+    r"(?:游戏|项目).*(?:有什么|有哪些|哪些).*(?:bug|问题|异常|故障)|"
+    r"(?:试玩|运行|跑起来).*(?:问题|异常|bug|故障)",
+    re.I,
+)
+
+
+def _is_project_audit_question(question):
+    return bool(_PROJECT_AUDIT.search(str(question or "")))
+
+
+def _has_project_evidence(evidence):
+    """Whether this turn already inspected code or observed the running game."""
+    return any(re.match(
+        r"(?:search_code|grep|read_file|game_playtest|dev_mcp_call)\(",
+        str(item or ""),
+    ) for item in (evidence or []))
+
 
 def _parse_written_rel(obs):
     """从写工具成功 Observation 里解析出刚写入的相对路径（已写入/已创建 <rel>）。"""
@@ -183,7 +202,7 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - dev_asset_get(asset_id/path, consumer_region?): 通过素材区接口取得素材引用，只返回 assets 区内的安全路径和元数据。
 - dev_asset_register(asset_id, path, type?, license?, tags?): 将素材区已有文件注册到 manifest.json。
 - dev_capture_bug(error/traceback/source_region/reproduction/title/severity): 将异常归档到 bugs 区并生成可追踪 Bug ID。
-- dev_list_bugs(): 列出 Bug 区异常记录。
+- dev_list_bugs(): 列出 bugs/ 中已经归档的历史异常记录；它不是当前游戏诊断工具，不能替代读取当前项目代码或运行观察。
 - dev_update_bug(bug_id, status): 更新 Bug 状态为 open/investigating/fixed/ignored。
 - game_upsert_task(title, region, priority, status, ...): 创建或更新游戏开发任务。
 - game_validate_data(): 校验项目 JSON/YAML/TOML 配置。
@@ -199,6 +218,7 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - 需要教程、GitHub/B站方案或最新外部资料时，优先使用 web_research；回答必须根据其返回的来源证据，并列出可点击 URL，不得把搜索摘要当作已验证正文。
 - 关于"文档 / 提示词 / 教程 / 规范 / 某份资料里讲了什么 / 某概念怎么定义 / 知识库里的文件"类问题，【第一个 Action 必须是 search_knowledge】：严禁先用 search_code——知识库文档并不在代码库索引中，先搜代码只会命中无关字符串（如 EXT_blend_minmax、DOWNLOAD_ATTEMPTS_MAX）后误判"项目没有该文档"。只有 search_knowledge 确实定位不到、且问题明确转向代码实现时才允许改用 search_code / grep。
 - 检索类查询（search_knowledge / search_code / grep / web_search）允许基于结果不满意而改写查询：可以更换关键词、补充 site/时间/类型限定、缩小范围或切换工具；这类**不同参数**的重试不会被“重复调用”护栏拦截。只有同一工具的完全相同参数再次调用才会被拦截。对需要“目前/趋势/适合/比较/推荐”的研究型问题，单次结果为空、明显跑题或来源样本过少都不能算证据充分；应由模型自行决定继续搜索，主动覆盖不同年份、平台、地区、开发规模或项目案例，并在达到足够覆盖后再收敛。联网检索默认允许更大的有界预算（由 `DOCMIND_WEB_SEARCH_FAIL_LIMIT` / Agent 步数共同限制），不要因为一次搜索返回非空就停止，也不要把低相关结果写成结论。
+- 当用户问“当前游戏有什么 bug / 项目有哪些问题 / 试玩是否正常 / 哪里可能出错”时，进入【当前项目缺陷审查】流程：第一优先是当前项目证据（search_code 或 grep 定位，read_file 核对实现；项目已运行且连接器可用时再读取运行日志、场景树、截图或执行受控 playtest）。`dev_list_bugs` 只能在拿到当前项目证据之后补充历史记录，必须明确标为“历史归档”，不能把 bugs/ 目录内容直接当成当前项目 bug，也不能只凭目录里有记录就下结论。没有运行证据时要明确写“未运行验证”，没有代码证据时要明确写“仅为线索”。
 - 用户要"调外部接口 / 查订单 / 拉取内部服务数据 / 打通某个业务 API"时，用 dev_http_request（需先确认 EXTERNAL_API_ALLOWLIST 已包含目标域名，否则会被安全拦截）。
 - 用户想要"视频提示词/分镜/短视频脚本"类产出时用 gen_video_prompt。
 - 关于"代码/工程/实现/函数/类/枚举/字段/数据库表/配置/报错/播放逻辑/服务器切换"等一切涉及已索引代码库内容的问题，【第一个 Action 必须是 search_code / read_file / grep 之一】：
@@ -226,8 +246,13 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - Thought 只写【决策】——下一步调哪个工具、为什么这么调，一两句话即可；严禁把检索结果、文档原文、Observation 内容或大段复述写进 Thought。给出 Final Answer 后即视为回答结束：禁止在 Final Answer 之后再补 Thought / Action 或重复检索；Final Answer 应一次性完整，不要把同一结论拆到多轮里慢慢给。
 - 简洁综合总结检索/执行结果，2-4 句话或简明的要点列表即可，不要大段复制原文。
 - 用中文回答；如检索原文含英文片段，请翻译或概括，不要直接混杂长英文片段。
-- 面向"里面讲了什么/总结/介绍"类问题，给出提炼后的要点，不要逐条罗列原文编号。
+- 面向“里面讲了什么/总结/介绍”类问题，给出提炼后的要点，不要逐条罗列原文编号。
 - 尽量保持客观，不要编造检索结果中没有的信息。
+- 对当前项目缺陷审查，最终只输出用户能直接理解的中文结果，按以下结构组织：
+  1. 已确认的问题（每项写现象、证据来源/文件路径或运行事件、影响）；
+  2. 可疑但未确认的线索（说明还缺什么验证）；
+  3. 本次没有发现或无法检查的部分；
+  4. 建议的下一步。不要直接粘贴原始 JSON、完整日志、工具调用过程或模型内部指令；历史 bugs/ 记录单独标注“历史归档”，不能混入“当前已确认”。
 - 工具已返回明确结果（尤其是数字/代码片段）时，Final Answer 应直接引用工具给出的内容，不要自行重算或改写其中的数字。
 - 没有实际重新执行测试/构建并看到成功输出前，禁止声称"测试通过""已修复""可以正常工作"；验证结果以 run_command 的真实输出为准，未复验只能说"建议修复为…"。
 - gen_video_prompt 等"产出即最终交付物"的工具，其返回内容（如 H3 三段结构提示词）应原样呈现给用户，不要改写成别的格式（例如不要改成"三幕结构"）。
@@ -2113,6 +2138,25 @@ class Agent:
                     yield {"type": "action", "text": f"{action_name}({action_arg})"}
                     yield {"type": "observation", "text": _obs}
                     executed.add(sig)  # 登记已「处理」签名：同参重复出现时可触发防重复升级
+                    continue
+
+                # A project-bug question must be grounded in the current code or
+                # runtime before historical bug records can be consulted. This
+                # prevents a populated bugs/ directory from masquerading as a
+                # diagnosis of the current game.
+                if (action_name == "dev_list_bugs" and
+                        _is_project_audit_question(question) and
+                        not _has_project_evidence(evidence)):
+                    _obs = (
+                        "[当前项目缺陷审查] dev_list_bugs 只返回历史归档，当前尚无项目证据；"
+                        "本次未执行。请先调用 search_code/grep/read_file，或在引擎连接器可用时"
+                        "获取运行日志/场景/截图/受控 playtest，再按需补充历史记录。"
+                    )
+                    trail.append({"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)})
+                    trail.append({"role": "user", "content": f"Observation: {_obs}"})
+                    executed.add(sig)
+                    yield {"type": "action", "text": f"{action_name}() [已拦截：需要当前项目证据]"}
+                    yield {"type": "observation", "text": _obs}
                     continue
 
                 # pre_tool 钩子：可改写参数，或拦截本次执行（热插拔）

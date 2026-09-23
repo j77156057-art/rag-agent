@@ -29,6 +29,14 @@ class ProgressiveArchitectureTests(unittest.TestCase):
         self.assertIn("web", current.tool_groups)
         self.assertIn("web", current.sources)
 
+    def test_project_bug_questions_use_project_audit_context(self):
+        router = ContextRouter()
+        plan = router.route("你看看目前的游戏有什么bug吗", code_root="D:/project")
+        joined = "\n".join(plan.messages)
+        self.assertIn("当前项目缺陷审查", joined)
+        self.assertIn("dev_list_bugs", joined)
+        self.assertIn("不能作为当前缺陷结论或唯一证据", joined)
+
 
 if __name__ == "__main__":
     unittest.main()
