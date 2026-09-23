@@ -385,8 +385,27 @@ function onProjectChanged() {
   currentId.value = getSessionId()
   if (open.value) void loadAll()
 }
-onMounted(() => window.addEventListener('docmind:project-changed', onProjectChanged))
-onBeforeUnmount(() => window.removeEventListener('docmind:project-changed', onProjectChanged))
+function onOpenHarnessWorkflow(ev?: Event) {
+  const prompt = String((ev as CustomEvent<{ prompt?: string }> | undefined)?.detail?.prompt || '').trim()
+  if (!prompt) return
+  open.value = true
+  tab.value = 'workflow'
+  workflowPrompt.value = prompt
+  workflowCustomPending.value = false
+  if (demoMode.value) {
+    actionMsg.value = '演示模式只展示入口；连接真实项目后会由 AI 生成方案。'
+    return
+  }
+  void startWorkflow()
+}
+onMounted(() => {
+  window.addEventListener('docmind:project-changed', onProjectChanged)
+  window.addEventListener('docmind:open-harness-workflow', onOpenHarnessWorkflow as EventListener)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('docmind:project-changed', onProjectChanged)
+  window.removeEventListener('docmind:open-harness-workflow', onOpenHarnessWorkflow as EventListener)
+})
 
 function switchTab(k: typeof tab.value) {
   tab.value = k

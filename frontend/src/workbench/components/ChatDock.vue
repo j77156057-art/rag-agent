@@ -90,6 +90,21 @@ const input = ref(readDraft())
 watch(input, v => { try { sessionStorage.setItem(draftKey(), v) } catch {} }, { flush: 'sync' })
 const sending = ref(false)
 let abortCtl: AbortController | null = null
+const TASK_EXAMPLES = [
+  { id: 'feature', label: '实现一个功能', prompt: '在现有游戏项目中实现一个新功能，并先给我 2-4 个可选方案。' },
+  { id: 'bug', label: '修复一个问题', prompt: '定位并修复现有游戏项目中的一个问题，先给我推荐方案和验收标准。' },
+  { id: 'scene', label: '添加场景或 UI', prompt: '在现有游戏项目中添加一个场景或 UI，先给我推荐实现方案并说明影响范围。' },
+  { id: 'custom', label: '描述我的目标', prompt: '' },
+] as const
+
+function startTaskExample(example: typeof TASK_EXAMPLES[number]) {
+  if (example.id === 'custom') {
+    input.value = ''
+    void nextTick(() => inputEl.value?.focus())
+    return
+  }
+  window.dispatchEvent(new CustomEvent('docmind:start-workflow', { detail: { prompt: example.prompt } }))
+}
 
 const scroller = ref<HTMLElement | null>(null)
 /** 仅当用户已贴底时才自动滚；用户上滚看历史时暂停自动滚动，回到底部再恢复 */
@@ -478,9 +493,15 @@ function onFocusChat(ev?: Event) {
     inputEl.value?.focus()
   })
 }
+function onStartWorkflow(ev?: Event) {
+  const prompt = String((ev as CustomEvent<{ prompt?: string }> | undefined)?.detail?.prompt || '').trim()
+  if (!prompt) return
+  window.dispatchEvent(new CustomEvent('docmind:open-harness-workflow', { detail: { prompt } }))
+}
 onMounted(() => {
   elapsedTimer = window.setInterval(() => { nowTick.value = Date.now() }, 500)
   window.addEventListener('docmind:focus-chat', onFocusChat as EventListener)
+  window.addEventListener('docmind:start-workflow', onStartWorkflow as EventListener)
   window.addEventListener('docmind:project-context-changed', resetChatContext)
   window.addEventListener('pagehide', onPageHide)
   window.addEventListener('beforeunload', onBeforeLeave)
@@ -493,6 +514,7 @@ onBeforeUnmount(() => {
   if (elapsedTimer !== null) { window.clearInterval(elapsedTimer); elapsedTimer = null }
   onPageHide()
   window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener)
+  window.removeEventListener('docmind:start-workflow', onStartWorkflow as EventListener)
   window.removeEventListener('docmind:project-context-changed', resetChatContext)
   window.removeEventListener('pagehide', onPageHide)
   window.removeEventListener('beforeunload', onBeforeLeave)
@@ -906,6 +928,13 @@ function connectorGuide(s: McpServer) {
     <template v-if="!collapsed">
       <div ref="scroller" class="cd-body" @scroll="onScroll" @wheel="onWheel">
         <p v-if="historyError" role="alert">{{ historyError }}</p>
+        <div v-if="!messages.length && !sending" class="cd-task-entry">
+          <span class="cd-task-entry-title">从一个目标开始</span>
+          <button v-for="example in TASK_EXAMPLES" :key="example.id" class="cd-task-chip" @click="startTaskExample(example)">
+            {{ example.label }}
+          </button>
+          <small>点击后先看 AI 方案，再选择或微调</small>
+        </div>
         <div v-for="m in messages" :key="m.id" class="cd-msg" :class="`cd-msg-${m.role}`">
           <div v-if="m.role === 'user'" class="cd-user-bubble">{{ m.text }}</div>
           <template v-else>
@@ -1207,6 +1236,17 @@ function connectorGuide(s: McpServer) {
   background: transparent; color: var(--text-muted); cursor: pointer;
 }
 .cd-quick:hover { color: var(--accent); border-color: var(--accent); }
+.cd-task-entry {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+  padding: 10px 6px 12px; color: var(--text-muted);
+}
+.cd-task-entry-title { width: 100%; font-size: 11px; color: var(--text-dim); }
+.cd-task-chip {
+  padding: 5px 9px; border: 1px solid var(--border); border-radius: 999px;
+  background: transparent; color: var(--text-muted); font-size: 11px; cursor: pointer;
+}
+.cd-task-chip:hover { color: var(--accent); border-color: var(--accent); background: var(--bg-selected); }
+.cd-task-entry small { color: var(--text-faint); font-size: 10px; }
 
 .cd-msg { margin-bottom: 10px; }
 .cd-user-bubble {
