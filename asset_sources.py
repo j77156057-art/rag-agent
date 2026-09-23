@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import ntpath
 import os
 import re
 import shutil
@@ -120,7 +121,12 @@ def root_path(root: str) -> str:
 def safe_join(root: str, rel: str) -> str:
     """把项目内相对路径解析为绝对路径，拒绝越出项目根。"""
     base = root_path(root)
-    rel = (rel or '').replace('\\', '/').strip('/')
+    raw_rel = (rel or '').replace('\\', '/')
+    # 无论当前 runner 是 Windows 还是 POSIX，都拒绝 Windows 驱动器/UNC 绝对路径。
+    # 否则 `C:/Windows/x` 在 Linux 会被当作普通相对目录，跨平台安全测试失真。
+    if ntpath.isabs(raw_rel) or re.match(r'^[A-Za-z]:', raw_rel):
+        raise AssetError('目标路径越出了项目目录。')
+    rel = raw_rel.strip('/')
     p = os.path.abspath(os.path.join(base, rel))
     if not (p == base or p.startswith(base + os.sep)):
         raise AssetError('目标路径越出了项目目录。')

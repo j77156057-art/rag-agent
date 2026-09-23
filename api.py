@@ -170,6 +170,7 @@ import asset_sources
 import asset_gen
 import cloud_gen
 import mcp_client
+import mcp_capabilities
 import web_export
 import unity_graph
 import agent_trace
@@ -919,6 +920,50 @@ async def mcp_probe_ep(req: McpProbeReq):
     if not root: return {"ok": False, "error": "未配置代码库"}
     try: return await run_in_threadpool(mcp_client.probe_server, root, req.key)
     except mcp_client.MCPError as e: return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+
+class McpDiscoverReq(BaseModel):
+    key: str
+    web_enabled: bool = False
+
+class McpDirectorySearchReq(BaseModel):
+    query: str
+    web_enabled: bool = True
+
+@app.post("/api/mcp/catalog/search")
+async def mcp_catalog_search_ep(req: McpDirectorySearchReq):
+    return await run_in_threadpool(
+        mcp_capabilities.search_directory, req.query,
+        web_enabled=req.web_enabled, search_fn=web_search,
+    )
+
+@app.get("/api/mcp/capabilities")
+async def mcp_capabilities_ep():
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    return mcp_capabilities.list_capabilities(root)
+
+@app.post("/api/mcp/discover")
+async def mcp_discover_ep(req: McpDiscoverReq):
+    """生成能力候选；联网结果仅作为来源，候选不会自动进入路由。"""
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    try:
+        return await run_in_threadpool(
+            mcp_capabilities.discover, root, req.key,
+            web_enabled=req.web_enabled, search_fn=web_search,
+        )
+    except mcp_client.MCPError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+
+class McpCapabilityDecisionReq(BaseModel):
+    key: str
+    approved: bool = True
+
+@app.post("/api/mcp/capabilities/decision")
+async def mcp_capability_decision_ep(req: McpCapabilityDecisionReq):
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    return mcp_capabilities.approve(root, req.key, req.approved)
 
 @app.get("/api/mcp/tools")
 async def mcp_tools_ep(key: str):

@@ -36,10 +36,18 @@ DocMind 不内置任何引擎专用协议，而是通过标准 **MCP（Model Con
 | POST | `/api/mcp/servers` | `{key, config}` | 新增/更新一个服务器（400 包裹非法配置） |
 | POST | `/api/mcp/servers/remove` | `{key}` | 删除；预设仅置 `enabled:false` |
 | POST | `/api/mcp/probe` | `{key}` | `initialize` + `tools/list`，返回工具数量（探测用） |
+| POST | `/api/mcp/catalog/search` | `{query, web_enabled}` | 搜索 EDA 等领域的连接方式、使用步骤与可信来源 |
+| POST | `/api/mcp/discover` | `{key, web_enabled}` | 根据真实 `tools/list` 生成待审批能力与前端表单候选 |
+| GET | `/api/mcp/capabilities` | — | 读取已批准和待审批的项目级能力清单 |
+| POST | `/api/mcp/capabilities/decision` | `{key, approved}` | 批准或拒绝能力路由候选 |
 | GET | `/api/mcp/tools?key=` | query | 列出该服务器工具及 input schema |
 | POST | `/api/mcp/call` | `{key, name, arguments}` | 调用工具，返回文本/结构化/其它块 |
 
 > 注意：保存/删除类接口错误以 **HTTP 400** 返回；`probe` / `tools` / `call` 的调用错误统一以 **HTTP 200 + `{ok:false, error}`** 包裹，便于前端直接展示，不会走异常状态码。
+
+### 能力搜索与受控学习
+
+设置 → MCP 的搜索栏可直接搜索 `EDA`、`PCB`、`KiCad` 等需求。内置目录先给出离线可用的 stdio / Streamable HTTP 连接指引；允许联网时仅把官网或代码仓库链接作为来源显示，搜索摘要不会变成可执行命令。用户填写官方命令或 URL、测试连接后，系统读取服务器真实 `tools/list`，推断能力标签、工具映射和通用 schema 表单。候选保存在项目状态中，只有点击“批准路由”后才参与 Agent 自动选择；拒绝或尚未批准的候选不会改变路由。它是受控的能力发现，不是自动下载、自动运行第三方 MCP，也不会自动生成专用前端源码。
 
 ### 使用前提（务必先满足）
 - **godot-ai**：必须通过 **stdio `attach`** 方式连接（`uvx godot-ai attach`）。裸 HTTP 无法完成 capability 轮换认证；且需 Godot 编辑器处于打开状态、并已安装启用 godot-ai 插件。

@@ -33,7 +33,10 @@ _CHILD_STATE = {}
 _STATE_LOCK = threading.RLock()
 
 # x64 下必须显式声明指针宽度的签名，否则 Python int 会被按 c_int 截断 HWND。
-_WNDPROCTYPE = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+# WINFUNCTYPE 只存在于 Windows；Linux CI 仍需要安全导入本模块以测试降级路径，
+# 此时用调用约定不会被实际执行的 CFUNCTYPE 占位，_user32() 会直接返回 None。
+_WNDPROCTYPE = getattr(ctypes, 'WINFUNCTYPE', ctypes.CFUNCTYPE)(
+    ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
 GWL_STYLE = -16
 WS_CHILD = 0x40000000

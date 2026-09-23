@@ -1875,6 +1875,33 @@ export interface McpToolInfo {
   input_schema: Record<string, unknown>
 }
 
+export interface McpCapabilityCandidate {
+  id: string
+  server: string
+  domain: string
+  capabilities: string[]
+  keywords: string[]
+  best_for: string
+  tool_mappings: Array<{ tool: string; capabilities: string[] }>
+  ui_requirements: Array<{ tool: string; kind: string; fields: string[]; renderer: string }>
+  sources: string[]
+  confidence: number
+  tool_count: number
+  status: 'pending' | 'active' | 'rejected'
+}
+
+export interface McpDirectoryResult {
+  id: string
+  label: string
+  summary: string
+  capabilities: string[]
+  connection_options: Array<{ transport: 'stdio' | 'http'; when: string; value: string }>
+  setup_steps: string[]
+  template: { key: string; label: string; transport: 'stdio' | 'http'; command: string; args: string[]; url: string }
+  sources: string[]
+  source_status: 'web_sources' | 'offline_guide'
+}
+
 export interface GodotAddonStatus {
   ok: boolean
   is_godot_project: boolean
@@ -1894,6 +1921,18 @@ export const mcpApi = {
   },
   probe(key: string): Promise<{ ok: boolean; tool_count?: number; tools?: string[]; error?: string }> {
     return postJson('/api/mcp/probe', { key })
+  },
+  capabilities(): Promise<{ ok: boolean; active: Record<string, McpCapabilityCandidate>; pending: Record<string, McpCapabilityCandidate>; error?: string }> {
+    return request('/api/mcp/capabilities')
+  },
+  searchCatalog(query: string, webEnabled = true): Promise<{ ok: boolean; results: McpDirectoryResult[]; search_error?: string; error?: string }> {
+    return postJson('/api/mcp/catalog/search', { query, web_enabled: webEnabled })
+  },
+  discover(key: string, webEnabled = false): Promise<{ ok: boolean; candidate?: McpCapabilityCandidate; error?: string }> {
+    return postJson('/api/mcp/discover', { key, web_enabled: webEnabled })
+  },
+  decideCapability(key: string, approved: boolean): Promise<{ ok: boolean; approved?: boolean; capability?: McpCapabilityCandidate; error?: string }> {
+    return postJson('/api/mcp/capabilities/decision', { key, approved })
   },
   tools(key: string): Promise<{ ok: boolean; tools: McpToolInfo[]; count?: number; error?: string }> {
     return request(`/api/mcp/tools?key=${encodeURIComponent(key)}`)

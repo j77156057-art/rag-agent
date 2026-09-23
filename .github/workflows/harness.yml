@@ -44,8 +44,20 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - uses: actions/setup-node@v4
+        if: matrix.backend == 'sqlite'
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
+      - name: Build workbench frontend
+        if: matrix.backend == 'sqlite'
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
       - name: Compile runtime
         run: python -m compileall -q agent_runtime api_routes
       - name: Verify Postgres driver and pool API
@@ -91,6 +103,9 @@ jobs:
           done
           exit 1
       - name: Run full test suite
+        if: matrix.backend == 'sqlite'
+        env:
+          DOCMIND_TRACE: "1"
         run: python -m unittest discover -s tests -p "test*.py" -q
       - name: Verify strict Postgres integration
         if: matrix.backend == 'postgres'

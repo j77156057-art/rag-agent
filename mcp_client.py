@@ -252,15 +252,26 @@ def connector_directory(root):
     与前端 `/api/agent/connectors` 同源，但额外带 capabilities / best_for，供 Agent 自主挑选。
     """
     rows = []
+    try:
+        import mcp_capabilities
+    except Exception:  # 可选能力清单不可用时保持旧行为
+        mcp_capabilities = None
     for item in server_configs(root):
+        learned = mcp_capabilities.active_for(root, item.get("key")) if mcp_capabilities else {}
+        caps = set(capabilities_of(item))
+        caps.update(c for c in (learned.get("capabilities") or []) if isinstance(c, str))
         rows.append({
             "key": item.get("key"),
             "label": item.get("label"),
             "engine": item.get("engine"),
             "transport": item.get("transport"),
             "enabled": bool(item.get("enabled")),
-            "capabilities": capabilities_of(item),
-            "best_for": best_for_of(item),
+            "capabilities": sorted(caps),
+            "best_for": learned.get("best_for") or best_for_of(item),
+            "domain": learned.get("domain") or (item.get("engine") or "general"),
+            "keywords": learned.get("keywords") or [],
+            "tool_mappings": learned.get("tool_mappings") or [],
+            "capability_source": "discovered" if learned else "configured",
             "help": item.get("help") or "",
             "config_error": item.get("config_error"),
         })
@@ -300,6 +311,12 @@ def select_connector(root, task_hint, only_enabled=True):
                     score += 2
                     matched.append(cap)
                     break
+        # 已批准能力清单的领域关键词参与路由，但不会绕过 enabled/config_error。
+        for keyword in item.get("keywords") or []:
+            word = str(keyword).lower().strip()
+            if len(word) >= 2 and word in hint:
+                score += 2
+                matched.append(word)
         if engine and engine in hint:
             score += 3
             matched.append(f"engine:{engine}")

@@ -2,11 +2,12 @@
 // 统一设置页：左侧分组导航（用量费用 / 网络搜索 / MCP / 智能体），右侧对应面板。
 // 网络搜索与 URL 获取走 settingsApi（复用 /api/config 的保存通道，密钥不回显）；
 // MCP 走 mcpApi；智能体为本地预设（localStorage），后续可升级为后端持久化。
-import { ref, watch, computed } from 'vue'
+import { ref, watch, computed, nextTick } from 'vue'
 import {
   settingsApi, mcpApi, harnessApi,
   WEB_SEARCH_PROVIDERS, WEB_FETCH_PROVIDERS,
   type SettingsConfigInfo, type ModelConfigInfo, type ProviderOption, type McpServer,
+  type McpCapabilityCandidate, type McpDirectoryResult,
   type BudgetStatus, type TraceSummary,
 } from '../api'
 
@@ -123,6 +124,16 @@ const mcpLoading = ref(false)
 const mcpError = ref('')
 const mcpForm = ref({ key: '', label: '', transport: 'stdio' as 'stdio' | 'http', command: '', args: '', url: '' })
 const mcpAdding = ref(false)
+const mcpCapabilities = ref<{ active: Record<string, McpCapabilityCandidate>; pending: Record<string, McpCapabilityCandidate> }>({ active: {}, pending: {} })
+const mcpDiscovering = ref('')
+const mcpWebLearn = ref(true)
+const mcpSearch = ref('')
+const mcpSearching = ref(false)
+const mcpSearchResults = ref<McpDirectoryResult[]>([])
+const mcpAddAnchor = ref<HTMLElement | null>(null)
+const mcpTemplateNote = ref('')
+const mcpFormFlash = ref(false)
+let mcpFlashTimer: ReturnType<typeof setTimeout> | undefined
 
 // ---------------- 智能体（本地预设） ----------------
 interface AgentPreset { id: string; name: string; model: string; system: string }
@@ -208,13 +219,68 @@ async function loadMcp() {
   mcpLoading.value = true
   mcpError.value = ''
   try {
-    const r = await mcpApi.servers()
+    const [r, caps] = await Promise.all([mcpApi.servers(), mcpApi.capabilities()])
     mcpServers.value = r.servers || []
+    mcpCapabilities.value = { active: caps.active || {}, pending: caps.pending || {} }
   } catch (e) {
     mcpError.value = (e as { message?: string }).message || '读取 MCP 失败'
   } finally {
     mcpLoading.value = false
   }
+}
+
+async function discoverMcp(key: string) {
+  mcpDiscovering.value = key
+  mcpError.value = ''
+  try {
+    const r = await mcpApi.discover(key, mcpWebLearn.value)
+    if (!r.ok) { mcpError.value = r.error || '能力发现失败'; return }
+    await loadMcp()
+  } catch (e) { mcpError.value = (e as { message?: string }).message || '能力发现失败' }
+  finally { mcpDiscovering.value = '' }
+}
+
+async function searchMcpDirectory() {
+  const query = mcpSearch.value.trim()
+  if (query.length < 2) { mcpError.value = '请输入至少 2 个字符，例如 Godot。'; return }
+  mcpSearching.value = true
+  mcpError.value = ''
+  try {
+    const r = await mcpApi.searchCatalog(query, mcpWebLearn.value)
+    if (!r.ok) { mcpError.value = r.error || '搜索失败'; return }
+    mcpSearchResults.value = r.results || []
+    if (r.search_error) mcpError.value = `联网来源暂不可用，已显示离线连接指引：${r.search_error}`
+  } catch (e) { mcpError.value = (e as { message?: string }).message || '搜索失败' }
+  finally { mcpSearching.value = false }
+}
+
+async function useMcpTemplate(item: McpDirectoryResult) {
+  mcpForm.value = {
+    key: item.template.key, label: item.template.label,
+    transport: item.template.transport, command: item.template.command,
+    args: (item.template.args || []).join(' '), url: item.template.url,
+  }
+  const ready = item.template.transport === 'http' ? !!item.template.url.trim() : !!item.template.command.trim()
+  mcpTemplateNote.value = ready
+    ? `已填入「${item.label}」连接模板，确认参数后点「添加」。`
+    : `已填入「${item.label}」模板的标识、名称与传输方式；${item.template.transport === 'http' ? 'URL' : '命令与参数'}需按上方可信来源里的官方文档补全，然后再点「添加」。`
+  await nextTick()
+  mcpAddAnchor.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  mcpFormFlash.value = false
+  if (mcpFlashTimer) clearTimeout(mcpFlashTimer)
+  requestAnimationFrame(() => {
+    mcpFormFlash.value = true
+    mcpFlashTimer = setTimeout(() => { mcpFormFlash.value = false }, 1600)
+  })
+}
+
+async function decideMcpCapability(key: string, approved: boolean) {
+  mcpError.value = ''
+  try {
+    const r = await mcpApi.decideCapability(key, approved)
+    if (!r.ok) { mcpError.value = r.error || '保存能力失败'; return }
+    await loadMcp()
+  } catch (e) { mcpError.value = (e as { message?: string }).message || '保存能力失败' }
 }
 
 async function addMcp() {
@@ -236,6 +302,7 @@ async function addMcp() {
       return
     }
     mcpForm.value = { key: '', label: '', transport: 'stdio', command: '', args: '', url: '' }
+    mcpTemplateNote.value = ''
     await loadMcp()
   } catch (e) {
     mcpError.value = (e as { message?: string }).message || '添加失败'
@@ -422,19 +489,40 @@ function close() { emit('close') }
             <h4 class="sv-h4">MCP 连接器</h4>
             <p class="sv-hint">管理内置与自定义 MCP Server；引擎连接器在对话中由 Agent 自动选择调用。</p>
             <p v-if="mcpError" class="sv-err">{{ mcpError }}</p>
+            <div class="sv-search-row">
+              <input v-model="mcpSearch" class="sv-input" placeholder="搜索需要的能力，例如 Godot、Unity、数据库" @keyup.enter="searchMcpDirectory" />
+              <button class="sv-btn sv-primary" :disabled="mcpSearching" @click="searchMcpDirectory">{{ mcpSearching ? '搜索中…' : '搜索连接方式' }}</button>
+            </div>
+            <div v-for="item in mcpSearchResults" :key="item.id" class="sv-directory-card">
+              <div class="sv-directory-head"><div><b>{{ item.label }}</b><p>{{ item.summary }}</p></div><button class="sv-mini" @click="useMcpTemplate(item)">填入连接模板</button></div>
+              <p class="sv-list-sub">可发现能力：{{ item.capabilities.join('、') || '连接后由 tools/list 判断' }}</p>
+              <ol><li v-for="step in item.setup_steps" :key="step">{{ step }}</li></ol>
+              <div v-if="item.sources.length" class="sv-source-list">可信来源：<a v-for="source in item.sources" :key="source" :href="source" target="_blank" rel="noreferrer">{{ source }}</a></div>
+              <p v-else class="sv-list-sub">当前显示离线安全指引；具体 command / URL 必须以插件官网为准。</p>
+            </div>
             <ul class="sv-list" v-if="mcpServers.length">
               <li v-for="s in mcpServers" :key="s.key" class="sv-list-item">
                 <div class="sv-list-main">
                   <span class="sv-list-name">{{ s.label || s.key }}</span>
-                  <span class="sv-list-sub">{{ s.transport }}{{ s.enabled ? ' · 已启用' : ' · 未启用' }}</span>
+                  <span class="sv-list-sub">{{ s.transport }}{{ s.enabled ? ' · 已启用' : ' · 未启用' }} · {{ (mcpCapabilities.active[s.key]?.domain || s.engine || '未发现能力') }}</span>
                 </div>
-                <button class="sv-mini" @click="removeMcp(s.key)">移除</button>
+                <div class="sv-row-actions">
+                  <button class="sv-mini" :disabled="mcpDiscovering === s.key || !s.enabled" @click="discoverMcp(s.key)">{{ mcpDiscovering === s.key ? '发现中…' : '发现能力' }}</button>
+                  <button class="sv-mini" @click="removeMcp(s.key)">移除</button>
+                </div>
               </li>
             </ul>
             <p v-else-if="!mcpLoading" class="sv-hint">暂无 MCP Server。</p>
+            <label class="sv-toggle-row"><input v-model="mcpWebLearn" type="checkbox" />允许联网补充工具说明来源（只生成候选，不自动启用）</label>
+            <div v-for="(candidate, key) in mcpCapabilities.pending" :key="`pending-${key}`" class="sv-cap-card">
+              <div><b>{{ key }} · {{ candidate.domain.toUpperCase() }}</b><span class="sv-list-sub">候选能力：{{ candidate.capabilities.join('、') || '通用 MCP 工具' }} · 置信度 {{ Math.round(candidate.confidence * 100) }}%</span></div>
+              <div class="sv-row-actions"><button class="sv-mini sv-approve" @click="decideMcpCapability(key, true)">批准路由</button><button class="sv-mini" @click="decideMcpCapability(key, false)">拒绝</button></div>
+            </div>
 
             <div class="sv-sep"></div>
-            <h4 class="sv-h4">添加连接器</h4>
+            <div class="sv-add-form" :class="{ flash: mcpFormFlash }">
+            <h4 class="sv-h4" ref="mcpAddAnchor">添加连接器</h4>
+            <p v-if="mcpTemplateNote" class="sv-template-note">{{ mcpTemplateNote }}</p>
             <label class="sv-label">标识 key</label>
             <input v-model="mcpForm.key" class="sv-input" placeholder="my-server" spellcheck="false" />
             <label class="sv-label">名称</label>
@@ -458,6 +546,7 @@ function close() { emit('close') }
               <button class="sv-btn sv-primary" :disabled="mcpAdding" @click="addMcp">
                 {{ mcpAdding ? '添加中…' : '添加' }}
               </button>
+            </div>
             </div>
           </section>
 
@@ -588,6 +677,20 @@ function close() { emit('close') }
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
   padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
 }
+.sv-row-actions { display: flex; align-items: center; gap: 6px; flex: none; }
+.sv-cap-card { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; padding: 9px 12px; border: 1px solid var(--accent); border-radius: 8px; background: color-mix(in srgb, var(--accent) 7%, var(--bg)); font-size: 12px; }
+.sv-cap-card > div:first-child { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.sv-approve { color: var(--accent); }
+.sv-search-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: 10px 0; }
+.sv-add-form { border-radius: 10px; padding: 2px 12px 10px; margin: 0 -12px; transition: box-shadow .3s, background .3s; scroll-margin-top: 8px; }
+.sv-add-form.flash { background: color-mix(in srgb, var(--accent) 7%, var(--bg)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent); }
+.sv-template-note { margin: 0 0 4px; padding: 7px 10px; border-radius: 8px; font-size: 12px; line-height: 1.55; color: var(--text-muted); background: color-mix(in srgb, var(--accent) 9%, var(--bg)); border-left: 2px solid var(--accent); }
+.sv-directory-card { margin: 8px 0; padding: 11px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); font-size: 12px; }
+.sv-directory-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+.sv-directory-head p { margin: 3px 0 0; color: var(--text-muted); }
+.sv-directory-card ol { margin: 8px 0; padding-left: 20px; color: var(--text-muted); line-height: 1.65; }
+.sv-source-list { display: flex; flex-direction: column; gap: 3px; overflow-wrap: anywhere; }
+.sv-source-list a { color: var(--accent); }
 .sv-list-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .sv-list-name { font-size: 13px; font-weight: 600; }
 .sv-list-sub { font-size: 11px; color: var(--text-faint); }

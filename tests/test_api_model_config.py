@@ -300,6 +300,9 @@ class ProjectKeyPersistenceTests(unittest.TestCase):
         self._old_state_file = config.STATE_FILE
         self._old_runtime = dict(config._RUNTIME)
         self._old_llm = api.agent.llm
+        self._old_deepseek_window = config.get_context_window_override(
+            "deepseek", "deepseek-chat"
+        )
         self._tmp = tempfile.TemporaryDirectory(prefix="docmind_project_key_")
         self._state_root = os.path.join(self._tmp.name, "state")
         self._game_root = os.path.join(self._tmp.name, "game")
@@ -312,6 +315,12 @@ class ProjectKeyPersistenceTests(unittest.TestCase):
         config._RUNTIME.clear()
 
     def tearDown(self):
+        if self._old_deepseek_window:
+            config.set_context_window_override(
+                "deepseek", "deepseek-chat", self._old_deepseek_window
+            )
+        else:
+            config.clear_context_window_override("deepseek", "deepseek-chat")
         config.STATE_ROOT = self._old_state_root
         config.STATE_FILE = self._old_state_file
         config._RUNTIME.clear()
