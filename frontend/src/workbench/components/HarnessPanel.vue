@@ -392,6 +392,7 @@ function onOpenHarnessWorkflow(ev?: Event) {
   tab.value = 'workflow'
   workflowPrompt.value = prompt
   workflowCustomPending.value = false
+  actionMsg.value = '正在根据你的目标生成方案，请稍候…'
   if (demoMode.value) {
     actionMsg.value = '演示模式只展示入口；连接真实项目后会由 AI 生成方案。'
     return
@@ -722,8 +723,9 @@ onBeforeUnmount(() => { stopWorkflowPolling(); open.value = false })
     </button>
 
     <template v-if="open">
-      <div class="hp-backdrop" @click="open = false" />
-      <div class="hp-pop" role="dialog" aria-label="AI 运行台">
+      <Teleport to="body">
+        <div class="hp-backdrop" @click="open = false" />
+        <div class="hp-pop" role="dialog" aria-label="AI 运行台" :aria-busy="workflowBusy">
         <div class="hp-head">
           <div>
             <b>AI 运行台</b>
@@ -887,6 +889,10 @@ onBeforeUnmount(() => { stopWorkflowPolling(); open.value = false })
         <!-- ---------------- 游戏开发工作流 ---------------- -->
         <div v-else-if="tab === 'workflow'" class="hp-pane">
           <p class="hp-plain">从自然语言目标开始，查看方案、检索、子代理分工、审批和复核结果。任何文件修改仍需经过后端安全边界。</p>
+          <div v-if="workflowBusy" class="hp-wf-busy" role="status">
+            <span class="hp-wf-spinner" aria-hidden="true" />
+            正在生成方案，首次连接模型可能需要一点时间…
+          </div>
           <div class="hp-row">
             <input v-model="workflowPrompt" placeholder="例如：做一个带移动和跳跃的 2D 原型" @keyup.enter="startWorkflow" />
             <button class="hp-btn primary" :disabled="workflowBusy" @click="startWorkflow">开始</button>
@@ -1058,7 +1064,8 @@ onBeforeUnmount(() => { stopWorkflowPolling(); open.value = false })
           </div>
           <div v-else class="hp-empty">还没有运行中的游戏工作流。</div>
         </div>
-      </div>
+        </div>
+      </Teleport>
     </template>
   </div>
 </template>
@@ -1077,13 +1084,16 @@ onBeforeUnmount(() => { stopWorkflowPolling(); open.value = false })
 .hp-trigger:hover { border-color: #2f6fed; filter: brightness(1.02); }
 .hp-backdrop { position: fixed; inset: 0; z-index: 40; }
 .hp-pop {
-  position: absolute; right: 0; top: 36px; z-index: 41;
+  position: fixed; right: 16px; top: 54px; z-index: 1001;
   width: 480px; max-width: calc(100vw - 32px);
   max-height: calc(100vh - 70px); overflow: auto;
   background: #fff; border: 1px solid #dde3ee; border-radius: 14px;
   box-shadow: 0 18px 50px rgba(35, 52, 84, .22);
   padding: 15px 16px 14px;
 }
+.hp-wf-busy { display: flex; align-items: center; gap: 7px; margin-top: 9px; padding: 8px 10px; border: 1px solid #c8dcfa; border-radius: 8px; background: #f2f7ff; color: #3767aa; line-height: 1.5; }
+.hp-wf-spinner { width: 12px; height: 12px; flex: 0 0 12px; border: 2px solid #b8cdf1; border-top-color: #2f6fed; border-radius: 50%; animation: hp-spin .75s linear infinite; }
+@keyframes hp-spin { to { transform: rotate(360deg); } }
 .hp-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
 .hp-head b { font-size: 14.5px; color: #1b2433; }
 .hp-head p { margin: 3px 0 0; font-size: 11.5px; color: #98a3b4; }
