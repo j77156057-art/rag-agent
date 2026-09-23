@@ -129,7 +129,7 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - calculate(expression): 计算数学表达式，如 '23*45+12'；也支持比较运算，如 '9.9 > 9.11'（结果为「成立/不成立」）。支持 + - * / % ** //、括号与 > < >= <= == !=。比较/差值类问题算出结果后，必须用自然语言给出结论（如「所以 9.9 更大」），不要只丢一个数字。
 - web_search(query): 联网搜索（DuckDuckGo/百度/Bing 自动故障转移，无需 Key）。当知识库不足、信息有时效性、或需要外部资料时使用。默认偏好近一年结果（自动追加 after:<去年>，可用 env WEB_SEARCH_PREFER_RECENT=0 关闭）。需要限定站点时，在输入里追加 `site: github.com` 或 `platform: github/b站/微博/贴吧`（自动映射域名），把结果收敛到指定站。
 - web_fetch(url): 读取搜索结果中的公开网页正文，保留来源 URL 和标题后再总结。
-- web_research(query): 一步完成搜索与最多 3 个来源正文读取，适合教程、GitHub、引擎文档和最新资料；会标记来源排序参考与明显数字冲突。
+- web_research(query): 一步完成搜索与多个来源正文读取，适合教程、GitHub、引擎文档和最新资料；会标记来源排序参考与明显数字冲突。研究型问题可先用不同关键词、年份和平台做多轮 web_search，直到证据覆盖足够或达到本轮预算。
 - web_subtitles(url): 读取公开 B 站视频字幕（BV/av URL）；无公开字幕或需要登录时如实返回原因。
 - dev_http_request(url, method?, headers?, body?, timeout?): 调用你自己的外部业务 API（REST/JSON）。受 EXTERNAL_API_ALLOWLIST 域名白名单约束（防 SSRF），未配置白名单则拒绝。当用户要求"调用外部接口 / 查订单 / 调内部服务 / 打通某个 API"时使用。输入（多行 key: value）：第一行 `url: <完整URL>`，可选 `method: <GET/POST/...>`、`headers: <单行JSON对象>`、`body: <请求体，可多行>`、`timeout: <秒>`。
 - dev_list_connectors(): 列出已配置连接器（key/label/engine/能力标签/适用说明/启用状态）。调用游戏引擎类工具前先用它看清有哪些连接器可用、各自能干什么。
@@ -198,7 +198,7 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - 知识库能答的优先 search_knowledge；知识库没有、或需要最新/外部信息时用 web_search。
 - 需要教程、GitHub/B站方案或最新外部资料时，优先使用 web_research；回答必须根据其返回的来源证据，并列出可点击 URL，不得把搜索摘要当作已验证正文。
 - 关于"文档 / 提示词 / 教程 / 规范 / 某份资料里讲了什么 / 某概念怎么定义 / 知识库里的文件"类问题，【第一个 Action 必须是 search_knowledge】：严禁先用 search_code——知识库文档并不在代码库索引中，先搜代码只会命中无关字符串（如 EXT_blend_minmax、DOWNLOAD_ATTEMPTS_MAX）后误判"项目没有该文档"。只有 search_knowledge 确实定位不到、且问题明确转向代码实现时才允许改用 search_code / grep。
-- 检索类查询（search_knowledge / search_code / grep / web_search）允许基于结果不满意而改写查询：可以更换关键词、补充 site/时间/类型限定、缩小范围或切换工具；这类**不同参数**的重试不会被“重复调用”护栏拦截。只有同一工具的完全相同参数再次调用才会被拦截。若连续 3 次检索都明确失败，才触发有界收尾并如实说明"未找到相关信息"；一轮回答的总检索步数建议不超过 4 步，超过则应基于已有证据收敛，不要无意义空转。
+- 检索类查询（search_knowledge / search_code / grep / web_search）允许基于结果不满意而改写查询：可以更换关键词、补充 site/时间/类型限定、缩小范围或切换工具；这类**不同参数**的重试不会被“重复调用”护栏拦截。只有同一工具的完全相同参数再次调用才会被拦截。对需要“目前/趋势/适合/比较/推荐”的研究型问题，单次结果为空、明显跑题或来源样本过少都不能算证据充分；应由模型自行决定继续搜索，主动覆盖不同年份、平台、地区、开发规模或项目案例，并在达到足够覆盖后再收敛。联网检索默认允许更大的有界预算（由 `DOCMIND_WEB_SEARCH_FAIL_LIMIT` / Agent 步数共同限制），不要因为一次搜索返回非空就停止，也不要把低相关结果写成结论。
 - 用户要"调外部接口 / 查订单 / 拉取内部服务数据 / 打通某个业务 API"时，用 dev_http_request（需先确认 EXTERNAL_API_ALLOWLIST 已包含目标域名，否则会被安全拦截）。
 - 用户想要"视频提示词/分镜/短视频脚本"类产出时用 gen_video_prompt。
 - 关于"代码/工程/实现/函数/类/枚举/字段/数据库表/配置/报错/播放逻辑/服务器切换"等一切涉及已索引代码库内容的问题，【第一个 Action 必须是 search_code / read_file / grep 之一】：
@@ -524,6 +524,10 @@ _MAX_REFLECTIONS = 2
 # 同一工具连续失败达到该次数：即便模型换了参数也判为「无用重试」，强制其收尾。
 # 防的是弱模型对同一工具（尤其入参格式没吃透的 dev_* 工具）无限重试耗尽上下文。
 _TOOL_FAIL_LIMIT = 3
+# 联网研究的失败含义更宽：搜索返回了结果但明显跑题，仍应允许换查询继续取样。
+# 只对 web_search/web_research 生效，普通工具继续使用较小的护栏。
+_WEB_RESEARCH_FAIL_LIMIT = max(3, int(os.getenv("DOCMIND_WEB_SEARCH_FAIL_LIMIT", "6")))
+_WEB_RESEARCH_TOTAL_LIMIT = max(4, int(os.getenv("DOCMIND_WEB_SEARCH_TOTAL_LIMIT", "8")))
 # 连续失败总次数上限（跨工具的「交替失败」也兜住：A 失败→B 失败→A 失败… 同样强制收尾）。
 _TOTAL_FAIL_LIMIT = 5
 # 回合进行中实时刷新上下文用量指示的最小间隔（秒）。count_tokens 对本地 provider
@@ -535,11 +539,48 @@ _MAX_NUDGES = 2
 # 与各工具失败文案字面保持一致；新增工具失败文案时请同步补这里并更新 test_failure_markers。
 _FAILURE_MARKERS = (
     "未找到相关内容", "计算失败", "表达式包含非法字符",
-    "搜索失败", "搜索未返回结果", "网页读取失败", "字幕提取失败", "没有公开字幕",   # 联网类（web_search / web_fetch / web_research / web_subtitles）
+    "搜索失败", "搜索未返回结果", "搜索结果相关性不足", "网页读取失败", "字幕提取失败", "没有公开字幕",   # 联网类（web_search / web_fetch / web_research / web_subtitles）
     "读取失败", "文件不存在", "拒绝访问",           # read_file 类（含路径越界拒绝）
     "未提供", "安全限制", "拒绝写入",
     "参数缺失",                                     # dev_* 等工具入参缺失/格式错（否则会被当成功→无限重试）
 )
+
+_WEB_ACTIONS = {"web_search", "web_research"}
+_WEB_QUERY_STOPWORDS = {
+    "请", "帮我", "找一下", "目前", "现在", "比较", "适合", "开发", "推荐", "有哪些",
+    "the", "and", "for", "with", "from", "best", "current", "latest", "popular",
+}
+
+
+def _web_query_terms(query):
+    """提取用于低相关性防护的少量关键词，不做语义判断。"""
+    raw = re.sub(r"\b(?:query|q|keyword|site|platform)\s*[:：][^\s]+", " ", str(query or ""), flags=re.I)
+    terms = []
+    for word in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", raw.lower()):
+        if word in _WEB_QUERY_STOPWORDS:
+            continue
+        if re.fullmatch(r"[\u4e00-\u9fff]+", word):
+            # 长中文短语拆成双字词，避免只命中一个泛词就误判相关。
+            terms.extend(word[i:i + 2] for i in range(len(word) - 1))
+        else:
+            terms.append(word)
+    return list(dict.fromkeys(terms))
+
+
+def _web_result_relevant(action, query, observation):
+    """判断搜索候选是否至少包含查询主题信号；低相关只触发换查询，不丢弃原文。"""
+    if action not in _WEB_ACTIONS or not observation or _is_failure(observation):
+        return True
+    body = str(observation).lower()
+    if action == "web_research":
+        # web_research 会回显“研究主题”，不能用它本身作为相关性证据。
+        body = re.sub(r"研究主题：.*?(?:\n|$)", "", body, count=1)
+    terms = _web_query_terms(query)
+    if not terms:
+        return True
+    matched = sum(1 for term in terms if term in body)
+    needed = 1 if len(terms) <= 2 else max(2, int(len(terms) * 0.2))
+    return matched >= needed
 
 # 历史回放「整段计数」时的轮间分隔符：仅用于把候选轮拼成 1 条文本、只发 1 次
 # count_tokens（替代过去逐轮 O(N) 次网络往返）；分隔符本身计入的少量 token 可忽略。
@@ -2125,6 +2166,15 @@ class Agent:
                     )
                 obs = _hooks.run_post_tool(action_name, action_arg, _result.text)
                 _tool_ok = _result.ok and (obs == _result.text or not _is_failure(obs))
+                if _tool_ok and action_name in _WEB_ACTIONS and not _web_result_relevant(action_name, action_arg, obs):
+                    # 非空不等于有用：把明显跑题的搜索结果标记为可恢复失败，
+                    # 让模型继续换关键词/年份/平台，而不是把它写进结论。
+                    obs = (
+                        "搜索结果相关性不足：当前候选与查询主题缺少足够共同信号，"
+                        "请更换关键词、年份、平台或地区后继续搜索；不得把以下候选直接当作证据。\n"
+                        + _clip(obs, OBS_MAX_CHARS)
+                    )
+                    _tool_ok = False
                 _duration_ms = int((time.monotonic() - _t_tool) * 1000)
                 if _result.error_kind == "timeout" and self._is_network_tool(action_name):
                     _timeout_hook = _hooks.run_workflow("network_timeout", {
@@ -2185,7 +2235,10 @@ class Agent:
                     # 同一工具连续失败到上限（换参数也算），或连续失败总数越界：判为「无用重试」，
                     # 强制收尾。否则弱模型会一直重试同一工具耗尽上下文——这正是
                     # dev_apply_regions 入参格式没被识别时报「参数缺失」刷出死循环的成因。
-                    if streak >= _TOOL_FAIL_LIMIT or fail_total >= _TOTAL_FAIL_LIMIT:
+                    is_web_research = parsed["action"] in _WEB_ACTIONS
+                    fail_limit = _WEB_RESEARCH_FAIL_LIMIT if is_web_research else _TOOL_FAIL_LIMIT
+                    total_limit = _WEB_RESEARCH_TOTAL_LIMIT if is_web_research else _TOTAL_FAIL_LIMIT
+                    if streak >= fail_limit or fail_total >= total_limit:
                         forced_finals = _MAX_FORCED_FINALS
                         forced_final_reason = (
                             f"（工具 {parsed['action']} 已连续失败 {streak} 次，"

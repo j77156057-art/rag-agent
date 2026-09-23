@@ -264,6 +264,8 @@ curl --noproxy '*' -X POST http://127.0.0.1:8000/api/budget -H "Content-Type: ap
 
 新增环境变量全部列在 `.env.example`（`DOCMIND_TRACE*` / `DOCMIND_SESSION_*` / `DOCMIND_LLM_*` / `DOCMIND_TOOL_MODE` / `DOCMIND_ORCH_*` / `DOCMIND_BUDGET_CNY` / `DOCMIND_HOOKS_DIR` / `DOCMIND_SKILLS_DIR` / `DOCMIND_PARALLEL_*`）。
 
+联网研究不会把“返回了非空页面”直接视为有效证据：搜索结果与主题明显不相关时会被标记为低相关，Agent 可继续改写关键词并切换年份、平台、地区或项目案例。研究型问题的搜索次数由 Agent 根据证据覆盖度决定，同时受 `DOCMIND_WEB_SEARCH_FAIL_LIMIT`、`DOCMIND_WEB_SEARCH_TOTAL_LIMIT` 和总步数上限约束；`web_research` 默认读取最多 5 个来源正文，可用 `DOCMIND_WEB_RESEARCH_MAX_SOURCES` 调整。
+
 > **能力边界（不夸大）**：子代理**不共享**父上下文（靠上游结论注入传递）；重规划只改**未执行**的计划、**不回滚**已执行任务；轨迹是**有界摘要**（全文在 `.docmind_traces.jsonl`）；hooks 无沙箱（`.py` 直载，权限等同本服务）；技能本身是提示词指引，办公文件由受控的 `create_artifact` 工具执行，不运行技能内任意脚本。
 
 ## 🧪 测试与自检

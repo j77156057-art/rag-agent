@@ -1031,14 +1031,22 @@ def _builtin_fetch(url):
     except Exception as e: return f"网页读取失败：{type(e).__name__}: {e}"
 
 def web_research(query):
-    """搜索并抓取前 3 个公开来源，供 Agent 直接做联网研究。"""
+    """搜索并抓取多个公开来源，供 Agent 直接做联网研究。
+
+    默认读取 5 个候选正文，可用 DOCMIND_WEB_RESEARCH_MAX_SOURCES 调整（1~8）。
+    多轮不同查询由 Agent 决定，避免单次搜索样本不足就贸然下结论。
+    """
     results = web_search(query)
     urls = re.findall(r'https?://[^\s)]+', results)
     if not urls:
         return results
     out = [f"研究主题：{query}", "搜索摘要：", results, "\n来源正文："]
     seen = set()
-    for url in urls[:3]:
+    try:
+        max_sources = max(1, min(8, int(os.getenv("DOCMIND_WEB_RESEARCH_MAX_SOURCES", "5"))))
+    except (TypeError, ValueError):
+        max_sources = 5
+    for url in urls[:max_sources]:
         url = url.rstrip('.,')
         if url in seen: continue
         seen.add(url)
@@ -3674,7 +3682,7 @@ def recall_experience(arg=""):
 
 
 TOOLS = {
-    "web_research": {"description": "联网研究：先搜索，再读取最多 3 个公开网页正文，返回来源和证据。适合教程、GitHub、引擎文档和需要最新资料的问题。输入研究主题。", "func": web_research},
+    "web_research": {"description": "联网研究：先搜索，再读取多个公开网页正文（默认最多 5 个，可配置），返回来源和证据。适合教程、GitHub、引擎文档和需要最新资料的问题；样本不足时可用不同主题再次调用。输入研究主题。", "func": web_research},
     "web_fetch": {"description": "读取公开网页正文并返回来源、标题和清理后的文本。输入完整 http/https URL。联网研究时先 web_search，再对关键来源调用。", "func": web_fetch},
     "web_subtitles": {"description": "读取公开 B 站视频字幕。输入包含 BV 号或 av 号的完整视频 URL；没有公开字幕、需要登录或被风控时返回明确原因。", "func": web_subtitles},
     "dev_mcp_call": {"description": "调用已启用的 MCP 游戏引擎连接器。输入 key: 服务器key、name: 工具名、arguments: JSON；可选 fallback_keys 或 hint 触发有界故障转移。先用 dev_list_connectors 看清可用连接器、用 dev_route_connector 按任务语义挑 top 作为 key、用 dev_list_connector_tools 确认 name 与参数；外部连接器需已启用并遵守审批。涉及写入时传 side_effect: true，默认不会跨连接器重试；只有明确传 allow_side_effect_fallback: true 才允许。", "func": dev_mcp_call},
