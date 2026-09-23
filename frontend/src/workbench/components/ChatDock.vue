@@ -5,7 +5,7 @@
 //   与 godot-ai 插件安装引导（安装前必须用户确认）。
 import { nextTick, ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
-import { aiApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, getProjectId, startTabProbe } from '../api'
+import { aiApi, visionApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, getProjectId, startTabProbe } from '../api'
 import type { McpServer, ModelConfigInfo, ContextUsage } from '../api'
 import type { SseEvent } from '../api'
 import { mdToHtml, extractFileRefs, extractWebRefs } from '../markdown'
@@ -31,6 +31,7 @@ interface ChatMsg {
   finishedAt?: number
   error?: string
   recoverable?: boolean
+  imageCount?: number
 }
 
 interface InterruptedRecovery {
@@ -110,6 +111,11 @@ const scroller = ref<HTMLElement | null>(null)
 /** 仅当用户已贴底时才自动滚；用户上滚看历史时暂停自动滚动，回到底部再恢复 */
 const stickToBottom = ref(true)
 const inputEl = ref<HTMLTextAreaElement | null>(null)
+const imageInput = ref<HTMLInputElement | null>(null)
+const videoInput = ref<HTMLInputElement | null>(null)
+const pendingImages = ref<File[]>([])
+const attachmentError = ref('')
+const videoBusy = ref(false)
 let suppressScrollEvent = false
 
 // ---------------------------------------------------------------- 折叠
@@ -138,10 +144,17 @@ const modelLabel = computed(() => {
   return `${name} · ${c.llm_model || '默认模型'}`
 })
 const thinkingMode = computed(() => modelConfig.value?.capability?.thinking || 'none')
-const thinkingSupported = computed(() => thinkingMode.value !== 'none')
+const thinkingSupported = computed(() => thinkingMode.value === 'native' || thinkingMode.value === 'toggle')
 // native 思考模型（reasoner 类）开关恒开且不可点；toggle 家族才允许用户切
 const thinkingNative = computed(() => thinkingMode.value === 'native')
 const thinkingEffective = computed(() => thinkingNative.value || thinkingOn.value)
+const visionMode = computed(() => modelConfig.value?.capability?.vision || 'unknown')
+const visionLabel = computed(() => {
+  if (visionMode.value === 'native') return '当前模型直接识图'
+  if (visionMode.value === 'harness') return 'Harness 视觉辅助'
+  if (visionMode.value === 'none') return '当前模型不支持识图'
+  return '识图能力待确认，可由 Harness 辅助'
+})
 
 // ---------------------------------------------------------------- 上下文窗口用量
 // 后端按当前模型真实窗口估算（含系统提示/历史摘要/历史回放/当前问题），
@@ -209,7 +222,8 @@ function onModelSaved(info: ModelConfigInfo) {
 // ---------------------------------------------------------------- 发送 / 停止
 async function send(text?: string) {
   const q = (text ?? input.value).trim()
-  if (!q || sending.value) return
+  const imgs = pendingImages.value.slice()
+  if ((!q && !imgs.length) || sending.value) return
   const recovery = readInterruptedRecovery()
   const isResume = !!recovery && isContinuationRequest(q)
   const request = isResume ? continuationQuestion(q, recovery!) : q
@@ -221,8 +235,10 @@ async function send(text?: string) {
     if (previous?.recoverable) previous.recoverable = false
   }
   input.value = ''
+  pendingImages.value = []
+  attachmentError.value = ''
   stickToBottom.value = true  // 用户主动发送，恢复贴底自动滚动
-  messages.value.push({ id: msgSeq++, role: 'user', text: q, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
+  messages.value.push({ id: msgSeq++, role: 'user', text: q || '请分析附件图片', status: 'done', trace: [], reasoning: '', notices: [], plan: [], imageCount: imgs.length })
   const turn: ChatMsg = {
     id: msgSeq++, role: 'assistant', text: '', status: 'streaming', trace: [], reasoning: '', notices: [], plan: [],
     startedAt: Date.now(),
@@ -280,6 +296,7 @@ async function send(text?: string) {
     await aiApi.askGrounded(request, { onEvent, signal: ac.signal }, {
       web: webOn.value,
       thinking: thinkingOpt,
+      images: imgs,
     })
     const t = live()
     if (t) { t.status = t.text ? 'done' : 'stopped'; t.finishedAt = Date.now() }
@@ -320,6 +337,49 @@ function preserveInterrupted() {
       plan: assistant?.plan?.slice(-12) || [], startedAt: assistant?.startedAt,
     } satisfies InterruptedRecovery))
   } catch {}
+}
+
+function addImages(files: FileList | File[]) {
+  const incoming = Array.from(files || [])
+  const valid = incoming.filter((f) => /^image\/(png|jpeg|webp|gif)$/i.test(f.type))
+  if (valid.length !== incoming.length) attachmentError.value = '仅支持 PNG、JPEG、WEBP、GIF 图片。'
+  const merged = [...pendingImages.value, ...valid].slice(0, 4)
+  if (pendingImages.value.length + valid.length > 4) attachmentError.value = '单条消息最多附带 4 张图片。'
+  pendingImages.value = merged
+}
+function removeImage(index: number) { pendingImages.value.splice(index, 1) }
+function onImagePick(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  if (input.files) addImages(input.files)
+  input.value = ''
+}
+function onPaste(ev: ClipboardEvent) {
+  const files = Array.from(ev.clipboardData?.files || []).filter((f) => f.type.startsWith('image/'))
+  if (files.length) { ev.preventDefault(); addImages(files) }
+}
+function onDrop(ev: DragEvent) {
+  ev.preventDefault()
+  if (ev.dataTransfer?.files?.length) addImages(ev.dataTransfer.files)
+}
+function onDragover(ev: DragEvent) { ev.preventDefault() }
+async function onVideoPick(ev: Event) {
+  const fileInput = ev.target as HTMLInputElement
+  const file = fileInput.files?.[0]
+  fileInput.value = ''
+  if (!file || videoBusy.value) return
+  videoBusy.value = true
+  attachmentError.value = ''
+  try {
+    const result = await visionApi.analyzeVideo(file)
+    if (!result.ok) throw new Error(result.error || '视频分析失败')
+    const observation = (result.context || []).join('\n\n')
+    input.value = observation
+    await nextTick(() => inputEl.value?.focus())
+  } catch (e) {
+    attachmentError.value = (e as { message?: string }).message || '视频分析失败'
+  } finally {
+    videoBusy.value = false
+  }
 }
 function restoreInterrupted(turns: { user: string; assistant: string }[]) {
   try {
@@ -659,6 +719,7 @@ function toggleThinking() {
   thinkingOn.value = !thinkingOn.value
 }
 const thinkingTitle = computed(() => {
+  if (thinkingMode.value === 'unknown') return '深度思考能力待确认，请在模型设置中选择能力'
   if (!thinkingSupported.value) return '当前模型不支持深度思考，可点左侧模型芯片切换支持思考的模型'
   if (thinkingNative.value) return '该模型内置深度思考，始终开启'
   return thinkingOn.value ? '深度思考已开启：回答前先推理，耗时更长' : '点击开启深度思考'
@@ -936,7 +997,10 @@ function connectorGuide(s: McpServer) {
           <small>点击后先看 AI 方案，再选择或微调</small>
         </div>
         <div v-for="m in messages" :key="m.id" class="cd-msg" :class="`cd-msg-${m.role}`">
-          <div v-if="m.role === 'user'" class="cd-user-bubble">{{ m.text }}</div>
+          <div v-if="m.role === 'user'" class="cd-user-bubble">
+            <span v-if="m.imageCount" class="cd-msg-attachment">{{ m.imageCount }} 张图片</span>
+            <span>{{ m.text }}</span>
+          </div>
           <template v-else>
             <div v-if="m.trace.length || m.reasoning || m.status === 'streaming'" class="cd-run-head">
               <span class="cd-run-avatar">✦</span>
@@ -1018,6 +1082,21 @@ function connectorGuide(s: McpServer) {
 
       <footer class="cd-inputbar">
         <div class="cd-tools">
+          <input ref="imageInput" class="cd-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple @change="onImagePick" />
+          <input ref="videoInput" class="cd-file-input" type="file" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,video/avi,image/gif" @change="onVideoPick" />
+          <button class="cd-chip cd-attach" :disabled="demoMode || sending" :title="visionLabel" @click="imageInput?.click()">
+            <span aria-hidden="true">▧</span><span>图片</span>
+          </button>
+          <button class="cd-chip cd-attach" :disabled="demoMode || sending || videoBusy" title="视频会由 Harness 抽帧并生成时间轴观察" @click="videoInput?.click()">
+            <span aria-hidden="true">▹</span><span>{{ videoBusy ? '分析视频…' : '视频' }}</span>
+          </button>
+          <span v-if="pendingImages.length" class="cd-attachments">
+            <span v-for="(img, i) in pendingImages" :key="img.name + i" class="cd-attachment">
+              {{ img.name || '图片' }}
+              <button type="button" title="移除图片" @click="removeImage(i)">×</button>
+            </span>
+          </span>
+          <span v-if="attachmentError" class="cd-attachment-error">{{ attachmentError }}</span>
           <button
             class="cd-chip cd-chip-model"
             :disabled="demoMode"
@@ -1067,7 +1146,7 @@ function connectorGuide(s: McpServer) {
               <path d="M6 1 L7.1 4.9 L11 6 L7.1 7.1 L6 11 L4.9 7.1 L1 6 L4.9 4.9 Z" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>
             </svg>
             <span>深度思考</span>
-            <span class="cd-chip-badge">不支持</span>
+            <span class="cd-chip-badge">{{ thinkingMode === 'unknown' ? '待确认' : '不支持' }}</span>
           </span>
 
           <!-- 上下文窗口占用：按当前模型真实窗口估算，65% 转黄、80%（压缩触发线）转红 -->
@@ -1094,9 +1173,12 @@ function connectorGuide(s: McpServer) {
             rows="2"
             placeholder="提问：角色数值在哪 / 解释这段逻辑 / 这个报错怎么改…（Ctrl+Enter 发送）"
             @keydown="onKeydown"
+            @paste="onPaste"
+            @drop="onDrop"
+            @dragover="onDragover"
           />
           <button v-if="sending" class="cd-send cd-stop" @click="stop">停止</button>
-          <button v-else class="cd-send" :disabled="!input.trim()" @click="send()">发送</button>
+          <button v-else class="cd-send" :disabled="!input.trim() && !pendingImages.length" @click="send()">发送</button>
         </div>
       </footer>
     </template>
@@ -1446,6 +1528,13 @@ function connectorGuide(s: McpServer) {
   background: rgba(47,111,237,.08); color: var(--accent);
   font-size: 11px; cursor: pointer;
 }
+.cd-msg-attachment { display: inline-flex; margin-right: 6px; color: var(--accent); font-size: 10.5px; }
+.cd-file-input { display: none; }
+.cd-attach { cursor: pointer; }
+.cd-attachments { display: inline-flex; gap: 4px; flex-wrap: wrap; max-width: 360px; }
+.cd-attachment { display: inline-flex; align-items: center; gap: 3px; max-width: 150px; padding: 2px 5px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-muted); font-size: 10px; }
+.cd-attachment button { border: 0; background: transparent; color: var(--text-faint); cursor: pointer; padding: 0 1px; }
+.cd-attachment-error { color: var(--danger); font-size: 10px; }
 .cd-resume:hover { background: rgba(47,111,237,.15); }
 
 /* 计划步骤 */

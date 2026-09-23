@@ -14,6 +14,9 @@ import urllib.request
 import urllib.error
 import uuid
 import contextvars
+import tempfile
+import base64
+import io
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -61,10 +64,14 @@ from config import (
     CHAT_IMAGE_MAX_FILES,
     CHAT_IMAGE_MAX_BYTES,
     CHAT_IMAGE_ALLOWED_TYPES,
+    CHAT_VIDEO_MAX_BYTES,
+    CHAT_VIDEO_MAX_FRAMES,
     model_capability,
     model_context_window,
     set_context_window_override,
     get_context_window_override,
+    get_model_capability_override,
+    set_model_capability_override,
     ensure_dirs,
     _apply_persisted_state,
     set_context_code_root,
@@ -73,6 +80,7 @@ from config import (
 from ingest import ingest_file, ingest_code_directory, load_project_rules
 from vectorstore import reset_collection, list_sources, count
 from llm import LLMClient, probe_ollama_context
+from agent_runtime.vision import analyze_images
 from tools import (
     set_embedding_provider,
     list_pending_edits,
@@ -1551,6 +1559,15 @@ async def chat(
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
+    # 图片能力路由：原生视觉模型保留图片；文本模型交给 Harness 视觉适配层，
+    # 只把受约束的观察文本交给主 Agent，避免把 base64 误传给不支持多模态的端点。
+    _active_llm = _agent_for(session_id).llm
+    vision_images, vision_context, vision_audit = await run_in_threadpool(
+        analyze_images,
+        b64_images,
+        current_capability=getattr(_active_llm, "capability", None),
+    )
+
     if not question:
         # 纯图片消息：给一个通用分析指令，避免空 prompt
         question = "请分析这张图片的内容。" if b64_images else ""
@@ -1619,7 +1636,7 @@ async def chat(
     # Routing metadata belongs in a real system message.  Prefixing it onto
     # the user question made small models echo the internal prompt verbatim
     # (and polluted the conversation history with implementation details).
-    request_context = tuple(hints)
+    request_context = tuple(hints) + tuple(vision_context)
 
     def event_stream():
         # 注意：此处不得再申请 GPU 租约。llm.py 的 _ollama_chat 已以 owner="ollama"
@@ -1627,12 +1644,14 @@ async def chat(
         gen = None
         try:
             yield f"data: {json.dumps({'type':'route','route':routing['route'],'complexity':routing['complexity'],'reason':routing['reason']}, ensure_ascii=False)}\n\n"
+            if vision_audit.get("mode") not in ("none", "native"):
+                yield f"data: {json.dumps({'type':'notice','text':'图片已由 Harness 视觉链路处理：' + vision_audit.get('mode', 'unknown')}, ensure_ascii=False)}\n\n"
             cloud_question = redact_for_cloud(question) if is_cloud else question
             cloud_context = tuple(redact_for_cloud(item) for item in request_context) if is_cloud else request_context
             # 逐请求覆盖（含云端 llm）全部随 run(...) 传入：run 在 finally 里还原，
             # 不污染共享单例；本地路由时 llm=None（用回会话自身的本地 client）。
             gen = selected_agent.run(
-                cloud_question, stream=True, images=b64_images or None,
+                cloud_question, stream=True, images=vision_images,
                 llm=cloud_llm,
                 system_context=cloud_context,
                 ingested_sources=tuple(sorted(_INGESTED)),
@@ -1663,6 +1682,47 @@ async def chat(
         yield "data: {\"type\":\"done\"}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/api/vision/video")
+async def analyze_video_ep(file: UploadFile = File(...)):
+    """游戏运行视频的 Harness 抽帧入口。
+
+    当前统一输出时间轴式图片观察，便于任何文本模型消费；具备原生视频能力的
+    provider 可在能力画像中标记为 native，后续适配器可在此端点替换为原生调用。
+    """
+    raw = await file.read()
+    if len(raw) > CHAT_VIDEO_MAX_BYTES:
+        return JSONResponse({"ok": False, "error": f"视频超过 {CHAT_VIDEO_MAX_BYTES // 1024 // 1024}MB 上限。"}, status_code=400)
+    ext = os.path.splitext(file.filename or "")[1].lower() or ".mp4"
+    if ext not in {".mp4", ".mov", ".webm", ".mkv", ".avi", ".gif"}:
+        return JSONResponse({"ok": False, "error": "仅支持 MP4/MOV/WEBM/MKV/AVI/GIF 视频。"}, status_code=400)
+
+    def _work():
+        import asset_gen
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(raw)
+            path = tmp.name
+        try:
+            frames, info = asset_gen.extract_frames(path, target_fps=2, max_frames=CHAT_VIDEO_MAX_FRAMES)
+            encoded = []
+            for frame in frames:
+                buf = io.BytesIO()
+                frame.save(buf, format="JPEG", quality=82, optimize=True)
+                encoded.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+            # 视频逐帧交给视觉模型，禁止误把帧当作主模型原生图片能力。
+            _, context, audit = analyze_images(encoded, current_capability={"vision": "unknown"})
+            return {"ok": True, "info": info, "context": list(context), "audit": audit}
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    try:
+        return await run_in_threadpool(_work)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"视频抽帧失败：{type(exc).__name__}: {str(exc)[:300]}"}, status_code=400)
 
 
 @app.get("/api/trace")
@@ -2164,6 +2224,10 @@ class ConfigReq(BaseModel):
     edit_confirm: Optional[bool] = None
     # 用户手填的上下文窗口（token）：>0 设置覆盖；=0 清除覆盖回到自动；None=不变
     context_window: Optional[int] = None
+    # 能力确认：不传=不修改；可按 provider/model 持久化覆盖静态画像
+    thinking_capability: Optional[str] = None
+    vision_capability: Optional[str] = None
+    video_capability: Optional[str] = None
     # AI 越界访问模式：'safe'=仅项目内；'high'=允许受控越界读写。None=不变
     external_access_mode: Optional[str] = None
     # 网络搜索 / URL 获取服务商配置：None=不变
@@ -2218,6 +2282,7 @@ async def get_config():
     emb = get_runtime("embedding_provider") or EMBEDDING_PROVIDER
     eff_model = get_runtime("llm_model") or LLM_MODEL or PROVIDERS.get(prov, {}).get("default_model", "")
     _ctx_override = get_context_window_override(prov, eff_model)
+    _cap_override = get_model_capability_override(prov, eff_model) or {}
     # 当前厂商专用 env（MOONSHOT/ZHIPU/SILICONFLOW/OPENAI…），并保留对两家旧厂商的兼容检查
     _envk = PROVIDERS.get(prov, {}).get("api_key_env", "")
     has_key = bool(
@@ -2251,6 +2316,7 @@ async def get_config():
         # 当前模型能力：当前运行客户端一致时直接取其实例画像（含 Ollama 实时探测结果），
         # 否则按静态画像渲染（自定义覆盖优先级已在 model_capability 内处理）
         "capability": _live_capability(prov, eff_model) or model_capability(prov, eff_model),
+        "capability_override": _cap_override,
         # 当前生效窗口的来源：custom 手填 / probe Ollama 实时探测 / profile 内置画像
         "context_source": _context_source(prov, eff_model),
         "embedding_options": ["local", "ollama", "qwen"],
@@ -2830,6 +2896,8 @@ async def set_config(req: ConfigReq):
                 status_code=400)
         set_runtime("llm_base_url", custom_base_url)
 
+    target_model = req.model or PROVIDERS[req.provider]["default_model"]
+
     # 手填上下文窗口：先做范围校验（1k~2M；0=清除覆盖回到自动），避免无意义探活
     if req.context_window is not None and req.context_window != 0 and not (
             1024 <= req.context_window <= 2_097_152):
@@ -2838,7 +2906,6 @@ async def set_config(req: ConfigReq):
             status_code=400)
 
     # 切到 Ollama 时先做模型健康检查：避免选了一个加载不起来的模型后页面卡死、显示原始检索内容
-    target_model = req.model or PROVIDERS[req.provider]["default_model"]
     if req.provider == "ollama" and target_model:
         # 真实推理探活最坏等待模型冷加载（60s），必须在线程池执行
         ok, err = await run_in_threadpool(_check_ollama_model, target_model)
@@ -2851,6 +2918,18 @@ async def set_config(req: ConfigReq):
                 "embedding_provider": get_runtime("embedding_provider") or EMBEDDING_PROVIDER,
                 "ingested_files": sorted(_INGESTED),
             }
+
+    # 能力覆盖在探活通过后落盘，失败切换不会留下半成品配置。
+    if any(v is not None for v in (req.thinking_capability, req.vision_capability, req.video_capability)):
+        try:
+            set_model_capability_override(
+                req.provider, target_model,
+                thinking=req.thinking_capability,
+                vision=req.vision_capability,
+                video=req.video_capability,
+            )
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     # 探活/校验全部通过后才落窗口覆盖，紧接着重建客户端即按新窗口算预算
     if req.context_window is not None:
@@ -2943,6 +3022,7 @@ async def set_config(req: ConfigReq):
         "base_url": get_runtime("llm_base_url") or PROVIDERS[prov].get("base_url", ""),
         # 用新建客户端上的画像：含 Ollama 实时探测结果（model_capability 静态调用拿不到）
         "capability": new_llm.capability,
+        "capability_override": get_model_capability_override(prov, eff_model) or {},
         "context_source": getattr(new_llm, "context_source", "profile"),
         "context_window_override": get_context_window_override(prov, eff_model) or 0,
         "ingested_files": sorted(_INGESTED),

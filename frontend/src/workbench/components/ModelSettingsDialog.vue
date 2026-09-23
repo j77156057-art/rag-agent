@@ -30,6 +30,9 @@ const lookupResult = ref<ContextLookupResult | null>(null)
 
 // AI 越界访问模式：safe=仅限项目内；high=允许受控越界读写（须配置白名单目录）
 const accessMode = ref<'safe' | 'high'>('safe')
+const thinkingCapability = ref('')
+const visionCapability = ref('')
+const videoCapability = ref('')
 
 const meta = computed(() => props.config?.provider_meta?.[provider.value])
 const isCustom = computed(() => provider.value === 'custom')
@@ -86,6 +89,9 @@ watch(
     baseUrl.value = props.config.custom_base_url || ''
     ctxWindow.value = props.config.context_window_override ? String(props.config.context_window_override) : ''
     accessMode.value = props.config.external_access_mode || 'safe'
+    thinkingCapability.value = props.config.capability?.thinking || 'unknown'
+    visionCapability.value = props.config.capability?.vision || 'unknown'
+    videoCapability.value = props.config.capability?.video || 'unknown'
     ctxBusy.value = ''
     ctxMsg.value = ''
     lookupResult.value = null
@@ -99,6 +105,9 @@ watch(provider, (p) => {
   ctxMsg.value = ''
   lookupResult.value = null
   ctxWindow.value = ''
+  thinkingCapability.value = 'unknown'
+  visionCapability.value = 'unknown'
+  videoCapability.value = 'unknown'
   const m = props.config?.provider_meta?.[p]
   if (p !== 'custom') model.value = m?.default_model || ''
 })
@@ -175,6 +184,9 @@ async function save() {
       base_url: isCustom.value ? baseUrl.value.trim() : '',
       // 空=0：清除覆盖回到自动（Ollama 实时探测/内置画像）
       context_window: ctxVal,
+      thinking_capability: thinkingCapability.value,
+      vision_capability: visionCapability.value,
+      video_capability: videoCapability.value,
       // 越界访问模式：safe/high（与模型切换一并保存，幂等）
       external_access_mode: accessMode.value,
     })
@@ -285,6 +297,36 @@ async function save() {
       <p v-else-if="lookupResult && !lookupResult.ok" class="ms-hint ms-hint-err">{{ lookupResult.error }}</p>
 
       <div class="ms-sep"></div>
+      <label class="ms-label">能力确认</label>
+      <div class="ms-cap-edit">
+        <label>深度思考
+          <select v-model="thinkingCapability" class="ms-select" :disabled="saving">
+            <option value="unknown">未知 / 待确认</option>
+            <option value="none">不支持</option>
+            <option value="toggle">可开关</option>
+            <option value="native">模型内置</option>
+          </select>
+        </label>
+        <label>图片识别
+          <select v-model="visionCapability" class="ms-select" :disabled="saving">
+            <option value="unknown">未知 / 交给 Harness</option>
+            <option value="none">不支持</option>
+            <option value="harness">使用 Harness 视觉模型</option>
+            <option value="native">模型原生支持</option>
+          </select>
+        </label>
+        <label>视频识别
+          <select v-model="videoCapability" class="ms-select" :disabled="saving">
+            <option value="unknown">未知 / 待确认</option>
+            <option value="none">不支持</option>
+            <option value="frames">Harness 抽帧分析</option>
+            <option value="native">模型原生支持</option>
+          </select>
+        </label>
+      </div>
+      <p class="ms-hint ms-cap-help">“未知 / 交给 Harness”不会把图片直接发送给当前模型；需配置 DOCMIND_VISION_MODEL 才会自动生成图片观察。</p>
+
+      <div class="ms-sep"></div>
       <label class="ms-label">AI 越界访问权限</label>
       <div class="ms-seg" role="radiogroup" aria-label="越界访问模式">
         <button type="button" class="ms-seg-opt" :class="{ 'ms-seg-on': accessMode === 'safe' }"
@@ -328,7 +370,14 @@ async function save() {
         <span class="ms-cap-tag">{{ sourceLabel }}</span>
         <span class="ms-cap-tag" v-if="props.config?.capability?.thinking === 'native'">深度思考·模型内置</span>
         <span class="ms-cap-tag" v-else-if="props.config?.capability?.thinking === 'toggle'">深度思考·可开关</span>
+        <span class="ms-cap-tag ms-cap-off" v-else-if="props.config?.capability?.thinking === 'unknown'">深度思考·待确认</span>
         <span class="ms-cap-tag ms-cap-off" v-else>不支持深度思考</span>
+        <span class="ms-cap-tag" v-if="props.config?.capability?.vision === 'native'">图片·模型原生</span>
+        <span class="ms-cap-tag" v-else-if="props.config?.capability?.vision === 'harness'">图片·Harness 辅助</span>
+        <span class="ms-cap-tag ms-cap-off" v-else>图片·待确认</span>
+        <span class="ms-cap-tag" v-if="props.config?.capability?.video === 'native'">视频·模型原生</span>
+        <span class="ms-cap-tag" v-else-if="props.config?.capability?.video === 'frames'">视频·Harness 抽帧</span>
+        <span class="ms-cap-tag ms-cap-off" v-else>视频·待确认</span>
         <span class="ms-cap-tag" v-if="props.config?.capability?.cloud">云端</span>
         <span class="ms-cap-tag ms-cap-off" v-else>本地</span>
       </div>
@@ -421,6 +470,10 @@ async function save() {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
 }
 .ms-cap { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+.ms-cap-edit { display: grid; grid-template-columns: 1fr; gap: 6px; }
+.ms-cap-edit label { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--text-muted); }
+.ms-select { min-width: 190px; padding: 5px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-input, #fff); color: var(--text); font-size: 12px; }
+.ms-cap-help { margin-top: 2px; line-height: 1.45; }
 .ms-cap-cap-title { font-size: 11px; color: var(--text-faint); margin-right: 2px; }
 .ms-cap-tag {
   font-size: 11px; color: var(--text-muted);

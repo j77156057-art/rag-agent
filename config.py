@@ -269,6 +269,15 @@ _TOGGLE_THINK_RULES = (
     ("siliconflow", "qwen3"),
 )
 
+# 视觉能力画像。未知模型不自动把图片交给原模型，除非用户在设置里确认；
+# 未确认时由 Harness 视觉兜底（若已配置）。
+_NATIVE_VISION_HINTS = (
+    "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl", "qwen3.6",
+    "llava", "gemma-3", "gemma3", "gpt-4o", "gpt-4.1", "gpt-5",
+    "claude-3", "claude-4", "glm-4v", "glm-4.5v", "kimi-vl", "deepseek-vl",
+)
+_NATIVE_VIDEO_HINTS = ("gemini", "gpt-4o", "gpt-4.1", "gpt-5", "qwen3-vl")
+
 
 def model_context_window(provider: str, model: str, live_window: int = None) -> int:
     """该模型可用的上下文窗口（token）。
@@ -330,17 +339,42 @@ def model_thinking_mode(provider: str, model: str) -> str:
     return "none"
 
 
+def model_vision_mode(provider: str, model: str) -> str:
+    """图片能力：native=原生支持，unknown=未确认，none=明确不支持。"""
+    p = (provider or "").strip().lower()
+    m = (model or "").strip().lower()
+    if any(h in m for h in _NATIVE_VISION_HINTS):
+        return "native"
+    if p in ("mock", "deepseek", "kimi", "zhipu"):
+        return "unknown"
+    return "unknown"
+
+
+def model_video_mode(provider: str, model: str) -> str:
+    """视频能力：native=原生视频，frames=Harness 抽帧，unknown=未确认。"""
+    m = (model or "").strip().lower()
+    if any(h in m for h in _NATIVE_VIDEO_HINTS):
+        return "native"
+    return "unknown"
+
+
 def model_capability(provider: str, model: str, context_window: int = None) -> dict:
-    """汇总模型能力：{context_window, thinking, cloud}，供前后端共同决策。
+    """汇总模型能力：{context_window, thinking, vision, video, cloud}。
 
     context_window 可传入实时探测值（如 Ollama /api/show）；用户自定义覆盖优先。
     """
     cfg = PROVIDERS.get(provider or "", {})
-    return {
+    cap = {
         "context_window": model_context_window(provider, model, live_window=context_window),
         "thinking": model_thinking_mode(provider, model),
+        "vision": model_vision_mode(provider, model),
+        "video": model_video_mode(provider, model),
         "cloud": bool(cfg.get("cloud")),
     }
+    override = get_model_capability_override(provider, model)
+    if override:
+        cap.update({k: v for k, v in override.items() if k in ("thinking", "vision", "video")})
+    return cap
 
 CODE_ROOT = os.getenv("CODE_ROOT", "")  # 代码问答模式的代码库根目录；为空表示未配置
 CODE_CHUNK = int(os.getenv("CODE_CHUNK", "1200"))  # 单个代码切片的最大字符数
@@ -391,6 +425,8 @@ _WEB_FETCH_PROVIDERS = {"builtin", "jina", "firecrawl", "custom"}
 CHAT_IMAGE_MAX_FILES = int(os.getenv("CHAT_IMAGE_MAX_FILES", "4"))  # 单条消息最多图片数
 CHAT_IMAGE_MAX_BYTES = int(os.getenv("CHAT_IMAGE_MAX_BYTES", str(10 * 1024 * 1024)))  # 单图大小上限（压缩前）
 CHAT_IMAGE_ALLOWED_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+CHAT_VIDEO_MAX_BYTES = int(os.getenv("CHAT_VIDEO_MAX_BYTES", str(200 * 1024 * 1024)))
+CHAT_VIDEO_MAX_FRAMES = int(os.getenv("CHAT_VIDEO_MAX_FRAMES", "8"))
 
 # ---- 运行时覆盖（由前端 /api/config 动态设置，优先级高于 .env）----
 # 模型类切换仅存于内存（重启恢复 .env）；code_root 例外，经 STATE_FILE 跨重启恢复。
@@ -471,6 +507,7 @@ def load_state(key, default=None):
 # 内置画像不可能覆盖所有模型（尤其自定义 OpenAI 端点），允许用户显式指定；
 # 跨重启持久化在 STATE_FILE，优先级高于实时探测与内置画像。
 _CONTEXT_WINDOW_OVERRIDES = {}
+_MODEL_CAPABILITY_OVERRIDES = {}
 
 
 def _ctx_override_key(provider: str, model: str) -> str:
@@ -500,6 +537,37 @@ def set_context_window_override(provider: str, model: str, tokens):
 def clear_context_window_override(provider: str, model: str):
     _CONTEXT_WINDOW_OVERRIDES.pop(_ctx_override_key(provider, model), None)
     save_state("context_window_overrides", dict(_CONTEXT_WINDOW_OVERRIDES))
+
+
+def get_model_capability_override(provider: str, model: str):
+    value = _MODEL_CAPABILITY_OVERRIDES.get(_ctx_override_key(provider, model))
+    return dict(value) if isinstance(value, dict) else None
+
+
+def set_model_capability_override(provider: str, model: str, *, thinking=None, vision=None, video=None):
+    key = _ctx_override_key(provider, model)
+    current = dict(_MODEL_CAPABILITY_OVERRIDES.get(key) or {})
+    allowed = {
+        "thinking": {"native", "toggle", "none", "unknown"},
+        "vision": {"native", "harness", "none", "unknown"},
+        "video": {"native", "frames", "none", "unknown"},
+    }
+    for name, value in (("thinking", thinking), ("vision", vision), ("video", video)):
+        if value is None:
+            continue
+        if value not in allowed[name]:
+            raise ValueError(f"无效的{name}能力值: {value}")
+        current[name] = value
+    if current:
+        _MODEL_CAPABILITY_OVERRIDES[key] = current
+    else:
+        _MODEL_CAPABILITY_OVERRIDES.pop(key, None)
+    save_state("model_capability_overrides", dict(_MODEL_CAPABILITY_OVERRIDES))
+
+
+def clear_model_capability_override(provider: str, model: str):
+    _MODEL_CAPABILITY_OVERRIDES.pop(_ctx_override_key(provider, model), None)
+    save_state("model_capability_overrides", dict(_MODEL_CAPABILITY_OVERRIDES))
 
 
 def _apply_persisted_state():
@@ -550,6 +618,15 @@ def _apply_persisted_state():
         for k, v in ov.items():
             if isinstance(k, str) and "/" in k and isinstance(v, int) and v > 0:
                 _CONTEXT_WINDOW_OVERRIDES[k] = v
+    cap_ov = data.get("model_capability_overrides")
+    if isinstance(cap_ov, dict):
+        for k, value in cap_ov.items():
+            if isinstance(k, str) and "/" in k and isinstance(value, dict):
+                clean = {n: v for n, v in value.items() if v in {
+                    "native", "toggle", "none", "unknown", "harness", "frames"
+                }}
+                if clean:
+                    _MODEL_CAPABILITY_OVERRIDES[k] = clean
     # 越界访问模式（safe/high）：UI 切换后跨重启恢复；显式 set_runtime 优先
     m = data.get("external_access_mode")
     if m in ("safe", "high") and "external_access_mode" not in _RUNTIME:

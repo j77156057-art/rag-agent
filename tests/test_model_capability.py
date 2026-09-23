@@ -15,10 +15,14 @@ from config import (  # noqa: E402
     model_context_window,
     model_thinking_mode,
     model_capability,
+    model_vision_mode,
+    model_video_mode,
     prompt_token_budget,
     set_context_window_override,
     get_context_window_override,
     clear_context_window_override,
+    set_model_capability_override,
+    clear_model_capability_override,
     load_state,
     LLM_MAX_TOKENS,
 )
@@ -87,6 +91,19 @@ class ThinkingModeTests(unittest.TestCase):
         self.assertEqual(cap_local["thinking"], "toggle")
         self.assertFalse(cap_local["cloud"])
         self.assertEqual(cap_local["context_window"], 16384)
+
+    def test_multimodal_capability_and_user_override(self):
+        self.assertEqual(model_vision_mode("ollama", "qwen3-vl:8b"), "native")
+        self.assertEqual(model_video_mode("openai", "gpt-4o"), "native")
+        provider, model = "custom", "zz-vision-override"
+        try:
+            set_model_capability_override(provider, model, thinking="toggle", vision="harness", video="frames")
+            cap = model_capability(provider, model)
+            self.assertEqual(cap["thinking"], "toggle")
+            self.assertEqual(cap["vision"], "harness")
+            self.assertEqual(cap["video"], "frames")
+        finally:
+            clear_model_capability_override(provider, model)
 
 
 class PromptBudgetScalingTests(unittest.TestCase):

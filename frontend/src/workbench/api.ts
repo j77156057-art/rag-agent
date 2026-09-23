@@ -1734,9 +1734,22 @@ export interface ProviderMeta {
 
 export interface ModelCapability {
   context_window: number
-  /** native=模型天生推理（开关恒开） / toggle=可开关（qwen3 家族） / none=不支持 */
-  thinking: 'native' | 'toggle' | 'none' | string
+  /** native=模型天生推理 / toggle=可开关 / none=不支持 / unknown=待确认 */
+  thinking: 'native' | 'toggle' | 'none' | 'unknown' | string
+  /** native=原生图片 / harness=Harness 视觉辅助 / none=不支持 / unknown=待确认 */
+  vision: 'native' | 'harness' | 'none' | 'unknown' | string
+  /** native=原生视频 / frames=Harness 抽帧 / none=不支持 / unknown=待确认 */
+  video: 'native' | 'frames' | 'none' | 'unknown' | string
   cloud: boolean
+}
+
+export const visionApi = {
+  analyzeVideo(file: File): Promise<{ ok: boolean; context?: string[]; info?: { frame_count?: number }; error?: string }> {
+    const fd = new FormData()
+    fd.append('file', file, file.name || 'clip.mp4')
+    return fetch('/api/vision/video', withProject({ method: 'POST', body: fd }))
+      .then(async (res) => (await res.json()) as { ok: boolean; context?: string[]; info?: { frame_count?: number }; error?: string })
+  },
 }
 
 export interface OllamaStatus {
@@ -1760,6 +1773,7 @@ export interface ModelConfigInfo {
   ollama_status?: OllamaStatus
   /** 用户手填的窗口覆盖；0/缺省 = 自动（实时探测或内置画像） */
   context_window_override?: number
+  capability_override?: { thinking?: string; vision?: string; video?: string }
   /** 当前生效窗口来源：custom 手填 / probe Ollama 实时探测 / profile 内置画像 */
   context_source?: 'custom' | 'probe' | 'profile'
   /** AI 越界访问模式：safe=仅限项目内；high=允许受控越界读写（须配置白名单） */
@@ -1773,6 +1787,9 @@ export interface SaveModelReq {
   base_url?: string
   /** >0 设置窗口覆盖；0 清除覆盖回到自动；undefined=不改动 */
   context_window?: number | null
+  thinking_capability?: string
+  vision_capability?: string
+  video_capability?: string
   /** AI 越界访问模式：'safe' | 'high'；undefined=不改动 */
   external_access_mode?: 'safe' | 'high'
 }

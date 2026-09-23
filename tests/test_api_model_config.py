@@ -107,6 +107,8 @@ class GetConfigShapeTests(unittest.TestCase):
             self.assertIn("cloud", meta)
         self.assertIn("context_window", resp["capability"])
         self.assertIn("thinking", resp["capability"])
+        self.assertIn("vision", resp["capability"])
+        self.assertIn("video", resp["capability"])
         self.assertIn("custom_base_url", resp)
         # 窗口覆盖/来源字段存在
         self.assertIn("context_window_override", resp)

@@ -151,6 +151,28 @@ cd frontend && npm install && npm run build      # 产物 -> ../web
 curl -X POST http://127.0.0.1:8000/api/chat -F "question=DocMind 支持哪些文件格式？"
 ```
 
+### 图片 / 视频视觉链路
+
+工作台的 ChatDock 支持选择、粘贴或拖拽图片。模型能力画像会区分“模型原生识图”和
+“Harness 视觉辅助”：原生视觉模型直接收到图片；文本模型不会被误传图片，而是由已配置
+的视觉模型生成有界观察，再交给当前 Agent 结合代码和日志复核。视频入口会用 imageio/ffmpeg
+抽取关键帧，生成时间轴观察后填回对话输入，适合检查游戏启动画面、HUD 重叠、摄像机越界和
+长时间游玩中的可见异常。
+
+```dotenv
+# 可选：为不支持视觉的主模型配置本地视觉兜底（默认不出网）
+DOCMIND_VISION_PROVIDER=ollama
+DOCMIND_VISION_MODEL=qwen3-vl:8b
+# DOCMIND_VISION_BASE_URL=http://127.0.0.1:11434/v1
+# DOCMIND_VISION_API_KEY=
+CHAT_VIDEO_MAX_BYTES=209715200
+CHAT_VIDEO_MAX_FRAMES=8
+```
+
+打开“模型设置”可分别确认深度思考、图片识别和视频识别能力；确认结果按
+`provider/model` 持久化。`unknown` 不等同于“不支持”，而是要求 Harness 使用已配置的
+视觉模型，或等待用户确认后再把原图交给当前模型。
+
 ## 🖥️ 桌面端（原生窗口一键启动）
 
 `desktop.py` 把后端服务与前端组装成桌面窗口。**优先使用 pywebview 原生窗口（Windows 走 Edge WebView2）；若目标机器缺少 WebView2 运行时，会自动降级为「控制台窗口 + 打开默认浏览器」**——这条降级路径正是为「双击没反应」准备的（原生窗口在缺运行时会静默失败：不报错也不弹窗、进程却还活着），两种模式都能正常使用。启动时另有**单实例保护**：若 8000 端口已在提供 DocMind 服务，直接打开浏览器并退出，不会堆积进程。
