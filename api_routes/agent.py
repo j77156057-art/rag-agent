@@ -2,7 +2,7 @@
 import json
 from dataclasses import replace
 
-from fastapi import APIRouter
+from fastapi import APIRouter, BackgroundTasks
 from pydantic import BaseModel
 from agent_runtime import langsmith
 from agent_runtime.game_workflow import (WORKFLOWS, StateGraph, WorkflowError,
@@ -222,7 +222,7 @@ def build_router(ctx) -> APIRouter:
                 "checkpoint_health": WORKFLOWS.checkpoint_health()}
 
     @router.post("/workflow/start")
-    async def workflow_start(req: WorkflowStartReq):
+    async def workflow_start(req: WorkflowStartReq, background_tasks: BackgroundTasks):
         root = ctx._project_root_or_error() or ""
         try:
             policy = WorkflowPolicy(**(req.policy or {})).normalized()
@@ -292,7 +292,10 @@ def build_router(ctx) -> APIRouter:
                 # kept as a callback so credentials/cache policy remain in
                 # the audited tool implementation and never enter a
                 # checkpoint.
-                research_runner=(web_research if req.web_enabled else None))
+                research_runner=(web_research if req.web_enabled else None),
+                defer_option_generation=True)
+            if workflow.get("status") == "generating_options":
+                background_tasks.add_task(WORKFLOWS.generate_options, workflow["workflow_id"])
             return {"ok": True, "workflow": workflow}
         except (WorkflowError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}

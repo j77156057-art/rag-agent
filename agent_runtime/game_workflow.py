@@ -950,7 +950,8 @@ class GameWorkflowManager:
               policy: WorkflowPolicy | None = None,
               option_generator: Callable[[str, ContextPlan], Any] | None = None,
               research_runner: Callable[[str], Any] | None = None,
-              task_generator: Callable[[str, Mapping[str, Any], ContextPlan], Any] | None = None) -> dict[str, Any]:
+              task_generator: Callable[[str, Mapping[str, Any], ContextPlan], Any] | None = None,
+              defer_option_generation: bool = False) -> dict[str, Any]:
         request = _clean_text(request, 12000)
         if not request:
             raise WorkflowError("开发目标不能为空")
@@ -986,6 +987,16 @@ class GameWorkflowManager:
                             "budgets": allocate_layer_budgets(policy.max_context_chars),
                             "schema": "five-layer-v1"},
             created_at=_now(), updated_at=_now())
+        defer_options = bool(defer_option_generation and llm_enabled and option_generator is not None
+                             and StateGraph is not None and graph_interrupt is not None)
+        if defer_options:
+            # Return the deterministic candidates immediately.  The HTTP layer
+            # schedules the optional LLM refinement after the response so a
+            # slow/temporarily unavailable provider cannot freeze the workbench.
+            state.status = "generating_options"
+            state.phase = "clarify"
+            self._event(state, "options_pending", option_count=len(options),
+                        option_source=option_source)
         try:
             from .langsmith import start_workflow
             state.langsmith_trace = start_workflow(state.public())
@@ -1001,7 +1012,7 @@ class GameWorkflowManager:
             if task_generator is not None:
                 self._task_generators[wid] = task_generator
             self._save(state)
-            if StateGraph is not None and graph_interrupt is not None:
+            if StateGraph is not None and graph_interrupt is not None and not defer_options:
                 graph_view = self._invoke_graph(state, self._graph_payload(
                     state, option_generation_pending=bool(llm_enabled and option_generator is not None)))
                 pending_value = (((graph_view.get("pending_interrupts") or [{}])[0]).get("value") or {})
@@ -1012,6 +1023,40 @@ class GameWorkflowManager:
                                 option_source=pending_value.get("option_source") or
                                 graph_view.get("option_source") or "deterministic")
         return state.public()
+
+    def generate_options(self, workflow_id: str) -> dict[str, Any]:
+        """Complete deferred initial option generation in a worker thread."""
+        state = self._load(workflow_id)
+        if state.status != "generating_options":
+            return state.public()
+        graph = self.build_langgraph(workflow_id=workflow_id)
+        if graph is None:
+            state.status, state.phase = "awaiting_choice", "clarify"
+            state.interrupt_reason = ""
+            self._event(state, "options_generated", option_source="deterministic")
+            return self._save(state).public()
+        try:
+            graph_view = self._invoke_graph(
+                state,
+                self._graph_payload(state, option_generation_pending=True),
+                graph=graph,
+            )
+            generated_options = graph_view.get("options") or state.options
+            state.options = [dict(item) for item in generated_options]
+            state.status, state.phase = "awaiting_choice", "clarify"
+            state.interrupt_reason = ""
+            self._event(
+                state,
+                "options_generated",
+                option_source=graph_view.get("option_source") or "deterministic",
+                option_count=len(state.options),
+            )
+        except Exception as exc:  # noqa: BLE001 - deterministic options remain usable
+            state.status, state.phase = "awaiting_choice", "clarify"
+            state.interrupt_reason = ""
+            state.error = "方案生成失败，已保留本地方案：" + type(exc).__name__
+            self._event(state, "options_generation_failed", error=type(exc).__name__)
+        return self._save(state).public()
 
     @staticmethod
     def _options(request: str, plan: ContextPlan) -> list[WorkflowOption]:

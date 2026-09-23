@@ -393,6 +393,7 @@ function onOpenHarnessWorkflow(ev?: Event) {
   workflowPrompt.value = prompt
   workflowCustomPending.value = false
   actionMsg.value = '正在根据你的目标生成方案，请稍候…'
+  startWorkflowPolling()
   if (demoMode.value) {
     actionMsg.value = '演示模式只展示入口；连接真实项目后会由 AI 生成方案。'
     return
@@ -492,7 +493,17 @@ async function startWorkflow() {
   workflowBusy.value = true
   try {
     const r = await agentApi.workflowStart(prompt, { use_llm: true, web_enabled: true })
-    if (r.ok && r.workflow) { workflow.value = r.workflow; workflowEvaluation.value = null; workflowPrompt.value = ''; workflowCustomPending.value = false; actionMsg.value = '已生成方案，请选择下一步'; void refreshWorkflowDiagnostics() }
+    if (r.ok && r.workflow) {
+      workflow.value = r.workflow
+      workflowEvaluation.value = null
+      workflowPrompt.value = ''
+      workflowCustomPending.value = false
+      actionMsg.value = r.workflow.status === 'generating_options'
+        ? '方案生成已在后台开始，暂显示本地候选。'
+        : '已生成方案，请选择下一步'
+      startWorkflowPolling()
+      void refreshWorkflowDiagnostics()
+    }
     else actionMsg.value = r.error || '工作流启动失败'
   } catch (e) { actionMsg.value = (e as Error).message || '工作流启动失败' }
   finally { workflowBusy.value = false }
@@ -948,8 +959,8 @@ onBeforeUnmount(() => { stopWorkflowPolling(); open.value = false })
                 <button class="hp-btn danger" :disabled="workflowBusy" @click="approveRevision(false)">拒绝修改</button>
               </div>
             </div>
-            <div v-if="workflow.status === 'awaiting_choice'" class="hp-wf-options">
-              <button v-for="option in (workflow.options || [])" :key="option.id" class="hp-wf-option" :disabled="workflowBusy" @click="workflowChoice(option.id)">
+            <div v-if="['awaiting_choice', 'generating_options'].includes(workflow.status)" class="hp-wf-options">
+              <button v-for="option in (workflow.options || [])" :key="option.id" class="hp-wf-option" :disabled="workflowBusy || workflow.status === 'generating_options'" @click="workflowChoice(option.id)">
                 <b>{{ option.title }}<em v-if="option.recommended">推荐</em></b><span>{{ option.summary }}</span>
               </button>
             </div>

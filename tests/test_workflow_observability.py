@@ -1,10 +1,40 @@
 import tempfile
 import unittest
 
-from agent_runtime.game_workflow import GameWorkflowManager
+from agent_runtime.game_workflow import GameWorkflowManager, StateGraph, WorkflowPolicy
 
 
 class WorkflowObservabilityTests(unittest.TestCase):
+    @unittest.skipIf(StateGraph is None, "LangGraph 未安装")
+    def test_deferred_option_generation_returns_before_provider_call(self):
+        calls = []
+
+        def options(prompt, _plan):
+            calls.append(prompt)
+            return {"options": [{"id": "fast", "title": "快速原型",
+                                 "summary": "先做可运行版本", "recommended": True}]}
+
+        with tempfile.TemporaryDirectory() as root:
+            manager = GameWorkflowManager(root)
+            try:
+                state = manager.start(
+                    "创建一个可验证的游戏原型",
+                    llm_enabled=True,
+                    option_generator=options,
+                    defer_option_generation=True,
+                    policy=WorkflowPolicy(provider_retries=0),
+                )
+                self.assertEqual(state["status"], "generating_options")
+                self.assertEqual(calls, [], "启动接口不应同步等待模型方案")
+                self.assertGreater(len(state["options"]), 0, "应先返回本地候选避免空白卡住")
+
+                ready = manager.generate_options(state["workflow_id"])
+                self.assertEqual(ready["status"], "awaiting_choice")
+                self.assertEqual(calls, ["创建一个可验证的游戏原型"])
+                self.assertEqual(ready["options"][0]["id"], "fast")
+            finally:
+                manager.close()
+
     def test_public_state_contains_bounded_runtime_counters(self):
         with tempfile.TemporaryDirectory() as root:
             manager = GameWorkflowManager(root)
