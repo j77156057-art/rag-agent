@@ -365,8 +365,16 @@ def build_router(ctx) -> APIRouter:
     @router.post("/workflow/{workflow_id}/choice")
     async def workflow_choice(workflow_id: str, req: WorkflowChoiceReq):
         try:
-            return {"ok": True, "workflow": WORKFLOWS.choose(
-                workflow_id, req.choice, custom_request=req.custom_request)}
+            # Choosing an option may resume the graph and invoke a planner/LLM.
+            # Keep that synchronous work off the event loop so a slow model does
+            # not freeze unrelated UI requests (polling, chat, or file views).
+            workflow = await run_in_threadpool(
+                WORKFLOWS.choose,
+                workflow_id,
+                req.choice,
+                custom_request=req.custom_request,
+            )
+            return {"ok": True, "workflow": workflow}
         except WorkflowError as exc:
             return {"ok": False, "error": str(exc)}
 

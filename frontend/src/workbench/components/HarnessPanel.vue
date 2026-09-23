@@ -427,11 +427,14 @@ function stopWorkflowPolling() {
 function startWorkflowPolling() {
   if (workflowPollTimer !== undefined) return
   workflowPollTimer = setInterval(() => {
-    // Keep polling while an execute/research request is in flight. The
-    // backend persists workflow events incrementally, so this is what makes
-    // subagent starts, wave progress, failures and reflection visible before
-    // the action request itself returns.
+    // The backend persists workflow events incrementally, so polling makes
+    // subagent starts, wave progress, failures and reflection visible while
+    // long-running actions are executing.
     if (!open.value || tab.value !== 'workflow') return
+    // Do not let a background GET overwrite the optimistic state while an
+    // action is changing the workflow. The next interval observes the durable
+    // result after the action releases the busy lock.
+    if (workflowBusy.value) return
     if (!workflow.value?.workflow_id) {
       void refreshWorkflowDiagnostics()
       return
@@ -494,7 +497,7 @@ async function startWorkflow() {
   finally { workflowBusy.value = false }
 }
 async function workflowChoice(choice: string) {
-  if (!workflow.value) return
+  if (!workflow.value || workflowBusy.value) return
   if (choice === 'custom') {
     workflowCustomPending.value = true
     workflowCustom.value = ''
@@ -506,6 +509,8 @@ async function workflowChoice(choice: string) {
     const r = await agentApi.workflowChoice(workflow.value.workflow_id, choice, workflowPrompt.value)
     if (r.ok && r.workflow) { workflow.value = r.workflow; workflowPrompt.value = ''; void refreshWorkflowDiagnostics() }
     else actionMsg.value = r.error || '方案选择失败'
+  } catch (e) {
+    actionMsg.value = (e as Error).message || '方案选择失败'
   } finally { workflowBusy.value = false }
 }
 async function submitResearch() {
@@ -938,7 +943,7 @@ onBeforeUnmount(() => { stopWorkflowPolling(); open.value = false })
               </div>
             </div>
             <div v-if="workflow.status === 'awaiting_choice'" class="hp-wf-options">
-              <button v-for="option in (workflow.options || [])" :key="option.id" class="hp-wf-option" @click="workflowChoice(option.id)">
+              <button v-for="option in (workflow.options || [])" :key="option.id" class="hp-wf-option" :disabled="workflowBusy" @click="workflowChoice(option.id)">
                 <b>{{ option.title }}<em v-if="option.recommended">推荐</em></b><span>{{ option.summary }}</span>
               </button>
             </div>
