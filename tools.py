@@ -23,6 +23,7 @@ import time
 import mcp_client
 import mcp_capabilities
 from artifact_tools import create_artifact
+from textutil import as_text
 
 from config import (TOP_K, COLLECTION_NAME, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime,
                      edit_confirm_enabled, external_access_high, EXTERNAL_API_ALLOWLIST,
@@ -1855,7 +1856,7 @@ def web_research(query):
     默认读取 5 个候选正文，可用 DOCMIND_WEB_RESEARCH_MAX_SOURCES 调整（1~8）。
     多轮不同查询由 Agent 决定，避免单次搜索样本不足就贸然下结论。
     """
-    results = web_search(query)
+    results = as_text(web_search(query))
     urls = re.findall(r'https?://[^\s)]+', results)
     if not urls:
         return results
@@ -1884,8 +1885,10 @@ def web_research(query):
                         images.append(img)
                         image_sources.append(src)
                 page = page.text
+            page = as_text(page)  # 与下方统一口径：确保进 join 的一定是 str
         else:
-            page = web_fetch(url)
+            # web_fetch 可能返回 ToolResult（图片分支未启用时）：先规整，避免 join 抛 TypeError
+            page = as_text(web_fetch(url))
         out.append(page)
     conflict = _detect_source_conflicts(out[3:])
     if conflict:

@@ -21,6 +21,7 @@ from config import (
     output_token_budget, resolve_context_from_docs, _PROVIDER_CONTEXT_DEFAULT,
 )
 from agent_runtime.local_runtime import local_llm_slot
+from textutil import as_text
 
 # 默认单次 LLM 调用超时（秒）与重试策略（可用环境变量覆盖）
 LLM_TIMEOUT = float(os.getenv("DOCMIND_LLM_TIMEOUT", "180"))
@@ -361,7 +362,8 @@ def _doc_context_resolver(query: str) -> str:
     except Exception:
         return ""
     try:
-        res = web_search(query) or ""
+        # web_search 可能返回 ToolResult 等非 str 包装对象：先规整再正则，绝不上抛。
+        res = as_text(web_search(query))
     except Exception:
         return ""
     if not res:
@@ -369,7 +371,7 @@ def _doc_context_resolver(query: str) -> str:
     urls = re.findall(r"https?://[^\s)\"'`]+", res)
     for u in urls[:3]:
         try:
-            body = web_fetch(u) or ""
+            body = as_text(web_fetch(u))
         except Exception:
             body = ""
         if body:

@@ -11,6 +11,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tools
 
 
+class _FakeToolResult:
+    """模拟 ToolResult：带 `.text` 字符串，但自身不可切片 / 不可下标 / 不可成员判断。
+
+    若下游未先规整成 str 就 `re.findall` / `join` / `in`，这里会主动抛 TypeError，
+    从而使测试真正覆盖「工具返回值未规整即被使用」这一 bug 类。
+    """
+
+    def __init__(self, text):
+        self.text = text
+
+    def __getitem__(self, item):
+        raise TypeError("'ToolResult' object is not subscriptable")
+
+    def __contains__(self, item):
+        raise TypeError("'ToolResult' object is not iterable")
+
+
 class WebResearchProductTests(unittest.TestCase):
     def test_source_score_is_explainable(self):
         score, reason = tools._source_score("https://github.com/a/b", "official docs", "")
@@ -48,6 +65,20 @@ class WebResearchProductTests(unittest.TestCase):
             out = tools.web_search("platform: b站\n教程")
         self.assertIn("B 站专用搜索暂不可用", out)
         self.assertIn("通用搜索回退结果", out)
+
+    def test_web_research_coerces_toolresult_without_raising(self):
+        # 回归 #2：web_search / web_fetch 返回不可切片的 ToolResult（非图片分支）
+        # 不得抛 TypeError，且应把 .text 当正文产出可 join 的 str。
+        search_tr = _FakeToolResult("· 标题\n  https://example.com/doc")
+        fetch_tr = _FakeToolResult("来源：https://example.com/doc\n正文：窗口上下文说明")
+        with patch("tools.web_search", return_value=search_tr), \
+                patch("tools.web_fetch", return_value=fetch_tr), \
+                patch("tools._web_images_enabled", return_value=False), \
+                patch.dict(tools.os.environ, {"DOCMIND_WEB_RESEARCH_MAX_SOURCES": "1"}, clear=False):
+            out = tools.web_research("上下文窗口")
+        self.assertIsInstance(out, str)
+        self.assertIn("example.com/doc", out)
+        self.assertIn("正文：窗口上下文说明", out)
 
 
 if __name__ == "__main__":

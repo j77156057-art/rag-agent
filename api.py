@@ -180,6 +180,7 @@ from mcp_autoconnect import (
     vision_extract_params, AutoConnectError,
     register_resume, register_commit,
 )
+from textutil import as_text
 import mcp_capabilities
 import web_export
 import unity_graph
@@ -2537,6 +2538,7 @@ def _extract_context_candidates(text: str, limit: int = 5):
     置信度 = 命中次数 + 邻近上下文关键词加权；裸数字必须邻近
     context/window/上下文/窗口 等词才采信，避免把无关数字当窗口。
     """
+    text = as_text(text)  # 兜底：调用方若传入 ToolResult 等非 str，先规整再正则
     if not text:
         return []
     tally = {}  # tokens -> [count, kw_hits, evidence]
