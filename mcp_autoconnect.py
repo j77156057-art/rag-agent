@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 import mcp_client
 import secrets_store
 import project_state
+from textutil import as_text as _as_text
 from mcp_server_index import match_curated_server, curated_entry_to_config
 
 _log = logging.getLogger("docmind.mcp_autoconnect")
@@ -414,22 +415,25 @@ def auto_connect_pipeline(root: str, query: str, *,
 
     try:
         if search_fn:
-            raw = search_fn(f"{query} MCP server official GitHub installation connection usage")
-            sources = list(dict.fromkeys(re.findall(r"https?://[^\s)]+", raw or "")))[:8]
+            raw = _as_text(search_fn(f"{query} MCP server official GitHub installation connection usage"))
+            sources = list(dict.fromkeys(re.findall(r"https?://[^\s)]+", raw)))[:8]
     except Exception as exc:
         search_error = str(exc)[:300]
 
     docs: list[tuple[str, str]] = []
     for url in sources:
-        body = None
+        # 逐 URL 兜底：任一来源返回非字符串 / 抛错都只跳过该条，绝不打崩整个请求。
+        # （曾因 fetch_fn 返回 ToolResult 而 `body[:20]` 抛 TypeError → HTTP 500。）
         try:
-            if fetch_fn:
-                body = fetch_fn(url)
+            body = _as_text(fetch_fn(url)) if fetch_fn else ""
         except Exception:
-            body = None
+            body = ""
         # github 链接兜底：JS 渲染 HTML 抓不到正文，改写走 API readme 取 markdown
         if not body or "网页读取失败" in body[:20] or "读取失败" in body[:20]:
-            gh = _github_readme_markdown(url)
+            try:
+                gh = _github_readme_markdown(url)
+            except Exception:
+                gh = ""
             if gh:
                 body = gh
         if body and "网页读取失败" not in body[:20] and "读取失败" not in body[:20]:
@@ -438,7 +442,8 @@ def auto_connect_pipeline(root: str, query: str, *,
     # 无来源则无法安全抽取（保留 :117 安全语义：正文才成候选，不凭摘要捏命令）
     if not docs and llm_fn:
         try:
-            hint = llm_fn(query, "请只给出官方安装命令，如 uvx <pkg> 或 npx -y <pkg>")
+            # llm_fn 返回值可能是 ToolResult 等非 str 包装对象，先规整再做切片/正则。
+            hint = _as_text(llm_fn(query, "请只给出官方安装命令，如 uvx <pkg> 或 npx -y <pkg>"))
             if hint:
                 docs.append(("", hint))
         except Exception:
@@ -518,7 +523,7 @@ def discover_from_need(root: str, need: str, *, web_enabled: bool = False,
     search_error = ""
     if not candidates and web_enabled and github_search_fn:
         try:
-            raw = github_search_fn(need) or ""
+            raw = _as_text(github_search_fn(need))
         except Exception as exc:
             raw = ""
             search_error = f"GitHub 搜索失败：{type(exc).__name__}: {exc}"[:300]

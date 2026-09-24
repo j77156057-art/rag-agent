@@ -635,5 +635,88 @@ class _BrowserHarness(_TmpProject):
         self.assertFalse(mcp_autoconnect._provider_url_trusted("https://evil.example/x", adapter))
 
 
+class _ToolResultLike:
+    """模拟 ToolResult：带 `.text` 字符串，但自身不可切片 / 不可下标 / 不可成员判断。
+
+    若下游未先经 `_as_text` 转成 str 就做 `body[:20]` / `re.findall` / `x in body`，
+    这里会主动抛 TypeError —— 从而使测试真正覆盖「曾经导致 500 的 TypeError」。
+    """
+
+    def __init__(self, text):
+        self.text = text
+
+    def __getitem__(self, item):
+        raise TypeError("'ToolResult' object is not subscriptable")
+
+    def __contains__(self, item):
+        raise TypeError("'ToolResult' object is not iterable")
+
+
+class ToolResultCoercionTests(_TmpProject):
+    """回归：工具返回 ToolResult（非 str）不得让 auto_connect_pipeline 打崩（曾 HTTP 500）。"""
+
+    def _tools_dir(self):
+        d = os.path.join(self.tmp.name, "tools")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    # ---- 1) fetch_fn 返回 ToolResult：`.text` 当正文，不出错且能出候选
+    def test_fetch_toolresult_text_used_as_body(self):
+        tr = _ToolResultLike(
+            "Run: uvx foo-server\nOr Streamable HTTP https://github.com/owner/repo/mcp")
+        tools = self._tools_dir()
+        with patch.object(mcp_autoconnect.mcp_client, "resolve_command",
+                          lambda launcher: os.path.join(tools, launcher)), \
+             patch.object(mcp_autoconnect, "_safe_dir", lambda cmd: True), \
+             patch.object(mcp_autoconnect, "_github_readme_markdown", lambda url: ""):
+            res = mcp_autoconnect.auto_connect_pipeline(
+                self.project, "zzz-unique-need-xyz",
+                search_fn=lambda q: "https://github.com/owner/repo",
+                fetch_fn=lambda url: tr)
+        self.assertIn("ok", res)
+        self.assertIn("candidates", res)
+        self.assertIn("search_error", res)
+        self.assertTrue(res["ok"], res.get("search_error"))
+        self.assertTrue(res["candidates"])
+
+    # ---- 2) fetch_fn 返回既非 str 也无 .text：安全跳过该来源，不抛
+    def test_fetch_without_text_is_skipped(self):
+        with patch.object(mcp_autoconnect, "_github_readme_markdown", lambda url: ""):
+            res = mcp_autoconnect.auto_connect_pipeline(
+                self.project, "zzz-unique-need-xyz2",
+                search_fn=lambda q: "https://github.com/owner/repo",
+                fetch_fn=lambda url: object())
+        self.assertIn("ok", res)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["candidates"], [])
+
+    # ---- 3) search_fn 返回 ToolResult：优雅落 search_error，不 500
+    def test_search_toolresult_no_links_sets_search_error(self):
+        tr = _ToolResultLike("no links here at all")
+        res = mcp_autoconnect.auto_connect_pipeline(
+            self.project, "zzz-unique-need-xyz3",
+            search_fn=lambda q: tr, fetch_fn=lambda url: "")
+        self.assertIn("search_error", res)
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["search_error"])
+
+    # ---- 4) _as_text 四种输入均不抛
+    def test_as_text_coercions(self):
+        self.assertEqual(mcp_autoconnect._as_text(None), "")
+        self.assertEqual(mcp_autoconnect._as_text("x"), "x")
+        self.assertEqual(mcp_autoconnect._as_text(_ToolResultLike("body")), "body")
+        s = mcp_autoconnect._as_text(object())
+        self.assertIsInstance(s, str)
+        self.assertTrue(s)
+
+        class _Nasty:
+            text = 123  # .text 非 str → 回落 str()
+
+            def __str__(self):
+                raise RuntimeError("boom")  # 连 str() 都抛 → 仍返回 ""
+
+        self.assertEqual(mcp_autoconnect._as_text(_Nasty()), "")
+
+
 if __name__ == "__main__":
     unittest.main()
