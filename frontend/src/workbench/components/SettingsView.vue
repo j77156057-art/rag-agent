@@ -133,6 +133,14 @@ function notifyMcp(msg: string) {
   if (mcpNoticeTimer !== null) window.clearTimeout(mcpNoticeTimer)
   mcpNoticeTimer = window.setTimeout(() => { mcpNotice.value = ''; mcpNoticeTimer = null }, 6000)
 }
+/**
+ * 凭证落盘成功提示。stdio 与 http 都会在发起请求时解析 `@secret:` 引用
+ * （http 侧经 `http_headers_for` + `_http_post(headers=)`，且仅 https+受信域才转发），
+ * 故两种情况统一提示「可继续确认落盘」，不再区分。
+ */
+function notifyCredentialsSaved() {
+  notifyMcp('凭证已写入本机钥匙串（secrets_store），可继续「确认添加并启用」。')
+}
 const mcpForm = ref({ key: '', label: '', transport: 'stdio' as 'stdio' | 'http', command: '', args: '', url: '' })
 const mcpAdding = ref(false)
 const mcpCapabilities = ref<{ active: Record<string, McpCapabilityCandidate>; pending: Record<string, McpCapabilityCandidate> }>({ active: {}, pending: {} })
@@ -164,7 +172,11 @@ const regOpen = ref(false)
 const regTier = ref<McpRegisterTier>('L2')
 const regTaskId = ref('')
 const regUrl = ref('')
-const regCredential = ref('')
+// L2 手动回填：一个候选可能引用多个 provider（如 @secret:slack + @secret:slack_team），
+// 逐项填写、逐项非空校验，commit 时一次全量提交（漏一个 spawn 就解析失败）。
+const regFields = ref<{ provider: string; value: string }[]>([])
+/** 候选是否「本就带 @secret 引用」：带引用时按 provider 逐项填；否则回退单字段（旧行为）。 */
+const regHasRefs = ref(false)
 const regSecretKey = ref('')
 const regError = ref('')
 const regCommitting = ref(false)
@@ -323,13 +335,47 @@ const acSources = (c: McpAutoConnectCandidate | null): AcSource[] => {
   return [{ domain, trust: c.trust === 'source_untrusted' ? 'unknown' : 'official', url }]
 }
 const acResolvedCmd = (c: McpAutoConnectCandidate | null) => c ? [c.config.command, ...(c.config.args || [])].filter(Boolean).join(' ') : ''
-const acEnvMasked = (c: McpAutoConnectCandidate | null) => {
-  if (!c) return '无'
-  const env = c.config.env || {}
-  const keys = Object.keys(env)
+/**
+ * 把 key→value 映射渲染成 "k=v  k2=v2" 并脱敏：
+ * - `maskAll`（env：一律脱敏，沿用既有口径）；
+ * - 或值以 `@secret:` 开头（headers：引用钥匙串即脱敏）。
+ */
+const acMaskEntries = (entries: Record<string, string> | undefined, maskAll = false): string => {
+  const keys = Object.keys(entries || {})
   if (keys.length === 0) return '无'
-  return keys.map(k => `${k}=已填写（脱敏）`).join('  ')
+  return keys.map(k => {
+    const v = (entries || {})[k] ?? ''
+    return (maskAll || v.startsWith('@secret:')) ? `${k}=已填写（脱敏）` : `${k}=${v}`
+  }).join('  ')
 }
+const acEnvMasked = (c: McpAutoConnectCandidate | null) => (c ? acMaskEntries(c.config.env, true) : '无')
+const acHeadersMasked = (c: McpAutoConnectCandidate | null) => (c ? acMaskEntries(c.config.headers, false) : '无')
+/** http = 远程 MCP：连接信息在 url/headers，而非 stdio 的 command/args。 */
+const isHttpTransport = (c: McpAutoConnectCandidate | null) => !!c && c.config.transport === 'http'
+/**
+ * 从候选的 env/headers 里取第一个 `@secret:<provider>` 引用的 provider 名（无则 ''）。
+ * 这是「凭证最终要写进哪个 secrets_store 键」的权威来源——**优先于 provenance.domain**。
+ */
+/**
+ * 收集候选 env/headers 里**全部 distinct** `@secret:<provider>`（保序去重）。
+ * 一个候选可引用多个 provider（如 slack → @secret:slack + @secret:slack_team），
+ * commit 必须一次全量覆盖，漏一个 spawn 时 resolve_secret_refs 就会抛错。
+ */
+const acSecretProviders = (c: McpAutoConnectCandidate | null): string[] => {
+  if (!c) return []
+  const out: string[] = []
+  for (const bag of [c.config.env, c.config.headers]) {
+    for (const v of Object.values(bag || {})) {
+      const m = /^@secret:(.+)$/.exec((v || '').trim())
+      if (m && m[1] && !out.includes(m[1])) out.push(m[1])
+    }
+  }
+  return out
+}
+/** 主 provider：用于 `register/start` 的 adapter 选择，以及无引用回退时的 env 键名。 */
+const acSecretProvider = (c: McpAutoConnectCandidate | null): string => acSecretProviders(c)[0] || ''
+/** 候选是否「需要凭证」：env 或 headers 任一值以 `@secret:` 开头（与 transport / command_unresolved 无关）。 */
+const acNeedsSecret = (c: McpAutoConnectCandidate | null): boolean => acSecretProviders(c).length > 0
 const acRawJson = (c: McpAutoConnectCandidate | null) =>
   c ? JSON.stringify({ key: candidateKey(c), ...c.config }, null, 2) : ''
 const candidateKey = (c: McpAutoConnectCandidate | null): string => {
@@ -462,6 +508,10 @@ const regL1Prompt = computed(() => regNote.value || regUserPrompt.value || REG_L
 const regL1Extra = computed(() =>
   regNote.value && regUserPrompt.value && regUserPrompt.value !== regNote.value ? regUserPrompt.value : '')
 
+/** L2 可提交：至少一项且**每一项都非空**（后端逐项写入，漏一个 spawn 会解析失败）。 */
+const regCanCommit = computed(() =>
+  regFields.value.length > 0 && regFields.value.every(f => !!f.value.trim()))
+
 function stopRegPoll() {
   if (regPollTimer !== null) { window.clearInterval(regPollTimer); regPollTimer = null }
 }
@@ -486,10 +536,14 @@ function switchToManual() {
   regError.value = ''
 }
 
-/** 把已存入钥匙串的凭证回写成连接器的 @secret 引用（L0/L1 自动、L2 手动共用）。 */
+/**
+ * 把已存入钥匙串的凭证回写成连接器的 @secret 引用（L0/L1 自动、L2 手动共用）。
+ * 若候选**本来就带** `@secret:<provider>` 引用（env/headers），引用已就绪 → 不再新增键，避免污染配置。
+ */
 function applySecretToCandidate() {
   const c = acSelected.value
   if (!c) return
+  if (acSecretProvider(c)) return
   acSelected.value = {
     ...c,
     config: {
@@ -525,7 +579,7 @@ async function finalizeAutoRegister() {
     return
   }
   applySecretToCandidate()
-  notifyMcp('凭证已写入本机钥匙串（secrets_store），可继续「确认添加并启用」。')
+  notifyCredentialsSaved()
   regOpen.value = false
   acNeedRegister.value = false
 }
@@ -573,8 +627,13 @@ async function pollRegStatus() {
 async function openRegister(c: McpAutoConnectCandidate) {
   stopRegPoll()
   acSelected.value = c
-  regCredential.value = ''
-  regSecretKey.value = c.config.provenance?.domain || 'provider'
+  // provider 名以候选已有的 `@secret:<provider>` 引用为准（写回/写钥匙串都用它）；
+  // 无引用（命令未解析等着新建凭证）时才回退 provenance.domain —— 兼容既有行为。
+  const providers = acSecretProviders(c)
+  regHasRefs.value = providers.length > 0
+  regFields.value = (providers.length ? providers : [acSecretProvider(c) || c.config.provenance?.domain || 'provider'])
+    .map(p => ({ provider: p, value: '' }))
+  regSecretKey.value = regFields.value[0]?.provider || 'provider'
   regError.value = ''
   regUserPrompt.value = ''
   regStep.value = ''
@@ -630,16 +689,22 @@ async function resumeRegister() {
   }
 }
 
-/** L2：人工回填凭证 → 写钥匙串 → 回写 @secret 引用（原流程，保持不变）。 */
+/**
+ * L2：人工回填凭证 → 写钥匙串 → 回写 @secret 引用。
+ * 一个候选可能引用多个 provider，**逐项非空**后**一次全量提交**（后端空值会跳过 → 漏项会导致 spawn 解析失败）。
+ */
 async function commitRegister() {
-  if (!regCredential.value.trim()) { regError.value = '请先填写凭证'; return }
+  if (!regFields.value.length) { regError.value = '没有需要填写的凭证'; return }
+  if (regFields.value.some(f => !f.value.trim())) { regError.value = '请填写全部凭证后再提交'; return }
+  const credentials: Record<string, string> = {}
+  for (const f of regFields.value) credentials[f.provider] = f.value.trim()
   regCommitting.value = true
   regError.value = ''
   try {
-    const r = await mcpApi.registerCommit(regTaskId.value, { [regSecretKey.value]: regCredential.value.trim() })
+    const r = await mcpApi.registerCommit(regTaskId.value, credentials)
     if (!r.ok) { regError.value = r.error || '凭证保存失败'; return }
     applySecretToCandidate()
-    notifyMcp('凭证已写入本机钥匙串（secrets_store），可继续「确认添加并启用」。')
+    notifyCredentialsSaved()
     closeRegister()
     acNeedRegister.value = false
   } catch (e) {
@@ -913,12 +978,22 @@ function close() { emit('close') }
                   <b>{{ c.config.provenance?.domain || 'server' }}</b>
                   <span class="sv-cap-badge" :data-trust="c.trust === 'source_untrusted' ? 'unknown' : 'official'">{{ acTrustTag(c) }}</span>
                 </div>
-                <label class="sv-label">将要运行的命令</label>
-                <pre class="sv-cmd" data-role="command-preview">{{ acResolvedCmd(c) }}</pre>
-                <label class="sv-label">参数</label>
-                <pre class="sv-cmd">{{ (c.config.args || []).join(' ') || '无' }}</pre>
-                <label class="sv-label">环境变量</label>
-                <pre class="sv-cmd" data-role="env-preview">{{ acEnvMasked(c) }}</pre>
+                <!-- stdio：命令 / 参数 / 环境变量 -->
+                <template v-if="!isHttpTransport(c)">
+                  <label class="sv-label">将要运行的命令</label>
+                  <pre class="sv-cmd" data-role="command-preview">{{ acResolvedCmd(c) }}</pre>
+                  <label class="sv-label">参数</label>
+                  <pre class="sv-cmd">{{ (c.config.args || []).join(' ') || '无' }}</pre>
+                  <label class="sv-label">环境变量</label>
+                  <pre class="sv-cmd" data-role="env-preview">{{ acEnvMasked(c) }}</pre>
+                </template>
+                <!-- http（远程 MCP）：连接地址 / 请求头 -->
+                <template v-else>
+                  <label class="sv-label">连接地址</label>
+                  <pre class="sv-cmd" data-role="url-preview">{{ c.config.url || '无' }}</pre>
+                  <label class="sv-label">请求头</label>
+                  <pre class="sv-cmd" data-role="headers-preview">{{ acHeadersMasked(c) }}</pre>
+                </template>
 
                 <!-- C6：可信来源域徽标折叠态 -->
                 <div class="sv-src-row" data-role="src-badges">
@@ -949,7 +1024,7 @@ function close() { emit('close') }
                     <Icon v-if="acProbing && acSelected === c" name="loader" :size="16" class="dm-spin" />
                     <template v-else>测试连接</template>
                   </button>
-                  <button v-if="c.config.command_unresolved || acNeedRegister" class="sv-mini" @click="openRegister(c)">
+                  <button v-if="c.config.command_unresolved || acNeedRegister || acNeedsSecret(c)" class="sv-mini" @click="openRegister(c)">
                     <Icon name="lock" :size="16" />需要凭证
                   </button>
                   <button class="sv-mini" :disabled="acProbing" @click="acSelected === c ? (acSelected = null) : (acSelected = c)">
@@ -974,9 +1049,16 @@ function close() { emit('close') }
                   <p class="sv-hint">DocMind 会把下面这条配置写入本机并立即启用，之后你可以在对话里调用它的工具。</p></div>
                 </div>
                 <div class="sv-dialog-body" v-if="acSelected">
-                  <label class="sv-label">将要运行的命令</label>
-                  <pre class="sv-cmd" data-role="command-preview">{{ acResolvedCmd(acSelected) }}</pre>
-                  <p class="sv-list-sub">环境变量：{{ acEnvMasked(acSelected) }}</p>
+                  <template v-if="!isHttpTransport(acSelected)">
+                    <label class="sv-label">将要运行的命令</label>
+                    <pre class="sv-cmd" data-role="command-preview">{{ acResolvedCmd(acSelected) }}</pre>
+                    <p class="sv-list-sub">环境变量：{{ acEnvMasked(acSelected) }}</p>
+                  </template>
+                  <template v-else>
+                    <label class="sv-label">连接地址</label>
+                    <pre class="sv-cmd" data-role="url-preview">{{ acSelected.config.url || '无' }}</pre>
+                    <p class="sv-list-sub">请求头：{{ acHeadersMasked(acSelected) }}</p>
+                  </template>
                   <label class="sv-label">参数来源</label>
                   <div class="sv-src-row" data-role="src-badges">
                     <span v-for="s in acSources(acSelected)" :key="s.domain" class="sv-src-badge" :data-trust="s.trust">
@@ -984,8 +1066,9 @@ function close() { emit('close') }
                       <span class="sv-src-tag" :data-tone="s.trust">{{ s.trust === 'official' ? '官方' : s.trust === 'community' ? '社区' : '未知' }}</span>
                     </span>
                   </div>
-                  <p class="sv-note" data-tone="neutral">这条命令会在本机启动一个进程来提供工具；它只在你主动调用时才运行，不会在后台自行动作。</p>
-                  <p class="sv-note" data-tone="warn" v-if="acSelected.trust === 'source_untrusted'">该来源未被标记为官方渠道，请确认命令与公开文档一致后再启用。</p>
+                  <p v-if="!isHttpTransport(acSelected)" class="sv-note" data-tone="neutral">这条命令会在本机启动一个进程来提供工具；它只在你主动调用时才运行，不会在后台自行动作。</p>
+                  <p v-else class="sv-note" data-tone="neutral">这是一个远程 MCP 服务：只有你在对话里调用它的工具时才会向上面这个地址发起请求，不会在后台自行动作。</p>
+                  <p class="sv-note" data-tone="warn" v-if="acSelected.trust === 'source_untrusted'">{{ isHttpTransport(acSelected) ? '该来源未被标记为官方渠道，请确认连接地址与公开文档一致后再启用。' : '该来源未被标记为官方渠道，请确认命令与公开文档一致后再启用。' }}</p>
                   <button class="sv-expand" data-action="toggle-config" @click="acShowRaw = !acShowRaw">
                     <Icon name="chevron-down" :size="16" :class="acShowRaw ? 'dm-rot' : ''" />我想先看看完整配置
                   </button>
@@ -1045,11 +1128,25 @@ function close() { emit('close') }
                     <a v-if="regUrl" class="sv-btn sv-primary sv-ext" :href="regUrl" target="_blank" rel="noreferrer">
                       <Icon name="external-link" :size="16" />去官网创建凭证
                     </a>
-                    <label class="sv-label">API Key / 连接凭证</label>
-                    <div class="sv-input-wrap">
-                      <Icon name="lock" :size="20" />
-                      <input v-model="regCredential" class="sv-input" type="password" placeholder="粘贴 API Key" autocomplete="off" spellcheck="false" />
-                    </div>
+                    <!-- 候选已带 @secret 引用：按 provider 逐项填写（可能多项，如 slack + slack_team） -->
+                    <template v-if="regHasRefs">
+                      <p class="sv-list-sub">该连接器引用了 {{ regFields.length }} 项凭证，请逐项填写后提交。</p>
+                      <template v-for="f in regFields" :key="f.provider">
+                        <label class="sv-label">凭证 · {{ f.provider }}</label>
+                        <div class="sv-input-wrap">
+                          <Icon name="lock" :size="20" />
+                          <input v-model="f.value" class="sv-input" type="password" placeholder="粘贴凭证" autocomplete="off" spellcheck="false" />
+                        </div>
+                      </template>
+                    </template>
+                    <!-- 无引用（命令未解析等）：沿用单字段旧行为 -->
+                    <template v-else>
+                      <label class="sv-label">API Key / 连接凭证</label>
+                      <div class="sv-input-wrap">
+                        <Icon name="lock" :size="20" />
+                        <input v-model="regFields[0].value" class="sv-input" type="password" placeholder="粘贴 API Key" autocomplete="off" spellcheck="false" />
+                      </div>
+                    </template>
                     <p class="sv-note" data-tone="neutral">凭证会存进本机钥匙串（OS keychain），仅该连接器调用时使用，不会外传。</p>
                     <p v-if="regError" class="sv-err">{{ regError }}</p>
                   </template>
@@ -1058,7 +1155,7 @@ function close() { emit('close') }
                   <button class="sv-mini" :data-action="regView === 'manual' ? 'cancel' : 'manual'" @click="regView === 'manual' ? closeRegister() : switchToManual()">
                     {{ regView === 'manual' ? '取消' : '改用手动填写' }}
                   </button>
-                  <button v-if="regView === 'manual'" class="sv-btn sv-primary" data-action="continue" :disabled="regCommitting || !regCredential.trim()" @click="commitRegister">
+                  <button v-if="regView === 'manual'" class="sv-btn sv-primary" data-action="continue" :disabled="regCommitting || !regCanCommit" @click="commitRegister">
                     {{ regCommitting ? '处理中…' : '写入并测试连接' }}
                   </button>
                   <button v-else-if="regView === 'waiting'" class="sv-btn sv-primary" data-action="resume" :disabled="regResuming" @click="resumeRegister">

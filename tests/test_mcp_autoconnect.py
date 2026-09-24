@@ -3,11 +3,13 @@
 覆盖纯函数与编排；不依赖网络。probe_candidate 仅用必然会失败的命令验证「受控执行抛 MCPError」，
 不真正连外部服务。
 """
+import io
 import os
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 import config
@@ -263,6 +265,155 @@ class ProbeCandidateTests(_TmpProject):
                 "args": [], "url": "", "env": {}, "headers": {}, "command_unresolved": True}
         with self.assertRaises(mcp_client.MCPError):
             mcp_autoconnect.probe_candidate(self.project, cand)
+
+
+class HttpProbeTests(_TmpProject):
+    """http 探针：带浏览器 UA + 错误体清洗（真机 403 反爬场景）。"""
+
+    def _http_cand(self, url="https://server.smithery.ai/@smithery-ai/weather/mcp"):
+        return {"transport": "http", "command": "", "args": [], "url": url, "env": {},
+                "headers": {}, "provenance": {"domain": "server.smithery.ai"},
+                "command_unresolved": False}
+
+    def test_user_agent_parity(self):
+        # 传输层 UA 与抽取层一致（防漂移）
+        self.assertEqual(mcp_client.HTTP_USER_AGENT, mcp_autoconnect._BROWSER_UA)
+
+    def test_http_probe_sends_browser_ua(self):
+        seen = {}
+
+        class _Resp:
+            status = 202
+            headers = {"content-type": "application/json"}
+
+            def read(self):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            seen["ua"] = req.get_header("User-agent") or (req.headers or {}).get("User-agent")
+            return _Resp()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = mcp_autoconnect.probe_candidate(self.project, self._http_cand())
+        self.assertTrue(res["probe_ok"])
+        self.assertTrue(seen["ua"] and "Mozilla" in seen["ua"], seen)
+
+    def test_http_probe_403_returns_clean_message(self):
+        long_body = (b"<html><body>" + b"A" * 3000
+                     + b'{"status":403,"detail":"blocked by your browser signature",'
+                       b'"instance":"a404e6a73b2b9ff9"}</body></html>')
+        err = urllib.error.HTTPError(
+            "https://server.smithery.ai/@smithery-ai/weather/mcp", 403, "Forbidden", {}, io.BytesIO(long_body))
+        with patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(mcp_client.MCPError) as ctx:
+                mcp_autoconnect.probe_candidate(self.project, self._http_cand())
+        msg = str(ctx.exception)
+        self.assertIn("403", msg)                      # 保留 HTTP status
+        self.assertNotIn("<html>", msg)                # 不回传原始 HTML
+        self.assertNotIn("browser signature", msg)     # 不回传原始长 JSON
+        self.assertLess(len(msg), 200)
+
+    def test_http_probe_non_json_returns_clean_message(self):
+        class _Resp:
+            status = 200
+            headers = {"content-type": "text/html"}
+
+            def read(self):
+                return b"<html>cloudflare bot blocked page</html>"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with patch("urllib.request.urlopen", return_value=_Resp()):
+            with self.assertRaises(mcp_client.MCPError) as ctx:
+                mcp_autoconnect.probe_candidate(self.project, self._http_cand())
+        msg = str(ctx.exception)
+        self.assertNotIn("<html>", msg)
+        self.assertNotIn("cloudflare bot blocked", msg)
+
+
+class HttpHeaderTrustTests(_TmpProject):
+    """http 传输自定义头：@secret 解析后实际发送 + 受信域安全闸（非受信/非 https 不发）。"""
+
+    class _Resp:
+        status = 202
+        headers = {"content-type": "application/json"}
+
+        def read(self):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _cand(self, url, headers):
+        return {"transport": "http", "command": "", "args": [], "url": url,
+                "env": {}, "headers": headers, "provenance": {"domain": "server.smithery.ai"},
+                "command_unresolved": False}
+
+    def _capture(self, cand):
+        """跑一次 http 探针，返回所有出站请求的头字典列表。"""
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(dict(req.headers or {}))
+            return self._Resp()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = mcp_autoconnect.probe_candidate(self.project, cand)
+        self.assertTrue(res["probe_ok"])
+        return seen
+
+    def test_secret_header_resolved_and_sent(self):
+        secrets_store.save(self.project, "weather_key", "SEKRET-123")
+        seen = self._capture(self._cand(
+            "https://server.smithery.ai/mcp", {"Authorization": "@secret:weather_key"}))
+        vals = [h.get("Authorization") for h in seen]
+        self.assertIn("SEKRET-123", vals)                 # 实际发送（解密后）
+        self.assertNotIn("@secret:weather_key", vals)     # 不发哨兵
+
+    def test_headers_dropped_for_untrusted_host(self):
+        secrets_store.save(self.project, "weather_key", "SEKRET-123")
+        seen = self._capture(self._cand(
+            "https://evil.example/mcp", {"Authorization": "@secret:weather_key"}))
+        for h in seen:
+            self.assertNotIn("Authorization", h)           # 非受信域：密钥头不得发送
+
+    def test_headers_dropped_for_plain_http(self):
+        secrets_store.save(self.project, "weather_key", "SEKRET-123")
+        seen = self._capture(self._cand(
+            "http://127.0.0.1:8123/mcp", {"Authorization": "@secret:weather_key"}))
+        for h in seen:
+            self.assertNotIn("Authorization", h)           # 非 https：密钥头不得发送
+
+    def test_missing_provider_raises_readable_error(self):
+        # 受信域 + 未存入 provider → 抛 MCPError（可读，不静默）
+        with patch("urllib.request.urlopen", side_effect=lambda req, timeout=None: self._Resp()):
+            with self.assertRaises(mcp_client.MCPError) as ctx:
+                mcp_autoconnect.probe_candidate(
+                    self.project,
+                    self._cand("https://server.smithery.ai/mcp", {"Authorization": "@secret:nope"}))
+        msg = str(ctx.exception)
+        self.assertIn("凭证解析失败", msg)
+        self.assertIn("nope", msg)
+
+    def test_resolve_secret_refs_covers_headers(self):
+        secrets_store.save(self.project, "weather_key", "SEKRET-123")
+        out = mcp_autoconnect.resolve_secret_refs(
+            {"headers": {"Authorization": "@secret:weather_key", "X-Trace": "on"}}, self.project)
+        self.assertEqual(out["headers"]["Authorization"], "SEKRET-123")
+        self.assertEqual(out["headers"]["X-Trace"], "on")
 
 
 class BrowserRegisterTests(_TmpProject):

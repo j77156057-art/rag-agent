@@ -32,6 +32,11 @@ INIT_TIMEOUT = 180
 CALL_TIMEOUT = 120
 HTTP_TIMEOUT = 30
 
+# HTTP 传输 UA：远端常按 UA/指纹拦截程序化请求（Cloudflare 等），默认 Python-urllib UA 会被
+# 403；用浏览器 UA 与抽取层一致。与 mcp_autoconnect._BROWSER_UA 同源，单测 test_user_agent_parity 防漂移。
+HTTP_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
 # 预设：godot-ai 必须 stdio attach（裸 HTTP 无法通过 capability 轮换认证）
 DEFAULT_SERVERS = {
     "godot": {
@@ -589,21 +594,30 @@ def active_servers(root):
 
 # ---------------------------------------------------------------- HTTP 传输（无状态）
 
-def _http_post(url, body, timeout=HTTP_TIMEOUT):
+def _http_status_message(code):
+    """把 HTTP 状态码清洗为可读信息；**绝不回传远端原始 body**（HTML/长 JSON 会上屏变乱码）。"""
+    hints = {400: "请求被拒绝", 401: "需要鉴权", 403: "可能为反爬或鉴权拦截",
+             404: "端点不存在", 405: "方法不被允许", 429: "请求过于频繁"}
+    hint = hints.get(code, "远端服务错误" if code and code >= 500 else "请求被拒绝")
+    return f"远端拒绝程序化试连（HTTP {code}，{hint}）"
+
+
+def _http_post(url, body, timeout=HTTP_TIMEOUT, *, headers=None):
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, method="POST",
-        headers={"Content-Type": "application/json",
-                 "Accept": "application/json, text/event-stream"},
-    )
+    hdrs = {"Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "User-Agent": HTTP_USER_AGENT}
+    if headers:
+        hdrs.update({str(k): str(v) for k, v in headers.items()})
+    req = urllib.request.Request(url, data=data, method="POST", headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             ctype = resp.headers.get("content-type", "")
             raw = resp.read().decode("utf-8", errors="replace")
             status = resp.status
     except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:500]
-        raise MCPError(f"HTTP {e.code}: {detail}")
+        # 只保留状态码语义，丢弃原始 body（可能含反爬拦截页/长 JSON）。
+        raise MCPError(_http_status_message(e.code))
     except (urllib.error.URLError, OSError) as e:
         raise MCPError(f"无法连接 {url}：{e}")
     if status == 202 or not raw.strip():
@@ -623,21 +637,42 @@ def _http_post(url, body, timeout=HTTP_TIMEOUT):
     try:
         msg = json.loads(raw)
     except ValueError:
-        raise MCPError(f"无法解析 MCP HTTP 响应：{raw[:200]}")
+        # 非 JSON（多为反爬拦截页 / 错误端点）：只报状态，不回传原始正文。
+        raise MCPError(f"无法解析 MCP HTTP 响应（HTTP {status}，远端返回非 JSON，"
+                       "可能为反爬拦截页或端点错误）")
     if "error" in msg:
         err = msg["error"]
         raise MCPError(f"{err.get('code')}: {err.get('message')}")
     return msg.get("result")
 
 
-def _http_initialize(item):
+def _http_headers(item, root):
+    """解析 http 传输可发送的自定义头（含 @secret），并施加受信域闸。
+
+    可信度判断在 mcp_autoconnect 侧完成（惰性 import，避免循环依赖）：
+    - 非 https / 非受信域 → 返回 {}（不发任何自定义头，尤其是密钥）；
+    - @secret 未存入 → **抛 MCPError（可读，不静默）**。
+    """
+    try:
+        from mcp_autoconnect import http_headers_for
+    except Exception:
+        return {}
+    try:
+        return dict(http_headers_for(item, root) or {})
+    except MCPError:
+        raise
+    except Exception as exc:
+        raise MCPError(f"凭证解析失败（@secret 引用无法解析）：{exc}")
+
+
+def _http_initialize(item, *, headers=None):
     """无状态模式下 initialize 与后续请求相互独立；失败仅影响探测，不阻断 tools/call。"""
     try:
         return _http_post(item["url"], {
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
                        "clientInfo": CLIENT_INFO},
-        }) or {}
+        }, headers=headers) or {}
     except MCPError:
         return {}
 
@@ -672,9 +707,11 @@ def probe_server(root, key, timeout=INIT_TIMEOUT):
             if sess is not None:
                 pass  # 保留长驻会话供后续调用
     else:
-        _http_initialize(item)
+        headers = _http_headers(item, root)
+        _http_initialize(item, headers=headers)
         result = _http_post(item["url"], {"jsonrpc": "2.0", "id": 2,
-                                          "method": "tools/list", "params": {}}) or {}
+                                          "method": "tools/list", "params": {}},
+                            headers=headers) or {}
         names = [t.get("name") for t in result.get("tools", [])]
         return {"ok": True, "server": key, "tool_count": len(names),
                 "tools": names, "transport": "http",
@@ -688,9 +725,11 @@ def list_tools(root, key):
         sess = _session_for(root, item)
         result = sess.request("tools/list", {}, timeout=30) or {}
     else:
-        _http_initialize(item)
+        headers = _http_headers(item, root)
+        _http_initialize(item, headers=headers)
         result = _http_post(item["url"], {"jsonrpc": "2.0", "id": 2,
-                                          "method": "tools/list", "params": {}}) or {}
+                                          "method": "tools/list", "params": {}},
+                            headers=headers) or {}
     tools = []
     for t in result.get("tools", []):
         if not isinstance(t, dict) or not t.get("name"):
@@ -728,10 +767,11 @@ def call_tool(root, key, name, arguments=None, timeout=CALL_TIMEOUT):
             sess = _session_for(root, item)
             result = sess.request("tools/call", params, timeout=timeout) or {}
         else:
-            _http_initialize(item)
+            headers = _http_headers(item, root)
+            _http_initialize(item, headers=headers)
             result = _http_post(item["url"], {"jsonrpc": "2.0", "id": 3,
                                               "method": "tools/call", "params": params},
-                                timeout=timeout) or {}
+                                timeout=timeout, headers=headers) or {}
     except Exception as exc:
         error_text = "%s: %s" % (type(exc).__name__, str(exc)[:240])
         raise

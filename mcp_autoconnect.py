@@ -655,6 +655,27 @@ def resolve_secret_refs(cfg: dict[str, Any], root: str) -> dict[str, Any]:
     return out
 
 
+def http_headers_for(cfg: dict[str, Any], root: str) -> dict[str, str]:
+    """http 传输可发送的自定义请求头（含 @secret 解密）。带**受信域安全闸**。
+
+    - url 非 https / 主机非受信域 → 返回 {}（忽略请求头，并记日志），防凭证外泄到明文/陌生主机；
+    - 否则用 resolve_secret_refs 解析 env/headers 里的 @secret；**未存入的 provider 会抛
+      AutoConnectError（可读，不静默）**。
+    注：本函数在 mcp_autoconnect 侧（调用方）裁决可信度，以避免 mcp_client 反向 import 造成循环。
+    """
+    raw = dict(cfg.get("headers") or {})
+    if not raw:
+        return {}
+    url = str(cfg.get("url") or "")
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if ((parts.scheme or "").lower() != "https" or not ALLOWED_URL_RE.match(url)
+            or not is_trusted_domain(host)):
+        _log.warning("忽略 http 请求头：主机非受信域或非 https（host=%s）", host or "?")
+        return {}
+    return dict(resolve_secret_refs({"headers": raw}, root).get("headers") or {})
+
+
 def probe_candidate(root: str, cand: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
     """临时进程 initialize + tools/list，读后 close()（不持久化、不路由）。
 
@@ -665,9 +686,12 @@ def probe_candidate(root: str, cand: dict[str, Any], timeout: int = 60) -> dict[
     cfg["command"] = mcp_client.resolve_command(cfg.get("command") or "")
     if cfg.get("transport") == "http":
         from mcp_client import _http_initialize, _http_post  # 惰性，避免顶层依赖私有符号
-        mcp_client._http_initialize(cfg)
+        # 凭证缺失/非受信域：mcp_client._http_headers 抛 MCPError（可读）或返回 {}（不发头）。
+        headers = mcp_client._http_headers(cfg, root)
+        _http_initialize(cfg, headers=headers)
         result = _http_post(cfg["url"], {"jsonrpc": "2.0", "id": 2,
-                                         "method": "tools/list", "params": {}}) or {}
+                                         "method": "tools/list", "params": {}},
+                            headers=headers) or {}
         names = [t.get("name") for t in result.get("tools", [])]
         return {"ok": True, "probe_ok": True, "tools": names, "error": ""}
     sess = mcp_client._StdioSession(cfg, cwd=os.path.abspath(root))
