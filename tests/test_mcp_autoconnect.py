@@ -6,6 +6,7 @@
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -226,15 +227,412 @@ class ProbeCandidateTests(_TmpProject):
 
 
 class BrowserRegisterTests(_TmpProject):
-    def test_degrades_to_l2_with_url(self):
-        cand = {"transport": "http", "command": "", "args": [],
+    def _github_cand(self):
+        return {"transport": "http", "command": "", "args": [],
                 "url": "https://github.com/owner/repo/mcp",
                 "env": {}, "headers": {}, "provenance": {"url": "https://github.com/owner/repo"}}
-        res = mcp_autoconnect.browser_register(self.project, "k", cand, "p")
+
+    def test_degrades_to_l2_when_browser_unavailable(self):
+        # 无 Edge / 无 playwright → L2（本机 playwright 缺失时也走此分支，故补丁使其确定）
+        with patch.object(mcp_autoconnect, "_edge_available", lambda: False), \
+             patch.object(mcp_autoconnect, "_playwright_available", lambda: False):
+            res = mcp_autoconnect.browser_register(self.project, "k", self._github_cand(), "p")
         self.assertTrue(res["ok"])
         self.assertEqual(res["tier"], "L2")
         # 回传的是官方来源页（注册入口），便于前端弹 L2 引导用户创建凭证
         self.assertIn("github.com", res["url"])
+
+    def test_unknown_provider_degrades_to_l2(self):
+        res = mcp_autoconnect.browser_register(self.project, "k", {"provenance": {}}, "some-unknown-provider")
+        self.assertEqual(res["tier"], "L2")
+        self.assertTrue(res["note"])
+
+    def test_l2_only_provider_never_launches(self):
+        # Brave 首版不自动 → L2，且不应触碰浏览器能力探测
+        with patch.object(mcp_autoconnect, "_launch_edge",
+                          side_effect=AssertionError("L2 不应启动浏览器")):
+            res = mcp_autoconnect.browser_register(
+                self.project, "k", {"provenance": {"url": "https://api.search.brave.com/app/keys"}},
+                "brave")
+        self.assertEqual(res["tier"], "L2")
+
+
+class _FakeLocator:
+    def __init__(self, page, selector):
+        self.page = page
+        self.selector = selector
+
+    @property
+    def first(self):
+        return self
+
+    def fill(self, value):
+        self.page.actions.append(("fill", self.selector, value))
+
+    def click(self):
+        self.page.actions.append(("click", self.selector))
+
+    def check(self):
+        self.page.actions.append(("check", self.selector))
+
+    def select_option(self, value):
+        self.page.actions.append(("select", self.selector, value))
+
+    def input_value(self):
+        return self.page.values.get(self.selector, "")
+
+    def inner_text(self):
+        return self.page.values.get(self.selector, "")
+
+
+class _FakePage:
+    def __init__(self, url="", body="", values=None, goto_url=None):
+        self.url = url
+        self.body = body
+        self.values = values or {}
+        self.actions = []
+        self.goto_url = goto_url  # goto 后的最终 url（模拟跨域重定向）；None 则等于入参
+
+    def locator(self, selector):
+        return _FakeLocator(self, selector)
+
+    def inner_text(self, selector):
+        return self.body
+
+    def goto(self, url, **kwargs):
+        self.url = self.goto_url or url
+
+    def wait_for_load_state(self, *args, **kwargs):
+        return None
+
+
+class _FakeContext:
+    def __init__(self, page):
+        self.pages = [page]
+        self.closed = False
+
+    def new_page(self):
+        page = _FakePage()
+        self.pages.append(page)
+        return page
+
+    def close(self):
+        self.closed = True
+
+
+class _FakePW:
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+class _BrowserHarness(_TmpProject):
+    """mock playwright（不真拉浏览器）：覆盖适配器选择 / 挑战分支 / 会话流转 / 凭证边界。"""
+
+    def _cand(self, url="https://github.com/owner/repo", domain="github.com"):
+        return {"transport": "http", "command": "", "args": [], "url": url,
+                "env": {}, "headers": {},
+                "provenance": {"url": url, "domain": domain}}
+
+    def _stripe_cand(self):
+        return self._cand("https://dashboard.stripe.com/test/apikeys", "dashboard.stripe.com")
+
+    def _patch_browser(self, page):
+        ctx = _FakeContext(page)
+        pw = _FakePW()
+        return ctx, pw, patch.object(mcp_autoconnect, "_launch_edge", lambda d: (pw, ctx)), \
+            patch.object(mcp_autoconnect, "_edge_available", lambda: True), \
+            patch.object(mcp_autoconnect, "_playwright_available", lambda: True)
+
+    def tearDown(self):
+        with mcp_autoconnect._BROWSER_SESSIONS_LOCK:
+            mcp_autoconnect._BROWSER_SESSIONS.clear()
+        super().tearDown()
+
+    def _sessions_raw(self):
+        with open(mcp_autoconnect._sessions_path(), encoding="utf-8") as fh:
+            return fh.read()
+
+    # ---- 适配器选择（数据驱动，纯函数）
+    def test_adapter_selection_tiers(self):
+        sel = mcp_autoconnect.select_provider_adapter
+        # §7：L0 = Stripe 测试键；L1 = GitHub/Figma/Notion/Slack；L2 = Brave/Google Drive
+        self.assertEqual(sel("github")["tier"], "L1")
+        self.assertEqual(sel("figma")["tier"], "L1")
+        self.assertEqual(sel("stripe test key")["tier"], "L0")
+        self.assertEqual(sel("notion")["tier"], "L1")
+        self.assertEqual(sel("slack")["tier"], "L1")
+        self.assertEqual(sel("brave")["tier"], "L2")
+        self.assertEqual(sel("google drive")["tier"], "L2")
+        self.assertEqual(sel("github", self._cand())["name"], "github")
+        self.assertIsNone(sel("totally-unknown-xyz"))
+
+    # ---- 挑战检测（本地确定性）
+    def test_detect_challenge_branches(self):
+        self.assertEqual(mcp_autoconnect._detect_challenge(_FakePage(body="Welcome to the dashboard")), "")
+        self.assertNotEqual(mcp_autoconnect._detect_challenge(_FakePage(body="Enter the code we emailed you")), "")
+        self.assertNotEqual(mcp_autoconnect._detect_challenge(_FakePage(url="https://github.com/login")), "")
+
+    # ---- L0：揭示已存在凭证（无创建动作，如 Stripe 测试键）→ 捕获 → secrets_store
+    def test_l0_captures_credential_to_secrets_store(self):
+        token = "sk_test_" + "a" * 24
+        page = _FakePage(url="https://dashboard.stripe.com/test/apikeys", body="Test keys",
+                         values={"input[readonly][type='text']": token})
+        ctx, pw, p_launch, p_edge, p_pw = self._patch_browser(page)
+        with p_launch, p_edge, p_pw, self.assertLogs("docmind.mcp_autoconnect", level="INFO") as logs:
+            res = mcp_autoconnect.browser_register(self.project, "stripe", self._stripe_cand(), "stripe")
+        self.assertEqual(res["tier"], "L0")
+        self.assertEqual(res["note"].count("secrets_store"), 1)
+        self.assertEqual(secrets_store.load(self.project, "stripe"), token)
+        # 凭证绝不落会话 JSON / 绝不进日志
+        self.assertNotIn(token, self._sessions_raw())
+        self.assertNotIn(token, "\n".join(logs.output))
+        sess = mcp_autoconnect._load_session(res["task_id"])
+        self.assertEqual(sess["status"], "done")
+        self.assertEqual(sess["step"], "captured")
+        # L0 完成应关闭 live 会话
+        self.assertNotIn(res["task_id"], mcp_autoconnect._BROWSER_SESSIONS)
+
+    # ---- B1：创建长期令牌（§5 denylist）绝不自动提交 → 停 L1「submit」
+    def test_github_never_auto_submits_token_creation(self):
+        token = "ghp_" + "a" * 36
+        page = _FakePage(url="https://github.com/settings/tokens/new", body="New token form",
+                         values={"#new-oauth-token": token})
+        ctx, pw, p_launch, p_edge, p_pw = self._patch_browser(page)
+        with p_launch, p_edge, p_pw:
+            res = mcp_autoconnect.browser_register(self.project, "github", self._cand(), "github")
+        self.assertEqual(res["tier"], "L1")
+        self.assertEqual(mcp_autoconnect._load_session(res["task_id"])["step"], "submit")
+        # 关键：绝不自动点击「创建令牌」submit
+        self.assertNotIn(("click", "button:has-text('Generate token')"), page.actions)
+        # 也未捕获/落库任何凭证
+        self.assertEqual(secrets_store.load(self.project, "github"), "")
+
+    def test_figma_never_auto_submits_token_creation(self):
+        token = "figd_" + "a" * 24
+        page = _FakePage(url="https://www.figma.com/settings/", body="Settings",
+                         values={"input[readonly][type='text']": token})
+        ctx, pw, p_launch, p_edge, p_pw = self._patch_browser(page)
+        with p_launch, p_edge, p_pw:
+            res = mcp_autoconnect.browser_register(
+                self.project, "figma",
+                self._cand("https://www.figma.com/settings/", "figma.com"), "figma")
+        self.assertEqual(res["tier"], "L1")
+        self.assertEqual(mcp_autoconnect._load_session(res["task_id"])["step"], "submit")
+        self.assertNotIn(("click", "button:has-text('Generate token')"), page.actions)
+        self.assertEqual(secrets_store.load(self.project, "figma"), "")
+
+    def test_fill_and_submit_respects_auto_submit_flag(self):
+        base = {"fields": [{"selector": "#f", "action": "fill", "value": "v"}], "submit": "#go"}
+        p_no = _FakePage()
+        ok_no, _ = mcp_autoconnect._fill_and_submit(p_no, dict(base, auto_submit=False))
+        self.assertTrue(ok_no)
+        self.assertIn(("fill", "#f", "v"), p_no.actions)
+        self.assertNotIn(("click", "#go"), p_no.actions)  # 未授权 → 不点
+        self.assertTrue(mcp_autoconnect._submit_pending(dict(base, auto_submit=False)))
+
+        p_yes = _FakePage()
+        ok_yes, _ = mcp_autoconnect._fill_and_submit(p_yes, dict(base, auto_submit=True))
+        self.assertTrue(ok_yes)
+        self.assertIn(("click", "#go"), p_yes.actions)  # 授权 → 点
+        self.assertFalse(mcp_autoconnect._submit_pending(dict(base, auto_submit=True)))
+
+    def test_default_auto_submit_is_false(self):
+        # 显式默认：声明 submit 的适配器默认不自动提交；仅揭示型（stripe）显式开
+        self.assertFalse(mcp_autoconnect.PROVIDER_ADAPTERS["github"].get("auto_submit"))
+        self.assertFalse(mcp_autoconnect.PROVIDER_ADAPTERS["figma"].get("auto_submit"))
+        self.assertTrue(mcp_autoconnect.PROVIDER_ADAPTERS["stripe"].get("auto_submit"))
+        # _submit_pending：有 submit 且未授权 → 需要用户点
+        self.assertTrue(mcp_autoconnect._submit_pending({"submit": "#go"}))
+        self.assertFalse(mcp_autoconnect._submit_pending({"submit": "", "auto_submit": False}))
+        self.assertFalse(mcp_autoconnect._submit_pending({"submit": "#go", "auto_submit": True}))
+
+    # ---- N1：越域重定向不得填表/捕获
+    def test_untrusted_redirect_stops_before_fill(self):
+        page = _FakePage(body="sign in", goto_url="https://evil.example/steal")
+        ctx, pw, p_launch, p_edge, p_pw = self._patch_browser(page)
+        with p_launch, p_edge, p_pw:
+            res = mcp_autoconnect.browser_register(self.project, "github", self._cand(), "github")
+        self.assertEqual(res["tier"], "L1")
+        self.assertEqual(mcp_autoconnect._load_session(res["task_id"])["step"], "untrusted")
+        self.assertEqual(page.actions, [])  # 越域不得发生任何填表动作
+
+    def test_untrusted_redirect_after_fill_blocks_capture(self):
+        class _RedirectOnFillPage(_FakePage):
+            def locator(self, selector):
+                page = self
+
+                class _L(_FakeLocator):
+                    def fill(self, value):
+                        super().fill(value)
+                        page.url = "https://evil.example/after"  # 填表后跳去越域
+
+                return _L(page, selector)
+
+        adapter = {"tier": "L0", "domains": ("github.com",),
+                   "fields": [{"selector": "#f", "action": "fill", "value": "v"}],
+                   "submit": "", "auto_submit": True,
+                   "token_selectors": ["#t"], "token_pattern": r"ghp_[A-Za-z0-9]{30,}",
+                   "secret_provider": "x"}
+        page = _RedirectOnFillPage(url="https://github.com/settings/tokens/new",
+                                   values={"#t": "ghp_" + "a" * 36})
+        with patch.object(mcp_autoconnect, "_launch_edge", lambda d: (_FakePW(), _FakeContext(page))):
+            out = mcp_autoconnect._browser_run("ac_untrusted", "/tmp/x", adapter,
+                                               "https://github.com/settings/tokens/new")
+        self.assertEqual(out["outcome"], "l1")
+        self.assertEqual(out["step"], "untrusted")  # 未捕获越域页上的 token
+        self.assertNotIn("token", out)
+
+    # ---- L1：命中挑战 → 保活 + waiting_user + user_prompt
+    def test_l1_on_challenge_keeps_session(self):
+        page = _FakePage(url="https://github.com/settings/tokens/new",
+                         body="Please verify your email to continue")
+        ctx, pw, p_launch, p_edge, p_pw = self._patch_browser(page)
+        with p_launch, p_edge, p_pw:
+            res = mcp_autoconnect.browser_register(self.project, "github", self._cand(), "github")
+        self.assertEqual(res["tier"], "L1")
+        sess = mcp_autoconnect._load_session(res["task_id"])
+        self.assertEqual(sess["status"], "waiting_user")
+        self.assertEqual(sess["step"], "challenge")
+        self.assertTrue(sess["user_prompt"])
+        self.assertEqual(sess["provider"], "github")
+        # live 会话保活（用户要看验证码）
+        self.assertIn(res["task_id"], mcp_autoconnect._BROWSER_SESSIONS)
+
+    # ---- L1 → resume 回 L0 判定
+    def test_resume_advances_l1_to_l0(self):
+        page_challenge = _FakePage(url="https://github.com/login", body="sign in to continue")
+        ctx, pw, p_launch, p_edge, p_pw = self._patch_browser(page_challenge)
+        with p_launch, p_edge, p_pw:
+            start = mcp_autoconnect.browser_register(self.project, "github", self._cand(), "github")
+        self.assertEqual(start["tier"], "L1")
+
+        token = "ghp_" + "b" * 36
+        page_ok = _FakePage(url="https://github.com/settings/tokens", body="Done",
+                            values={"#new-oauth-token": token})
+        with mcp_autoconnect._BROWSER_SESSIONS_LOCK:
+            mcp_autoconnect._BROWSER_SESSIONS[start["task_id"]] = {
+                "pw": pw, "context": ctx, "page": page_ok,
+                "context_dir": "/nonexistent", "adapter": mcp_autoconnect.select_provider_adapter("github")}
+        res = mcp_autoconnect.register_resume(start["task_id"])
+        self.assertEqual(res["tier"], "L0")
+        self.assertEqual(res["status"], "done")
+        self.assertEqual(secrets_store.load(self.project, "github"), token)
+        self.assertNotIn(token, self._sessions_raw())
+
+    def test_resume_unknown_session_errors(self):
+        res = mcp_autoconnect.register_resume("ac_does_not_exist")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["tier"], "L2")
+
+    # ---- commit：只回 provider 名，凭证只进 secrets_store
+    def test_commit_stores_and_marks_done(self):
+        mcp_autoconnect._persist_session("ac_commit", "L1", "https://github.com/x", "/tmp/x",
+                                         status="waiting_user", provider="github", root=self.project)
+        token = "ghp_" + "c" * 36
+        res = mcp_autoconnect.register_commit(self.project, "ac_commit", {"github": token})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["stored"], ["github"])
+        self.assertNotIn(token, str(res))
+        self.assertEqual(secrets_store.load(self.project, "github"), token)
+        self.assertEqual(mcp_autoconnect._load_session("ac_commit")["status"], "done")
+        self.assertNotIn(token, self._sessions_raw())
+
+    def test_commit_empty_without_capture_fails(self):
+        # 空凭证 + 会话无已捕获凭证 → 不静默成功
+        res = mcp_autoconnect.register_commit(self.project, "ac_no_such_session", {})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["stored"], [])
+        self.assertTrue(res["error"])
+
+    def test_commit_empty_reuses_captured_provider(self):
+        # 空凭证但会话已在本轮捕获到凭证 → stored=[provider]，不重复要明文
+        token = "sk_test_" + "e" * 24
+        page = _FakePage(url="https://dashboard.stripe.com/test/apikeys", body="Test keys",
+                         values={"input[readonly][type='text']": token})
+        ctx, pw, p_launch, p_edge, p_pw = self._patch_browser(page)
+        with p_launch, p_edge, p_pw:
+            start = mcp_autoconnect.browser_register(self.project, "stripe", self._stripe_cand(), "stripe")
+        self.assertEqual(start["tier"], "L0")
+        res = mcp_autoconnect.register_commit(self.project, start["task_id"], {})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["stored"], ["stripe"])
+        self.assertNotIn(token, str(res))
+
+    def test_commit_idempotent(self):
+        mcp_autoconnect._persist_session("ac_idem", "L1", "https://github.com/x", "/tmp/x",
+                                         status="waiting_user", provider="github", root=self.project)
+        token = "ghp_" + "f" * 36
+        first = mcp_autoconnect.register_commit(self.project, "ac_idem", {"github": token})
+        second = mcp_autoconnect.register_commit(self.project, "ac_idem", {"github": token})
+        self.assertTrue(first["ok"] and second["ok"])
+        self.assertEqual(first["stored"], second["stored"])
+        self.assertEqual(secrets_store.load(self.project, "github"), token)
+
+    # ---- 线程亲和：所有触 playwright 的操作必须在同一 executor 线程
+    def test_browser_ops_run_on_single_executor_thread(self):
+        token = "sk_test_" + "d" * 24
+        names = []
+
+        def fake_launch(context_dir):
+            names.append(threading.current_thread().name)
+            page = _FakePage(url="https://dashboard.stripe.com/test/apikeys", body="Test keys",
+                             values={"input[readonly][type='text']": token})
+            return _FakePW(), _FakeContext(page)
+
+        with patch.object(mcp_autoconnect, "_launch_edge", fake_launch), \
+             patch.object(mcp_autoconnect, "_edge_available", lambda: True), \
+             patch.object(mcp_autoconnect, "_playwright_available", lambda: True):
+            r1 = mcp_autoconnect.browser_register(self.project, "stripe", self._stripe_cand(), "stripe")
+        self.assertEqual(r1["tier"], "L0")
+        self.assertTrue(names)
+        self.assertTrue(all(n.startswith("mcp-browser") for n in names), names)
+        self.assertNotEqual(names[0], threading.current_thread().name)
+        self.assertTrue(all(n == names[0] for n in names), names)  # 单 worker → 同线程
+
+        # resume 复用 live page 时不触发 relaunch，但仍必须由同一 executor 线程执行
+        mcp_autoconnect._persist_session("ac_resume_thread", "L1",
+                                         "https://dashboard.stripe.com/test/apikeys",
+                                         "/nonexistent", status="waiting_user",
+                                         provider="stripe", root=self.project)
+        with mcp_autoconnect._BROWSER_SESSIONS_LOCK:
+            mcp_autoconnect._BROWSER_SESSIONS["ac_resume_thread"] = {
+                "pw": _FakePW(), "context": _FakeContext(_FakePage()),
+                "page": _FakePage(url="https://dashboard.stripe.com/test/apikeys",
+                                  values={"input[readonly][type='text']": token}),
+                "context_dir": "/nonexistent",
+                "adapter": mcp_autoconnect.select_provider_adapter("stripe")}
+        r2 = mcp_autoconnect.register_resume("ac_resume_thread")
+        self.assertEqual(r2["tier"], "L0")
+        self.assertTrue(all(n.startswith("mcp-browser") for n in names), names)
+
+    # ---- N3：resume 落库缺 root 不得假成功
+    def test_resume_l0_without_root_not_done(self):
+        token = "sk_test_" + "g" * 24
+        mcp_autoconnect._persist_session("ac_noroot", "L1",
+                                         "https://dashboard.stripe.com/test/apikeys",
+                                         "/nonexistent", status="waiting_user",
+                                         provider="stripe", root="")  # root 缺失
+        with mcp_autoconnect._BROWSER_SESSIONS_LOCK:
+            mcp_autoconnect._BROWSER_SESSIONS["ac_noroot"] = {
+                "pw": _FakePW(), "context": _FakeContext(_FakePage()),
+                "page": _FakePage(url="https://dashboard.stripe.com/test/apikeys",
+                                  values={"input[readonly][type='text']": token}),
+                "context_dir": "/nonexistent",
+                "adapter": mcp_autoconnect.select_provider_adapter("stripe")}
+        res = mcp_autoconnect.register_resume("ac_noroot")
+        self.assertFalse(res["ok"])
+        self.assertTrue(res.get("error"))
+        # 绝不置 done 造成假成功
+        self.assertNotEqual(mcp_autoconnect._load_session("ac_noroot").get("status"), "done")
+
+    # ---- 导航越域拒绝（防跨域填凭证）
+    def test_provider_url_trust_gate(self):
+        adapter = mcp_autoconnect.select_provider_adapter("github")
+        self.assertTrue(mcp_autoconnect._provider_url_trusted("https://github.com/settings/tokens", adapter))
+        self.assertFalse(mcp_autoconnect._provider_url_trusted("https://evil.example/x", adapter))
 
 
 if __name__ == "__main__":

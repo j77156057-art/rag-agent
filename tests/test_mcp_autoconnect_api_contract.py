@@ -126,19 +126,30 @@ class ProbeEndpointContractTests(_TmpProject):
 
 
 class RegisterEndpointContractTests(_TmpProject):
-    def test_register_start_returns_l2_contract(self):
+    def test_register_start_response_shape_and_l2_degrade(self):
         cfg = {
             "transport": "stdio", "command": "npx", "args": ["-y", "x"],
             "url": "", "env": {}, "headers": {},
             "provenance": {"url": "https://github.com/owner/repo", "domain": "github.com"},
             "command_unresolved": False,
         }
-        r = mcp_autoconnect.browser_register(self.project, "github-server", cfg, "github.com")
-        # 端点返回 {ok, task_id, tier, url, note}
+        # 端点返回 {ok, task_id, tier, url, note}；无 Edge/playwright 时诚实降级 L2
+        with patch.object(mcp_autoconnect, "_edge_available", lambda: False), \
+             patch.object(mcp_autoconnect, "_playwright_available", lambda: False):
+            r = mcp_autoconnect.browser_register(self.project, "github-server", cfg, "github.com")
         for k in ("ok", "task_id", "tier", "url", "note"):
             self.assertIn(k, r)
+        self.assertIn(r["tier"], ("L0", "L1", "L2"))
         self.assertEqual(r["tier"], "L2")
         self.assertIn("github.com", r["url"])
+
+    def test_register_commit_response_shape(self):
+        r = mcp_autoconnect.register_commit(self.project, "", {"github": "ghp_" + "z" * 36})
+        self.assertIn("ok", r)
+        self.assertIn("stored", r)
+        self.assertEqual(r["stored"], ["github"])
+        # 响应绝不含明文
+        self.assertNotIn("ghp_", str(r))
 
 
 class ConfirmCredentialFlowTests(_TmpProject):

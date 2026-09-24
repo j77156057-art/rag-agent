@@ -178,6 +178,7 @@ import project_state
 from mcp_autoconnect import (
     auto_connect_pipeline, probe_candidate, browser_register,
     vision_extract_params, AutoConnectError,
+    register_resume, register_commit,
 )
 import mcp_capabilities
 import web_export
@@ -3395,18 +3396,20 @@ async def mcp_autoconnect_register_status_ep(task_id: str):
 
 @app.post("/api/mcp/autoconnect/register/resume")
 async def mcp_autoconnect_register_resume_ep(req: McpRegisterResumeReq):
-    """L1 用户点继续后续跑（TODO：与 browser_register 的 L1 态对接）。"""
-    return {"ok": True, "task_id": req.task_id, "note": "L1 续跑待实现（IMPL-PLAN §3.3 TODO）"}
+    """L1 用户点「继续」后续跑：复用 live context / 按 context_dir 重开 → 回 L0 判定。
+
+    返回 {ok, task_id, tier, status, user_prompt?, url?, step?, error?}。
+    """
+    try: return await run_in_threadpool(register_resume, req.task_id)
+    except AutoConnectError as e: return {"ok": False, "task_id": req.task_id, "tier": "L2", "error": str(e)}
 
 @app.post("/api/mcp/autoconnect/register/commit")
 async def mcp_autoconnect_register_commit_ep(req: McpRegisterCommitReq):
-    """把用户回填的凭证写入 secrets_store（不落明文），返回已存 provider 列表。"""
+    """把用户回填 / L1 捕获的凭证写入 secrets_store（不落明文），返回已存 provider 列表。"""
     root = _project_root_or_error()
     if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
     try:
-        for prov, val in (req.credentials or {}).items():
-            secrets_store.save(root, prov, val)
-        return {"ok": True, "stored": list((req.credentials or {}).keys())}
+        return await run_in_threadpool(register_commit, root, req.task_id, req.credentials)
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 

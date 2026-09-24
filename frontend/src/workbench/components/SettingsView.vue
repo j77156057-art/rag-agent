@@ -2,7 +2,7 @@
 // 统一设置页：左侧分组导航（用量费用 / 网络搜索 / MCP / 智能体），右侧对应面板。
 // 网络搜索与 URL 获取走 settingsApi（复用 /api/config 的保存通道，密钥不回显）；
 // MCP 走 mcpApi；智能体为本地预设（localStorage），后续可升级为后端持久化。
-import { ref, watch, computed } from 'vue'
+import { ref, watch, computed, onUnmounted } from 'vue'
 import {
   settingsApi, mcpApi, harnessApi,
   WEB_SEARCH_PROVIDERS, WEB_FETCH_PROVIDERS,
@@ -10,6 +10,7 @@ import {
   type McpCapabilityCandidate,
   type BudgetStatus, type TraceSummary,
   type McpAutoConnectCandidate, type McpAutoConnectConfig, type McpProbeRes,
+  type McpRegisterStatusRes, type McpRegisterTier, type McpRegisterState,
 } from '../api'
 import Icon from './Icon.vue'
 
@@ -124,6 +125,14 @@ const wfNeedsUrl = computed(() => WEB_FETCH_PROVIDERS.find(p => p.value === wfPr
 const mcpServers = ref<McpServer[]>([])
 const mcpLoading = ref(false)
 const mcpError = ref('')
+// 凭证落盘成功后的短暂提示（MCP 面板内，几秒后自动消失）
+const mcpNotice = ref('')
+let mcpNoticeTimer: number | null = null
+function notifyMcp(msg: string) {
+  mcpNotice.value = msg
+  if (mcpNoticeTimer !== null) window.clearTimeout(mcpNoticeTimer)
+  mcpNoticeTimer = window.setTimeout(() => { mcpNotice.value = ''; mcpNoticeTimer = null }, 6000)
+}
 const mcpForm = ref({ key: '', label: '', transport: 'stdio' as 'stdio' | 'http', command: '', args: '', url: '' })
 const mcpAdding = ref(false)
 const mcpCapabilities = ref<{ active: Record<string, McpCapabilityCandidate>; pending: Record<string, McpCapabilityCandidate> }>({ active: {}, pending: {} })
@@ -150,15 +159,24 @@ const acConfirmBusy = ref(false)
 const acConfirmError = ref('')
 const acShowRaw = ref(false)
 
-// 注册代管（C4）：v1 后端诚实降级为 L2（人工回填凭证）
+// 注册代管（C4）：L0 自动填充进度 / L1 停-继续 / L2 人工回填（默认与异常兜底路径）
 const regOpen = ref(false)
-const regTier = ref<'L0' | 'L1' | 'L2'>('L2')
+const regTier = ref<McpRegisterTier>('L2')
 const regTaskId = ref('')
 const regUrl = ref('')
 const regCredential = ref('')
 const regSecretKey = ref('')
 const regError = ref('')
 const regCommitting = ref(false)
+// L0/L1 会话态：由 registerStatus 轮询回填
+const regStatus = ref<McpRegisterState>('waiting_user')
+const regUserPrompt = ref('')
+const regStep = ref('')
+// register/start 返回的降级原因/指引（L1/L2 展示，如「未收录该 provider…已降级 L2」）
+const regNote = ref('')
+const regResuming = ref(false)
+let regPollTimer: number | null = null
+let regPollTries = 0
 
 // ---------------- 智能体（本地预设） ----------------
 interface AgentPreset { id: string; name: string; model: string; system: string }
@@ -403,27 +421,216 @@ async function confirmConnect() {
   } finally { acConfirmBusy.value = false }
 }
 
-// 注册代管（C4）：先问后端定档（L0/L1/L2），v1 后端诚实降级为 L2；不可达时回退 L2
+// 注册代管（C4）：先问后端定档（L0/L1/L2）。L0=自动填充进度；L1=停-继续；L2=人工回填兜底。
+const REG_POLL_MS = 1500
+const REG_POLL_MAX = 160 // ≈4 分钟上限；超时兜底转 L2，绝不死等
+const REG_L0_STEPS = ['opening', 'filling', 'submitting', 'capturing'] as const
+
+const regStepText = computed(() => {
+  const map: Record<string, string> = {
+    // L0 自动步
+    opening: '打开官方注册页',
+    filling: '填写表单字段',
+    submitting: '提交表单',
+    capturing: '读取并保存凭证',
+    // L1 停点步（后端 step 枚举）
+    fill: '填写注册表单',
+    challenge: '等待你完成人机验证',
+    submit: '等待你点击提交/生成',
+    capture: '读取并保存凭证',
+    untrusted: '来源未受信，转为手动',
+  }
+  return map[regStep.value] || regStep.value
+})
+// 后端只回「步名」不给百分比：按序号推进；未知步名返回 0 → 走不确定进度条
+const regProgress = computed(() => {
+  const i = (REG_L0_STEPS as readonly string[]).indexOf(regStep.value)
+  return i < 0 ? 0 : Math.round(((i + 1) / (REG_L0_STEPS.length + 1)) * 100)
+})
+type RegView = 'manual' | 'running' | 'waiting'
+/** 弹窗视图：L2=人工回填；非 L2 且 running=自动进行中；其余（waiting_user）=停-继续。 */
+const regView = computed<RegView>(() =>
+  regTier.value === 'L2' ? 'manual' : regStatus.value === 'running' ? 'running' : 'waiting')
+
+const REG_L1_FALLBACK = '页面需要你手动完成一步（如验证码 / 邮箱验证），完成后点下面的按钮，我会接着跑。'
+/**
+ * L1 主提示：**优先后端 `note`**（step 专属，如「已自动填表到提交前，请在浏览器中点『创建/生成』后回来点继续」），
+ * 再退 `user_prompt`（adapter 通用语），最后兜底。后端 note 只随 start 回传，故整段会话保留。
+ */
+const regL1Prompt = computed(() => regNote.value || regUserPrompt.value || REG_L1_FALLBACK)
+/** 次级提示：note 与 user_prompt 都有且不同（如续跑时后端给了新的 challenge 提示）→ 补一行，避免丢信息。 */
+const regL1Extra = computed(() =>
+  regNote.value && regUserPrompt.value && regUserPrompt.value !== regNote.value ? regUserPrompt.value : '')
+
+function stopRegPoll() {
+  if (regPollTimer !== null) { window.clearInterval(regPollTimer); regPollTimer = null }
+}
+
+function startRegPoll() {
+  stopRegPoll()
+  regPollTries = 0
+  regPollTimer = window.setInterval(() => { void pollRegStatus() }, REG_POLL_MS)
+}
+
+function closeRegister() {
+  stopRegPoll()
+  regOpen.value = false
+}
+
+/** 转人工回填（L2）：自动态失败/超时/用户主动时的安全兜底，绝不把用户卡在死路。 */
+function switchToManual() {
+  stopRegPoll()
+  regTier.value = 'L2'
+  regStatus.value = 'waiting_user'
+  regStep.value = ''
+  regError.value = ''
+}
+
+/** 把已存入钥匙串的凭证回写成连接器的 @secret 引用（L0/L1 自动、L2 手动共用）。 */
+function applySecretToCandidate() {
+  const c = acSelected.value
+  if (!c) return
+  acSelected.value = {
+    ...c,
+    config: {
+      ...c.config,
+      env: { ...(c.config.env || {}), [regSecretKey.value.toUpperCase()]: `@secret:${regSecretKey.value}` },
+    },
+  }
+}
+
+/**
+ * L0/L1 成功收尾：凭证由后端在捕获时写入 secrets_store，这里复用既有 commit 通道做**落盘确认**。
+ * 后端契约：空入参 + 已捕获凭证 → {ok:true, stored:[provider]}；无捕获 → {ok:false}+error。
+ * 故 ok:false / 抛错都**不得当作成功**——留在弹窗展示原因并转人工兜底（绝不吞错成成功）。
+ */
+async function finalizeAutoRegister() {
+  stopRegPoll()
+  let ok = false
+  let errMsg = ''
+  try {
+    // 明文绝不回传前端：不带 credentials，仅触发后端落盘确认。
+    const r = await mcpApi.registerCommit(regTaskId.value, {})
+    ok = r.ok === true
+    if (!ok) errMsg = r.error || '凭证落盘未确认'
+  } catch (e) {
+    errMsg = (e as { message?: string }).message || '凭证落盘确认失败'
+  }
+  if (!ok) {
+    // 诚实兜底：不显示成功、不关弹窗；转人工回填并展示原因（保留 regError，不走会清错的 switchToManual）
+    regTier.value = 'L2'
+    regStatus.value = 'waiting_user'
+    regStep.value = ''
+    regError.value = `${errMsg}。请手动粘贴凭证后完成。`
+    return
+  }
+  applySecretToCandidate()
+  notifyMcp('凭证已写入本机钥匙串（secrets_store），可继续「确认添加并启用」。')
+  regOpen.value = false
+  acNeedRegister.value = false
+}
+
+function applyRegStatus(r: McpRegisterStatusRes) {
+  if (r.tier) regTier.value = r.tier
+  if (r.status) regStatus.value = r.status
+  if (r.user_prompt) regUserPrompt.value = r.user_prompt
+  regStep.value = r.step || ''
+  if (r.url) regUrl.value = r.url
+}
+
+/** 轮询会话态：只在非 L2 且未到终态时进行；达上限或连续传输失败则兜底转 L2。 */
+async function pollRegStatus() {
+  if (!regOpen.value || regTier.value === 'L2') { stopRegPoll(); return }
+  const current = regStatus.value
+  if (current === 'done' || current === 'failed') { stopRegPoll(); return }
+  if (regPollTries >= REG_POLL_MAX) {
+    regError.value = '等待自动注册超时，已转为手动填写。'
+    switchToManual()
+    return
+  }
+  regPollTries++
+  try {
+    applyRegStatus(await mcpApi.registerStatus(regTaskId.value))
+  } catch (e) {
+    // 传输失败：先多试几次；达上限再兜底，避免一次网络抖动就打回手动
+    if (regPollTries >= REG_POLL_MAX) {
+      stopRegPoll()
+      regError.value = (e as { message?: string }).message || '读取注册状态失败'
+      switchToManual()
+    }
+    return
+  }
+  if (regStatus.value === 'done') { await finalizeAutoRegister(); return }
+  if (regStatus.value === 'failed') {
+    regError.value = '自动注册未成功，已转为手动填写。'
+    switchToManual()
+    return
+  }
+  // running 继续轮；waiting_user（L1 撞到验证码/2FA）停下，等用户点「继续」
+  if (regStatus.value === 'waiting_user') stopRegPoll()
+}
+
 async function openRegister(c: McpAutoConnectCandidate) {
+  stopRegPoll()
   acSelected.value = c
   regCredential.value = ''
   regSecretKey.value = c.config.provenance?.domain || 'provider'
   regError.value = ''
+  regUserPrompt.value = ''
+  regStep.value = ''
+  regNote.value = ''
   regOpen.value = true
   regTier.value = 'L2'
+  regStatus.value = 'waiting_user'
   regUrl.value = c.config.provenance?.url || ''
-  regTaskId.value = `ac-${Date.now().toString(16)}`
+  regTaskId.value = `ac-${Date.now().toString(16)}` // 后端不可达时的本地兜底 id
   try {
     const r = await mcpApi.registerStart(candidateKey(c), c.config, regSecretKey.value)
-    if (r.ok) {
-      regTier.value = r.tier
-      regUrl.value = r.url || regUrl.value
-      regTaskId.value = r.task_id || regTaskId.value
-    }
+    if (!r.ok) { regTier.value = 'L2'; return }
+    regTier.value = r.tier
+    regUrl.value = r.url || regUrl.value
+    regNote.value = r.note || ''
+    regTaskId.value = r.task_id || regTaskId.value
+    if (r.tier === 'L0') { regStatus.value = 'running'; startRegPoll(); void pollRegStatus() }
+    else if (r.tier === 'L1') { regStatus.value = 'waiting_user'; startRegPoll(); void pollRegStatus() }
+    // L2：保留纯手动回填 UI，不轮询
   } catch {
-    regTier.value = 'L2' // 后端不可达：诚实降级为 L2（与 v1 设计一致）
+    regTier.value = 'L2' // 后端不可达：诚实降级为 L2（人工回填兜底）
   }
 }
+
+/** L1「我已完成，继续」：续跑同一持久会话；撞到下一个挑战会再次 waiting_user。 */
+async function resumeRegister() {
+  if (regTier.value === 'L2') return
+  regResuming.value = true
+  regError.value = ''
+  try {
+    const r = await mcpApi.registerResume(regTaskId.value)
+    if (r.tier) regTier.value = r.tier
+    if (r.status) regStatus.value = r.status
+    if (r.user_prompt) regUserPrompt.value = r.user_prompt
+    if (r.step) regStep.value = r.step
+    if (r.url) regUrl.value = r.url
+    if (r.ok === false) {
+      // 业务态失败（如无 live 会话）：保留提示，不当作传输错误
+      regError.value = r.error || '续跑未成功，请重试或改用手动填写。'
+      if (regStatus.value !== 'running') return
+    }
+    if (regStatus.value === 'done') { await finalizeAutoRegister(); return }
+    if (regStatus.value === 'failed') {
+      regError.value = r.error || '自动注册未成功，已转为手动填写。'
+      switchToManual()
+      return
+    }
+    if (regStatus.value === 'running') { startRegPoll(); void pollRegStatus() }
+  } catch (e) {
+    regError.value = (e as { message?: string }).message || '续跑请求失败'
+  } finally {
+    regResuming.value = false
+  }
+}
+
+/** L2：人工回填凭证 → 写钥匙串 → 回写 @secret 引用（原流程，保持不变）。 */
 async function commitRegister() {
   if (!regCredential.value.trim()) { regError.value = '请先填写凭证'; return }
   regCommitting.value = true
@@ -431,16 +638,9 @@ async function commitRegister() {
   try {
     const r = await mcpApi.registerCommit(regTaskId.value, { [regSecretKey.value]: regCredential.value.trim() })
     if (!r.ok) { regError.value = r.error || '凭证保存失败'; return }
-    if (acSelected.value) {
-      acSelected.value = {
-        ...acSelected.value,
-        config: {
-          ...acSelected.value.config,
-          env: { ...(acSelected.value.config.env || {}), [regSecretKey.value.toUpperCase()]: `@secret:${regSecretKey.value}` },
-        },
-      }
-    }
-    regOpen.value = false
+    applySecretToCandidate()
+    notifyMcp('凭证已写入本机钥匙串（secrets_store），可继续「确认添加并启用」。')
+    closeRegister()
     acNeedRegister.value = false
   } catch (e) {
     regError.value = (e as { message?: string }).message || '凭证保存失败'
@@ -496,13 +696,21 @@ async function removeMcp(key: string) {
 
 // immediate：组件在首次打开设置时才由 App 异步挂载，挂载即 visible=true，需立即加载
 watch(() => props.visible, async (v) => {
-  if (!v) return
+  if (!v) { stopRegPoll(); return } // 关掉设置即停轮询，绝不让定时器泄漏
   await Promise.all([loadConfig(), loadMcp(), loadUsage()])
   loadAgents()
   tab.value = 'usage'
   savedMsg.value = ''
   usageSaved.value = ''
 }, { immediate: true })
+
+// 注册弹窗关闭 → 立即停轮询
+watch(regOpen, (open) => { if (!open) stopRegPoll() })
+
+onUnmounted(() => {
+  stopRegPoll()
+  if (mcpNoticeTimer !== null) window.clearTimeout(mcpNoticeTimer)
+})
 
 function close() { emit('close') }
 </script>
@@ -662,6 +870,7 @@ function close() { emit('close') }
             <h4 class="sv-h4">MCP 自动连接</h4>
             <p class="sv-hint">描述你想要的能力，DocMind 会读取官方文档、提取连接命令、试连并请你确认后写入本机。</p>
             <p v-if="mcpError" class="sv-err">{{ mcpError }}</p>
+            <p v-if="mcpNotice" class="sv-ok" data-role="mcp-notice">{{ mcpNotice }}</p>
 
             <!-- C1：自动连接向导主流程（步骤条） -->
             <div class="sv-search-row">
@@ -793,32 +1002,70 @@ function close() { emit('close') }
               </div>
             </div>
 
-            <!-- C4：注册代管弹窗（v1 诚实降级为 L2） -->
-            <div v-if="regOpen" class="sv-mask" data-dialog="mcp-register" :data-tier="regTier" @click.self="regOpen = false">
+            <!-- C4：注册代管弹窗（L0 自动填充 / L1 停-继续 / L2 人工回填兜底） -->
+            <div v-if="regOpen" class="sv-mask" data-dialog="mcp-register" :data-tier="regTier" :data-status="regStatus" @click.self="closeRegister">
               <div class="sv-dialog" style="width: 440px">
                 <div class="sv-dialog-head">
-                  <Icon name="lock" :size="24" />
-                  <h3 class="sv-title">这一步需要你手动完成</h3>
+                  <Icon :name="regView === 'running' ? 'zap' : regView === 'waiting' ? 'user-check' : 'lock'" :size="24" />
+                  <h3 class="sv-title">{{ regView === 'running' ? '自动填充注册信息' : regView === 'waiting' ? '需要你确认一步' : '这一步需要你手动完成' }}</h3>
                 </div>
                 <div class="sv-dialog-body">
-                  <p class="sv-hint">这个连接器无法自动配置——先在官网创建账号并拿到连接凭证（API Key），填好后我帮你写入并测试。</p>
-                  <ol class="sv-guide"><li>注册账号</li><li>创建凭证</li><li>复制 Key</li></ol>
-                  <a v-if="regUrl" class="sv-btn sv-primary sv-ext" :href="regUrl" target="_blank" rel="noreferrer">
-                    <Icon name="external-link" :size="16" />去官网创建凭证
-                  </a>
-                  <label class="sv-label">API Key / 连接凭证</label>
-                  <div class="sv-input-wrap">
-                    <Icon name="lock" :size="20" />
-                    <input v-model="regCredential" class="sv-input" type="password" :placeholder="'粘贴 API Key'" autocomplete="off" spellcheck="false" />
-                  </div>
-                  <p class="sv-note" data-tone="neutral">凭证会存进本机钥匙串（OS keychain），仅该连接器调用时使用，不会外传。</p>
-                  <p v-if="regError" class="sv-err">{{ regError }}</p>
+                  <!-- 自动进行中（L0 填表 / L1 续跑）：进度态 -->
+                  <template v-if="regView === 'running'">
+                    <p class="sv-hint">DocMind 正在官方页面按文档结构填入并提交，全程限定在可信域内完成；凭证不会进入对话上下文。</p>
+                    <div class="sv-ac-state" data-role="l0-progress">
+                      <Icon name="loader" :size="20" class="dm-spin" />
+                      <span>自动填充中{{ regStep ? '：' + regStepText : '…' }}</span>
+                    </div>
+                    <div class="sv-progress" :data-determinate="regProgress > 0 ? '1' : '0'" role="progressbar" aria-label="自动填充进度">
+                      <span :style="regProgress > 0 ? { width: regProgress + '%' } : {}"></span>
+                    </div>
+                    <p class="sv-note" data-tone="neutral">浏览器会保持打开；若页面弹出验证码或二次验证，会自动停下等你确认。</p>
+                  </template>
+
+                  <!-- 停-继续：优先显示后端 note（step 专属），否则 user_prompt，用户点一下继续 -->
+                  <template v-else-if="regView === 'waiting'">
+                    <p class="sv-hint" data-role="l1-prompt">{{ regL1Prompt }}</p>
+                    <p v-if="regL1Extra" class="sv-note" data-tone="neutral" data-role="l1-prompt-extra">{{ regL1Extra }}</p>
+                    <div class="sv-l1-wait" data-role="l1-wait">
+                      <Icon name="user-check" :size="20" />
+                      <span>浏览器窗口保持打开，DocMind 会在你完成后继续。</span>
+                    </div>
+                    <a v-if="regUrl" class="sv-btn sv-primary sv-ext" :href="regUrl" target="_blank" rel="noreferrer">
+                      <Icon name="external-link" :size="16" />在浏览器打开注册页
+                    </a>
+                    <p v-if="regError" class="sv-err">{{ regError }}</p>
+                  </template>
+
+                  <!-- 人工回填（默认与异常兜底路径） -->
+                  <template v-else>
+                    <p class="sv-hint">这个连接器无法自动配置——先在官网创建账号并拿到连接凭证（API Key），填好后我帮你写入并测试。</p>
+                    <p v-if="regNote" class="sv-note" data-tone="neutral" data-role="reg-note">{{ regNote }}</p>
+                    <ol class="sv-guide"><li>注册账号</li><li>创建凭证</li><li>复制 Key</li></ol>
+                    <a v-if="regUrl" class="sv-btn sv-primary sv-ext" :href="regUrl" target="_blank" rel="noreferrer">
+                      <Icon name="external-link" :size="16" />去官网创建凭证
+                    </a>
+                    <label class="sv-label">API Key / 连接凭证</label>
+                    <div class="sv-input-wrap">
+                      <Icon name="lock" :size="20" />
+                      <input v-model="regCredential" class="sv-input" type="password" placeholder="粘贴 API Key" autocomplete="off" spellcheck="false" />
+                    </div>
+                    <p class="sv-note" data-tone="neutral">凭证会存进本机钥匙串（OS keychain），仅该连接器调用时使用，不会外传。</p>
+                    <p v-if="regError" class="sv-err">{{ regError }}</p>
+                  </template>
                 </div>
                 <div class="sv-dialog-actions">
-                  <button class="sv-mini" @click="regOpen = false">取消</button>
-                  <button class="sv-btn sv-primary" data-action="continue" :disabled="regCommitting || !regCredential.trim()" @click="commitRegister">
+                  <button class="sv-mini" :data-action="regView === 'manual' ? 'cancel' : 'manual'" @click="regView === 'manual' ? closeRegister() : switchToManual()">
+                    {{ regView === 'manual' ? '取消' : '改用手动填写' }}
+                  </button>
+                  <button v-if="regView === 'manual'" class="sv-btn sv-primary" data-action="continue" :disabled="regCommitting || !regCredential.trim()" @click="commitRegister">
                     {{ regCommitting ? '处理中…' : '写入并测试连接' }}
                   </button>
+                  <button v-else-if="regView === 'waiting'" class="sv-btn sv-primary" data-action="resume" :disabled="regResuming" @click="resumeRegister">
+                    <Icon v-if="regResuming" name="loader" :size="16" class="dm-spin" />
+                    <template v-else><Icon name="circle-check" :size="16" />我已完成，继续</template>
+                  </button>
+                  <span v-else class="sv-wait-inline"><Icon name="loader" :size="16" class="dm-spin" />自动进行中…</span>
                 </div>
               </div>
             </div>
@@ -1098,9 +1345,22 @@ function close() { emit('close') }
 .sv-ext { display: inline-flex; align-items: center; gap: 6px; margin: 4px 0; text-decoration: none; }
 .sv-block { width: 100%; margin-top: 10px; justify-content: center; }
 
+/* C4：L0 自动填充进度 / L1 停-继续 */
+.sv-progress { height: 3px; margin: 2px 0; border-radius: var(--radius-pill); background: var(--bg-hover); overflow: hidden; }
+.sv-progress span { display: block; height: 100%; width: 38%; border-radius: var(--radius-pill); background: var(--accent); animation: dm-indeterminate 1.2s var(--ease-standard) infinite; }
+.sv-progress[data-determinate="1"] span { animation: none; }
+@keyframes dm-indeterminate { from { transform: translateX(-110%); } to { transform: translateX(320%); } }
+.sv-l1-wait { display: flex; align-items: center; gap: 8px; margin: 8px 0 2px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-hover); font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+.sv-l1-wait .dm-icon { color: var(--accent); flex: none; }
+.sv-wait-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); }
+
 .dm-spin { animation: dm-spin 1s linear infinite; transform-origin: center; }
 .dm-rot { transition: transform var(--motion-base) var(--ease-standard); transform: rotate(180deg); }
 @keyframes dm-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .dm-spin, .sv-progress span { animation: none; }
+}
 
 @media (max-width: 680px) {
   .sv-box { height: calc(100vh - 20px); max-width: calc(100vw - 20px); }

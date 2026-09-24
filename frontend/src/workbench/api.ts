@@ -2034,20 +2034,47 @@ export interface McpProbeRes {
   tools?: string[]
   error?: string
 }
+/** L0/L1/L2 档位：L0=全自动填表取凭证；L1=遇验证码/2FA 暂停、用户点继续；L2=仅人工回填。 */
+export type McpRegisterTier = 'L0' | 'L1' | 'L2'
+/** 注册会话状态：running=自动进行中；waiting_user=等用户人工完成一步；done=成功；failed=失败。 */
+export type McpRegisterState = 'running' | 'waiting_user' | 'done' | 'failed'
+
 export interface McpRegisterStartRes {
   ok: boolean
   task_id?: string
-  tier: 'L0' | 'L1' | 'L2'
+  tier: McpRegisterTier
   url?: string
   note?: string
   error?: string
 }
+/** GET register/status 展平后的会话字典（后端 autoconnect_sessions.json 的一条）。 */
 export interface McpRegisterStatusRes {
   ok: boolean
-  tier?: string
-  status?: string
-  prompt?: string
+  task_id?: string
+  tier?: McpRegisterTier
+  status?: McpRegisterState
+  url?: string
+  context_dir?: string
   resume_token?: string
+  created_at?: number
+  /** 本次代管的 provider（与 secrets_store / commit 的 stored 同名）。 */
+  provider?: string
+  /** 给用户看的一步提示（如「请在浏览器里完成验证码后点继续」）。L1 展示。 */
+  user_prompt?: string
+  /** 当前自动步子（challenge/submit/untrusted/fill/capture/opening/filling/submitting/capturing）。 */
+  step?: string
+  error?: string
+}
+export interface McpRegisterResumeRes {
+  ok: boolean
+  task_id?: string
+  tier?: McpRegisterTier
+  status?: McpRegisterState
+  url?: string
+  user_prompt?: string
+  step?: string
+  /** 业务态说明（如「没有可续跑的会话」），与传输失败区分。 */
+  error?: string
 }
 export interface McpRegisterCommitRes {
   ok: boolean
@@ -2138,6 +2165,16 @@ export const mcpApi = {
   },
   registerStatus(taskId: string): Promise<McpRegisterStatusRes> {
     return request(`/api/mcp/autoconnect/register/status?task_id=${encodeURIComponent(taskId)}`)
+  },
+  /**
+   * L1「我已完成，继续」：让后端在同一持久会话上续跑（撞到下一个挑战会再次 waiting_user）。
+   *
+   * 走 rawJson：响应里的 `status`（waiting_user/done/failed）与 `user_prompt` 是**业务态**，
+   * 即便后端以 `ok:false` 返回（例如「没有可续跑的 live 会话」）也要读出来渲染，
+   * 不能被通用 request 当成传输失败抛掉（与上面 autoConnectSearch/probe 同一通道约定）。
+   */
+  registerResume(taskId: string): Promise<McpRegisterResumeRes> {
+    return rawJson('/api/mcp/autoconnect/register/resume', { task_id: taskId })
   },
   registerCommit(taskId: string, credentials: Record<string, string>): Promise<McpRegisterCommitRes> {
     return postJson('/api/mcp/autoconnect/register/commit', { task_id: taskId, credentials })

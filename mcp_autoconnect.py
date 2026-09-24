@@ -13,9 +13,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import shutil
+import tempfile
+import threading
 import time
+import concurrent.futures
 import base64
 import urllib.request
 from typing import Any, Callable, Optional
@@ -24,6 +29,8 @@ import mcp_client
 import secrets_store
 import project_state
 from mcp_server_index import match_curated_server, curated_entry_to_config
+
+_log = logging.getLogger("docmind.mcp_autoconnect")
 
 
 # ---------------------------------------------------------------- 常量（白名单，与 R3 并存）
@@ -614,33 +621,149 @@ def vision_extract_params(image_b64: str, root: str) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- 注册代管（L0/L1/L2 降级链）
 
-def browser_register(root: str, key: str, cand: dict[str, Any], provider: str) -> dict[str, Any]:
-    """L0/L1/L2 降级链入口。
+# provider 适配器注册表（数据驱动）：新增 provider = 加一条数据，**不改状态机**。
+# 字段含义：
+#   tier              该 provider 的自动化档（L0 全自动 / L1 自动填表但停在提交或挑战前，
+#                     由用户点后 resume / L2 仅给指引不自动）
+#   aliases           匹配 provider 名 / 来源域 / 产品名的别名（配合域名兜底）
+#   domains           导航可信域（注册页主机必须落在其中，防跨域填凭证）
+#   register_url      注册 / 取凭证页
+#   deep_link         官方预填深链（可选；覆盖 register_url）
+#   fields            确定性填表动作序列 [{selector, action, value}]
+#   submit            提交按钮选择器（空串 = 不需要提交）
+#   auto_submit       是否允许自动点击 submit；默认 False。§5 denylist：创建长期令牌/PAT
+#                     等动作绝不自动 → 保持 False，填到提交前停下走 L1；仅「揭示/复制已存在
+#                     凭证」（如 Stripe 测试键）可设 True
+#   token_selectors   凭证白名单 DOM 选择器集（只读，绝不 eval 页面脚本）
+#   token_pattern     凭证正则（命中才捕获，避免把噪声当凭证）
+#   secret_provider   secrets_store 落库用的 provider key
+#   user_prompt       L1 停等待时给用户看的提示
+DEFAULT_USER_PROMPT = "如页面出现登录 / 验证 / 授权，请在浏览器中完成后点“继续”。"
 
-    v1 状态：系统 Edge + playwright 能力探测已实现；但 L0 全自动填表与 L1 点验证码续跑
-    为 TODO 桩（IMPL-PLAN §3.3），尚未实现。故当前**诚实降级为 L2 手动回填**——不自动
-    拉起浏览器，仅登记会话并返回官方 URL，由前端弹 L2 弹窗引导用户创建凭证。
-    若未来启用 L0/L1，此处再按能力探测走 `playwright channel='msedge'` 长驻会话。
+PROVIDER_ADAPTERS: dict[str, dict[str, Any]] = {
+    "github": {
+        "tier": "L1",  # §7：创建长期令牌不可自动 → 自动填表停在提交前，用户点后 resume
+        "aliases": ("github", "github.com", "github pat", "personal access token"),
+        "domains": ("github.com",),
+        "register_url": "https://github.com/settings/tokens/new",
+        "deep_link": ("https://github.com/settings/tokens/new"
+                      "?description=DocMind&scopes=repo%2Cread%3Auser"),
+        "fields": [{"selector": "#oauth_access_description", "action": "fill", "value": "DocMind"}],
+        "submit": "button:has-text('Generate token')",
+        "auto_submit": False,  # 创建长期令牌属 §5 denylist：绝不自动提交，留给用户点
+        "token_selectors": ["#new-oauth-token", "code.js-token-value",
+                            "input[readonly][type='text']", "code"],
+        "token_pattern": r"ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}",
+        "secret_provider": "github",
+        "user_prompt": "GitHub 需登录与两步验证，请在浏览器中完成后点“继续”。",
+    },
+    "figma": {
+        "tier": "L1",  # §7：创建长期令牌不可自动 → 自动填表停在提交前，用户点后 resume
+        "aliases": ("figma", "figma.com"),
+        "domains": ("figma.com", "www.figma.com"),
+        "register_url": "https://www.figma.com/settings/",
+        "deep_link": "https://www.figma.com/settings/",
+        "fields": [
+            {"selector": "a[href*='personal-access-tokens']", "action": "click"},
+            {"selector": "button:has-text('Generate new token')", "action": "click"},
+        ],
+        "submit": "button:has-text('Generate token')",
+        "auto_submit": False,  # 创建长期令牌属 §5 denylist：绝不自动提交，留给用户点
+        "token_selectors": ["input[readonly][type='text']", "code"],
+        "token_pattern": r"figd_[A-Za-z0-9_-]{20,}",
+        "secret_provider": "figma",
+        "user_prompt": "Figma 需登录，请在浏览器中完成后点“继续”。",
+    },
+    "stripe": {
+        "tier": "L0",
+        "aliases": ("stripe", "stripe.com", "stripe test", "stripe test key"),
+        "domains": ("dashboard.stripe.com", "stripe.com"),
+        "register_url": "https://dashboard.stripe.com/test/apikeys",
+        "deep_link": "https://dashboard.stripe.com/test/apikeys",
+        "fields": [],
+        "submit": "",
+        "auto_submit": True,  # 仅揭示/复制已存在测试键（无创建动作），可自动
+        "token_selectors": ["input[readonly][type='text']", "code"],
+        "token_pattern": r"sk_test_[A-Za-z0-9]{16,}|rk_test_[A-Za-z0-9]{16,}",
+        "secret_provider": "stripe",
+        "user_prompt": "Stripe 测试密钥页需登录，请在浏览器中完成后点“继续”。",
+    },
+    "notion": {
+        "tier": "L1",
+        "aliases": ("notion", "notion.so"),
+        "domains": ("notion.so", "www.notion.so"),
+        "register_url": "https://www.notion.so/my-integrations",
+        "deep_link": "https://www.notion.so/my-integrations",
+        "fields": [],
+        "submit": "",
+        "token_selectors": ["input[readonly]", "code"],
+        "token_pattern": r"secret_[A-Za-z0-9]{20,}|ntn_[A-Za-z0-9]{20,}",
+        "secret_provider": "notion",
+        "user_prompt": "Notion 需登录并在页面内确认集成，请在浏览器中完成后点“继续”。",
+    },
+    "slack": {
+        "tier": "L1",
+        "aliases": ("slack", "slack.com", "slack api"),
+        "domains": ("api.slack.com", "slack.com", "app.slack.com"),
+        "register_url": "https://api.slack.com/apps",
+        "deep_link": "https://api.slack.com/apps",
+        "fields": [],
+        "submit": "",
+        "token_selectors": ["input[readonly]", "code"],
+        "token_pattern": r"xoxb-[A-Za-z0-9-]{20,}|xapp-[A-Za-z0-9-]{20,}",
+        "secret_provider": "slack",
+        "user_prompt": "Slack 需登录并创建工作区应用，请在浏览器中完成后点“继续”。",
+    },
+    "brave": {
+        "tier": "L2",
+        "aliases": ("brave", "brave search", "brave-search"),
+        "domains": ("api.search.brave.com", "brave.com"),
+        "register_url": "https://api.search.brave.com/app/keys",
+        "note": "Brave Search API 需绑定信用卡，首版不做自动注册，请手动创建后回填。",
+    },
+    "google_drive": {
+        "tier": "L2",
+        "aliases": ("google drive", "googledrive", "google_drive", "gdrive"),
+        "domains": ("console.cloud.google.com", "console.developers.google.com"),
+        "register_url": "https://console.cloud.google.com/apis/credentials",
+        "note": "Google Drive 需 Cloud Console 多步配置 + OAuth，首版不做自动注册，请手动创建后回填。",
+    },
+}
+
+# 挑战关键字（本地确定性匹配，只用于「停-继续」判定；页面正文绝不回传模型）。
+CHALLENGE_KEYWORDS: tuple[str, ...] = (
+    "captcha", "recaptcha", "hcaptcha", "cloudflare", "verify you are human",
+    "two-factor", "2fa", "authentication code", "one-time code", "one time code",
+    "verify your email", "confirm your email", "check your email",
+    "enter the code", "enter your password", "confirm your password",
+    "sign in to continue", "sign in to your account", "log in to continue",
+    "add a payment method", "payment method required",
+)
+
+# URL 路径标记（登录/授权跳转即视为需人工的挑战）。
+CHALLENGE_URL_MARKERS: tuple[str, ...] = (
+    "/login", "/signin", "/sign_in", "/session", "/auth/", "/oauth",
+)
+
+# 进程内 live 会话注册表（仿 mcp_client._SESSIONS）：磁盘 context_dir 作崩溃恢复兜底。
+_BROWSER_SESSIONS: dict[str, dict[str, Any]] = {}
+_BROWSER_SESSIONS_LOCK = threading.Lock()
+
+# 所有触 playwright 的操作串行到单一线程：playwright sync API 线程亲和（对象只能在
+# 创建它的线程使用），而 FastAPI 的 run_in_threadpool 每次请求可能换线程——故 launch/
+# goto/detect/fill/capture/close 全部 submit 到该单 worker 执行，保证创建与使用同线程，
+# 跨请求复用 live page 才安全。单 worker 也顺带把并发浏览器请求串行化。
+_BROWSER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="mcp-browser")
+
+
+def _browser_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """把浏览器操作提交到单线程 executor 并等待结果。
+
+    被提交的函数内部自行 try/except 收敛异常（返回结果字典），故 future 一般不抛；
+    若仍抛（例如 executor 已关闭），异常向上抛由调用方降级处理，绝不静默吞错。
     """
-    import shutil
-    import tempfile
-
-    edge_ok = bool(shutil.which("msedge")) or _edge_in_programfiles()
-    playwright_ok = True
-    try:
-        import playwright  # 仅探测可用性，不在 v1 拉起浏览器
-    except Exception:
-        playwright_ok = False
-
-    url = (cand.get("provenance") or {}).get("url") or ""
-    # L0/L1 自动填表 TODO：能力不足或功能未实现都走 L2，调用方据此弹 L2 弹窗
-    task_id = _new_task_id()
-    context_dir = tempfile.mkdtemp(prefix="docmind_ac_")
-    _persist_session(task_id, "L2", url, context_dir, status="waiting_user")
-    note = "注册自动填充尚未启用（L0/L1 TODO），已降级 L2 手动回填"
-    if not (edge_ok and playwright_ok):
-        note += "（本机未检测到 Microsoft Edge 或 playwright，无法做 L0/L1）"
-    return {"ok": True, "task_id": task_id, "tier": "L2", "url": url, "note": note}
+    return _BROWSER_EXECUTOR.submit(fn, *args, **kwargs).result()
 
 
 def _edge_in_programfiles() -> bool:
@@ -651,26 +774,573 @@ def _edge_in_programfiles() -> bool:
     return False
 
 
+def _edge_available() -> bool:
+    return bool(shutil.which("msedge")) or _edge_in_programfiles()
+
+
+def _playwright_available() -> bool:
+    try:
+        import playwright  # 惰性探测；不在此拉起浏览器
+        return True
+    except Exception:
+        return False
+
+
 def _new_task_id() -> str:
     import uuid
     return f"ac_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
 
 
-def _persist_session(task_id: str, tier: str, url: str, context_dir: str, status: str = "running") -> None:
-    """会话状态落 project_state（.docmind_autoconnect_sessions.json）。"""
-    path = project_state.path(os.getcwd(), "autoconnect_sessions.json", legacy=".docmind_autoconnect_sessions.json")
-    # browser_register 传入的 root 未必等于 cwd；会话文件落在 cwd 即可（运行时单用户桌面）
-    data: dict[str, Any] = {}
-    if os.path.exists(path):
+def select_provider_adapter(provider: str, cand: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+    """按 provider 名 / 来源域 / 产品名解析适配器；未收录返回 None（→ L2）。
+
+    纯数据查找，无副作用。新增 provider 只需往 PROVIDER_ADAPTERS 加一条数据。
+    """
+    parts = [str(provider or "")]
+    if isinstance(cand, dict):
+        prov = cand.get("provenance") or {}
+        parts += [str(prov.get("domain", "")), str(prov.get("url", "")), str(cand.get("url", ""))]
+    hay = " ".join(parts).lower()
+    for name, adapter in PROVIDER_ADAPTERS.items():
+        for alias in adapter.get("aliases", ()):
+            if alias and alias.lower() in hay:
+                return {"name": name, **adapter}
+    for token in parts:  # 域名兜底
+        found = _adapter_by_url(token)
+        if found:
+            return found
+    return None
+
+
+def _adapter_by_url(url: str) -> Optional[dict[str, Any]]:
+    host = _domain_of(url)
+    if not host:
+        return None
+    for name, adapter in PROVIDER_ADAPTERS.items():
+        for dom in adapter.get("domains", ()):
+            if host == dom or host.endswith("." + dom):
+                return {"name": name, **adapter}
+    return None
+
+
+def _provider_url_trusted(url: str, adapter: dict[str, Any]) -> bool:
+    """导航限定：注册页主机必须落在适配器可信域（防跨域重定向填凭证）。"""
+    host = _domain_of(url)
+    if not host:
+        return False
+    return any(host == dom or host.endswith("." + dom) for dom in adapter.get("domains", ()))
+
+
+def _launch_edge(context_dir: str) -> tuple[Any, Any]:
+    """持久上下文：复用系统 Edge（channel='msedge'），保 cookie/login 跨人工步与崩溃。
+
+    playwright 惰性 import；必须用 launch_persistent_context(user_data_dir=...)，
+    browser.new_context(user_data_dir=...) 不是合法 API。返回 (playwright, context)。
+    """
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    try:
+        context = pw.chromium.launch_persistent_context(
+            user_data_dir=context_dir,
+            channel="msedge",
+            headless=False,
+            args=["--no-first-run", "--no-default-browser-check"],
+        )
+    except Exception:
         try:
-            data = json.load(open(path, encoding="utf-8"))
+            pw.stop()
         except Exception:
-            data = {}
-    data[task_id] = {
-        "tier": tier, "url": url, "context_dir": context_dir,
-        "resume_token": task_id, "created_at": time.time(), "status": status,
-    }
+            pass
+        raise
+    return pw, context
+
+
+def _stop_session_objects(sess: Optional[dict[str, Any]]) -> None:
+    if not sess:
+        return
+    ctx = sess.get("context")
+    if ctx is not None:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+    pw = sess.get("pw")
+    if pw is not None:
+        try:
+            pw.stop()
+        except Exception:
+            pass
+
+
+def _close_browser_session_locked(task_id: str) -> None:
+    """已在 executor 线程上时调用：pop 并关闭 live context（触 playwright 对象）。"""
+    with _BROWSER_SESSIONS_LOCK:
+        sess = _BROWSER_SESSIONS.pop(task_id, None)
+    _stop_session_objects(sess)
+
+
+def _close_browser_session(task_id: str) -> None:
+    """从任意线程安全关闭：把触 playwright 的动作转交单线程 executor 执行。"""
+    try:
+        _browser_call(_close_browser_session_locked, task_id)
+    except Exception as exc:
+        _log.warning("close_browser_session failed task=%s err=%s", task_id, type(exc).__name__)
+
+
+def _detect_challenge(page: Any) -> str:
+    """本地确定性挑战检测；命中即 L1 停-继续。页面正文只在本地比对，绝不回传模型。"""
+    url = ""
+    try:
+        url = str(getattr(page, "url", "") or "").lower()
+    except Exception:
+        url = ""
+    text = ""
+    try:
+        text = str(page.inner_text("body") or "")[:40000].lower()
+    except Exception:
+        text = ""
+    hay = url + "\n" + text
+    for marker in CHALLENGE_URL_MARKERS:
+        if marker in url:
+            return "login"
+    for kw in CHALLENGE_KEYWORDS:
+        if kw in hay:
+            return kw
+    return ""
+
+
+def _fill_and_submit(page: Any, adapter: dict[str, Any]) -> tuple[bool, str]:
+    """按适配器数据的确定性动作序列填表并（仅当 auto_submit 为 True 时）提交。
+
+    返回 (ok, 失败原因)。auto_submit 默认 False：创建长期令牌/PAT 等 §5 denylist 动作
+    绝不自动点 submit，填到提交前停下，由用户点「创建/生成」后走 resume 捕获。
+    """
+    for spec in adapter.get("fields", []) or []:
+        selector = str(spec.get("selector") or "")
+        if not selector:
+            continue
+        action = spec.get("action", "fill")
+        try:
+            loc = page.locator(selector).first
+            if action == "fill":
+                loc.fill(str(spec.get("value", "")))
+            elif action == "check":
+                loc.check()
+            elif action == "click":
+                loc.click()
+            elif action == "select":
+                loc.select_option(str(spec.get("value", "")))
+            else:
+                return False, f"未知字段动作：{action}"
+        except Exception as exc:
+            return False, f"字段操作失败：{selector}（{type(exc).__name__}）"
+    submit = str(adapter.get("submit") or "")
+    if submit and adapter.get("auto_submit") is True:
+        try:
+            page.locator(submit).first.click()
+        except Exception as exc:
+            return False, f"提交失败（{type(exc).__name__}）"
+        try:
+            page.wait_for_load_state("domcontentloaded")
+        except Exception:
+            pass
+    return True, ""
+
+
+def _submit_pending(adapter: dict[str, Any]) -> bool:
+    """是否需要用户手动点提交：有 submit 选择器且未授权自动提交（§5 denylist 保护）。"""
+    return bool(str(adapter.get("submit") or "")) and adapter.get("auto_submit") is not True
+
+
+def _capture_credential(page: Any, patterns: list[str], token_pattern: str = "") -> str:
+    """由白名单 DOM 选择器只读凭证。绝不 eval 页面脚本、绝不回传模型、绝不落日志。"""
+    pat = re.compile(token_pattern) if token_pattern else None
+    for selector in patterns or []:
+        value = ""
+        try:
+            loc = page.locator(selector).first
+            try:
+                value = str(loc.input_value() or "")
+            except Exception:
+                value = ""
+            if not value:
+                value = str(loc.inner_text() or "")
+        except Exception:
+            value = ""
+        value = value.strip()
+        if not value:
+            continue
+        if pat:
+            m = pat.search(value)
+            if m:
+                return m.group(0)
+        elif _looks_like_secret(value):
+            return value
+    return ""
+
+
+# ---------------------------------------------------------------- 会话持久化（写/读/增量更新）
+
+def _sessions_path() -> str:
+    """会话文件落 project_state（.docmind_autoconnect_sessions.json）。
+
+    root 传 os.getcwd()：会话文件只按运行时单用户桌面落盘，API status 端点读同一路径。
+    """
+    return project_state.path(os.getcwd(), "autoconnect_sessions.json",
+                              legacy=".docmind_autoconnect_sessions.json")
+
+
+def _read_sessions_file(path: str) -> dict[str, Any]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_sessions_file(path: str, data: dict[str, Any]) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+
+def _persist_session(task_id: str, tier: str, url: str, context_dir: str, status: str = "running",
+                     *, provider: str = "", user_prompt: str = "", step: str = "",
+                     root: str = "") -> dict[str, Any]:
+    """落会话（含 provider/user_prompt/step）。凭证明文绝不进本文件。"""
+    path = _sessions_path()
+    data = _read_sessions_file(path)
+    record = {
+        "tier": tier, "url": url, "context_dir": context_dir,
+        "resume_token": task_id, "created_at": time.time(), "status": status,
+        "provider": provider, "user_prompt": user_prompt, "step": step, "root": root,
+    }
+    data[task_id] = record
+    _write_sessions_file(path, data)
+    return record
+
+
+def _load_session(task_id: str) -> dict[str, Any]:
+    return _read_sessions_file(_sessions_path()).get(task_id, {}) or {}
+
+
+def _update_session(task_id: str, **fields: Any) -> dict[str, Any]:
+    path = _sessions_path()
+    data = _read_sessions_file(path)
+    current = dict(data.get(task_id, {}) or {})
+    current.update(fields)
+    data[task_id] = current
+    _write_sessions_file(path, data)
+    return current
+
+
+def _session_view(task_id: str, sess: dict[str, Any], *, ok: bool = True, **extra: Any) -> dict[str, Any]:
+    view: dict[str, Any] = {
+        "ok": ok, "task_id": task_id,
+        "tier": sess.get("tier", "L2"), "status": sess.get("status", "waiting_user"),
+        "url": sess.get("url", ""),
+    }
+    if sess.get("user_prompt"):
+        view["user_prompt"] = sess["user_prompt"]
+    if sess.get("step"):
+        view["step"] = sess["step"]
+    view.update(extra)
+    return view
+
+
+def _l2_result(note: str, url: str, *, provider: str = "",
+               adapter: Optional[dict[str, Any]] = None, root: str = "") -> dict[str, Any]:
+    """L2 降级：不起浏览器，登记会话并返回官方 URL，由前端弹 L2 引导。"""
+    task_id = _new_task_id()
+    context_dir = tempfile.mkdtemp(prefix="docmind_ac_")
+    secret_provider = (adapter or {}).get("secret_provider", provider)
+    _persist_session(task_id, "L2", url, context_dir, status="waiting_user",
+                     provider=secret_provider, step="l2", root=root)
+    _log.info("browser_register degraded tier=L2 task=%s provider=%s", task_id, secret_provider)
+    return {"ok": True, "task_id": task_id, "tier": "L2", "url": url, "note": note}
+
+
+def _capability_note() -> str:
+    missing = []
+    if not _edge_available():
+        missing.append("Microsoft Edge")
+    if not _playwright_available():
+        missing.append("playwright")
+    return "自动注册组件缺失（" + "、".join(missing) + "），已降级 L2 手动回填"
+
+
+def _browser_run(task_id: str, context_dir: str, adapter: dict[str, Any],
+                 register_url: str) -> dict[str, Any]:
+    """在单线程 executor 上执行的浏览器操作段（launch→goto→挑战/填表/捕获）。
+
+    返回纯数据结果字典（外层不持有任何 playwright 对象）：
+      {'outcome': 'launch_error', 'reason'}
+      {'outcome': 'l1', 'step': 'challenge'|'untrusted'|'fill'|'submit'|'capture', 'reason'}
+      {'outcome': 'l0', 'step': 'captured', 'token'}   # token 仅内存传递，绝不落盘/日志
+    本函数内部吞掉 launch 异常返回 launch_error，故 future 不抛，executor 不被卡死。
+    """
+    pw: Any = None
+    context: Any = None
+    try:
+        pw, context = _launch_edge(context_dir)
+        page = context.pages[0] if getattr(context, "pages", None) else context.new_page()
+    except Exception as exc:
+        # N5：page 获取并入 launch 的 try；失败先关掉已拉起的 pw/context，避免对象泄漏
+        _stop_session_objects({"pw": pw, "context": context})
+        return {"outcome": "launch_error", "reason": type(exc).__name__}
+    with _BROWSER_SESSIONS_LOCK:
+        _BROWSER_SESSIONS[task_id] = {"pw": pw, "context": context, "page": page,
+                                      "context_dir": context_dir, "adapter": adapter}
+    try:
+        page.goto(register_url, wait_until="domcontentloaded")
+    except Exception:
+        pass  # 导航异常不致命：仍由挑战检测/填表结果决定停在哪一档
+
+    challenge = _detect_challenge(page)
+    if challenge:
+        return {"outcome": "l1", "step": "challenge", "reason": challenge}
+    # N1：fill 前复核当前页仍在可信域（防跨域重定向后填凭证）
+    if not _provider_url_trusted(str(getattr(page, "url", "") or ""), adapter):
+        return {"outcome": "l1", "step": "untrusted", "reason": ""}
+    filled, reason = _fill_and_submit(page, adapter)
+    if not filled:
+        return {"outcome": "l1", "step": "fill", "reason": reason}
+    if _submit_pending(adapter):
+        # B1：创建长期令牌类动作绝不自动提交 → 填到提交前停下走 L1，用户点后 resume 捕获
+        return {"outcome": "l1", "step": "submit", "reason": ""}
+    # N1：capture 前再复核一次可信域
+    if not _provider_url_trusted(str(getattr(page, "url", "") or ""), adapter):
+        return {"outcome": "l1", "step": "untrusted", "reason": ""}
+    token = _capture_credential(page, adapter.get("token_selectors", []),
+                                adapter.get("token_pattern", ""))
+    if token:
+        _close_browser_session_locked(task_id)  # 已在 executor 线程，直接关
+        return {"outcome": "l0", "step": "captured", "token": token}
+    return {"outcome": "l1", "step": "capture", "reason": ""}
+
+
+# ---------------------------------------------------------------- 注册代管入口（drop-in）
+
+def browser_register(root: str, key: str, cand: dict[str, Any], provider: str) -> dict[str, Any]:
+    """L0/L1/L2 降级链入口（签名与返回键 {ok,task_id,tier,url,note} 不变）。
+
+    L0：单页无验证 → 确定性填表 + 提交 + 白名单选择器捕获凭证 → secrets_store → done。
+    L1：命中挑战（验证码 / 邮箱验证 / 2FA / 支付墙）或填表未完成 → 浏览器保活，status=waiting_user。
+    L2：provider 未收录 / 首版不自动 / Edge 或 playwright 缺失 / 主机越域 → 不起浏览器，返 URL+note。
+
+    安全不变量：抽取层不 subprocess；真实执行仅 probe_candidate 与 confirm→save_server；
+    凭证只走 secrets_store；页面正文绝不喂模型；导航限 provider 可信域。
+    """
+    provenance = cand.get("provenance") or {}
+    fallback_url = provenance.get("url") or cand.get("url") or ""
+    adapter = select_provider_adapter(provider, cand)
+    if adapter is None:
+        return _l2_result("未收录该 provider 的自动注册流程，已降级 L2 手动回填",
+                          fallback_url, provider=provider, root=root)
+    if adapter.get("tier") == "L2":
+        return _l2_result(adapter.get("note") or "该 provider 首版不做自动注册，已降级 L2",
+                          adapter.get("register_url") or fallback_url,
+                          provider=provider, adapter=adapter, root=root)
+
+    register_url = adapter.get("deep_link") or adapter.get("register_url") or fallback_url
+    if not _provider_url_trusted(register_url, adapter):
+        return _l2_result("注册页主机不在 provider 可信域，已降级 L2 手动回填",
+                          fallback_url, provider=provider, adapter=adapter, root=root)
+    if not (_edge_available() and _playwright_available()):
+        return _l2_result(_capability_note(), register_url,
+                          provider=provider, adapter=adapter, root=root)
+
+    task_id = _new_task_id()
+    context_dir = tempfile.mkdtemp(prefix="docmind_ac_")
+    secret_provider = adapter.get("secret_provider", provider)
+    user_prompt = adapter.get("user_prompt", DEFAULT_USER_PROMPT)
+
+    # 浏览器操作段提交单线程 executor（保证 playwright 对象创建与使用同线程）。
+    try:
+        outcome = _browser_call(_browser_run, task_id, context_dir, adapter, register_url)
+    except Exception as exc:
+        _log.warning("browser_run failed task=%s err=%s", task_id, type(exc).__name__)
+        return _l2_result("浏览器操作异常（" + type(exc).__name__ + "），已降级 L2 手动回填",
+                          register_url, provider=provider, adapter=adapter, root=root)
+
+    if outcome.get("outcome") == "launch_error":
+        _log.warning("launch_edge failed task=%s err=%s", task_id, outcome.get("reason"))
+        return _l2_result("无法启动系统 Edge（" + str(outcome.get("reason")) + "），已降级 L2 手动回填",
+                          register_url, provider=provider, adapter=adapter, root=root)
+
+    if outcome.get("outcome") == "l0":
+        secrets_store.save(root, secret_provider, outcome.get("token", ""))
+        _persist_session(task_id, "L0", register_url, context_dir, status="done",
+                         provider=secret_provider, step="captured", root=root)
+        _log.info("browser_register tier=L0 task=%s provider=%s captured=1", task_id, secret_provider)
+        return {"ok": True, "task_id": task_id, "tier": "L0", "url": register_url,
+                "note": "已捕获凭证并写入 secrets_store"}
+
+    step = outcome.get("step", "capture")
+    reason = outcome.get("reason", "")
+    _persist_session(task_id, "L1", register_url, context_dir, status="waiting_user",
+                     provider=secret_provider, user_prompt=user_prompt, step=step, root=root)
+    _log.info("browser_register tier=L1 task=%s step=%s", task_id, step)
+    note = {
+        "challenge": "命中人工验证（" + reason + "），请在浏览器中完成后点继续",
+        "untrusted": "检测到注册页跳转到 provider 可信域之外，已停止自动填写与捕获，请在浏览器中核对后点继续",
+        "fill": "自动填写未完成（" + reason + "），请手动处理后点继续",
+        "submit": "已自动填表到提交前（创建令牌不可自动执行），请在浏览器中点「创建/生成」后回来点继续",
+    }.get(step, "已提交但未在页面捕获到凭证，请在浏览器中复制后点继续")
+    return {"ok": True, "task_id": task_id, "tier": "L1", "url": register_url, "note": note}
+
+
+def _resume_page(task_id: str, sess: dict[str, Any], adapter: dict[str, Any], url: str) -> Optional[Any]:
+    """仅由 executor 线程调用：优先复用 live context；否则按 context_dir 重开持久上下文。
+
+    复用安全的前提：所有浏览器操作都提交到同一单线程 executor，live page 创建与使用同线程。
+    """
+    with _BROWSER_SESSIONS_LOCK:
+        live = _BROWSER_SESSIONS.get(task_id)
+    if live and live.get("page") is not None:
+        return live["page"]
+    context_dir = sess.get("context_dir") or ""
+    if not (context_dir and os.path.isdir(context_dir)
+            and _edge_available() and _playwright_available()):
+        return None
+    pw: Any = None
+    context: Any = None
+    try:
+        pw, context = _launch_edge(context_dir)
+        page = context.pages[0] if getattr(context, "pages", None) else context.new_page()
+    except Exception as exc:
+        # N5：page 获取并入 try；失败先关已拉起的 pw/context，避免对象泄漏
+        _stop_session_objects({"pw": pw, "context": context})
+        _log.warning("resume relaunch failed task=%s err=%s", task_id, type(exc).__name__)
+        return None
+    with _BROWSER_SESSIONS_LOCK:
+        _BROWSER_SESSIONS[task_id] = {"pw": pw, "context": context, "page": page,
+                                      "context_dir": context_dir, "adapter": adapter}
+    if url:
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+        except Exception:
+            pass
+    return page
+
+
+def _browser_resume_run(task_id: str, sess: dict[str, Any], adapter: dict[str, Any],
+                        url: str) -> dict[str, Any]:
+    """executor 线程上的 resume 浏览器操作段。返回纯数据结果字典（不持有 playwright 对象）。
+
+    resume 语义：用户已在浏览器中完成人工步（过验证码 / 点了「创建/生成」）后点「继续」。
+    故 **先尝试捕获**；捕获不到才回落到更具体的停点，绝不因 re-fill 失败就放弃捕获。
+    """
+    page = _resume_page(task_id, sess, adapter, url)
+    if page is None:
+        return {"outcome": "no_session"}
+    challenge = _detect_challenge(page)
+    if challenge:
+        return {"outcome": "l1", "step": "challenge", "reason": challenge}
+    # N1：fill 前复核可信域（防跨域重定向）
+    if not _provider_url_trusted(str(getattr(page, "url", "") or ""), adapter):
+        return {"outcome": "l1", "step": "untrusted", "reason": ""}
+    filled, reason = _fill_and_submit(page, adapter)
+    # N1：capture 前再复核一次可信域
+    if not _provider_url_trusted(str(getattr(page, "url", "") or ""), adapter):
+        return {"outcome": "l1", "step": "untrusted", "reason": ""}
+    token = _capture_credential(page, adapter.get("token_selectors", []),
+                                adapter.get("token_pattern", ""))
+    if not token:
+        if not filled:
+            return {"outcome": "l1", "step": "fill", "reason": reason}
+        if _submit_pending(adapter):
+            return {"outcome": "l1", "step": "submit", "reason": ""}
+        return {"outcome": "l1", "step": "capture", "reason": ""}
+    _close_browser_session_locked(task_id)  # 已在 executor 线程，直接关
+    return {"outcome": "l0", "step": "captured", "token": token}
+
+
+def register_resume(task_id: str) -> dict[str, Any]:
+    """L1 用户点「继续」后续跑：复用 live / 按 context_dir 重开 → 回 L0 判定。
+
+    返回 {ok, task_id, tier, status, user_prompt?, url?, step?, error?}。
+    浏览器操作段提交单线程 executor；会话落盘与 secrets_store 留在调用线程。
+    """
+    sess = _load_session(task_id)
+    if not sess:
+        return {"ok": False, "task_id": task_id, "tier": "L2", "status": "unknown",
+                "error": "会话不存在或已过期"}
+    tier = sess.get("tier", "L2")
+    adapter = select_provider_adapter(sess.get("provider", "")) or _adapter_by_url(sess.get("url", ""))
+    if tier == "L2" or adapter is None or adapter.get("tier") == "L2":
+        return _session_view(task_id, sess, ok=False, error="该会话为 L2 手动回填，无自动续跑")
+
+    root = sess.get("root", "")
+    url = sess.get("url") or adapter.get("register_url") or ""
+    secret_provider = adapter.get("secret_provider", sess.get("provider", ""))
+    user_prompt = adapter.get("user_prompt", DEFAULT_USER_PROMPT)
+    try:
+        outcome = _browser_call(_browser_resume_run, task_id, sess, adapter, url)
+    except Exception as exc:
+        _log.warning("browser_resume failed task=%s err=%s", task_id, type(exc).__name__)
+        return _session_view(task_id, sess, ok=False,
+                             error="浏览器续跑异常（" + type(exc).__name__ + "）")
+
+    if outcome.get("outcome") == "no_session":
+        return _session_view(task_id, sess, ok=False, error="无法恢复浏览器会话，请重新开始")
+    if outcome.get("outcome") == "l0":
+        if not root:
+            # N3：root 为空则无法落库，绝不置 done 造成假成功
+            _log.warning("register_resume l0 without root task=%s", task_id)
+            return _session_view(task_id, sess, ok=False,
+                                 error="会话缺少项目根目录，无法写入 secrets_store")
+        secrets_store.save(root, secret_provider, outcome.get("token", ""))
+        _update_session(task_id, tier="L0", status="done", step="captured", user_prompt="")
+        _log.info("register_resume tier=L0 task=%s provider=%s captured=1", task_id, secret_provider)
+        return _session_view(task_id, _load_session(task_id))
+
+    step = outcome.get("step", "capture")
+    _update_session(task_id, tier="L1", status="waiting_user", step=step, user_prompt=user_prompt)
+    _log.info("register_resume tier=L1 task=%s step=%s", task_id, step)
+    return _session_view(task_id, _load_session(task_id))
+
+
+def register_commit(root: str, task_id: str, credentials: dict[str, Any]) -> dict[str, Any]:
+    """用户回填 / L1 捕获的凭证 → secrets_store.save。返回 {ok, stored:[provider...]}。
+
+    契约：
+      - 有凭证：逐个 save，stored 含 provider 名（无明文）；会话置 done；重复 commit 幂等。
+      - 空 credentials：回读会话是否已有本轮捕获的凭证（step=captured 或 done+provider）——
+        有则返 stored=[provider] 并把会话置 done；无则 ok=False + 明确 error（不静默成功）。
+    stored 只含 provider 名，绝不含明文；凭证绝不写会话 JSON、不写日志。
+    """
+    stored: list[str] = []
+    for provider, value in (credentials or {}).items():
+        if not str(value or "").strip():
+            continue
+        secrets_store.save(root, provider, value)
+        stored.append(str(provider))
+
+    sess = _load_session(task_id) if task_id else {}
+
+    if stored:
+        if task_id and sess:
+            _update_session(task_id, status="done", step="commit", user_prompt="")
+            _close_browser_session(task_id)
+        _log.info("register_commit task=%s stored_count=%d", task_id, len(stored))
+        return {"ok": True, "stored": stored}
+
+    captured_provider = ""
+    if sess and (sess.get("step") == "captured"
+                 or (sess.get("status") == "done" and sess.get("provider"))):
+        captured_provider = str(sess.get("provider") or "")
+    if captured_provider:
+        if sess.get("status") != "done":
+            _update_session(task_id, status="done", step="captured", user_prompt="")
+            _close_browser_session(task_id)
+        _log.info("register_commit task=%s reused_captured provider=%s", task_id, captured_provider)
+        return {"ok": True, "stored": [captured_provider]}
+
+    _log.info("register_commit task=%s empty_credentials no_captured", task_id)
+    return {"ok": False, "stored": [],
+            "error": "未提供凭证，且该会话没有已捕获的凭证（请先在注册流程中创建或回填）"}
