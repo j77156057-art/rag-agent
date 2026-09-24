@@ -134,5 +134,58 @@ class R4StatePathTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class R5PytestIsolationTests(unittest.TestCase):
+    """R5：pytest 会话同样必须隔离 STATE_ROOT。
+
+    历史事故：隔离只判 `python -m unittest`，pytest 跑 test_api_model_config.py
+    时把 mock/zz-unit-ctx 等夹具值写进真实 .docmind_state.json，用户重启后云端
+    模型被打回离线 mock。
+    """
+
+    _PROBE_SRC = """# -*- coding: utf-8 -*-
+import config
+
+def test_pytest_state_root_isolated():
+    assert config._running_under_pytest() is True
+    assert config._TEST_STATE_ISOLATED is True
+    assert config.STATE_ROOT != config.BASE_DIR
+    print("R5_ROOT=" + config.STATE_ROOT)
+"""
+
+    def test_pytest_process_uses_isolated_state_root(self):
+        tmp = tempfile.mkdtemp(prefix="docmind_r5pytest_")
+        probe = os.path.join(tmp, "test_r5_probe.py")
+        try:
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write(self._PROBE_SRC)
+            env = dict(os.environ)
+            env.pop("DOCMIND_STATE_ROOT", None)
+            env.pop("DOCMIND_NO_TEST_ISOLATION", None)
+            env["PYTHONPATH"] = _REPO + os.pathsep + env.get("PYTHONPATH", "")
+            proc = subprocess.run(
+                [sys.executable, "-B", "-m", "pytest", "-q", "-s", probe],
+                cwd=_REPO, env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            root = _extract(proc.stdout, "R5_ROOT=")
+            self.assertNotEqual(os.path.abspath(root), _REPO,
+                                "pytest 进程不得把 STATE_ROOT 留在仓库根")
+            self.assertNotEqual(os.path.abspath(root), config.BASE_DIR)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_plain_import_config_not_treated_as_pytest(self):
+        # 普通 python 进程（无 pytest）不得命中 pytest 隔离判据
+        env = dict(os.environ)
+        env.pop("DOCMIND_STATE_ROOT", None)
+        code = "import config; print('PYTEST_FLAG=', config._running_under_pytest())"
+        proc = subprocess.run(
+            [sys.executable, "-B", "-c", code],
+            cwd=_REPO, env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("PYTEST_FLAG= False", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

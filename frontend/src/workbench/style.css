@@ -21,6 +21,36 @@
   --shadow-pop: 0 16px 44px rgba(35, 52, 84, .16);
   --font-ui: 'Segoe UI Variable Display', 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', system-ui, sans-serif;
   --font-mono: 'Cascadia Code', 'JetBrains Mono', Consolas, 'Courier New', monospace;
+
+  /* ---------- MCP 自动连接链路 Token（与 docs/mcp-autoconnect/design-tokens.css 同源） ---------- */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 14px;
+  --radius-pill: 9999px;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-out: ease-out;
+  --motion-base: 150ms;
+  --motion-modal: 300ms;
+
+  --trust-verified-fg: var(--green);
+  --trust-verified-bg: rgba(28, 158, 102, .10);
+  --trust-community-fg: var(--amber);
+  --trust-community-bg: rgba(200, 129, 28, .10);
+  --trust-unknown-fg: var(--text-faint);
+  --trust-unknown-bg: rgba(152, 163, 180, .12);
+
+  --diag-done: var(--green);
+  --diag-fail: var(--danger);
+  --diag-warn: var(--amber);
+  --diag-active: var(--accent);
+  --diag-idle: var(--text-faint);
+  --diag-seg-done: var(--green);
+  --diag-seg-idle: var(--border);
+
+  --tier-l0: var(--accent);
+  --tier-l1: var(--amber);
+  --tier-l2: var(--amber);
 }
 
 * { box-sizing: border-box; }

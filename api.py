@@ -92,7 +92,11 @@ from tools import (
     dev_capture_bug,
     dev_list_bugs,
     dev_update_bug,
+    take_pending_workflow,
+    push_pending_stream,
+    pop_pending_stream,
     web_search,
+    web_fetch,
     _run_region_cmd,
 )
 from regions import (
@@ -170,6 +174,11 @@ import asset_sources
 import asset_gen
 import cloud_gen
 import mcp_client
+import project_state
+from mcp_autoconnect import (
+    auto_connect_pipeline, probe_candidate, browser_register,
+    vision_extract_params, AutoConnectError,
+)
 import mcp_capabilities
 import web_export
 import unity_graph
@@ -1776,6 +1785,9 @@ async def chat(
         # 注意：此处不得再申请 GPU 租约。llm.py 的 _ollama_chat 已以 owner="ollama"
         # 持租约，SSE 层若以别的 owner 再申请，serial 模式不可重入 → 必然自锁报"GPU 正忙"。
         gen = None
+        # 注册本流的工作流待取队列：start_workflow 在 agent 生成器内部执行，
+        # 必须用跨线程持久的持有者（不能用 contextvars，见 tools.py 注释）。
+        wf_holder = push_pending_stream()
         try:
             yield f"data: {json.dumps({'type':'route','route':routing['route'],'complexity':routing['complexity'],'reason':routing['reason']}, ensure_ascii=False)}\n\n"
             if vision_audit.get("mode") not in ("none", "native"):
@@ -1796,6 +1808,13 @@ async def chat(
             )
             for ev in gen:
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                # start_workflow 工具成功后补发结构化事件：前端据此在对话内
+                # 直接挂载工作流卡片并连接 SSE（取走即清，最多补发一次）。
+                pending_wf = take_pending_workflow(wf_holder)
+                if pending_wf:
+                    yield ("data: " + json.dumps(
+                        {"type": "workflow", "phase": "started", **pending_wf},
+                        ensure_ascii=False) + "\n\n")
         except Exception as e:
             # LLM 崩溃 / Ollama CUDA 错 / 网络中断等：给前端一个明确的错误 final，不要让前端把检索原文当答案。
             err_msg = f"{type(e).__name__}: {e}"
@@ -1813,6 +1832,7 @@ async def chat(
                     gen.close()
                 except Exception:  # noqa: BLE001
                     pass
+            pop_pending_stream(wf_holder)
         yield "data: {\"type\":\"done\"}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -2652,14 +2672,32 @@ def _match_model_size(name: str, sizes: dict) -> int:
     return 0
 
 
-def check_ollama():
+# Ollama 探测结果短 TTL 缓存：页面一次加载会打多次 /api/config（问答页/工作台/
+# 聊天前检查），而 Ollama 未运行时 Windows 上一次探测即便被拒绝也要 ~2s，
+# 串行叠加会拖慢所有依赖该状态的请求。存活状态 2s 内复用足够新鲜。
+_OLLAMA_CHECK_TTL = 2.0
+_ollama_check_cache: dict = {"ts": 0.0, "value": None}
+# 与 _ollama_ps 一致：本机回环绝不走系统/企业代理，避免代理把 127.0.0.1
+# 请求挂到 8s 超时。
+_ollama_no_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def check_ollama(force: bool = False):
     """探测本机 Ollama 服务可达性、所需模型是否已拉取，并返回用户引导文案。
 
     设计：即使 Ollama 不可用也绝不抛异常，返回一个结构化状态字典，
     让前端/启动器/聊天接口都能据此给出明确引导，而不是静默失败。
     仅当当前配置确实依赖 Ollama（needed_models 非空）时才生成引导文案，
     避免骚扰使用 mock/local/qwen 等不依赖本机 Ollama 的用户。
+
+    结果带 2s TTL 缓存（``force=True`` 跳过）；**不要**把本函数放进
+    /api/health 这类存活探针——Ollama 未运行时探测本身就可能耗时数秒。
     """
+    now = time.time()
+    cached = _ollama_check_cache["value"]
+    if (not force and cached is not None
+            and now - _ollama_check_cache["ts"] < _OLLAMA_CHECK_TTL):
+        return cached
     base = OLLAMA_BASE
     prov = get_runtime("llm_provider") or LLM_PROVIDER
     emb = get_runtime("embedding_provider") or EMBEDDING_PROVIDER
@@ -2676,7 +2714,8 @@ def check_ollama():
     reachable = False
     present = []
     try:
-        with urllib.request.urlopen(f"{base}/api/tags", timeout=8) as r:
+        # 本机回环 3s 足够；原 8s 在防火墙 DROP 场景会让 /api/config 卡满 8s
+        with _ollama_no_proxy.open(f"{base}/api/tags", timeout=3) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
         reachable = True
         present = [m.get("name") for m in data.get("models", []) if isinstance(m, dict)]
@@ -2709,7 +2748,7 @@ def check_ollama():
             "Ollama 已运行，但缺少所需模型：" + "、".join(missing) +
             "。请执行：\n  ollama pull " + "\n  ollama pull ".join(missing)
         )
-    return {
+    result = {
         "reachable": reachable,
         "base": base,
         "provider": prov,
@@ -2719,6 +2758,9 @@ def check_ollama():
         "missing_models": missing,
         "guidance": guidance,
     }
+    _ollama_check_cache["ts"] = time.time()
+    _ollama_check_cache["value"] = result
+    return result
 
 
 def _ollama_down_stream(guidance: str):
@@ -3268,13 +3310,126 @@ async def fill_exports_ep(req: CreateRegionReq):
     return {"ok": True, **detail, "regions": list_regions()}
 
 
+class McpAutoConnectSearchReq(BaseModel):
+    query: str
+    web_enabled: bool = True
+
+class McpAutoConnectProbeReq(BaseModel):
+    config: dict
+
+class McpAutoConnectConfirmReq(BaseModel):
+    key: str
+    config: dict
+    user_ack: bool = False
+
+class McpRegisterStartReq(BaseModel):
+    key: str
+    config: dict
+    provider: str
+
+class McpRegisterResumeReq(BaseModel):
+    task_id: str
+
+class McpRegisterCommitReq(BaseModel):
+    task_id: str
+    credentials: dict = {}
+
+class VisionExtractReq(BaseModel):
+    image_base64: str
+
+
+@app.post("/api/mcp/autoconnect/search")
+async def mcp_autoconnect_search_ep(req: McpAutoConnectSearchReq):
+    """搜索→抓官方正文→抽取→校验，返回候选（不执行、不写盘）。
+
+    web_enabled=False 时不联网：不传 search_fn/fetch_fn，管线仅走离线路径
+    （当前会返回空候选 + 说明），绝不因用户关了联网还去请求网络。
+    """
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    if req.web_enabled:
+        return await run_in_threadpool(
+            auto_connect_pipeline, root, req.query,
+            search_fn=web_search, fetch_fn=web_fetch,
+        )
+    return await run_in_threadpool(auto_connect_pipeline, root, req.query)
+
+@app.post("/api/mcp/autoconnect/probe")
+async def mcp_autoconnect_probe_ep(req: McpAutoConnectProbeReq):
+    """临时进程 initialize + tools/list，用毕即关（受控命令，已通过 R3/R4/R8）。"""
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    try: return await run_in_threadpool(probe_candidate, root, req.config)
+    except mcp_client.MCPError as e: return {"ok": True, "probe_ok": False, "tools": [], "error": str(e)}
+
+@app.post("/api/mcp/autoconnect/confirm")
+async def mcp_autoconnect_confirm_ep(req: McpAutoConnectConfirmReq):
+    """写盘闸门：必须 user_ack=True 才写 .docmind_mcp.json。"""
+    root = _project_root_or_error()
+    if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
+    if not req.user_ack:
+        return JSONResponse({"ok": False, "error": "写入 .docmind_mcp.json 需显式确认"}, status_code=400)
+    # 候选层元数据（provenance/command_unresolved）不入库，避免污染 .docmind_mcp.json
+    _meta = ("provenance", "command_unresolved", "trust", "validation_errors")
+    clean = {k: v for k, v in (req.config or {}).items() if k not in _meta}
+    try: return await run_in_threadpool(mcp_client.save_server, root, req.key, clean)
+    except mcp_client.MCPError as e: return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+@app.post("/api/mcp/autoconnect/register/start")
+async def mcp_autoconnect_register_start_ep(req: McpRegisterStartReq):
+    """起浏览器代管注册后台任务，返 task_id + tier（L0/L1/L2）。"""
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    try: return await run_in_threadpool(browser_register, root, req.key, req.config, req.provider)
+    except AutoConnectError as e: return {"ok": False, "tier": "L2", "error": str(e)}
+
+@app.get("/api/mcp/autoconnect/register/status")
+async def mcp_autoconnect_register_status_ep(task_id: str):
+    """L1 轮询当前档/态/用户提示/resume_token。"""
+    path = project_state.path(os.getcwd(), "autoconnect_sessions.json", legacy=".docmind_autoconnect_sessions.json")
+    data = {}
+    if os.path.exists(path):
+        try: data = json.load(open(path, encoding="utf-8"))
+        except Exception: data = {}
+    return {"ok": True, **data.get(task_id, {})}
+
+@app.post("/api/mcp/autoconnect/register/resume")
+async def mcp_autoconnect_register_resume_ep(req: McpRegisterResumeReq):
+    """L1 用户点继续后续跑（TODO：与 browser_register 的 L1 态对接）。"""
+    return {"ok": True, "task_id": req.task_id, "note": "L1 续跑待实现（IMPL-PLAN §3.3 TODO）"}
+
+@app.post("/api/mcp/autoconnect/register/commit")
+async def mcp_autoconnect_register_commit_ep(req: McpRegisterCommitReq):
+    """把用户回填的凭证写入 secrets_store（不落明文），返回已存 provider 列表。"""
+    root = _project_root_or_error()
+    if not root: return JSONResponse({"ok": False, "error": "未配置代码库"}, status_code=400)
+    try:
+        for prov, val in (req.credentials or {}).items():
+            secrets_store.save(root, prov, val)
+        return {"ok": True, "stored": list((req.credentials or {}).keys())}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+@app.post("/api/mcp/autoconnect/vision/extract")
+async def mcp_autoconnect_vision_extract_ep(req: VisionExtractReq):
+    """视觉读图提参：图→vision 观察文本→parse+信任闸门（同规则，绝不因来自图片放行）。"""
+    root = _project_root_or_error()
+    if not root: return {"ok": False, "error": "未配置代码库"}
+    return await run_in_threadpool(vision_extract_params, req.image_base64, root)
+
+
 @app.get("/api/health")
 async def health_ep():
-    """轻量健康检查：返回 Ollama 可达性/模型就绪状态与引导文案。
+    """纯存活探针：只回答「后端进程是否在」，绝不探测 Ollama。
 
-    供启动器、外部探针及前端配置面板按需查询（同步 urllib 探活放线程池执行）。
+    前端 probeBackend（2.5s 超时）与桌面启动器的就绪等待都打这个端点。
+    历史上这里同步调用 check_ollama，而 Ollama 未运行时在部分 Windows
+    环境里连「连接被拒绝」都要 1~4 秒，探针超时后前端误判后端离线、
+    退化成示例演示模式——用户体感就是「必须先启动 Ollama 才能打开页面」。
+    Ollama 可达性/模型就绪状态请走 /api/config（ollama_status）或
+    GET /api/ollama/probe。
     """
-    return await run_in_threadpool(check_ollama)
+    return {"ok": True, "service": "docmind"}
 
 
 @app.get("/api/region_git/{region}")

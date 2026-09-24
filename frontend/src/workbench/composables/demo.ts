@@ -1,4 +1,4 @@
-// 离线演示模式：页面打开时探测同源后端（/api/health）。
+// 离线演示模式：页面打开时探测同源后端（/api/health，纯存活探针、不依赖 Ollama）。
 // 示例数据仅在显式 ?demo=1 时启用，断连不能冒充项目数据。
 import { ref } from 'vue'
 // P4 收口：开发台内所有 /api/* 请求统一带上当前项目头（withProject）。健康探测本身与项目
@@ -10,7 +10,7 @@ export const demoMode = ref(false)
 export const demoProbed = ref(false)
 let probing: Promise<boolean> | null = null
 
-export function probeBackend(timeoutMs = 2500): Promise<boolean> {
+export function probeBackend(timeoutMs = 4000): Promise<boolean> {
   if (probing) return probing
   probing = (async () => {
     if (new URLSearchParams(location.search).get('demo') === '1') {

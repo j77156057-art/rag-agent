@@ -14,6 +14,7 @@ from config import (
     MAX_AGENT_STEPS,
     AUDIT_MAX_AGENT_STEPS,
     CODE_MAX_AGENT_STEPS,
+    NAV_FREE_STEPS,
     AGENT_HISTORY_TURNS,
     OBS_MAX_CHARS,
     AUDIT_OBS_MAX_CHARS,
@@ -25,7 +26,9 @@ from config import (
     get_runtime,
 )
 from llm import LLMClient, args_to_input
-from tools import TOOLS, tool_schemas, self_verify
+from tools import (TOOLS, tool_schemas, self_verify,
+                   set_session_web_enabled, _session_web_enabled,
+                   set_session_vision_mode, _session_vision_mode)
 import agent_trace as _trace
 import sessions as _sessions
 import hooks as _hooks
@@ -55,8 +58,25 @@ TOOL_MODE = os.getenv("DOCMIND_TOOL_MODE", "react").strip().lower()
 _NATIVE_CAPABLE = {"qwen", "deepseek", "ollama", "llamacpp", "openai", "azure"}
 # 子代理最大递归深度（父=0）
 SUBAGENT_MAX_DEPTH = int(os.getenv("DOCMIND_SUBAGENT_MAX_DEPTH", "2"))
-# 子代理单次最多执行多少步
-SUBAGENT_MAX_STEPS = int(os.getenv("DOCMIND_SUBAGENT_MAX_STEPS", "4"))
+# 子代理单次默认最多执行多少步（多 Agent 工作流可逐任务申请上调，但不超过硬顶）
+SUBAGENT_MAX_STEPS = max(1, int(os.getenv("DOCMIND_SUBAGENT_MAX_STEPS", "6")))
+# 子代理单任务步数硬顶：无论 env 默认还是工作流任务 max_steps 都不得越过，
+# 防止弱模型在单个子任务里无限刷工具（多个 Agent 并行时总量由波次宽度另计）。
+SUBAGENT_STEPS_HARD_CAP = max(1, int(os.getenv("DOCMIND_SUBAGENT_STEPS_HARD_CAP", "12")))
+
+
+def _resolve_child_max_steps(max_steps):
+    """生效步数 = clamp(任务申请值或默认, 1, 硬顶)；非法值回退默认。"""
+    if max_steps in (None, ""):
+        requested = SUBAGENT_MAX_STEPS
+    else:
+        try:
+            requested = int(max_steps)
+        except (TypeError, ValueError):
+            requested = SUBAGENT_MAX_STEPS
+    return max(1, min(requested, SUBAGENT_STEPS_HARD_CAP))
+
+
 # 并行工具批次开关与并发上限（一轮返回多个只读工具调用时并发执行）
 PARALLEL_TOOLS = os.getenv("DOCMIND_PARALLEL_TOOLS", "1") != "0"
 PARALLEL_MAX = int(os.getenv("DOCMIND_PARALLEL_MAX", "4"))
@@ -65,13 +85,20 @@ ORCH_MAX_REPLANS = int(os.getenv("DOCMIND_ORCH_MAX_REPLANS", "2"))
 # 子代理执行轨迹回传：保留多少步、每步观察截断多少字（喂给 replanner 做归因）
 ORCH_TRACE_STEPS = int(os.getenv("DOCMIND_ORCH_TRACE_STEPS", "6"))
 ORCH_TRACE_OBS_CHARS = int(os.getenv("DOCMIND_ORCH_TRACE_OBS_CHARS", "240"))
+# 工作流实时轨迹（step_sink → SSE）：面向 UI 的单条裁剪上限，比回传轨迹更宽，
+# 但仍然有界——实时流与内存轨迹环都不能携带未裁剪正文。
+SINK_THOUGHT_CHARS = int(os.getenv("DOCMIND_SINK_THOUGHT_CHARS", "400"))
+SINK_ACTION_CHARS = int(os.getenv("DOCMIND_SINK_ACTION_CHARS", "300"))
+SINK_OBS_CHARS = int(os.getenv("DOCMIND_SINK_OBS_CHARS", "1200"))
+SINK_STEP_TYPES = {"thought", "action", "observation"}
 # 明确有副作用、**不可并发**的工具：批内只要出现一个就整体退回顺序执行。
 # （delegate 允许并发——子代理各自持独立 LLMClient，见 _delegate）
 _NO_PARALLEL_TOOLS = {"apply_edit", "create_file", "create_artifact", "dev_region_edit", "run_command",
                       "python_exec", "dev_mcp_call", "dev_commit", "dev_commit_all",
                       "dev_rollback_changeset", "init_regions_tool", "dev_apply_regions",
                       "dev_add_region", "dev_refactor", "dev_rebuild_index",
-                      "orchestrate"}
+                      "dev_mcp_add", "dev_mcp_decide", "dev_mcp_remove", "dev_mcp_probe",
+                      "orchestrate", "start_workflow"}
 
 # 写后自验证收尾门开关（Phase 1 闭环）。默认开启；设 DOCMIND_SELF_VERIFY=0 可关闭
 # （例如纯问答场景或校验器本身不可用）。关闭时写操作不再自动触发 self_verify。
@@ -116,6 +143,11 @@ def _step_budget(question):
     if _CODE_REVIEW.search(value):
         return max(base, int(CODE_MAX_AGENT_STEPS))
     return base
+
+
+# 纯只读「目录导航」工具：每轮前 NAV_FREE_STEPS 次不占工具步数，
+# 让勘察目录的开销不挤占 read_file/grep 等真正取证的预算。
+_NAV_TOOLS = {"list_dir"}
 
 
 def _observation_budget(question):
@@ -190,6 +222,12 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - dev_route_connector(hint): 按任务语义（如 "Godot 里打开 Main 场景并运行"）挑选最合适的【已启用】连接器，返回排序候选与匹配理由。优先用它的 top.key 作为 dev_mcp_call 的 key；若某连接器不可用或调用失败，重新用它挑选其它已启用连接器。
 - dev_list_connector_tools(key): 列出某连接器暴露的工具（name/description），确定要调用的 name 与参数。仅对打算调用的连接器使用（godot 等 stdio 需先建立会话）。
 - dev_mcp_call(key, name, arguments?): 调用选中的连接器工具。若调用失败（连接器未启用/引擎未开/工具名不对），用 dev_route_connector 重新挑选其它已启用连接器，或改用内置工具（search_code/apply_edit/python_exec）。外部连接器调用需保留审计信息。
+- 当需要的能力没有现成连接器时，可【自助装配 MCP】，严格按顺序：
+  1) dev_mcp_search(能力关键词) 查离线安全目录；目录没有时（联网开启）用 web_search/web_fetch 查该软件的【官方】MCP 文档，确认官方 command/URL，禁止使用搜索摘要里未经验证的命令；
+  2) dev_mcp_add 写入配置——该操作会返回 blocked，按提示 dev_approve(action: mcp_server, target 原样照抄) 后用相同参数重试；
+  3) dev_mcp_probe 探活（stdio 首次冷启动可能较慢）；
+  4) dev_mcp_discover 生成能力候选，先把候选能力与来源向用户说明；
+  5) 用户确认后 dev_approve(action: mcp_capability, target: key) 再 dev_mcp_decide(decision: approve)，此后该连接器才可被自动路由；拒绝或撤销用 dev_mcp_remove（同样需 mcp_server 审批）。
 - python_exec(code): 在受限子进程中执行 Python 代码并返回输出。用于数值计算、数据处理、文本变换等需要"真正动手"的任务。
 - create_artifact(json): 创建并校验 DOCX、PDF、PPTX 或 XLSX 文件，写入当前项目 artifacts 目录。制作文档时先用 dev_use_skill 读取对应技能，再传入结构化 JSON；不要用 create_file 伪造二进制文件。
 - self_verify(scope?, files?): 写后自验证工具（闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，按改动文件类型做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck、场景子系统自检）并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。引擎嵌入自检默认关闭（需真 Godot），你可显式用 scope:engine 或开 DOCMIND_SELF_VERIFY_ENGINE=1 触发。你也可以主动调用它复验某文件（scope 取 auto/backend/frontend/scene/engine/all/skip）。
@@ -233,6 +271,7 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - dev_tool_install_audit(limit?): 查询工具安装尝试、版本、沙箱路径和失败类别，不执行安装。
 - delegate(role, task): 把一个**相对独立**的子任务委派给受限子代理执行并取回结论。role 可取 dispatcher/planner（拆文件和分工）、researcher（检索查证）、coder（在授权范围改码）、reviewer（只读评审）或 tester（跑受控命令验证）；task 写清这一件子任务的目标与验收点。适合把大任务拆成互不干扰的检索/实现/评审/验证子任务；**不要**用它转交模糊的整轮问题，也不要在子任务需要与你共享上下文时使用。
 - orchestrate(plan_json): 按【任务图】并行调度多个受限子代理并合成结论，适合需要多角色协作、有先后依赖、或需要交叉验证的复杂任务。输入为 JSON：`{"tasks":[{"id":"a","role":"dispatcher|planner|researcher|coder|reviewer|tester","task":"...","depends_on":["b"],"optional":false}],"synth":true,"max_parallel":4,"replan":true}`。不要固定生成两个 Subagent：由主 Agent 根据任务复杂度决定是直接执行、先派一个 dispatcher/planner 拆解，还是派发多个执行代理。dispatcher/planner 只负责分析文件和设计任务图；返回 tasks JSON 时，主 Agent 会校验后动态加入任务图，再负责汇总规划、审核结果以及最终写入决策。无依赖的任务并行执行；下游任务会拿到上游结论当上下文；`replan`（默认开）会在某任务失败时自动追加**补救任务**并继续跑（受 `max_replans` 限制），失败且不再补救时才阻断其下游（optional 上游除外）；`synth=true` 时额外合成一次并标注冲突。**任务要拆到"一个子代理一轮能做完"的粒度**，别把整轮问题原样塞进一个 task。
+- start_workflow(goal, kind?, web?): 当目标是一条【长链路开发流程】时，把它升级为跨窗口持久、带人工门的开发工作流（任意领域，不局限于游戏：通用开发、EDA、硬件、数据工程等都可以）。判据（满足其一）：多个有依赖或可并行的阶段、需要多种角色协作、包含写码/命令/连接器等副作用阶段、需要中途暂停等审批或下次继续。入参 keyed 多行：`goal: <完整可验收目标>`（也可整段直接写目标）、`kind: generic|game|eda`（缺省 generic；game=游戏开发，eda=原理图/PCB 电子设计）、`web: true|false`（缺省继承本轮联网开关）。它【只创建工作流并停在方案选择门】：随后必须由用户到 AI 运行台「开发工作流」面板选择方案、确认任务 DAG 并审批，多个子代理才会执行；你不能替用户审批，也不能把它当成"立即执行"。边界：一件独立子任务用 delegate；一轮内当场并行出结果、无需持久化和人工门用 orchestrate；需要持久化状态、人工方案门+审批门、失败重规划与跨窗口恢复才用 start_workflow。
 - dev_use_skill(name): 取回某项目技能的完整正文。系统提示会列出【可用技能】目录（只给名称与适用范围）；当问题落在某技能适用范围内时，先 dev_use_skill 取回正文再作答，不要凭目录名臆测内容。
 - dev_asset_get(asset_id/path, consumer_region?): 通过素材区接口取得素材引用，只返回 assets 区内的安全路径和元数据。
 - dev_asset_register(asset_id, path, type?, license?, tags?): 将素材区已有文件注册到 manifest.json。
@@ -253,7 +292,7 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - 需要教程、GitHub/B站方案或最新外部资料时，优先使用 web_research；回答必须根据其返回的来源证据，并列出可点击 URL，不得把搜索摘要当作已验证正文。
 - 关于"文档 / 提示词 / 教程 / 规范 / 某份资料里讲了什么 / 某概念怎么定义 / 知识库里的文件"类问题，【第一个 Action 必须是 search_knowledge】：严禁先用 search_code——知识库文档并不在代码库索引中，先搜代码只会命中无关字符串（如 EXT_blend_minmax、DOWNLOAD_ATTEMPTS_MAX）后误判"项目没有该文档"。只有 search_knowledge 确实定位不到、且问题明确转向代码实现时才允许改用 search_code / grep。
 - 检索类查询（search_knowledge / search_code / grep / web_search）允许基于结果不满意而改写查询：可以更换关键词、补充 site/时间/类型限定、缩小范围或切换工具；这类**不同参数**的重试不会被“重复调用”护栏拦截。只有同一工具的完全相同参数再次调用才会被拦截。对需要“目前/趋势/适合/比较/推荐”的研究型问题，单次结果为空、明显跑题或来源样本过少都不能算证据充分；应由模型自行决定继续搜索，主动覆盖不同年份、平台、地区、开发规模或项目案例，并在达到足够覆盖后再收敛。联网检索默认允许更大的有界预算（由 `DOCMIND_WEB_SEARCH_FAIL_LIMIT` / Agent 步数共同限制），不要因为一次搜索返回非空就停止，也不要把低相关结果写成结论。
-- 当用户问“当前游戏有什么 bug / 项目有哪些问题 / 试玩是否正常 / 哪里可能出错”时，进入【当前项目缺陷审查】流程：第一优先是当前项目证据（search_code 或 grep 定位，read_file 核对实现；项目已运行且连接器可用时再读取运行日志、场景树、截图或执行受控 playtest）。`dev_list_bugs` 只能在拿到当前项目证据之后补充历史记录，必须明确标为“历史归档”，不能把 bugs/ 目录内容直接当成当前项目 bug，也不能只凭目录里有记录就下结论。没有运行证据时要明确写“未运行验证”，没有代码证据时要明确写“仅为线索”。
+- 当用户问“当前游戏有什么 bug / 项目有哪些问题 / 试玩是否正常 / 哪里可能出错”时，进入【当前项目缺陷审查】流程：第一优先是当前项目证据（search_code 或 grep 定位，read_file 核对实现；项目已运行且连接器可用时再读取运行日志、场景树、调用 game_screenshot 截取运行画面，或执行受控 playtest）。截图只是某一瞬间的视觉观察，不是代码事实：画面必须与代码/日志复核后才能下结论；game_screenshot 明确返回无窗口/无头失败时，改用运行日志与受控 playtest 事件判断，严禁臆测画面。`dev_list_bugs` 只能在拿到当前项目证据之后补充历史记录，必须明确标为“历史归档”，不能把 bugs/ 目录内容直接当成当前项目 bug，也不能只凭目录里有记录就下结论。没有运行证据时要明确写“未运行验证”，没有代码证据时要明确写“仅为线索”。
 - 用户要"调外部接口 / 查订单 / 拉取内部服务数据 / 打通某个业务 API"时，用 dev_http_request（需先确认 EXTERNAL_API_ALLOWLIST 已包含目标域名，否则会被安全拦截）。
 - 用户想要"视频提示词/分镜/短视频脚本"类产出时用 gen_video_prompt。
 - 关于"代码/工程/实现/函数/类/枚举/字段/数据库表/配置/报错/播放逻辑/服务器切换"等一切涉及已索引代码库内容的问题，【第一个 Action 必须是 search_code / read_file / grep 之一】：
@@ -332,7 +371,7 @@ CORE_TOOL_NAMES = (
     "search_code", "read_file", "grep", "list_dir",
     "search_knowledge", "calculate", "python_exec",
     "apply_edit", "create_file", "run_command",
-    "delegate", "orchestrate", "tool_search",
+    "delegate", "orchestrate", "start_workflow", "tool_search",
 )
 
 _TOOL_BLOCK_RE = re.compile(r"^-\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
@@ -971,42 +1010,68 @@ class _PromptLeakStreamFilter:
 
 
 class _ReactTokenFilter:
-    """不把 ReAct 协议（Thought/Action/Final Answer）当作正文展示。"""
+    """流式期间不把 ReAct 协议（Thought/Action/Final Answer）当作正文展示。
+
+    - 普通回答（开头不是协议标记）：小探测窗口后原样放行；
+    - ReAct 轮（开头命中 Thought/Action/Final Answer）：整轮抑制，直到看到
+      `Final Answer:`，只放行其后的正文（标记可跨 chunk，保留尾部窗口拼接）。
+      工具轮没有 Final Answer → 不产生正文 token（取证过程由 thought/action/
+      observation 事件展示）。最终干净答案由 final 事件兜底，杜绝「Thought/Action
+      原文先流进气泡、最后才被完整答案整体替换」的错误观感。
+    """
 
     _MARKERS = ("Thought:", "Action:", "Final Answer:")
+    _FINAL_MARKER = "Final Answer:"
     _PROBE = 96
+    # >= len("Final Answer:")(13)：标记被 chunk 切断时尾部至少保留这么多字符
+    _TAIL = 16
 
     def __init__(self):
         self._buffer = ""
         self._internal = False
+        self._emitting = False
         self._decided = False
 
     def feed(self, text):
         if not text:
             return ""
-        if self._decided:
+        if self._emitting:
             return text
         self._buffer += str(text)
-        prefix = self._buffer.lstrip()
-        if any(prefix.startswith(marker) for marker in self._MARKERS):
-            self._internal = True
-            self._decided = True
+        if not self._decided:
+            prefix = self._buffer.lstrip()
+            if any(prefix.startswith(marker) for marker in self._MARKERS):
+                self._internal = True
+                self._decided = True
+                self._buffer = prefix
+            elif len(prefix) >= self._PROBE or "\nThought:" in prefix or "\nAction:" in prefix:
+                # 给普通回答一个很小的探测窗口，避免把首个 "Thought" token 闪现到正文。
+                self._decided = True
+                out, self._buffer = self._buffer, ""
+                return out
+            else:
+                return ""
+        # ReAct 轮：在缓存里定位 Final Answer 标记，找到后才开始放行正文
+        idx = self._buffer.find(self._FINAL_MARKER)
+        if idx >= 0:
+            out = self._buffer[idx + len(self._FINAL_MARKER):]
             self._buffer = ""
-            return ""
-        # 给普通回答一个很小的探测窗口，避免把首个 "Thought" token 闪现到正文。
-        if len(prefix) >= self._PROBE or "\nThought:" in prefix or "\nAction:" in prefix:
-            self._decided = True
-            out, self._buffer = self._buffer, ""
+            self._emitting = True
             return out
+        # 还没看到完整标记：只保留尾部窗口，其余抑制（不能全留，长工具轮会无限缓存）
+        if len(self._buffer) > self._TAIL:
+            self._buffer = self._buffer[-self._TAIL:]
         return ""
 
     def flush(self):
+        if self._emitting:
+            return ""
+        out, self._buffer = self._buffer, ""
+        # internal 且始终没看到 Final Answer：本轮是工具轮，绝不吐协议残句
         if self._internal:
             return ""
-        if self._decided:
-            return ""
+        # 普通回答不足探测窗口就结束：释放剩余缓存
         self._decided = True
-        out, self._buffer = self._buffer, ""
         return out
 
 
@@ -1061,8 +1126,22 @@ _SUBAGENT_ROLES = {
         "hint": "你是【评审专员】：只读代码，指出问题与风险并附具体 文件:行号；禁止修改任何文件。",
     },
     "tester": {
-        "tools": ["read_file", "grep", "python_exec"],
-        "hint": "你是【验证专员】：运行受控命令/测试，回报真实输出与结论，不要臆测。",
+        "tools": ["read_file", "grep", "python_exec", "game_screenshot",
+                  "dev_route_connector", "dev_list_connector_tools", "dev_mcp_call"],
+        "hint": "你是【验证专员】：运行受控命令/测试、必要时截取运行画面，回报真实输出与结论，不要臆测。",
+    },
+    "schematic": {
+        "tools": ["read_file", "grep",
+                  "dev_route_connector", "dev_list_connector_tools", "dev_mcp_call"],
+        "hint": "你是【EDA 原理图/网表专员】：只处理元件库、原理图与网表；调用连接器前先 "
+                "dev_list_connector_tools 核实真实工具名，再按白名单 dev_mcp_call；"
+                "产出必须附 ERC 结果（零错误或列明豁免依据），不要臆造工具名或检查结果。",
+    },
+    "layout": {
+        "tools": ["read_file", "grep",
+                  "dev_route_connector", "dev_list_connector_tools", "dev_mcp_call"],
+        "hint": "你是【EDA PCB 布局布线专员】：基于已审核网表做布局布线并遵守设计约束；"
+                "调用连接器前先 dev_list_connector_tools 核实工具名；未跑 DRC 不得宣布完成。",
     },
 }
 
@@ -1109,7 +1188,9 @@ def _child_trace(traj, thoughts, reflections=None, turn_record=None, used=None,
         "hooks": [dict(item) for item in (hooks or [])[:48] if isinstance(item, dict)],
         "outcome": rec.get("outcome"),
         "llm_calls": rec.get("llm_calls"),
-        "tokens": {"in": rec.get("prompt_tokens"), "out": rec.get("completion_tokens")},
+        "tokens": {"in": rec.get("prompt_tokens"), "out": rec.get("completion_tokens"),
+                   "cache_read": rec.get("cache_read_tokens"),
+                   "cache_creation": rec.get("cache_creation_tokens")},
         "elapsed_ms": rec.get("elapsed_ms"),
         "cost_cny": rec.get("cost_cny"),
     }
@@ -1262,10 +1343,17 @@ class Agent:
         self.plan_mode = bool(plan_mode)
         self.depth = int(depth or 0)
         self.tool_allowlist = list(tool_allowlist) if tool_allowlist else None
+        # 子代理逐任务步数覆盖（_run_child 按工作流任务 max_steps 注入）：
+        # None = 沿用 _step_budget(question) 的动态预算。
+        self.tool_step_override = None
         # 联网开关：默认关闭（代码问答不外联）；由 /api/chat 按请求显式设置。
         self.web_enabled = False
         # 深度思考开关：None=沿用模型默认/全局配置；True/False 按模型画像生效。
         self.thinking_enabled = None
+        # 单次截断续写纠偏时临时关思考：思考型模型（qwen3 / reasoner）会把整段
+        # 输出预算烧在 reasoning 上（config.py:242 已载明），导致 Final Answer 永远写不完、
+        # 续写也再被截断，运行台一片"续写纠偏"。重试时关思考，把 3072 token 全留给答案。
+        self._suppress_thinking_once = False
         self._native_queue = []    # 顺序回退用：逐个消化的 tool_calls
         self._pending_batch = []   # 并行批次用：一轮的多个只读 tool_calls
         self.last_turn_record = None   # 最近一回合的 trace 记录（父代理据此回传子代理轨迹）
@@ -1563,6 +1651,20 @@ class Agent:
                 del head[sys_end:sys_end + 2]
                 continue
             break
+        # 工具图片只允许留在【最后一条】带图 trail 观察上：历史轮次只保留文字，
+        # 与「跨会话历史只存文本」口径一致；任何单条消息最多 4 张。
+        # head（含本轮用户上传图片）不动。
+        last_img_idx = -1
+        for idx, msg in enumerate(trail):
+            if isinstance(msg, dict) and msg.get("images"):
+                last_img_idx = idx
+        for idx, msg in enumerate(trail):
+            if not isinstance(msg, dict) or not msg.get("images"):
+                continue
+            if idx != last_img_idx:
+                msg.pop("images", None)
+            elif len(msg["images"]) > 4:
+                msg["images"] = list(msg["images"])[:4]
         return head + trail
 
     def run(self, question, stream=True, images=None, deadline=None, *,
@@ -1604,6 +1706,12 @@ class Agent:
             self._request_system_context = tuple(str(item) for item in (system_context or ()))
         if ingested_sources is not None:
             self.ingested_sources = tuple(str(item) for item in (ingested_sources or ()))
+        # 把本轮联网缺省注入工具 context：start_workflow 未显式给 web 时继承本回合开关。
+        web_ctx_token = set_session_web_enabled(self.web_enabled)
+        # 本轮模型的视觉能力同步给 web 抓图门：按请求覆盖 llm（云端视觉模型）时，
+        # 全局 runtime 画像不代表当前模型，必须以 self.llm.capability 为准。
+        vision_ctx_token = set_session_vision_mode(
+            (getattr(self.llm, "capability", None) or {}).get("vision"))
         try:
             yield from self._run_shell(question, stream=stream, images=images, deadline=deadline)
         finally:
@@ -1612,6 +1720,16 @@ class Agent:
              self.tool_mode, self.plan_mode,
              self._request_system_context, self.ingested_sources) = prev
             self.llm = prev_llm
+            for _token, _var in ((web_ctx_token, _session_web_enabled),
+                                 (vision_ctx_token, _session_vision_mode)):
+                try:
+                    _var.reset(_token)
+                except (LookupError, ValueError):
+                    # ValueError: SSE 同步生成器在 Starlette 线程池里被调度，
+                    # .set() 与 finally 里的 .reset() 可能落在不同 context 副本
+                    # （Python 3.13 跨 context reset 直接抛 ValueError）。
+                    # 该 token 随副本一起回收，逐请求覆盖不会泄漏到共享单例，忽略即可。
+                    pass
 
     # ---------------------------------------------------------------------------
     # Phase 3 跨会话经验记录（回合收尾钩子）
@@ -1785,7 +1903,8 @@ class Agent:
             # ③ 按 provider 计价 + 预算累计（本地 provider 恒为 0，不影响离线演示）
             try:
                 turn.cost_cny = _pricing.cost_cny(
-                    turn.provider, turn.model, turn.prompt_tokens, turn.completion_tokens)
+                    turn.provider, turn.model, turn.prompt_tokens, turn.completion_tokens,
+                    turn.cache_read_tokens, turn.cache_creation_tokens)
             except Exception:  # noqa: BLE001
                 turn.cost_cny = 0.0
             # ④ 跨会话经验记录（Phase 3，可选）：回合结束若判定为「有趣」（失败-已修复 /
@@ -1834,10 +1953,13 @@ class Agent:
         failures = 0
         nudges = 0
         tool_steps = 0
+        nav_free_used = 0  # 已用掉的免费目录导航次数（_NAV_TOOLS，超出后照常计步）
         iterations = 0
         # 工具/观察预算按本轮真实用户问题动态选择。项目缺陷审查通常需要同时核对
         # 脚本、场景、输入与 UI，不能与普通问答共用同一个很小的固定上限。
-        tool_step_limit = _step_budget(question)
+        # 工作流子代理按任务显式申请加步时（tool_step_override），以申请值为准——
+        # 该值在 _run_child 已被夹到 [1, SUBAGENT_STEPS_HARD_CAP]。
+        tool_step_limit = int(self.tool_step_override or 0) or _step_budget(question)
         observation_limit = _observation_budget(question)
         repeats = 0  # 完全相同参数重复调用同一工具的次数
         tool_fail_streak = {}  # 同一工具连续失败次数（换参数也算；防同工具反复失败死循环）
@@ -1887,7 +2009,9 @@ class Agent:
                     "text": "（本轮已超出时间上限，已中止。请缩小问题范围或拆成更具体的问题后重试。）",
                 }
                 return
-            if iterations > tool_step_limit + _MAX_NUDGES + _MAX_FORCED_FINALS + 4:
+            # 免费目录导航额外占用迭代轮次（不占工具步数），硬顶同步放宽，
+            # 否则免费 list_dir 会先撞迭代上限，预算形同虚设。
+            if iterations > tool_step_limit + _MAX_NUDGES + _MAX_FORCED_FINALS + 4 + NAV_FREE_STEPS:
                 if turn is not None:
                     turn.outcome = "max_steps"
                 yield {
@@ -1901,33 +2025,62 @@ class Agent:
             if self._pending_batch:
                 if PARALLEL_TOOLS and self._parallel_safe(self._pending_batch):
                     remaining = max(0, tool_step_limit - tool_steps)
-                    if remaining == 0:
-                        # 交回顺序路径，让统一的步数耗尽逻辑生成强制收尾提示；
-                        # 不能在并行分支里越过本轮预算。
+                    # 按成本拆批：免费目录导航成本 0（即使付费步数耗尽也可放行），
+                    # 其余工具成本 1。严格按模型给出的顺序取用，不重排后续调用。
+                    batch = []
+                    batch_free = []  # 与 batch 同序：True=该次调用走免费导航额度
+                    paid_taken = 0
+                    nav_taken = 0
+                    for nm, ar in self._pending_batch:
+                        if len(batch) >= PARALLEL_MAX:
+                            break
+                        free_nav = (
+                            nm in _NAV_TOOLS
+                            and nav_free_used + nav_taken < NAV_FREE_STEPS
+                        )
+                        if not free_nav:
+                            if paid_taken >= remaining:
+                                break  # 付费预算用尽：剩余调用（含其后的导航）留给顺序路径
+                            paid_taken += 1
+                        else:
+                            nav_taken += 1
+                        batch.append((nm, ar))
+                        batch_free.append(free_nav)
+                    if not batch:
+                        # 队首付费调用已超预算：交回顺序路径，由统一的步数耗尽逻辑
+                        # 生成强制收尾提示；不能在并行分支里越过本轮预算。
                         self._native_queue = self._pending_batch
                         self._pending_batch = []
                         continue
-                    batch_size = min(PARALLEL_MAX, remaining)
-                    batch = self._pending_batch[:batch_size]
-                    self._pending_batch = self._pending_batch[batch_size:]
+                    self._pending_batch = self._pending_batch[len(batch):]
                     for nm, ar in batch:
                         executed.add((nm, ar))
                     results = self._run_batch(batch, turn)
-                    for nm, ar, _obs, _ok in results:
-                        yield {"type": "action", "text": f"{nm}({ar})"}
-                    for nm, ar, obs, _ok in results:
+                    for (nm, ar, _o, _k, _i), _free in zip(results, batch_free):
+                        # step_cost 透传给外层（子代理编排器按它统计上限，免费导航不计）
+                        yield {"type": "action", "text": f"{nm}({ar})",
+                               "step_cost": 0 if _free else 1}
+                    for nm, ar, obs, _ok, _imgs in results:
                         yield {"type": "observation", "text": obs}
                     trail.append({
                         "role": "assistant",
-                        "content": "（并行调用）" + "、".join(nm for nm, _a, _o, _k in results),
+                        "content": "（并行调用）" + "、".join(nm for nm, _a, _o, _k, _i in results),
                     })
-                    for nm, ar, obs, _ok in results:
-                        trail.append({"role": "user", "content": f"Observation: {_clip(obs, observation_limit)}"})
-                    evidence.extend(f"{nm}({_clip(ar, 120)})" for nm, ar, _o, _k in results)
-                    tool_steps += len(results)
+                    for nm, ar, obs, _ok, imgs in results:
+                        _obs_msg = {"role": "user",
+                                    "content": f"Observation: {_clip(obs, observation_limit)}"}
+                        if imgs:
+                            _obs_msg["images"] = list(imgs)
+                        trail.append(_obs_msg)
+                    evidence.extend(f"{nm}({_clip(ar, 120)})" for nm, ar, _o, _k, _i in results)
+                    # 免费导航只消耗导航额度（与拆批时判定的 batch_free 同序），
+                    # 其余结果按实际数量计入工具步数。
+                    _nav_freed = sum(1 for _free in batch_free if _free)
+                    nav_free_used += _nav_freed
+                    tool_steps += len(results) - _nav_freed
                     last_action = results[-1][0]
                     last_obs = results[-1][2]
-                    if any(self._is_write_tool(nm) for nm, _a, _o, _k in results):
+                    if any(self._is_write_tool(nm) for nm, _a, _o, _k, _i in results):
                         executed.clear()
                     continue
                 # 含非只读安全工具：退回顺序执行
@@ -1940,6 +2093,8 @@ class Agent:
                 turn.snapshot_prompt(messages)
             acc = ""
             finish_reason = None
+            # 续写纠偏重试：本次调用暂时关思考，把输出预算留给答案本身
+            eff_thinking = False if self._suppress_thinking_once else self.thinking_enabled
             native_override = None
             use_tools = self._native_enabled()
             tools_arg = tool_schemas(self._effective_tool_names(), registry=self.tools) if use_tools else None
@@ -1970,7 +2125,7 @@ class Agent:
                     with _llm_trace:
                         chat_stream = self.llm.chat(
                             messages, stream=True, deadline=deadline, tools=tools_arg,
-                            enable_thinking=self.thinking_enabled, reasoning_sink=reasoning_q,
+                            enable_thinking=eff_thinking, reasoning_sink=reasoning_q,
                         )
                         for tok in chat_stream:
                             while reasoning_q:
@@ -2000,11 +2155,13 @@ class Agent:
                     with _llm_trace:
                         acc = self.llm.chat(
                             messages, stream=False, deadline=deadline, tools=tools_arg,
-                            enable_thinking=self.thinking_enabled,
+                            enable_thinking=eff_thinking,
                         )
                 if turn is not None:
                     turn.llm_step((time.monotonic() - _t_llm) * 1000, finish_reason)
                     turn.add_usage(getattr(self.llm, "last_usage", None))
+                # 关思考只作用于被截断后的那一次续写重试；用完即复位，避免影响后续正常轮次
+                self._suppress_thinking_once = False
                 calls = (getattr(self.llm, "last_tool_calls", None) or []) if use_tools else []
                 if calls:
                     # 原生 tool_call 归一进文本协议：护栏 / 事件 / 账本完全复用
@@ -2140,7 +2297,10 @@ class Agent:
                     }
                     continue
 
-                if tool_steps >= tool_step_limit:
+                # 付费步数耗尽后，仍有免费目录导航额度时放行 list_dir（成本 0），
+                # 只有免费额度也用完才进入强制收尾；同参重复导航已在前面拦截。
+                _nav_is_free = action_name in _NAV_TOOLS and nav_free_used < NAV_FREE_STEPS
+                if tool_steps >= tool_step_limit and not _nav_is_free:
                     # 步数耗尽：先强制模型基于已有 Observation 收尾（不执行新工具、不计步），
                     # 给一次机会产出带证据的 Final Answer；仍要调工具则由前置拦截证据兜底。
                     if forced_finals < _MAX_FORCED_FINALS:
@@ -2237,12 +2397,19 @@ class Agent:
                     continue
 
                 executed.add(sig)
-                tool_steps += 1
+                # 免费目录导航只占导航额度（与并行批次同一口径），其余工具占 1 个工具步数。
+                if _nav_is_free:
+                    nav_free_used += 1
+                else:
+                    tool_steps += 1
                 # 事件展示 / 证据清单 / 实际派发必须统一用归一化后的 action_arg：
                 # 弱模型的 query:/pattern:/path: 关键字风格已在此处还原为工具真实入参。
                 evidence.append(f"{action_name}({_clip(action_arg, 120)})")
-                yield {"type": "action", "text": f"{action_name}({action_arg})"}
+                # step_cost 透传给外层：子代理编排器据此统计步数，免费导航为 0。
+                yield {"type": "action", "text": f"{action_name}({action_arg})",
+                       "step_cost": 0 if _nav_is_free else 1}
                 _t_tool = time.monotonic()
+                obs_images = None  # 工具图片经能力门后挂到成功路径的 Observation 消息
                 if action_name == "delegate":
                     # 子代理必须继承父代理的模型/会话，走特殊派发而非 TOOLS 里的占位实现
                     _fn = lambda arg: self._delegate(arg, turn=turn)
@@ -2263,6 +2430,7 @@ class Agent:
                         side_effect=_spec.side_effect if _spec is not None else SideEffect.PURE,
                     )
                 obs = _hooks.run_post_tool(action_name, action_arg, _result.text)
+                obs, obs_images = self._gate_tool_images(obs, _result.data)
                 _tool_ok = _result.ok and (obs == _result.text or not _is_failure(obs))
                 if _tool_ok and action_name in _WEB_ACTIONS and not _web_result_relevant(action_name, action_arg, obs):
                     # 非空不等于有用：把明显跑题的搜索结果标记为可恢复失败，
@@ -2429,15 +2597,17 @@ class Agent:
                 trail.append(
                     {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
                 )
-                trail.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Observation: {_clip(obs, observation_limit)}"
-                            "\n\n（请基于观察继续，或给出 Final Answer）"
-                        ),
-                    }
-                )
+                _obs_entry = {
+                    "role": "user",
+                    "content": (
+                        f"Observation: {_clip(obs, observation_limit)}"
+                        "\n\n（请基于观察继续，或给出 Final Answer）"
+                    ),
+                }
+                if obs_images:
+                    # 仅最近一条工具观察允许带图；_fit_budget 会剥离更早观察上的图片。
+                    _obs_entry["images"] = list(obs_images)
+                trail.append(_obs_entry)
                 continue
 
             truncated = finish_reason == "length"
@@ -2448,6 +2618,7 @@ class Agent:
                 # 不把半句直接抛给用户；纠偏额度耗尽后才接受这半句真实结论兜底。
                 if truncated and nudges < _MAX_NUDGES:
                     nudges += 1
+                    self._suppress_thinking_once = True   # 重试关思考，把预算留给答案
                     trail.append(
                         {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
                     )
@@ -2497,6 +2668,8 @@ class Agent:
             # 格式没写完。自动「续写纠偏」最多 _MAX_NUDGES 次，绝不把残句静默当答案。
             if nudges < _MAX_NUDGES and (truncated or not acc.strip() or not has_real_final):
                 nudges += 1
+                if truncated:
+                    self._suppress_thinking_once = True   # 重试关思考，避免再烧预算
                 if acc.strip():
                     trail.append(
                         {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
@@ -2575,11 +2748,32 @@ class Agent:
             for name, _ in batch
         )
 
+    def _gate_tool_images(self, obs, data):
+        """把 ToolResult.data 中的图片送统一视觉能力门。
+
+        返回 ``(observation_text, images_for_message)``；任何异常都静默降级为
+        纯文本观察，绝不因图片通道故障中断工具回合。
+        """
+        if not isinstance(data, dict):
+            return obs, None
+        raw_images = data.get("images")
+        if not raw_images:
+            return obs, None
+        try:
+            from agent_runtime.vision import attach_tool_observation
+            text, imgs, _audit = attach_tool_observation(
+                obs, raw_images,
+                current_capability=getattr(self.llm, "capability", None))
+            return text, imgs
+        except Exception:  # noqa: BLE001 —— 视觉过门失败只丢图，不丢观察
+            return obs, None
+
     def _run_batch(self, batch, turn):
-        """并发执行一批只读工具，返回 [(name, arg, obs, ok)]（保持入参顺序）。
+        """并发执行一批只读工具，返回 [(name, arg, obs, ok, images)]（保持入参顺序）。
 
         每条仍完整走：pre_tool 钩子 → 白名单/写意图已在派发前拦过 → 执行 →
         post_tool 钩子 → 账本记步。单条异常只影响本条，不拖垮整批。
+        images 为过视觉能力门后可挂到观察消息的 base64 列表（可能为 None）。
         """
         out = [None] * len(batch)
 
@@ -2587,14 +2781,14 @@ class Agent:
             try:
                 blocked, reason, arg2 = _hooks.run_pre_tool(name, arg)
                 if blocked:
-                    out[i] = (name, arg, f"[钩子拦截] {name} 未执行：{reason}", False)
+                    out[i] = (name, arg, f"[钩子拦截] {name} 未执行：{reason}", False, None)
                     return
                 lifecycle = _hooks.run_workflow("before_tool", {
                     "tool": name, "argument_chars": len(str(arg2 or "")),
                     "depth": self.depth, "session_id": self.session_id or "",
                 })
                 if lifecycle.get("blocked"):
-                    out[i] = (name, arg2, f"[钩子拦截] {name} 未执行：{lifecycle.get('reason') or '工具生命周期钩子拦截'}", False)
+                    out[i] = (name, arg2, f"[钩子拦截] {name} 未执行：{lifecycle.get('reason') or '工具生命周期钩子拦截'}", False, None)
                     return
                 t0 = time.monotonic()
                 if name == "delegate":
@@ -2616,6 +2810,7 @@ class Agent:
                         side_effect=spec.side_effect if spec is not None else SideEffect.PURE,
                     )
                 obs = _hooks.run_post_tool(name, arg2, result.text)
+                obs, obs_images = self._gate_tool_images(obs, result.data)
                 ok = result.ok and (obs == result.text or not _is_failure(obs))
                 duration_ms = int((time.monotonic() - t0) * 1000)
                 if result.error_kind == "timeout" and self._is_network_tool(name):
@@ -2642,15 +2837,15 @@ class Agent:
                     obs = "[并行执行失败] " + obs
                 if turn is not None:
                     turn.tool_step(name, arg2, (time.monotonic() - t0) * 1000, obs, ok=ok)
-                out[i] = (name, arg2, obs, ok)
+                out[i] = (name, arg2, obs, ok, (obs_images if ok else None))
             except Exception as e:  # noqa: BLE001 —— 单条失败不能炸整批
-                out[i] = (name, arg, f"[并行执行失败] {type(e).__name__}: {e}", False)
+                out[i] = (name, arg, f"[并行执行失败] {type(e).__name__}: {e}", False, None)
 
         with ThreadPoolExecutor(max_workers=min(PARALLEL_MAX, max(1, len(batch)))) as ex:
             futures = [ex.submit(_one, i, n, a) for i, (n, a) in enumerate(batch)]
             for f in futures:
                 f.result()
-        return [r if r is not None else ("?", "", "[并行执行未返回]", False) for r in out]
+        return [r if r is not None else ("?", "", "[并行执行未返回]", False, None) for r in out]
 
     # ------------------------------------------------------------------
     # 子代理（受限委派）
@@ -2667,15 +2862,29 @@ class Agent:
         return self.llm
 
     def _run_child(self, role, task, context=None, turn=None, *, persona="",
-                   tool_allowlist=None, mcp_policy="auto", reflect=True):
+                   tool_allowlist=None, mcp_policy="auto", reflect=True,
+                   max_steps=None, step_sink=None):
         """跑一个受限子代理，返回 {status, conclusion, steps, error}（delegate 与 orchestrate 共用）。
 
         - 角色决定工具白名单与角色提示（researcher / coder / reviewer / tester）；
         - 子代理持**独立** LLMClient、独立会话（不落盘、不污染父会话历史）；
         - 递归深度受 SUBAGENT_MAX_DEPTH 限制，白名单不含 delegate/orchestrate（天然防套娃）；
         - `context`（{上游id: 结论}）会被注入子任务提示——这是"下游看得见上游"的关键；
-        - 子代理 token 计入父回合账本。
+        - 子代理 token 计入父回合账本；
+        - `step_sink(item)` 可选：每产生一条 thought/action/observation 实时回调
+          （文本已按 SINK_* 有界裁剪），供工作流 SSE 推给 UI；sink 异常绝不影响执行。
         """
+
+        def emit_sink(step_type, text):
+            if not callable(step_sink) or step_type not in SINK_STEP_TYPES:
+                return
+            try:
+                limit = {"thought": SINK_THOUGHT_CHARS,
+                         "action": SINK_ACTION_CHARS,
+                         "observation": SINK_OBS_CHARS}[step_type]
+                step_sink({"type": step_type, "text": _clip(str(text or ""), limit)})
+            except Exception:
+                pass
         spec = _SUBAGENT_ROLES.get(role or "")
         if spec is None:
             return {"status": "failed", "conclusion": "", "steps": 0,
@@ -2729,7 +2938,7 @@ class Agent:
         if isinstance(requested_tools, (list, tuple, set)) and requested_tools:
             allowed = [str(name) for name in requested_tools
                        if str(name) in role_tools and str(name) in self.tools
-                       and str(name) not in {"delegate", "orchestrate"}]
+                       and str(name) not in {"delegate", "orchestrate", "start_workflow"}]
         else:
             allowed = list(spec["tools"])
         policy = str(mcp_policy or "auto").strip().lower()
@@ -2746,6 +2955,7 @@ class Agent:
         elif policy == "allow":
             allowed = list(dict.fromkeys(allowed + mcp_tools))
         allowed = [name for name in allowed if name in self.tools]
+        cap = _resolve_child_max_steps(max_steps)
         child = Agent(
             llm=child_llm,
             session_id=None,
@@ -2770,7 +2980,10 @@ class Agent:
         if context:
             ctx = "\n".join(f"- {k}：{_clip(str(v), 600)}" for k, v in context.items())
             question += "\n\n【上游子任务结论（供参考，勿重复劳动）】\n" + ctx
-        cap = max(1, SUBAGENT_MAX_STEPS)
+        # 仅当任务申请步数高于该问题自身的动态预算时才抬高子代理循环上限；
+        # 申请值更小时由外层 cap 截断（保持「耗尽步数未收尾 → 过程要点降级」语义）。
+        if cap > _step_budget(question):
+            child.tool_step_override = cap
         final_text, used = "", 0
         thoughts, reflections, last_obs = [], [], ""
         traj, pending = [], None          # traj: [{action, obs}] —— 有界的逐步轨迹
@@ -2785,7 +2998,9 @@ class Agent:
                         if et == "final":
                             final_text = ev.get("text") or ""
                         elif et == "action":
-                            used += 1
+                            # 免费目录导航 step_cost=0：不占子任务步数上限（与内层同一口径）
+                            used += int(ev.get("step_cost", 1))
+                            emit_sink("action", ev.get("text") or "")
                             if len(traj) < ORCH_TRACE_STEPS:
                                 pending = {"action": ev.get("text") or "", "obs": ""}
                                 traj.append(pending)
@@ -2793,16 +3008,19 @@ class Agent:
                                 pending = None    # 超出上限：只计数，不再累积（防止提示爆炸）
                         elif et == "thought":
                             thoughts.append(ev.get("text") or "")
+                            emit_sink("thought", ev.get("text") or "")
                         elif et == "reflection":
                             reflections.append(ev.get("text") or "")
                         elif et == "observation":
                             last_obs = ev.get("text") or ""
                             if pending is not None and not pending["obs"]:
                                 pending["obs"] = _clip(last_obs, ORCH_TRACE_OBS_CHARS)
+                            emit_sink("observation", last_obs)
                         if used > cap:
                             break
         except Exception as e:  # noqa: BLE001 —— 子代理失败不应炸掉父回合
             failed = {"status": "failed", "conclusion": "", "steps": used,
+                    "max_steps": cap,
                     "error": f"{type(e).__name__}: {e}",
                     "reflection": {"ok": False, "source": "exception",
                                    "issues": [type(e).__name__]},
@@ -2836,6 +3054,7 @@ class Agent:
         error = "" if status == "ok" else "子代理反思未通过：" + "; ".join(
             str(item) for item in (reflection.get("issues") or []))
         output = {"status": status, "conclusion": conclusion, "steps": used,
+                "max_steps": cap,
                 "error": error, "degraded": degraded, "reflection": reflection,
                 "trace": _child_trace(traj, thoughts, reflections,
                                       getattr(child, "last_turn_record", None), used,
@@ -2876,7 +3095,8 @@ class Agent:
             task.get("role"), task.get("task"), context=context, turn=turn,
             persona=task.get("persona", ""), tool_allowlist=task.get("tools"),
             mcp_policy=task.get("mcp", "auto"),
-            reflect=bool(task.get("reflection", True)))
+            reflect=bool(task.get("reflection", True)),
+            max_steps=task.get("max_steps"))
 
     def _synth(self, tasks, results, turn=None):
         """把所有子任务结论合成一段最终答复（一次 LLM 调用；失败退回原始拼接）。"""

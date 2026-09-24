@@ -32,6 +32,9 @@ _lock = threading.Lock()
 
 _USAGE_IN_KEYS = ("prompt_tokens", "in", "prompt_eval_count", "input_tokens")
 _USAGE_OUT_KEYS = ("completion_tokens", "out", "eval_count", "output_tokens")
+# prompt caching 字段（平铺键 + 嵌套 prompt_tokens_details.* 两种口径都兼容）
+_CACHE_READ_KEYS = ("cache_read_input_tokens", "cache_read_tokens", "cached_tokens")
+_CACHE_CREATION_KEYS = ("cache_creation_input_tokens", "cache_creation_tokens")
 
 
 def _pick(d, keys):
@@ -39,6 +42,20 @@ def _pick(d, keys):
         v = d.get(k)
         if isinstance(v, (int, float)):
             return int(v)
+    return 0
+
+
+def _pick_cache(d, flat_keys):
+    """取缓存 token 计数：先查顶层平铺键，再查 prompt_tokens_details / input_tokens_details 嵌套。"""
+    v = _pick(d, flat_keys)
+    if v:
+        return v
+    details = d.get("prompt_tokens_details") or d.get("input_tokens_details") or {}
+    if isinstance(details, dict):
+        for k in flat_keys:
+            dv = details.get(k)
+            if isinstance(dv, (int, float)):
+                return int(dv)
     return 0
 
 
@@ -72,6 +89,8 @@ class Turn:
         self.messages_count = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self.cache_read_tokens = 0      # prompt caching 命中（按折扣价计费）
+        self.cache_creation_tokens = 0  # prompt caching 首次写入（按溢价计费）
         self.llm_calls = 0
         self.llm_ms = 0
         self.steps = []
@@ -102,12 +121,14 @@ class Turn:
         return self.messages_hash
 
     def add_usage(self, usage):
-        """累加一次 LLM 调用的 token 用量（键名兼容 OpenAI 与 Ollama）。"""
+        """累加一次 LLM 调用的 token 用量（键名兼容 OpenAI / Ollama / Anthropic）。"""
         if not usage:
             return
         with self._lk:
             self.prompt_tokens += _pick(usage, _USAGE_IN_KEYS)
             self.completion_tokens += _pick(usage, _USAGE_OUT_KEYS)
+            self.cache_read_tokens += _pick_cache(usage, _CACHE_READ_KEYS)
+            self.cache_creation_tokens += _pick_cache(usage, _CACHE_CREATION_KEYS)
 
     def llm_step(self, latency_ms, finish_reason=None):
         self.llm_calls += 1
@@ -153,6 +174,8 @@ class Turn:
             "messages_count": self.messages_count,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
             "total_tokens": self.prompt_tokens + self.completion_tokens,
             "cost_cny": round(self.cost_cny, 8),
             "llm_calls": self.llm_calls,
@@ -237,6 +260,8 @@ def summary():
         "turns": len(rows),
         "prompt_tokens": 0,
         "completion_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
         "total_tokens": 0,
         "total_cost_cny": 0.0,
         "avg_elapsed_ms": 0,
@@ -250,8 +275,12 @@ def summary():
     for r in rows:
         p = int(r.get("prompt_tokens") or 0)
         c = int(r.get("completion_tokens") or 0)
+        cr = int(r.get("cache_read_tokens") or 0)
+        cc = int(r.get("cache_creation_tokens") or 0)
         agg["prompt_tokens"] += p
         agg["completion_tokens"] += c
+        agg["cache_read_tokens"] += cr
+        agg["cache_creation_tokens"] += cc
         agg["total_tokens"] += p + c
         cost = float(r.get("cost_cny") or 0.0)
         agg["total_cost_cny"] += cost
@@ -263,11 +292,14 @@ def summary():
         key = r.get("provider") or "?"
         slot = agg["by_provider"].setdefault(key, {
             "turns": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
             "tokens": 0, "cost_cny": 0.0,
         })
         slot["turns"] += 1
         slot["prompt_tokens"] += p
         slot["completion_tokens"] += c
+        slot["cache_read_tokens"] += cr
+        slot["cache_creation_tokens"] += cc
         slot["tokens"] += p + c
         slot["cost_cny"] += cost
     agg["total_cost_cny"] = round(agg["total_cost_cny"], 8)

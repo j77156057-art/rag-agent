@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent } from 'vue'
 import { runtimeApi, engineApi, playApi, sceneApi, regionsApi, bugsApi, changesetApi, aiApi, getProjectId } from '../api'
+import { createPoller } from '../composables/polling'
 import type { WebTemplates, WebExportResult, DesktopHost, EmbedRect, BugItem, RegionInfo } from '../api'
 import { useWorkbench } from '../composables/workbench'
 import { demoMode, demoBugs, demoChangesets, demoRegionCards, demoBugFixAnswer } from '../composables/demo'
@@ -319,8 +320,9 @@ function onWindowMessage(ev: MessageEvent) {
   runtimeApi.append([{ eid, type: d.type, data: d.data ?? {} }]).catch(() => {})
 }
 
-let pollEvTimer: number | undefined
-let engineChangeTimer: number | undefined
+// 可见性感知 + 单飞的轮询器：标签页切后台时暂停，回前台立即补一次
+const evPoller = createPoller(pollEvents, 3000)
+const engineChangePoller = createPoller(pollEngineChanges, 2500)
 async function pollEvents() {
   const project = getProjectId()
   try {
@@ -359,18 +361,13 @@ async function nativeReload() {
   }
 }
 function startTimers() {
-  stopTimers()
   captureSince.value = Date.now()
-  void pollEvents()
-  void pollEngineChanges()
-  pollEvTimer = window.setInterval(pollEvents, 3000)
-  engineChangeTimer = window.setInterval(pollEngineChanges, 2500)
+  evPoller.start()
+  engineChangePoller.start()
 }
 function stopTimers() {
-  if (pollEvTimer) window.clearInterval(pollEvTimer)
-  if (engineChangeTimer) window.clearInterval(engineChangeTimer)
-  pollEvTimer = undefined
-  engineChangeTimer = undefined
+  evPoller.stop()
+  engineChangePoller.stop()
 }
 
 function evClass(t: string) {

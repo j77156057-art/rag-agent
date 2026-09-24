@@ -150,7 +150,8 @@ watch(regionMapOpen, (open) => {
     selectedKey.value = null
     window.addEventListener('keydown', onKey)
   } else window.removeEventListener('keydown', onKey)
-})
+  // immediate：组件在首次打开时才由 App 异步挂载，挂载即 open=true，需立即绑键
+}, { immediate: true })
 onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 </script>
 

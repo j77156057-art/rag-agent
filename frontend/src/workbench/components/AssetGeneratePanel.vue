@@ -375,6 +375,7 @@ import {
   type CloudProvider, type CloudKeyState,
 } from '../api'
 import { demoMode, demoGenImages, demoGenSheet } from '../composables/demo'
+import { createPoller, type Poller } from '../composables/polling'
 import SpritePlayer from './SpritePlayer.vue'
 
 const emit = defineEmits<{ done: [] }>()
@@ -599,7 +600,13 @@ async function startComfy() {
 }
 
 // ---------------------------------------------------------------- 任务轮询
-function stopTimer() { if (timer) { clearInterval(timer); timer = 0 } }
+// timer：demo 假进度用；jobPoller：真实生成任务的可见性感知轮询
+let jobPoller: Poller | null = null
+function stopTimer() {
+  if (timer) { clearInterval(timer); timer = 0 }
+  jobPoller?.stop()
+  jobPoller = null
+}
 
 function followJob(jobId: string, onDone: (j: GenJob) => void) {
   stopTimer()
@@ -619,8 +626,9 @@ function followJob(jobId: string, onDone: (j: GenJob) => void) {
       }
     }
   }
-  timer = window.setInterval(tick, 2000)
-  void tick()
+  // 切后台时暂停任务状态请求，回前台立即补一次（生成本身在服务端继续）
+  jobPoller = createPoller(tick, 2000)
+  jobPoller.start()
 }
 
 // ---------------------------------------------------------------- 本地生图 / 帧动画

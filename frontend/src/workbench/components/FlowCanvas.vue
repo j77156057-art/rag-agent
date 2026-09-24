@@ -126,7 +126,8 @@ async function load() {
     loading.value = false
   }
 }
-watch(flowOpen, (v) => { if (v) void load() })
+// immediate：组件在首次打开时才由 App 异步挂载，挂载即 open=true，需立即加载
+watch(flowOpen, (v) => { if (v) void load() }, { immediate: true })
 
 function onKey(e: KeyboardEvent) {
   if (e.key === 'Escape' && flowOpen.value) closeFlow()
@@ -330,6 +331,7 @@ function providerLabel(p: string) {
             <span class="fl-chip">{{ (selectedTurn.steps || []).length }} 个工具调用</span>
             <span class="fl-chip">{{ selectedTurn.llm_calls }} 次模型思考 · {{ fmtMs(selectedTurn.llm_ms) }}</span>
             <span class="fl-chip">{{ selectedTurn.total_tokens.toLocaleString() }} token（入 {{ selectedTurn.prompt_tokens.toLocaleString() }} / 出 {{ selectedTurn.completion_tokens.toLocaleString() }}）</span>
+            <span v-if="selectedTurn.cache_read_tokens" class="fl-chip cache">缓存命中 {{ selectedTurn.cache_read_tokens.toLocaleString() }}</span>
             <span class="fl-chip">花费 {{ money(selectedTurn.cost_cny) }}</span>
             <span class="fl-chip">总耗时 {{ fmtMs(selectedTurn.elapsed_ms) }}</span>
           </div>
@@ -441,6 +443,7 @@ function providerLabel(p: string) {
               <p class="fl-d-line"><label>回答长度</label><span>{{ selectedDetail.turn.final_chars }} 字</span></p>
               <p class="fl-d-line"><label>总耗时</label><span>{{ fmtMs(selectedDetail.turn.elapsed_ms) }}</span></p>
               <p class="fl-d-line"><label>token</label><span>入 {{ selectedDetail.turn.prompt_tokens.toLocaleString() }} / 出 {{ selectedDetail.turn.completion_tokens.toLocaleString() }}</span></p>
+              <p v-if="selectedDetail.turn.cache_read_tokens" class="fl-d-line"><label>缓存命中</label><span>{{ selectedDetail.turn.cache_read_tokens.toLocaleString() }} token（按折扣价计费，已避免全价重复计）</span></p>
               <p class="fl-d-line"><label>花费</label><span>{{ money(selectedDetail.turn.cost_cny) }}（本地模型为 ¥0）</span></p>
               <p v-if="selectedDetail.turn.error" class="fl-d-line"><label>错误</label><span class="fl-bad">{{ selectedDetail.turn.error }}</span></p>
             </template>
@@ -541,6 +544,7 @@ function providerLabel(p: string) {
   border-radius: 999px; padding: 2px 9px; font-variant-numeric: tabular-nums; white-space: nowrap;
 }
 .fl-chip.model { color: #7a4fd1; border-color: #d9c9f5; background: #f8f4ff; font-weight: 600; }
+.fl-chip.cache { color: var(--green); border-color: #bfe6d2; background: #eefaf3; font-weight: 600; }
 .fl-canvas { flex: 1 1 auto; min-height: 0; position: relative; }
 .fl-empty-canvas { display: flex; align-items: center; justify-content: center; color: #93a0b5; font-size: 13px; }
 

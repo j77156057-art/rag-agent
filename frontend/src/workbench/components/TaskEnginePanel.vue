@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { engineApi, taskApi, comfyApi, getProjectId, getActiveTask, setActiveTask } from '../api'
+import { usePolling } from '../composables/polling'
 import { useWorkbench } from '../composables/workbench'
 const { jumpToLine } = useWorkbench()
 const panelProject = getProjectId()
@@ -22,11 +23,14 @@ async function toggleEngine() { busy.value = true; try { const r = running.value
 async function reloadEngine() { busy.value = true; try { const r = await engineApi.reload(); result.value = r.ok ? 'Godot 已热重载' : (r.error || '热重载失败'); running.value = !!r.running; await refresh() } catch (e) { result.value = (e as Error).message } finally { busy.value = false } }
 async function verifyEngine() { busy.value = true; try { const r = await engineApi.verify(); result.value = r.ok ? 'Godot 校验通过' : (r.error || 'Godot 校验失败') } catch (e) { result.value = (e as Error).message } finally { busy.value = false } }
 async function loadComfyHistory(page = comfyPage.value) { if (disposed || panelProject !== getProjectId()) return; try { const h=await comfyApi.jobs(page,20); comfyPage.value=page; comfyTotal.value=h.total||0; const ids=(h.items||[]).map(x=>String(x.prompt_id||'' )).filter(Boolean); comfyHistory.value=ids } catch (e) { comfyResult.value='历史加载失败：'+(e as Error).message } }
-onMounted(refresh); onMounted(loadTasks); onMounted(async () => { try { comfyTemplates.value = (await comfyApi.templates()).templates } catch {}; await loadComfyHistory() })
-let timer: number | undefined, comfyTimer: number | undefined
-onMounted(() => { timer = window.setInterval(refresh, 3000); comfyTimer = window.setInterval(() => { if (promptId.value) void pollComfy() }, 4000) })
-import { onBeforeUnmount } from 'vue'
-onBeforeUnmount(() => { disposed = true; if (timer) window.clearInterval(timer); if (comfyTimer) window.clearInterval(comfyTimer) })
+onMounted(loadTasks); onMounted(async () => { try { comfyTemplates.value = (await comfyApi.templates()).templates } catch {}; await loadComfyHistory() })
+// 引擎状态/日志轮询：仅弹窗打开且页面可见时进行（旧实现无论弹窗开关恒定 3s 轮询）
+usePolling(refresh, 3000, { active: open })
+// ComfyUI 任务进度：弹窗打开且确有在途生成时才轮询
+usePolling(() => { void pollComfy() }, 4000, {
+  active: computed(() => open.value && !!promptId.value),
+})
+onBeforeUnmount(() => { disposed = true })
 async function checkComfy() { try { const r = await comfyApi.status(comfyUrl.value); comfyState.value = r.available ? '可用' : '不可用' } catch { comfyState.value = '不可用' } }
 async function startComfy() { comfyResult.value = '正在启动 ComfyUI…'; try { const r=await comfyApi.start(); comfyResult.value=r.ok ? `ComfyUI 已启动（PID ${r.pid||'?' }）` : (r.error||'启动失败'); await checkComfy() } catch(e) { comfyResult.value=(e as Error).message } }
 async function stopComfy() { try { const r=await comfyApi.stop(); comfyResult.value=r.ok ? 'ComfyUI 已停止' : (r.error||'停止失败'); await checkComfy() } catch(e) { comfyResult.value=(e as Error).message } }

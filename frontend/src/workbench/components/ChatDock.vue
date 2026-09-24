@@ -3,15 +3,18 @@
 // - 答案中的文件引用渲染为可点击卡片：跳转代码行 + 文件树展开闪烁 + 分区高亮；
 // - 头部「引擎」弹层：MCP 服务器连接状态（godot-ai stdio / unity / unreal HTTP）
 //   与 godot-ai 插件安装引导（安装前必须用户确认）。
-import { nextTick, ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
+import { nextTick, reactive, ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
-import { aiApi, visionApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, getProjectId, setSessionId, startNewSession, startTabProbe } from '../api'
+import { aiApi, agentApi, visionApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, getProjectId, setSessionId, startNewSession, startTabProbe } from '../api'
 import type { McpServer, ModelConfigInfo, ContextUsage, SessionInfo } from '../api'
 import type { SseEvent } from '../api'
 import { mdToHtml, extractFileRefs, extractWebRefs } from '../markdown'
 import type { FileRef } from '../markdown'
 import { demoMode } from '../composables/demo'
 import ModelSettingsDialog from './ModelSettingsDialog.vue'
+import WorkflowCard from './WorkflowCard.vue'
+import WorkflowMembersDock from './WorkflowMembersDock.vue'
+import type { WorkflowState, WorkflowSummary } from '../api'
 
 const {
   nodeExists, revealPath, jumpToLine,
@@ -32,6 +35,141 @@ interface ChatMsg {
   error?: string
   recoverable?: boolean
   imageCount?: number
+  /** 对话内工作流卡片（start_workflow 触发，后续全走 SSE，不再弹独立面板） */
+  workflow?: { workflowId: string; seed?: Partial<WorkflowState> }
+}
+
+/** 活跃工作流团队（左下角成员抽屉数据源，终态自动移除） */
+interface WfTeam {
+  workflowId: string
+  active: boolean
+  members: Array<{ id: string; label: string; role: string; status: string; task: string }>
+}
+const wfTeams = ref<WfTeam[]>([])
+const wfActiveTeam = computed(() => {
+  const live = [...wfTeams.value].reverse().find(t => t.active && t.members.length)
+  return live || null
+})
+// 所有未终结的工作流（含停在方案门、成员尚为空的）——并发拦截与离开确认都以此为准
+const activeWorkflowIds = computed(() =>
+  wfTeams.value.filter(t => t.active).map(t => t.workflowId))
+// 正打开人工审批门的工作流集合：此时锁定对话台操作区（发送/工具/头部按钮），
+// 但不锁聊天滚动与编辑器——审批可以边看代码边做
+const gateOpenIds = ref<Set<string>>(new Set())
+const gateBlocking = computed(() => gateOpenIds.value.size > 0)
+function onWfGate(workflowId: string, open: boolean) {
+  const next = new Set(gateOpenIds.value)
+  if (open) next.add(workflowId); else next.delete(workflowId)
+  gateOpenIds.value = next
+}
+/**
+ * 离开当前对话（切换/新建/清空）前调用：有未终结工作流时必须先征得同意，
+ * 并在用户确认后尽力中断它们——否则卡片随消息卸载，后端工作流会停在
+ * 审批门成为无法操作的孤儿。文件改动不会回滚，需在文案里明示。
+ */
+async function confirmLeaveWorkflows(): Promise<boolean> {
+  const ids = activeWorkflowIds.value
+  if (!ids.length) return true
+  const ok = await askConfirm({
+    title: '工作流仍在进行',
+    message: `有 ${ids.length} 个工作流正在等待审批或执行中。离开后将无法继续操作，系统会自动中断它（工作流已产生的文件改动不会自动回滚）。确定离开？`,
+    confirmText: '中断并离开',
+  })
+  if (!ok) return false
+  await Promise.allSettled(ids.map(id =>
+    agentApi.workflowInterrupt(id, '用户离开当前对话，自动中断')))
+  return true
+}
+function onWfTeam(payload: WfTeam) {
+  const rest = wfTeams.value.filter(t => t.workflowId !== payload.workflowId)
+  if (payload.active) rest.push(payload)
+  wfTeams.value = rest
+  // 工作流终结：给对应回合盖结束时间，让秒表定格（计时钟也随之停走）
+  if (!payload.active) {
+    const turn = messages.value.find(m => m.workflow?.workflowId === payload.workflowId)
+    if (turn && turn.startedAt && !turn.finishedAt) turn.finishedAt = Date.now()
+    if (orphanWf.value?.workflow_id === payload.workflowId) orphanWf.value = null
+  }
+}
+
+// ---------------------------------------------------------------- 孤儿工作流恢复
+// 页面刷新/会话切换后对话消息是纯文本回灌，工作流卡片不会重建，但后端同项目
+// 互斥仍然存活 → 新请求被拒且界面无任何操作入口。挂载/切会话/发送后探测一次，
+// 发现「后端未终结、本地无卡片」的工作流时给出恢复条（挂回卡片或中断）。
+const WF_STATUS_LABEL: Record<string, string> = {
+  generating_options: '正在生成方案', awaiting_choice: '等待选择方案',
+  awaiting_research: '等待联网检索', researching: '联网调研中',
+  planning: '任务规划中', awaiting_plan_approval: '等待计划审批',
+  awaiting_approval: '等待审核', planned: '待执行',
+  executing: '子代理执行中', reviewing: '汇总检查中',
+  completed: '已完成', failed: '已失败', interrupted: '已中断',
+}
+const orphanWf = ref<WorkflowState | null>(null)
+const orphanBusy = ref(false)
+const orphanError = ref('')
+const orphanStatusLabel = computed(() =>
+  orphanWf.value ? WF_STATUS_LABEL[orphanWf.value.status] || orphanWf.value.status : '')
+
+async function detectOrphanWorkflow() {
+  if (demoMode.value) return
+  try {
+    const r = await agentApi.workflowActive()
+    const wf = r.ok ? (r.workflow ?? null) : null
+    // 本地已有卡片在管的不算孤儿（卡片自身即可审批/中断）
+    orphanWf.value = wf && !messages.value.some(m => m.workflow?.workflowId === wf.workflow_id)
+      ? wf : null
+    orphanError.value = ''
+  } catch {
+    /* 服务未启动/不可达时不显示恢复条 */
+  }
+}
+/** 把孤儿工作流以卡片形式挂回当前对话流；卡片挂载后会自行拉完整状态并订阅 SSE。 */
+async function reattachOrphan() {
+  const wf = orphanWf.value
+  if (!wf || orphanBusy.value) return
+  orphanBusy.value = true
+  try {
+    orphanWf.value = null
+    messages.value.push({
+      id: msgSeq++, role: 'assistant', text: '', status: 'done',
+      trace: [], reasoning: '', notices: [], plan: [],
+      workflow: { workflowId: wf.workflow_id, seed: wf },
+      startedAt: Date.now(),
+    })
+    stickToBottom.value = true
+    await nextTick(scrollToBottom)
+  } finally {
+    orphanBusy.value = false
+  }
+}
+async function interruptOrphan() {
+  const wf = orphanWf.value
+  if (!wf || orphanBusy.value) return
+  orphanBusy.value = true
+  orphanError.value = ''
+  try {
+    const r = await agentApi.workflowInterrupt(
+      wf.workflow_id, '页面刷新后卡片丢失，用户在孤儿恢复条中断')
+    if (r.ok === false) throw new Error(r.error || '中断失败')
+    orphanWf.value = null
+  } catch (e) {
+    orphanError.value = (e as { message?: string }).message || '中断失败，请重试'
+  } finally {
+    orphanBusy.value = false
+  }
+}
+async function focusWfMember(taskId: string) {
+  const team = wfActiveTeam.value
+  if (!team) return
+  // 面板折叠时先展开（卡片常驻未卸载），下一帧再定位，否则 scrollIntoView
+  // 落在被 overflow:hidden 裁掉的容器里用户看不到
+  if (collapsed.value) {
+    collapsed.value = false
+    await nextTick()
+  }
+  window.dispatchEvent(new CustomEvent('docmind:wf-focus-member', {
+    detail: { workflowId: team.workflowId, taskId },
+  }))
 }
 
 interface InterruptedRecovery {
@@ -108,7 +246,83 @@ function startTaskExample(example: typeof TASK_EXAMPLES[number]) {
     void nextTick(() => inputEl.value?.focus())
     return
   }
-  window.dispatchEvent(new CustomEvent('docmind:start-workflow', { detail: { prompt: example.prompt } }))
+  void startWorkflowTurn(example.prompt)
+}
+
+/** 快捷入口直接发起工作流：卡片内联挂到对话流，不再跳独立面板。 */
+async function startWorkflowTurn(prompt: string) {
+  if (sending.value || demoMode.value) return
+  // 已有未终结工作流时禁止再启动（后端 /workflow/start 也有同项目互斥兜底）
+  if (activeWorkflowIds.value.length) {
+    await askAlert({
+      title: gateBlocking.value ? '工作流等待你的处理' : '已有工作流进行中',
+      message: gateBlocking.value
+        ? '请先在居中的审批窗口中选择方案、批准或调整任务（也可中断该工作流），再启动新的。'
+        : '请先在对话中的工作流卡片上完成审批、等待执行结束，或中断当前工作流后再启动新的。',
+    })
+    return
+  }
+  // 与普通问答共用 chatEpoch：启动阶段用户点「停止」会使 epoch 失效，
+  // 迟到响应不再挂卡片（并尽力中断可能已创建的孤儿工作流，见下）。
+  const epoch = ++chatEpoch
+  messages.value.push({ id: msgSeq++, role: 'user', text: prompt, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
+  const turn: ChatMsg = {
+    id: msgSeq++, role: 'assistant', text: '', status: 'streaming', trace: [], reasoning: '', notices: [], plan: [],
+    workflow: { workflowId: '', seed: { status: 'generating_options', kind: 'generic', request: prompt } },
+    startedAt: Date.now(),
+  }
+  messages.value.push(turn)
+  sending.value = true
+  stickToBottom.value = true
+  await nextTick(scrollToBottom)
+  try {
+    const r = await agentApi.workflowStart(prompt, { use_llm: true, web_enabled: webOn.value, kind: 'generic' })
+    if (epoch !== chatEpoch) {
+      // 启动已被用户取消：请求可能已在服务端创建工作流，挂卡片只会出现
+      // 无法审批的孤儿，因此尽力中断它；UI 上的回合由 stop() 标记为已停止。
+      if (r.ok && r.workflow) {
+        void agentApi.workflowInterrupt(r.workflow.workflow_id, '用户在启动阶段取消').catch(() => {})
+      }
+      return
+    }
+    if (r.ok && r.workflow) {
+      turn.workflow = { workflowId: r.workflow.workflow_id, seed: r.workflow }
+      turn.status = 'done'
+    } else {
+      turn.workflow = undefined
+      turn.status = 'error'
+      turn.error = r.error || '工作流启动失败'
+    }
+  } catch (e) {
+    if (epoch !== chatEpoch) return
+    turn.workflow = undefined
+    turn.status = 'error'
+    turn.error = (e as Error).message || '工作流启动失败'
+  } finally {
+    // 仅当没有被更新的回合（停止/新发送）取代时才解除发送锁
+    if (epoch === chatEpoch) {
+      sending.value = false
+      // 启动被互斥拒绝时，发现已存在的那个工作流并提供挂回/中断入口
+      void detectOrphanWorkflow()
+    }
+    await nextTick(scrollToBottom)
+  }
+}
+
+/** 工作流主 Agent 的 start_workflow 动作行与其观察不在对话重复展示（卡片即反馈）。 */
+function visibleTrace(msg: ChatMsg) {
+  const hidden = new Set<number>()
+  msg.trace.forEach((item, i) => {
+    if (item.type === 'action' && /^start_workflow\s*\(/.test(item.text.trim())) {
+      hidden.add(i)
+      if (msg.trace[i + 1]?.type === 'observation') hidden.add(i + 1)
+    }
+  })
+  return msg.trace.map((item, index) => ({ item, index })).filter(x => !hidden.has(x.index))
+}
+function onCardActivity() {
+  // 卡片内部子代理步骤频率高：按帧合批跟随，不做每事件 nextTick
+  scheduleFollow()
 }
 
 const scroller = ref<HTMLElement | null>(null)
@@ -128,6 +342,9 @@ const expanded = ref(window.localStorage.getItem('docmind.chatDockExpanded') ===
 watch(collapsed, (v) => window.localStorage.setItem('docmind.chatDockCollapsed', v ? '1' : '0'))
 watch(expanded, (v) => window.localStorage.setItem('docmind.chatDockExpanded', v ? '1' : '0'))
 function toggleDock() {
+  // 审批门打开时禁止折叠（pointer-events 已挡鼠标，这里挡已聚焦元素的键盘触发），
+  // 否则 33px 裁剪会把居中审批模态吞掉
+  if (gateBlocking.value) return
   collapsed.value = !collapsed.value
   if (!collapsed.value) nextTick(() => inputEl.value?.focus())
 }
@@ -230,6 +447,14 @@ async function send(text?: string) {
   const q = (text ?? input.value).trim()
   const imgs = pendingImages.value.slice()
   if ((!q && !imgs.length) || sending.value) return
+  // 审批门打开期间禁止发起新问答（CSS 已挡鼠标，这里挡 Ctrl+Enter 键盘发送）
+  if (gateBlocking.value) {
+    void askAlert({
+      title: '工作流等待你的处理',
+      message: '请先在居中的审批窗口中选择方案、批准或调整任务（也可中断该工作流），再继续提问。',
+    })
+    return
+  }
   const recovery = readInterruptedRecovery()
   const isResume = !!recovery && isContinuationRequest(q)
   const request = isResume ? continuationQuestion(q, recovery!) : q
@@ -274,15 +499,25 @@ async function send(text?: string) {
     const t = live()
     if (!t) return
     if (ev.type === 'token' && typeof ev.text === 'string') {
-      t.text += ev.text
+      // 进帧缓冲：同一帧内到达的多个 token 合并成一次响应式提交
+      let buf = streamBuffers.get(t.id)
+      if (!buf) { buf = { turn: t, text: '', reasoning: '' }; streamBuffers.set(t.id, buf) }
+      buf.text += ev.text
+      scheduleStreamFlush()
     } else if (ev.type === 'final' && typeof ev.text === 'string' && ev.text) {
+      streamBuffers.delete(t.id)
       t.text = ev.text
+      // 立即停止节流渲染并预热完成态 HTML，避免最后一帧与成稿之间格式闪一下
+      finishLiveMd(t.id, () => answerHtml(t))
     } else if (ev.type === 'reasoning' && typeof ev.text === 'string') {
-      // 深度思考流：实时拼接到独立的思考窗口（与正文分开），流式期间自动展开
-      t.reasoning += ev.text
+      // 深度思考流：实时拼接到独立的思考窗口（与正文分开），同样按帧合批
+      let buf = streamBuffers.get(t.id)
+      if (!buf) { buf = { turn: t, text: '', reasoning: '' }; streamBuffers.set(t.id, buf) }
+      buf.reasoning += ev.text
       if (!reasonOpen.value.has(t.id)) {
         reasonOpen.value = new Set([...reasonOpen.value, t.id])
       }
+      scheduleStreamFlush()
     } else if (ev.type === 'notice' && ev.text) {
       t.notices.push(ev.text)
     } else if (ev.type === 'plan' && Array.isArray(ev.steps)) {
@@ -290,8 +525,18 @@ async function send(text?: string) {
     } else if (ev.type === 'thought' || ev.type === 'action' ||
                ev.type === 'observation' || ev.type === 'reflection') {
       if (ev.text) appendTrace(t, ev.type, ev.text)
+    } else if (ev.type === 'workflow') {
+      // start_workflow 已执行：卡片直接挂在当前助手回合内，后续由卡片自己连 SSE。
+      const w = ev as unknown as { workflow_id?: string; status?: string; phase?: string; kind?: string; request?: string }
+      if (w.workflow_id && !t.workflow?.workflowId) {
+        t.workflow = {
+          workflowId: w.workflow_id,
+          seed: { status: w.status, phase: w.phase, kind: w.kind, request: w.request },
+        }
+      }
     }
-    void nextTick(scrollToBottom)
+    // 结构类事件（计划/工具轨迹/通知）出现时跟随一次；token 滚动已在帧合批里处理
+    if (ev.type !== 'token' && ev.type !== 'reasoning') scheduleFollow()
   }
 
   try {
@@ -304,11 +549,18 @@ async function send(text?: string) {
       thinking: thinkingOpt,
       images: imgs,
     })
+    drainStreamNow()
     const t = live()
-    if (t) { t.status = t.text ? 'done' : 'stopped'; t.finishedAt = Date.now() }
+    if (t) {
+      t.status = t.text ? 'done' : 'stopped'
+      t.finishedAt = Date.now()
+      finishLiveMd(t.id, () => answerHtml(t))
+    }
   } catch (e) {
+    drainStreamNow()
     const t = live()
     if (!t) return
+    finishLiveMd(t.id, () => answerHtml(t))
     if ((e as Error).name === 'AbortError') {
       t.status = 'stopped'
       t.finishedAt = Date.now()
@@ -319,15 +571,27 @@ async function send(text?: string) {
       t.error = (e as { message?: string }).message || '请求失败'
     }
   } finally {
-    if (epoch === chatEpoch) { sending.value = false; abortCtl = null }
+    if (epoch === chatEpoch) {
+      sending.value = false; abortCtl = null
+      // 问答可能由主 Agent 经 start_workflow 工具触发工作流；若撞上同项目互斥，
+      // 错误只体现在回答文本里，这里补一次探测，让孤儿恢复条给出可操作入口。
+      void detectOrphanWorkflow()
+    }
     void refreshSessionList()
     await nextTick(scrollToBottom)
   }
 }
 
 function stop() {
+  drainStreamNow()
   const turn = messages.value[messages.value.length - 1]
-  if (turn?.status === 'streaming') { turn.status = 'stopped'; turn.notices.push('回答已中断；已执行的工具操作不会自动撤销。') }
+  if (turn) finishLiveMd(turn.id, () => answerHtml(turn))
+  if (turn?.status === 'streaming') {
+    turn.status = 'stopped'
+    turn.notices.push(turn.workflow
+      ? '工作流启动已取消；若服务端已经创建，会自动中断。'
+      : '回答已中断；已执行的工具操作不会自动撤销。')
+  }
   ++chatEpoch
   abortCtl?.abort()
   abortCtl = null
@@ -404,8 +668,9 @@ function resetChatContext() {
   stop()
   chatProject = getProjectId(); chatSession = getSessionId()
   messages.value = []; usage.value = null; historyError.value = ''
+  orphanWf.value = null
   input.value = readDraft()
-  void restoreHistory(true)
+  void restoreHistory(true).then(() => detectOrphanWorkflow())
 }
 function onPageHide() { preserveInterrupted(); stop() }
 function onBeforeLeave(e: BeforeUnloadEvent) { if (sending.value) { preserveInterrupted(); e.preventDefault(); e.returnValue = '' } }
@@ -422,12 +687,24 @@ function clearMessages() {
   if (sending.value) stop()
   messages.value = []
   usage.value = null
+  answerHtmlCache.clear()
+  refsCache.clear()
+  webRefsCache.clear()
+  liveMdTimers.forEach(t => clearTimeout(t))
+  liveMdTimers.clear()
+  liveMdLastAt.clear()
+  liveHtml.clear()
+  // 卡片随消息一起卸载，不会再发 team 事件；这里同步清掉左下角成员抽屉，
+  // 否则会残留指向已消失卡片的幽灵成员
+  wfTeams.value = []
+  gateOpenIds.value = new Set()
 }
 
 /** 头部「清空对话」：清空本地消息，并删除当前标签页会话在磁盘上的多轮历史。
  *  会话 id 每标签页独立（见 api.ts::getSessionId），故这里只清理本标签页自己的会话，
  *  不影响其它标签页；删除失败（无会话文件 / 服务未启动）不阻塞清空 UI。 */
 async function clearConversation() {
+  if (!(await confirmLeaveWorkflows())) return
   try { sessionStorage.removeItem(recoveryKey()) } catch {}
   clearMessages()
   if (demoMode.value) return
@@ -456,13 +733,16 @@ async function refreshSessionList() {
   if (demoMode.value) return
   try {
     const result = await harnessApi.sessions()
-    sessionItems.value = Array.isArray(result.items) ? result.items : []
+    // 会话按页面域隔离：问答页会话 id 为 ask- 前缀，工作台历史不展示它们
+    sessionItems.value = (Array.isArray(result.items) ? result.items : [])
+      .filter(i => !String(i.session_id || '').startsWith('ask-'))
     sessionError.value = ''
   } catch (e) {
     sessionError.value = (e as Error).message || '会话历史加载失败'
   }
 }
 async function prepareSessionChange(action: string): Promise<boolean> {
+  if (!(await confirmLeaveWorkflows())) return false
   if (!sending.value && !messages.value.length) return true
   return askConfirm({
     title: action,
@@ -513,7 +793,9 @@ async function createConversation() {
     attachmentError.value = ''
     try { sessionStorage.removeItem(recoveryKey()) } catch {}
     sessionOpen.value = false
+    orphanWf.value = null
     await refreshSessionList()
+    void detectOrphanWorkflow()
     await nextTick(() => inputEl.value?.focus())
   } catch (e) {
     sessionError.value = (e as Error).message || '新建对话失败'
@@ -529,6 +811,145 @@ async function loadContextUsage() {
     if (u) usage.value = u
   } catch {
     /* 未启动/无会话时不显示指示即可 */
+  }
+}
+
+/** 删除会话历史中的某一条；当前会话走 clearConversation（含工作流离开确认）。 */
+async function deleteSessionItem(id: string) {
+  const target = String(id || '').trim()
+  if (!target) return
+  if (target === chatSession) {
+    sessionOpen.value = false
+    await clearConversation()
+    return
+  }
+  if (sessionBusy.value) return
+  const ok = await askConfirm({
+    title: '删除对话',
+    message: '确定删除这段对话历史？此操作不可恢复。',
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!ok) return
+  sessionBusy.value = true
+  sessionError.value = ''
+  try {
+    const r = await harnessApi.deleteSession(target)
+    if (r?.ok === false) throw new Error('服务端拒绝删除')
+    await refreshSessionList()
+  } catch (e) {
+    sessionError.value = (e as Error).message || '删除失败'
+  } finally {
+    sessionBusy.value = false
+  }
+}
+
+// ---------------------------------------------------------------- 工作流历史
+// 快捷任务（不走对话 turns）与已结束工作流只落盘在 .docmind/workflows/，
+// 会话历史里永远找不到它们。这里提供独立弹层：查看（挂回卡片）、中断运行中、
+// 删除终态并清理磁盘文件。
+const WF_TERMINAL = new Set(['completed', 'failed', 'interrupted'])
+const wfHistoryOpen = ref(false)
+const wfHistoryItems = ref<WorkflowSummary[]>([])
+const wfHistoryBusy = ref(false)
+const wfHistoryError = ref('')
+const wfHistoryActingId = ref('')
+
+function wfStatusLabel(status: string): string {
+  return WF_STATUS_LABEL[status] || status
+}
+function wfTerminal(item: WorkflowSummary): boolean {
+  return WF_TERMINAL.has(item.status)
+}
+function wfDotKind(item: WorkflowSummary): 'run' | 'ok' | 'err' | 'stop' {
+  if (item.status === 'completed') return 'ok'
+  if (item.status === 'failed') return 'err'
+  if (item.status === 'interrupted') return 'stop'
+  return 'run'
+}
+async function refreshWfHistory() {
+  if (demoMode.value) return
+  wfHistoryBusy.value = true
+  wfHistoryError.value = ''
+  try {
+    const r = await agentApi.workflowList()
+    wfHistoryItems.value = Array.isArray(r.items) ? r.items : []
+  } catch (e) {
+    wfHistoryError.value = (e as Error).message || '工作流历史加载失败'
+  } finally {
+    wfHistoryBusy.value = false
+  }
+}
+function openWfHistory() {
+  wfHistoryOpen.value = true
+  void refreshWfHistory()
+}
+/** 把历史工作流挂回当前对话：先拉完整状态，再插入一张只读/可继续的卡片。 */
+async function reattachWfHistory(item: WorkflowSummary) {
+  if (wfHistoryActingId.value) return
+  wfHistoryActingId.value = item.workflow_id
+  try {
+    const r = await agentApi.workflow(item.workflow_id)
+    const wf = r.workflow
+    if (r.ok === false || !wf) throw new Error(r.error || '工作流状态读取失败')
+    wfHistoryOpen.value = false
+    if (!messages.value.some(m => m.workflow?.workflowId === item.workflow_id)) {
+      messages.value.push({
+        id: msgSeq++, role: 'assistant', text: '', status: 'done',
+        trace: [], reasoning: '', notices: [], plan: [],
+        workflow: { workflowId: item.workflow_id, seed: wf },
+        startedAt: Date.now(),
+      })
+      stickToBottom.value = true
+      await nextTick(scrollToBottom)
+    }
+  } catch (e) {
+    wfHistoryError.value = (e as Error).message || '挂回失败'
+  } finally {
+    wfHistoryActingId.value = ''
+  }
+}
+async function interruptWfHistory(item: WorkflowSummary) {
+  if (wfHistoryActingId.value) return
+  const ok = await askConfirm({
+    title: '中断工作流',
+    message: '确定中断这个工作流？已产生的文件改动不会自动回滚。',
+    confirmText: '中断',
+    danger: true,
+  })
+  if (!ok) return
+  wfHistoryActingId.value = item.workflow_id
+  wfHistoryError.value = ''
+  try {
+    const r = await agentApi.workflowInterrupt(item.workflow_id, '用户在工作流历史中中断')
+    if (r.ok === false) throw new Error(r.error || '中断失败')
+    await refreshWfHistory()
+    void detectOrphanWorkflow()
+  } catch (e) {
+    wfHistoryError.value = (e as Error).message || '中断失败'
+  } finally {
+    wfHistoryActingId.value = ''
+  }
+}
+async function deleteWfHistory(item: WorkflowSummary) {
+  if (wfHistoryActingId.value) return
+  const ok = await askConfirm({
+    title: '删除工作流记录',
+    message: '将删除该工作流的状态记录与磁盘文件，此操作不可恢复。确定删除？',
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!ok) return
+  wfHistoryActingId.value = item.workflow_id
+  wfHistoryError.value = ''
+  try {
+    const r = await agentApi.workflowDelete(item.workflow_id)
+    if (r.ok === false) throw new Error(r.error || '删除失败')
+    wfHistoryItems.value = wfHistoryItems.value.filter(i => i.workflow_id !== item.workflow_id)
+  } catch (e) {
+    wfHistoryError.value = (e as Error).message || '删除失败'
+  } finally {
+    wfHistoryActingId.value = ''
   }
 }
 
@@ -644,15 +1065,8 @@ function onFocusChat(ev?: Event) {
     inputEl.value?.focus()
   })
 }
-function onStartWorkflow(ev?: Event) {
-  const prompt = String((ev as CustomEvent<{ prompt?: string }> | undefined)?.detail?.prompt || '').trim()
-  if (!prompt) return
-  window.dispatchEvent(new CustomEvent('docmind:open-harness-workflow', { detail: { prompt } }))
-}
 onMounted(() => {
-  elapsedTimer = window.setInterval(() => { nowTick.value = Date.now() }, 500)
   window.addEventListener('docmind:focus-chat', onFocusChat as EventListener)
-  window.addEventListener('docmind:start-workflow', onStartWorkflow as EventListener)
   window.addEventListener('docmind:project-context-changed', resetChatContext)
   window.addEventListener('pagehide', onPageHide)
   window.addEventListener('beforeunload', onBeforeLeave)
@@ -660,13 +1074,15 @@ onMounted(() => {
   void loadModelConfig()
   void loadContextUsage()
   void refreshSessionList()
-  void restoreHistory()
+  // 历史回灌完成后再探测孤儿：避免本会话卡片已随历史逻辑存在时误报
+  void restoreHistory().then(() => detectOrphanWorkflow())
 })
 onBeforeUnmount(() => {
   if (elapsedTimer !== null) { window.clearInterval(elapsedTimer); elapsedTimer = null }
+  liveMdTimers.forEach(t => clearTimeout(t))
+  liveMdTimers.clear()
   onPageHide()
   window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener)
-  window.removeEventListener('docmind:start-workflow', onStartWorkflow as EventListener)
   window.removeEventListener('docmind:project-context-changed', resetChatContext)
   window.removeEventListener('pagehide', onPageHide)
   window.removeEventListener('beforeunload', onBeforeLeave)
@@ -685,13 +1101,91 @@ function onWheel(ev: WheelEvent) {
   // the stream running, but stop pulling the viewport back to the bottom.
   if (ev.deltaY < 0) stickToBottom.value = false
 }
-function scrollToBottom() {
+function followBottom() {
   const el = scroller.value
   if (el && stickToBottom.value) {
     suppressScrollEvent = true
     el.scrollTop = el.scrollHeight
-    window.setTimeout(() => { suppressScrollEvent = false }, 0)
+    // 滚动事件在本帧内派发，下一帧解除即可；比每 token 排一个 setTimeout(0) 便宜
+    requestAnimationFrame(() => { suppressScrollEvent = false })
   }
+}
+function scrollToBottom() { followBottom() }
+
+// 流式输出合批：SSE 一个数据帧常常只有 1~2 个 token。逐 token 触发响应式更新会让
+// Vue 每 token 重渲染整段答案（v-html 全量重建）并强制一次滚动布局——这就是输出
+// 「一卡一卡」的根因。增量文本先进缓冲，由单个 rAF 在每帧最多提交一次、滚动一次。
+interface StreamBuffer { turn: ChatMsg; text: string; reasoning: string }
+const streamBuffers = new Map<number, StreamBuffer>()
+let streamRaf = 0
+function flushStream() {
+  streamRaf = 0
+  if (!streamBuffers.size) return
+  for (const buf of streamBuffers.values()) {
+    if (buf.text) { buf.turn.text += buf.text; scheduleLiveMd(buf.turn) }
+    if (buf.reasoning) buf.turn.reasoning += buf.reasoning
+  }
+  streamBuffers.clear()
+  // Vue 的 DOM 刷新也排在微任务里，这里挂在其后：读到的就是本帧最新布局，
+  // 一次 scrollTop 写入完成跟随，不在 SSE 事件里做强制布局。
+  queueMicrotask(followBottom)
+}
+function scheduleStreamFlush() {
+  if (!streamRaf) streamRaf = requestAnimationFrame(flushStream)
+}
+/** 流结束时同步排空（取消未触发的帧回调），保证 final 文本不丢。 */
+function drainStreamNow() {
+  if (streamRaf) { cancelAnimationFrame(streamRaf); streamRaf = 0 }
+  if (streamBuffers.size) {
+    for (const buf of streamBuffers.values()) {
+      if (buf.text) buf.turn.text += buf.text
+      if (buf.reasoning) buf.turn.reasoning += buf.reasoning
+    }
+    streamBuffers.clear()
+  }
+}
+
+// 流式期的 markdown 是「节流富文本」折中：纯文本层最省，但用户想边出边看排版。
+// token 仍逐帧进 m.text（便宜），markdown 重渲染按消息限流到 ~8 次/秒——
+// 这是人眼「格式实时跟随」与「不逐 token 重建 DOM」之间的平衡点。
+const LIVE_MD_INTERVAL = 125
+const liveHtml = reactive(new Map<number, string>())
+const liveMdTimers = new Map<number, ReturnType<typeof setTimeout>>()
+let liveMdLastAt = new Map<number, number>()
+function renderLiveMd(turn: ChatMsg) {
+  liveMdTimers.delete(turn.id)
+  liveMdLastAt.set(turn.id, performance.now())
+  liveHtml.set(turn.id, mdToHtml(turn.text || ''))
+}
+function scheduleLiveMd(turn: ChatMsg) {
+  if (liveMdTimers.has(turn.id)) return
+  // 首个 token 帧立即成型，避免节流窗口内 fallback 每帧解析
+  if (!liveMdLastAt.has(turn.id)) { renderLiveMd(turn); return }
+  const last = liveMdLastAt.get(turn.id) ?? 0
+  const wait = Math.max(0, LIVE_MD_INTERVAL - (performance.now() - last))
+  liveMdTimers.set(turn.id, setTimeout(() => renderLiveMd(turn), wait))
+}
+/** 回合结束（done/stop/error/final 覆盖）：立即排一次待渲染并交还完成态渲染。 */
+function finishLiveMd(id: number, renderNow: () => string) {
+  const timer = liveMdTimers.get(id)
+  if (timer) { clearTimeout(timer); liveMdTimers.delete(id) }
+  liveMdLastAt.delete(id)
+  liveHtml.delete(id)
+  // 触发 answerHtml 缓存写入，完成态 v-html 与最后一帧不会出现格式回退
+  renderNow()
+}
+function streamHtmlOf(msg: ChatMsg): string {
+  return liveHtml.get(msg.id) ?? mdToHtml(msg.text || '')
+}
+
+// 工作流卡片自身高频事件（子代理每步都 emit activity）也按帧合批跟随，
+// 避免多代理并行时每步一次 nextTick + 强制布局。
+let followRaf = 0
+function scheduleFollow() {
+  if (!followRaf) followRaf = requestAnimationFrame(() => {
+    followRaf = 0
+    queueMicrotask(followBottom)
+  })
 }
 function resumeAutoScroll() {
   stickToBottom.value = true
@@ -699,17 +1193,33 @@ function resumeAutoScroll() {
 }
 
 // ---------------------------------------------------------------- 答案引用卡片
+// 模板每秒会因计时刷新重渲染；markdown 与引用提取都按 (消息 id, 文本) 缓存，
+// 文本不变时不做重复解析（流式期间走纯文本层，根本不进 markdown 解析）。
+const answerHtmlCache = new Map<number, { src: string; html: string }>()
+function answerHtml(msg: ChatMsg): string {
+  const hit = answerHtmlCache.get(msg.id)
+  if (hit && hit.src === msg.text) return hit.html
+  const html = mdToHtml(msg.text || '')
+  answerHtmlCache.set(msg.id, { src: msg.text, html })
+  return html
+}
+const refsCache = new Map<number, { src: string; refs: FileRef[] }>()
 function refsOf(msg: ChatMsg): FileRef[] {
   // 只对真实存在于文件树中的路径生成卡片（过滤幻觉引用）
-  return extractFileRefs(msg.text).filter((r) => nodeExists(r.path))
+  const hit = refsCache.get(msg.id)
+  if (hit && hit.src === msg.text) return hit.refs
+  const refs = extractFileRefs(msg.text).filter((r) => nodeExists(r.path))
+  refsCache.set(msg.id, { src: msg.text, refs })
+  return refs
 }
 
+const webRefsCache = new Map<number, { src: string; refs: ReturnType<typeof extractWebRefs> }>()
 function webRefsOf(msg: ChatMsg) {
-  return extractWebRefs(msg.text)
-}
-
-function answerHtml(msg: ChatMsg): string {
-  return mdToHtml(msg.text || '')
+  const hit = webRefsCache.get(msg.id)
+  if (hit && hit.src === msg.text) return hit.refs
+  const refs = extractWebRefs(msg.text)
+  webRefsCache.set(msg.id, { src: msg.text, refs })
+  return refs
 }
 
 async function openRef(r: FileRef) {
@@ -726,6 +1236,22 @@ const TRACE_GLYPH: Record<string, string> = {
 const activityOpen = ref<Set<string>>(new Set())
 const nowTick = ref(Date.now())
 let elapsedTimer: number | null = null
+// 计时钟只在「有活动回合」时走：空闲/全部结束后不再每 500ms 触发响应式刷新。
+// 工作流回合在工作流终结时由 onWfTeam 写入 finishedAt，秒表随之定格。
+const elapsedTicking = computed(() =>
+  sending.value
+  || messages.value.some(m => m.status === 'streaming' || (m.workflow?.workflowId && !m.finishedAt))
+  || activeWorkflowIds.value.length > 0)
+watch(elapsedTicking, (on) => {
+  if (on && elapsedTimer === null) {
+    nowTick.value = Date.now()
+    elapsedTimer = window.setInterval(() => { nowTick.value = Date.now() }, 500)
+  } else if (!on && elapsedTimer !== null) {
+    window.clearInterval(elapsedTimer)
+    elapsedTimer = null
+    nowTick.value = Date.now()
+  }
+})
 
 function appendTrace(msg: ChatMsg, type: string, text: string) {
   const at = Date.now()
@@ -969,14 +1495,38 @@ function connectorGuide(s: McpServer) {
 </script>
 
 <template>
-  <section class="cd-dock" :class="{ 'cd-collapsed': collapsed, 'cd-expanded': expanded && !collapsed }">
-    <header class="cd-head" @click="toggleDock">
-      <span class="cd-chevron" :class="{ rotated: !collapsed }">
-        <svg width="9" height="9" viewBox="0 0 9 9"><path d="M2 1.5 L5.5 4.5 L2 7.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+  <section
+    class="cd-dock"
+    :class="{
+      'cd-collapsed': collapsed,
+      'cd-expanded': expanded && !collapsed,
+      'cd-clipping': collapsed,
+      'cd-gate-blocked': gateBlocking,
+    }"
+  >
+    <header class="cd-head">
+      <!-- 折叠/收起只响应明确的标题热区，避免选中提示文字等误触把面板收起来 -->
+      <span
+        class="cd-head-toggle"
+        role="button"
+        :aria-expanded="!collapsed"
+        :title="collapsed ? '展开对话台' : '收起对话台'"
+        tabindex="0"
+        @click="toggleDock"
+        @keydown.enter.prevent="toggleDock"
+        @keydown.space.prevent="toggleDock"
+      >
+        <span class="cd-chevron" :class="{ rotated: !collapsed }">
+          <svg width="9" height="9" viewBox="0 0 9 9"><path d="M2 1.5 L5.5 4.5 L2 7.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        </span>
+        <span class="cd-title">AI 助手</span>
+        <span v-if="sending" class="cd-live">AI 正在查代码<span class="cd-dots">…</span></span>
+        <!-- 折叠态也要感知后台进展：工作流执行期 sending 已释放，靠成员抽屉状态补指示 -->
+        <span v-if="collapsed && activeWorkflowIds.length" class="cd-live cd-live-wf">
+          <i class="cd-live-dot" aria-hidden="true" />工作流进行中
+        </span>
       </span>
-      <span class="cd-title">AI 助手</span>
       <span class="cd-hint">用大白话问代码：数值在哪 · 逻辑怎么走 · 报错怎么改</span>
-      <span v-if="sending" class="cd-live">AI 正在查代码<span class="cd-dots">…</span></span>
       <span class="cd-spacer" />
       <button
         class="cd-btn"
@@ -992,6 +1542,18 @@ function connectorGuide(s: McpServer) {
       </button>
       <button class="cd-btn cd-new-session" title="开始一段新的独立对话" @click.stop="createConversation">
         <span aria-hidden="true">＋</span><span>新对话</span>
+      </button>
+      <button
+        class="cd-btn"
+        :class="{ 'cd-btn-on': wfHistoryOpen }"
+        title="工作流历史：查看进度、中断运行中的工作流、删除已结束记录"
+        @click.stop="wfHistoryOpen ? (wfHistoryOpen = false) : openWfHistory()"
+      >
+        <svg width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
+          <path d="M2.5 3.2h8v3.2h-8z M2.5 8h5v2.6h-5z" fill="none" stroke="currentColor" stroke-width="1.05" stroke-linejoin="round"/>
+          <path d="M8.7 8.2l2.1 1.2-2.1 1.2z" fill="currentColor"/>
+        </svg>
+        <span>工作流</span>
       </button>
       <button
         class="cd-btn"
@@ -1025,7 +1587,9 @@ function connectorGuide(s: McpServer) {
       </button>
     </header>
 
-    <!-- 会话历史弹层 -->
+    <!-- 会话历史弹层：Teleport 到 body，折叠态（33px + overflow:hidden）下也能完整显示，
+         且不会把输入栏挤出面板漏到编辑区 -->
+    <Teleport to="body">
     <div v-if="sessionOpen" class="cd-pop-mask" @click="sessionOpen = false" />
     <div v-if="sessionOpen" class="cd-session-pop" @click.stop>
       <div class="cd-session-head">
@@ -1049,12 +1613,67 @@ function connectorGuide(s: McpServer) {
             <small>{{ item.turns }} 轮<span v-if="sessionTime(item.updated_at)"> · {{ sessionTime(item.updated_at) }}</span></small>
           </span>
         </button>
-        <button v-if="item.session_id === chatSession" class="cd-session-delete" title="清空当前会话" @click="clearConversation(); sessionOpen = false">×</button>
+        <button
+          class="cd-session-delete"
+          :title="item.session_id === chatSession ? '清空当前会话' : '删除这条对话历史'"
+          :disabled="sessionBusy"
+          @click.stop="deleteSessionItem(item.session_id)"
+        >×</button>
       </div>
     </div>
+    </Teleport>
 
-    <!-- 引擎 / MCP 弹层 -->
+    <!-- 工作流历史弹层：快捷任务/已结束工作流不在会话历史里，单独一个入口。
+         同样 Teleport 到 body，避免折叠态裁剪。 -->
+    <Teleport to="body">
+    <div v-if="wfHistoryOpen" class="cd-pop-mask" @click="wfHistoryOpen = false" />
+    <div v-if="wfHistoryOpen" class="cd-session-pop cd-wf-pop" @click.stop>
+      <div class="cd-session-head">
+        <div>
+          <div class="cd-pop-title">工作流历史</div>
+          <div class="cd-session-subtitle">当前项目发起过的工作流。点击条目可在对话中打开卡片；运行中可中断，已结束可删除记录与磁盘文件。</div>
+        </div>
+        <button class="cd-mini" :disabled="wfHistoryBusy" title="刷新工作流列表" @click="refreshWfHistory">刷新</button>
+      </div>
+      <div v-if="wfHistoryError" class="cd-session-error">{{ wfHistoryError }}</div>
+      <div v-if="wfHistoryBusy && !wfHistoryItems.length" class="cd-session-empty">加载中…</div>
+      <div v-else-if="!wfHistoryItems.length && !wfHistoryError" class="cd-session-empty">还没有发起过工作流</div>
+      <div v-for="item in wfHistoryItems" :key="item.workflow_id" class="cd-session-item cd-wf-item">
+        <button class="cd-session-main cd-wf-main" :disabled="!!wfHistoryActingId" @click="reattachWfHistory(item)">
+          <span class="cd-wf-dot" :class="'cd-wf-dot-' + wfDotKind(item)" aria-hidden="true" />
+          <span class="cd-session-copy">
+            <strong>{{ item.request || '未命名工作流' }}</strong>
+            <small>
+              <em class="cd-wf-state" :class="'cd-wf-state-' + wfDotKind(item)">{{ wfStatusLabel(item.status) }}</em>
+              <template v-if="item.task_count"> · {{ item.task_done ?? 0 }}/{{ item.task_count }} 个任务</template>
+              <span v-if="sessionTime(item.updated_at || '')"> · {{ sessionTime(item.updated_at || '') }}</span>
+            </small>
+            <small v-if="wfTerminal(item) && (item.error || item.interrupt_reason)" class="cd-wf-sub">
+              {{ item.error || item.interrupt_reason }}
+            </small>
+          </span>
+        </button>
+        <button
+          v-if="!wfTerminal(item)"
+          class="cd-session-delete cd-wf-act"
+          title="中断这个工作流"
+          :disabled="!!wfHistoryActingId"
+          @click.stop="interruptWfHistory(item)"
+        >{{ wfHistoryActingId === item.workflow_id ? '…' : '中断' }}</button>
+        <button
+          v-else
+          class="cd-session-delete cd-wf-act cd-wf-act-danger"
+          title="删除记录与磁盘文件"
+          :disabled="!!wfHistoryActingId"
+          @click.stop="deleteWfHistory(item)"
+        >{{ wfHistoryActingId === item.workflow_id ? '…' : '删' }}</button>
+      </div>
+    </div>
+    </Teleport>
+
+    <!-- 引擎 / MCP 弹层（同样 Teleport 到 body） -->
     <!-- 点击外部关闭：透明遮罩截获弹层外点击 -->
+    <Teleport to="body">
     <div v-if="enginePopOpen" class="cd-pop-mask" @click="enginePopOpen = false" />
     <div v-if="enginePopOpen" class="cd-pop" @click.stop>
       <div class="cd-pop-title">连接游戏引擎</div>
@@ -1135,8 +1754,9 @@ function connectorGuide(s: McpServer) {
         </div>
       </div>
     </div>
+    </Teleport>
 
-    <template v-if="!collapsed">
+    <!-- 折叠时不再卸载对话区：靠高度过渡 + 裁剪做顺滑展开/收起，状态与滚动位置保留 -->
       <div ref="scroller" class="cd-body" @scroll="onScroll" @wheel="onWheel">
         <p v-if="historyError" role="alert">{{ historyError }}</p>
         <div v-if="!messages.length && !sending" class="cd-task-entry">
@@ -1167,6 +1787,19 @@ function connectorGuide(s: McpServer) {
             <button v-if="m.recoverable" class="cd-resume" @click="send('继续完成任务')">
               ↻ 继续上次任务
             </button>
+            <WorkflowCard
+              v-if="m.workflow?.workflowId"
+              :key="m.workflow.workflowId"
+              :workflow-id="m.workflow.workflowId"
+              :seed="m.workflow.seed"
+              @activity="onCardActivity"
+              @team="onWfTeam"
+              @gate="(open: boolean) => onWfGate(m.workflow!.workflowId, open)"
+            />
+            <div v-else-if="m.workflow && m.status === 'streaming'" class="cd-wf-pending">
+              <span class="cd-wf-spinner" aria-hidden="true" />
+              正在创建工作流，方案马上在对话中展开…
+            </div>
             <div v-if="m.plan.length" class="cd-plan">
               <div class="cd-plan-title">执行计划</div>
               <div v-for="(s, i) in m.plan" :key="'p' + i" class="cd-plan-step">
@@ -1180,27 +1813,32 @@ function connectorGuide(s: McpServer) {
               </button>
               <div v-if="reasonOpen.has(m.id)" class="cd-reason-body">{{ m.reasoning }}</div>
             </div>
-            <div v-if="m.trace.length" class="cd-activity">
-              <div v-for="(t, i) in m.trace" :key="i" class="cd-activity-item" :class="`cd-activity-${traceState(m, t, i)}`">
-                <button class="cd-activity-row" @click="toggleActivity(m.id, i)">
-                  <span class="cd-activity-glyph">{{ TRACE_GLYPH[t.type] || '·' }}</span>
+            <div v-if="visibleTrace(m).length" class="cd-activity">
+              <div v-for="row in visibleTrace(m)" :key="row.index" class="cd-activity-item" :class="`cd-activity-${traceState(m, row.item, row.index)}`">
+                <button class="cd-activity-row" @click="toggleActivity(m.id, row.index)">
+                  <span class="cd-activity-glyph">{{ TRACE_GLYPH[row.item.type] || '·' }}</span>
                   <span class="cd-activity-main">
-                    <span class="cd-activity-title">{{ traceTitle(t) }}</span>
-                    <span class="cd-activity-summary">{{ traceSummary(t) }}</span>
+                    <span class="cd-activity-title">{{ traceTitle(row.item) }}</span>
+                    <span class="cd-activity-summary">{{ traceSummary(row.item) }}</span>
                   </span>
                   <span class="cd-activity-meta">
-                    <span class="cd-activity-state">{{ traceStateLabel(traceState(m, t, i), t) }}</span>
-                    <span v-if="traceElapsed(t)" class="cd-activity-time">{{ traceElapsed(t) }}</span>
-                    <span class="cd-activity-chevron">{{ activityIsOpen(m.id, i, m) ? '▾' : '▸' }}</span>
+                    <span class="cd-activity-state">{{ traceStateLabel(traceState(m, row.item, row.index), row.item) }}</span>
+                    <span v-if="traceElapsed(row.item)" class="cd-activity-time">{{ traceElapsed(row.item) }}</span>
+                    <span class="cd-activity-chevron">{{ activityIsOpen(m.id, row.index, m) ? '▾' : '▸' }}</span>
                   </span>
                 </button>
-                <div v-if="activityIsOpen(m.id, i, m)" class="cd-activity-detail">{{ t.text }}</div>
+                <div v-if="activityIsOpen(m.id, row.index, m)" class="cd-activity-detail">{{ row.item.text }}</div>
               </div>
             </div>
             <div v-if="m.status === 'streaming'" class="cd-thinking">
               {{ m.reasoning ? '正在整理最终回答' : 'AI 正在翻代码、组织回答' }}<span class="cd-dots">…</span>
             </div>
-            <div v-if="m.text" class="ai-md cd-answer" v-html="answerHtml(m)" />
+            <!-- 流式中按 ~8fps 节流重渲染 markdown（格式边出边成型，又不逐 token 重建
+                 DOM）；结束瞬间由 answerHtml 缓存接管成稿，视觉无跳变 -->
+            <div v-if="m.text" class="ai-md cd-answer" :class="{ 'cd-answer-live': m.status === 'streaming' }">
+              <template v-if="m.status === 'streaming'"><span v-html="streamHtmlOf(m)" /><span class="cd-caret" aria-hidden="true" /></template>
+              <span v-else v-html="answerHtml(m)" />
+            </div>
             <details v-if="m.status === 'done' && webRefsOf(m).length" class="cd-web-sources">
               <summary>联网来源（{{ webRefsOf(m).length }}）</summary>
               <a v-for="(s, i) in webRefsOf(m)" :key="s.url + i" class="cd-web-source" :href="s.url" target="_blank" rel="noopener noreferrer">
@@ -1229,6 +1867,24 @@ function connectorGuide(s: McpServer) {
       <button v-if="sending && !stickToBottom" class="cd-jump-bottom" title="恢复跟随最新输出" @click="resumeAutoScroll">
         ↓ 回到底部
       </button>
+
+      <!-- 孤儿工作流恢复条：后端未终结但当前对话没有卡片（多为刷新后），不处理会持续拦截新请求 -->
+      <div v-if="orphanWf" class="cd-orphan" role="alert">
+        <span class="cd-orphan-glyph" aria-hidden="true">⚠</span>
+        <div class="cd-orphan-body">
+          <div class="cd-orphan-title">
+            该项目有一个未结束的工作流（{{ orphanStatusLabel }}），当前对话里没有它的审批卡片
+          </div>
+          <div class="cd-orphan-desc">
+            它可能创建于页面刷新前；在处理它之前，新的工作流请求会被拦截。ID：{{ orphanWf.workflow_id }}
+          </div>
+          <div v-if="orphanError" class="cd-orphan-err">{{ orphanError }}</div>
+        </div>
+        <button class="cd-mini" :disabled="orphanBusy" @click="reattachOrphan">挂回对话继续</button>
+        <button class="cd-mini cd-mini-danger" :disabled="orphanBusy" @click="interruptOrphan">
+          {{ orphanBusy ? '处理中…' : '中断它' }}
+        </button>
+      </div>
 
       <footer class="cd-inputbar">
         <div class="cd-tools">
@@ -1331,8 +1987,12 @@ function connectorGuide(s: McpServer) {
           <button v-else class="cd-send" :disabled="!input.trim() && !pendingImages.length" @click="send()">发送</button>
         </div>
       </footer>
-    </template>
 
+    <WorkflowMembersDock
+      :active="!!wfActiveTeam"
+      :members="wfActiveTeam?.members || []"
+      @focus="focusWfMember"
+    />
     <ModelSettingsDialog
       :visible="settingsOpen"
       :config="modelConfig"
@@ -1350,15 +2010,30 @@ function connectorGuide(s: McpServer) {
   background: var(--bg-raised);
   display: flex;
   flex-direction: column;
-  height: min(52vh, 680px);
-  min-height: 340px;
-  max-height: min(70vh, 760px);
+  height: min(62vh, 820px);
+  min-height: 380px;
+  max-height: calc(100vh - 86px);
+  /* 高度是布局属性，动画期间只改高度一个变量；曲线先快后稳，配合 chevron 同步翻转 */
+  transition: height .24s cubic-bezier(.32, .72, 0, 1),
+              min-height .24s cubic-bezier(.32, .72, 0, 1);
 }
 .cd-dock.cd-expanded {
-  height: min(70vh, 820px);
+  height: calc(100vh - 86px);
   max-height: calc(100vh - 86px);
 }
-.cd-collapsed { height: auto; min-height: 0; max-height: none; }
+/* 折叠态用显式高度（=头部 32 + 顶边 1），auto 无法参与过渡；
+   双类名保证在矮屏媒体查询里也能覆盖 .cd-dock 的高度声明 */
+.cd-dock.cd-collapsed { height: 33px; min-height: 0; max-height: none; }
+/* 折叠收起时裁掉对话区与输入栏（弹层已 Teleport 到 body，不受裁剪影响） */
+.cd-dock.cd-clipping { overflow: hidden; }
+/* 人工审批门打开：锁操作区与头部，但不锁聊天滚动（遮罩 pointer-events:none）。
+   头部必须整体锁定（含折叠点击）：否则折叠后 33px 裁剪会把居中审批模态吞掉。 */
+.cd-dock.cd-gate-blocked .cd-inputbar,
+.cd-dock.cd-gate-blocked .cd-head,
+.cd-dock.cd-gate-blocked .cd-task-entry {
+  pointer-events: none;
+}
+.cd-dock.cd-gate-blocked .cd-inputbar { opacity: .55; }
 @media (max-height: 620px) {
   .cd-dock {
     height: min(52vh, 340px);
@@ -1374,15 +2049,43 @@ function connectorGuide(s: McpServer) {
   gap: 8px;
   height: 32px;
   padding: 0 10px;
-  cursor: pointer;
   user-select: none;
 }
-.cd-head:hover { background: var(--bg-hover); }
-.cd-chevron { display: flex; color: var(--text-muted); transition: transform .15s; }
+/* 唯一的折叠热区：箭头 + 标题 + 状态指示；提示文字与按钮不触发折叠 */
+.cd-head-toggle {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 6px; margin-left: -6px;
+  border-radius: 6px; cursor: pointer; user-select: none;
+}
+.cd-head-toggle:hover { background: var(--bg-hover); }
+.cd-head-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.cd-head-toggle .cd-live-wf { cursor: inherit; }
+.cd-head-toggle .cd-chevron { flex: 0 0 auto; }
+.cd-chevron {
+  display: flex; color: var(--text-muted);
+  transform-origin: center;
+  transition: transform .24s cubic-bezier(.32, .72, 0, 1);
+  will-change: transform;
+}
 .cd-chevron.rotated { transform: rotate(90deg); }
 .cd-title { font-size: 12px; font-weight: 600; color: var(--text); }
 .cd-hint { font-size: 11px; color: var(--text-faint); }
 .cd-live { font-size: 11px; color: var(--amber); margin-left: 4px; }
+/* 折叠态工作流后台指示：脉冲点 + 文字，位于标题折叠热区内 */
+.cd-live-wf {
+  display: inline-flex; align-items: center; gap: 5px;
+  color: var(--accent); cursor: pointer;
+}
+.cd-live-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent);
+  animation: cd-live-pulse 1.4s ease-in-out infinite;
+}
+@keyframes cd-live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .35; transform: scale(.7); }
+}
+@media (prefers-reduced-motion: reduce) { .cd-live-dot { animation: none; } }
 .cd-spacer { flex: 1; }
 .cd-btn {
   display: inline-flex; align-items: center; gap: 5px;
@@ -1401,8 +2104,9 @@ function connectorGuide(s: McpServer) {
   z-index: 59;
 }
 .cd-pop {
-  position: absolute;
-  left: 10px; bottom: 38px;
+  position: fixed;
+  /* 26px 底部状态栏 + 原相对面板的 38px 间距 */
+  left: 10px; bottom: 64px;
   width: 460px; max-width: calc(100vw - 24px);
   max-height: 60vh; overflow-y: auto;
   background: var(--bg-raised);
@@ -1413,8 +2117,9 @@ function connectorGuide(s: McpServer) {
   z-index: 60;
 }
 .cd-session-pop {
-  position: absolute;
-  right: 10px; bottom: 38px;
+  /* Teleport 到 body：相对视口固定（26px 状态栏 + 原 38px 间距） */
+  position: fixed;
+  right: 10px; bottom: 64px;
   width: 360px; max-width: calc(100vw - 24px);
   max-height: min(62vh, 430px); overflow-y: auto;
   background: var(--bg-raised); border: 1px solid var(--border-strong);
@@ -1449,6 +2154,28 @@ function connectorGuide(s: McpServer) {
 .cd-session-copy small { margin-top: 2px; color: var(--text-faint); font-size: 10px; }
 .cd-session-delete { align-self: center; margin-right: 5px; width: 22px; height: 22px; border: 0; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 16px; }
 .cd-session-delete:hover { color: var(--danger); }
+.cd-session-delete:disabled { cursor: default; opacity: .5; }
+/* 工作流历史弹层 */
+.cd-wf-pop { max-height: min(70vh, 520px); }
+.cd-wf-dot { flex: 0 0 auto; align-self: center; width: 8px; height: 8px; border-radius: 50%; }
+.cd-wf-dot-run { background: var(--amber); box-shadow: 0 0 6px rgba(214,158,46,.6); animation: cd-wf-pulse 1.4s ease-in-out infinite; }
+.cd-wf-dot-ok { background: var(--green); }
+.cd-wf-dot-err { background: var(--danger); }
+.cd-wf-dot-stop { background: var(--text-faint); }
+@keyframes cd-wf-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+.cd-wf-state { font-style: normal; }
+.cd-wf-state-run { color: var(--amber); }
+.cd-wf-state-ok { color: var(--green); }
+.cd-wf-state-err { color: var(--danger); }
+.cd-wf-state-stop { color: var(--text-faint); }
+.cd-wf-sub { display: block; color: var(--danger); margin-top: 2px; }
+.cd-wf-act {
+  width: auto; min-width: 34px; height: auto; align-self: center;
+  margin-right: 5px; padding: 3px 8px; border: 1px solid var(--border);
+  border-radius: 5px; font-size: 10.5px; color: var(--text-muted);
+}
+.cd-wf-act:hover:not(:disabled) { color: var(--amber); border-color: var(--amber); }
+.cd-wf-act-danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
 .cd-new-session { color: var(--accent); border-color: #c8dcfa; }
 .cd-pop-title { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
 .cd-pop-subtitle { font-size: 11px; color: var(--text-dim); line-height: 1.5; margin-bottom: 8px; }
@@ -1510,6 +2237,22 @@ function connectorGuide(s: McpServer) {
   box-shadow: 0 2px 8px rgba(30, 50, 90, .14); cursor: pointer;
 }
 .cd-jump-bottom:hover { background: var(--bg-selected); }
+/* 孤儿工作流恢复条：贴在输入框上沿，琥珀色提示但不遮挡消息流 */
+.cd-orphan {
+  display: flex; align-items: center; gap: 8px;
+  margin: 6px 12px 0; padding: 8px 10px;
+  border: 1px solid var(--amber); border-radius: 8px;
+  background: color-mix(in srgb, var(--amber) 10%, var(--bg-raised));
+}
+.cd-orphan-glyph { color: var(--amber); font-size: 13px; line-height: 1; flex: none; }
+.cd-orphan-body { flex: 1 1 auto; min-width: 0; }
+.cd-orphan-title { font-size: 11.5px; font-weight: 600; color: var(--text); }
+.cd-orphan-desc {
+  font-size: 10.5px; color: var(--text-muted); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cd-orphan-err { font-size: 10.5px; color: var(--danger); margin-top: 2px; }
+.cd-orphan .cd-mini { flex: none; white-space: nowrap; }
 .cd-body { flex: 1 1 auto; overflow-y: auto; padding: 8px 14px 4px; min-height: 90px; }
 .cd-empty { padding: 14px 6px; color: var(--text-muted); }
 .cd-empty-title { font-size: 12px; margin: 0 0 10px; color: var(--text-muted); }
@@ -1542,6 +2285,14 @@ function connectorGuide(s: McpServer) {
 }
 .cd-msg-user { display: flex; justify-content: flex-end; }
 .cd-answer { font-size: 12.5px; max-width: 96%; }
+/* 流式期的节流 markdown 与成稿同一样式；光标在块级内容后自然落到新行 */
+.cd-caret {
+  display: inline-block; width: 6px; height: 1.05em; margin-left: 2px;
+  vertical-align: -0.18em; border-radius: 1px;
+  background: var(--accent); animation: cd-caret 1.05s steps(1, end) infinite;
+}
+@keyframes cd-caret { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .cd-caret { animation: none; } }
 .cd-thinking, .cd-error { font-size: 12px; color: var(--text-muted); padding: 4px 0; }
 .cd-error { color: var(--danger); }
 
@@ -1562,6 +2313,19 @@ function connectorGuide(s: McpServer) {
 .cd-run-error { color: var(--danger); }
 .cd-run-stopped { color: var(--amber); }
 .cd-run-time { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+
+.cd-wf-pending {
+  display: flex; align-items: center; gap: 9px;
+  margin: 4px 0 8px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg-hover); color: var(--text-muted); font-size: 12.5px;
+}
+.cd-wf-spinner {
+  width: 13px; height: 13px; border-radius: 50%; flex: 0 0 auto;
+  border: 2px solid var(--border-strong); border-top-color: var(--accent);
+  animation: cd-wf-spin .7s linear infinite;
+}
+@keyframes cd-wf-spin { to { transform: rotate(360deg); } }
 
 /* 聊天内的纵向活动流：动作按 SSE 到达顺序实时追加，详情按行折叠。 */
 .cd-activity {
@@ -1594,12 +2358,12 @@ function connectorGuide(s: McpServer) {
 .cd-activity-warn .cd-activity-glyph { color: var(--amber); }
 .cd-activity-error .cd-activity-glyph { color: var(--danger); }
 .cd-activity-main { min-width: 0; flex: 1; display: flex; align-items: baseline; gap: 7px; }
-.cd-activity-title { flex: 0 0 auto; color: var(--text); font-size: 11.5px; font-weight: 600; }
+.cd-activity-title { flex: 0 0 auto; color: var(--text); font-size: 12.5px; font-weight: 600; }
 .cd-activity-summary {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  color: var(--text-faint); font-size: 10.5px;
+  color: var(--text-muted); font-size: 12px;
 }
-.cd-activity-meta { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; font-size: 10px; }
+.cd-activity-meta { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; }
 .cd-activity-state { color: var(--text-faint); }
 .cd-activity-running .cd-activity-state { color: var(--accent); }
 .cd-activity-warn .cd-activity-state { color: var(--amber); }
@@ -1770,5 +2534,23 @@ function connectorGuide(s: McpServer) {
   font-size: 11px; line-height: 1.65; color: var(--text-dim);
   white-space: pre-wrap; word-break: break-word;
   max-height: 220px; overflow-y: auto;
+}
+
+/* 新功能按钮增多后，窄宽度下逐级收起装饰性文字，保证头部不溢出 */
+@media (max-width: 1280px) {
+  .cd-hint { display: none; }
+}
+@media (max-width: 1020px) {
+  .cd-live { display: none; }
+  .cd-btn { padding: 0 7px; }
+  .cd-btn span { display: none; }
+  /* 「＋新对话」的图标本身也是 span，单独保回来 */
+  .cd-new-session > span:first-child { display: inline-flex; }
+  .cd-size-btn span { display: none; }
+}
+/* 尊重系统「减少动态效果」：高度/箭头翻转改为瞬时，光标不闪烁 */
+@media (prefers-reduced-motion: reduce) {
+  .cd-dock { transition: none; }
+  .cd-chevron { transition: none; }
 }
 </style>

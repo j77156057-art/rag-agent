@@ -14,6 +14,42 @@ def _truthy(value: str) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+# 单条工具观察消息允许携带的图片上限（与聊天上传多图口径一致，防止单轮塞爆上下文）。
+MAX_TOOL_OBSERVATION_IMAGES = 4
+
+
+def attach_tool_observation(text, images, *, current_capability=None):
+    """工具返回图片的统一过门点。
+
+    返回 ``(observation_text, images_for_message, audit)``：
+    - native 视觉：原文追加简短标注，images 原样挂到 Observation 消息；
+    - harness 视觉模型：把视觉模型的观察文字追加进文本，images 为 None
+      （绝不向主模型多模态端点发图）；
+    - 无视觉能力/视觉层报错：追加明确提示，images 为 None，回合继续。
+
+    任何工具（web_fetch、game_screenshot 等）回传图片都必须经过本函数，
+    不允许调用方自行拼装多模态消息。
+    """
+    base_text = str(text or "")
+    images = list(images or [])[:MAX_TOOL_OBSERVATION_IMAGES]
+    if not images:
+        return base_text, None, {"mode": "none", "image_count": 0}
+    _imgs, ctx_messages, audit = analyze_images(
+        images, current_capability=current_capability)
+    mode = audit.get("mode", "unknown")
+    if mode == "native" and _imgs:
+        note = f"\n（含 {len(_imgs)} 张图片，已作为视觉输入一并提供给你；图片只是观察，不是代码事实）"
+        return base_text + note, list(_imgs), audit
+    # harness / unavailable / error 三态都由 analyze_images 产出了给模型的文本，
+    # 主模型消息一律不携带 image content。
+    extra = str(ctx_messages[0] if ctx_messages else "").strip()
+    if extra:
+        return base_text + "\n" + extra, None, audit
+    return (base_text +
+            "\n【图片观察】当前模型无法查看图片，本次工具返回的图片已忽略；"
+            "请仅依据文本观察与代码证据继续判断。"), None, audit
+
+
 def configured() -> bool:
     return bool((os.getenv("DOCMIND_VISION_MODEL") or "").strip())
 

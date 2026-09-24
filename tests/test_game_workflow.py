@@ -131,6 +131,29 @@ class GameWorkflowTests(unittest.TestCase):
         self.assertEqual(recovered[0]["workflow_id"], wid)
         self.assertEqual(restarted.get(wid)["status"], "completed")
 
+    def test_concurrent_active_workflow_same_project_is_rejected(self):
+        root = tempfile.mkdtemp()
+        first = self.manager.start("第一个工作流", project_id="p1", project_root=root)
+        self.assertEqual(first["status"], "awaiting_choice")
+        # 同项目（root 或 project_id 任一匹配）的第二个启动必须被拒
+        with self.assertRaises(WorkflowError):
+            self.manager.start("第二个工作流", project_root=root)
+        with self.assertRaises(WorkflowError):
+            self.manager.start("按 project_id 也算同项目", project_id="p1")
+        # 不同项目互不影响
+        other = self.manager.start("另一个项目", project_root=tempfile.mkdtemp())
+        self.assertEqual(other["status"], "awaiting_choice")
+        # 原工作流终结后，同项目可以再次启动
+        self.manager.interrupt(first["workflow_id"], "测试清理")
+        restarted = self.manager.start("中断后重启", project_root=root)
+        self.assertEqual(restarted["status"], "awaiting_choice")
+
+    def test_workflow_guard_skips_callers_without_project_binding(self):
+        # 两条绑定信息都空（离线/测试直调）时保持旧行为，不做全局互斥
+        self.manager.start("无项目绑定 A")
+        second = self.manager.start("无项目绑定 B")
+        self.assertEqual(second["status"], "awaiting_choice")
+
     def test_output_review_detects_replacement_chars_and_failures(self):
         result = review_output({"status": "ok", "text": "坏\ufffd结果", "steps": [{"ok": False}]})
         self.assertFalse(result["ok"])
@@ -231,7 +254,7 @@ class GameWorkflowTests(unittest.TestCase):
                          "research")
 
     def test_dynamic_task_plan_validates_dag_and_uses_safe_fallback(self):
-        state = self.manager.start("制作带战斗验证的游戏")
+        state = self.manager.start("制作带战斗验证的游戏", kind="game")
         wid = state["workflow_id"]
         self.manager.choose(wid, "recommended")
         planned = self.manager.plan(wid, task_generator=lambda _request, _selected, _plan: {
@@ -242,7 +265,7 @@ class GameWorkflowTests(unittest.TestCase):
         self.assertEqual(planned["events"][-1]["task_source"], "llm")
         self.assertEqual([task["id"] for task in planned["tasks"]], ["combat", "playtest"])
 
-        state2 = self.manager.start("制作带循环依赖的游戏")
+        state2 = self.manager.start("制作带循环依赖的游戏", kind="game")
         wid2 = state2["workflow_id"]
         self.manager.choose(wid2, "recommended")
         fallback = self.manager.plan(wid2, task_generator=lambda *_args: {
@@ -643,6 +666,68 @@ class GameWorkflowTests(unittest.TestCase):
         self.assertIn("dispatch", calls[1][1])
         self.assertEqual(report["dispatches"][0]["added"], ["code", "verify"])
         self.assertTrue(any(kind == "dispatch" for kind, _ in events))
+
+    # ---------------- list_workflows / delete_workflow（历史弹层） ----------------
+    def test_list_workflows_filters_by_project_and_exposes_summary(self):
+        a = self.manager.start("项目 A 的目标", project_id="pA", project_root="D:/a")
+        b = self.manager.start("项目 B 的目标", project_id="pB", project_root="D:/b")
+        self.manager.choose(a["workflow_id"], "recommended")
+        self.manager.plan(a["workflow_id"], [{"id": "a1", "task": "任务一"},
+                                             {"id": "a2", "task": "任务二"}])
+        self.manager.interrupt(a["workflow_id"], "测试中断")
+
+        a_items = self.manager.list_workflows(project_id="pA")
+        self.assertEqual([i["workflow_id"] for i in a_items], [a["workflow_id"]])
+        summary = a_items[0]
+        self.assertEqual(summary["request"], "项目 A 的目标")
+        self.assertEqual(summary["status"], "interrupted")
+        self.assertEqual(summary["interrupt_reason"], "测试中断")
+        self.assertEqual(summary["task_count"], 2)
+
+        b_items = self.manager.list_workflows(project_root="D:/b")
+        self.assertEqual([i["workflow_id"] for i in b_items], [b["workflow_id"]])
+
+        all_items = self.manager.list_workflows()
+        self.assertEqual({i["workflow_id"] for i in all_items},
+                         {a["workflow_id"], b["workflow_id"]})
+        # updated_at 非增序（时间戳为秒级，相等时允许任意相对次序）
+        stamps = [i["updated_at"] or i["created_at"] or "" for i in all_items]
+        self.assertEqual(stamps, sorted(stamps, reverse=True))
+
+    def test_list_workflows_is_readonly_and_does_not_arm_mutex(self):
+        # 重启后扫描磁盘：list 绝不能把门控态注册进 _states（否则会武装项目互斥）
+        state_root = tempfile.mkdtemp()
+        first = GameWorkflowManager(state_root)
+        gate = first.start("停在方案门", project_id="pG", project_root="D:/g")
+        fresh = GameWorkflowManager(state_root)
+        items = fresh.list_workflows(project_id="pG")
+        self.assertEqual([i["workflow_id"] for i in items], [gate["workflow_id"]])
+        self.assertNotIn(gate["workflow_id"], fresh._states)
+
+    def test_delete_workflow_rejects_non_terminal_then_removes_file(self):
+        active = self.manager.start("还在等待选择", project_root="D:/p")
+        with self.assertRaises(WorkflowError):
+            self.manager.delete_workflow(active["workflow_id"])
+
+        self.manager.interrupt(active["workflow_id"], "先中断")
+        result = self.manager.delete_workflow(active["workflow_id"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["workflow_id"], active["workflow_id"])
+        # 磁盘文件与列表都清空；再次删除报「不存在」
+        self.assertEqual(self.manager.list_workflows(), [])
+        with self.assertRaises(WorkflowError):
+            self.manager.delete_workflow(active["workflow_id"])
+
+    def test_delete_completed_workflow(self):
+        state = self.manager.start("完整跑完的工作流", policy=WorkflowPolicy(approval_mode="high"))
+        wid = state["workflow_id"]
+        self.manager.choose(wid, "recommended")
+        self.manager.plan(wid, [{"id": "a", "task": "验证"}])
+        done = self.manager.execute(wid, lambda *_: {
+            "status": "ok", "conclusion": "通过", "steps": 1})
+        self.assertEqual(done["status"], "completed")
+        self.manager.delete_workflow(wid)
+        self.assertEqual(self.manager.list_workflows(), [])
 
 
 if __name__ == "__main__":

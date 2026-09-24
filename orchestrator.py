@@ -29,6 +29,19 @@ class PlanError(ValueError):
     """任务图不合法（空任务、id 重复、依赖缺失、循环依赖、超量）。"""
 
 
+def _strict_int_steps(raw):
+    """max_steps 严格整数化：bool/非整浮点/非数字串/None → None（调用方回退默认）。"""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        return int(raw) if raw.is_integer() else None
+    if isinstance(raw, str) and re.fullmatch(r"\s*[+-]?\d+\s*", raw):
+        return int(raw.strip())
+    return None
+
+
 def _as_deps(value):
     if value is None:
         return []
@@ -83,7 +96,7 @@ def parse_plan(raw, known_ids=None):
         mcp = str(t.get("mcp") or "auto").strip().lower()
         if mcp not in {"auto", "allow", "deny"}:
             mcp = "auto"
-        out.append({
+        item = {
             "id": tid,
             "role": str(t.get("role") or "researcher").strip().lower(),
             "task": desc,
@@ -94,7 +107,13 @@ def parse_plan(raw, known_ids=None):
             "tools": tools,
             "mcp": mcp,
             "reflection": bool(t.get("reflection", True)),
-        })
+        }
+        # 逐任务加步申请：只透传 1..12 的非布尔整数（与 agent 子代理硬顶同源），
+        # 非法/越界值（布尔、10.7 这类浮点、非数字串）直接丢弃，回退默认步数。
+        steps_value = _strict_int_steps(t.get("max_steps"))
+        if steps_value is not None and 1 <= steps_value <= 12:
+            item["max_steps"] = steps_value
+        out.append(item)
 
     ids = {t["id"] for t in out} | {str(k) for k in (known_ids or ())}
     for t in out:

@@ -8,6 +8,7 @@
 import os
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -18,6 +19,9 @@ from config import (  # noqa: E402
     model_vision_mode,
     model_video_mode,
     prompt_token_budget,
+    output_token_budget,
+    resolve_context_from_docs,
+    _parse_context_from_text,
     set_context_window_override,
     get_context_window_override,
     clear_context_window_override,
@@ -95,6 +99,12 @@ class ThinkingModeTests(unittest.TestCase):
     def test_multimodal_capability_and_user_override(self):
         self.assertEqual(model_vision_mode("ollama", "qwen3-vl:8b"), "native")
         self.assertEqual(model_video_mode("openai", "gpt-4o"), "native")
+        # DeepSeek-V4.1-Flash（model id=deepseek-flash，2026-09 起原生多模态，
+        # 走标准 OpenAI image_url）必须被内置画像识别，否则 /api/chat 会丢弃图片。
+        self.assertEqual(model_vision_mode("deepseek", "deepseek-flash"), "native")
+        self.assertEqual(model_vision_mode("deepseek", "deepseek-v4-flash-vision-exp"), "native")
+        # 纯文本的 deepseek-chat / V4 Pro 不得误判为视觉模型
+        self.assertNotEqual(model_vision_mode("deepseek", "deepseek-chat"), "native")
         provider, model = "custom", "zz-vision-override"
         try:
             set_model_capability_override(provider, model, thinking="toggle", vision="harness", video="frames")
@@ -207,23 +217,58 @@ class OllamaBudgetTests(unittest.TestCase):
     def test_window_large_enough_uses_full_output_budget(self):
         win = 16384
         budget = prompt_token_budget("ollama", "qwen3:8b")
+        out_budget = output_token_budget("ollama", "qwen3:8b", win)
         want_ctx = budget + LLM_MAX_TOKENS + 512
         num_ctx = min(want_ctx, win)
-        # 16k 窗口放得下按比例缩放的预算：输出必须给满 LLM_MAX_TOKENS
+        # 16k 窗口放得下按比例缩放的预算：输出给满派生预算（>= 旧硬上限 3072 的保底）
         self.assertGreaterEqual(win, want_ctx)
         self.assertEqual(num_ctx, want_ctx)
-        num_predict = LLM_MAX_TOKENS if num_ctx >= want_ctx else 512
-        self.assertEqual(num_predict, LLM_MAX_TOKENS)
+        num_predict = out_budget if num_ctx >= want_ctx else 512
+        self.assertEqual(num_predict, out_budget)
+        self.assertGreaterEqual(num_predict, LLM_MAX_TOKENS)
 
     def test_small_window_reserves_minimum_output(self):
         # 8k 小窗口：预算再大也被物理封顶，至少留 512 输出
         win = 8192
         budget = 12288
+        out_budget = output_token_budget("ollama", "qwen3:8b", win)
         want_ctx = budget + LLM_MAX_TOKENS + 512
         num_ctx = min(want_ctx, win)
         self.assertEqual(num_ctx, 8192)
-        num_predict = min(LLM_MAX_TOKENS, max(512, win - num_ctx + 512))
+        num_predict = min(out_budget, max(512, win - num_ctx + 512))
         self.assertEqual(num_predict, 512)
+
+
+class ContextDocResolveTests(unittest.TestCase):
+    """联网检索官方文档判定上下文窗口：解析 + 缓存（fake web_fn，不触网）。"""
+
+    def test_parse_context_from_text(self):
+        self.assertEqual(_parse_context_from_text("max context window 128K tokens"), 128000)
+        self.assertEqual(_parse_context_from_text("supports up to 1M tokens"), 1_000_000)
+        self.assertEqual(_parse_context_from_text("context length 32768"), 32768)
+        # 范围外 / 无关键词的数字不应误判
+        self.assertIsNone(_parse_context_from_text("trained in 2024 on 4096 batches"))
+        self.assertIsNone(_parse_context_from_text("no context info here"))
+
+    def test_resolve_context_from_docs_uses_web_fn_and_caches(self):
+        calls = []
+        # 用独立 cache 字典，并屏蔽落盘，避免污染 .docmind_model_context.json
+        cache = {}
+        with unittest.mock.patch("config._save_model_ctx_cache"):
+            def fake_web(q):
+                calls.append(q)
+                return "The model supports a 1M token context window."
+            win = resolve_context_from_docs("deepseek", "deepseek-chat", fake_web, cache=cache)
+            self.assertEqual(win, 1_000_000)
+            self.assertEqual(cache["deepseek:deepseek-chat"], 1_000_000)
+            # 第二次命中缓存，不再调用 web_fn
+            win2 = resolve_context_from_docs("deepseek", "deepseek-chat", fake_web, cache=cache)
+            self.assertEqual(win2, 1_000_000)
+            self.assertEqual(len(calls), 1)
+
+    def test_resolve_context_from_docs_no_web_fn_returns_none(self):
+        self.assertIsNone(resolve_context_from_docs("deepseek", "deepseek-chat", None, cache={}))
+
 
 
 if __name__ == "__main__":

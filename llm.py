@@ -6,6 +6,7 @@ OpenAI chat/completions 接口后面，运行时切换 provider 即可，业务�
 import json
 import os
 import random
+import re
 import time
 import urllib.error
 import urllib.request
@@ -17,6 +18,7 @@ from config import (
     LLM_PROVIDER, PROVIDERS, LLM_MODEL, LLM_API_KEY,
     LLM_MAX_TOKENS, LLM_ENABLE_THINKING, PROMPT_TOKEN_BUDGET, get_runtime,
     model_capability, prompt_token_budget, get_context_window_override,
+    output_token_budget, resolve_context_from_docs, _PROVIDER_CONTEXT_DEFAULT,
 )
 from agent_runtime.local_runtime import local_llm_slot
 
@@ -185,15 +187,28 @@ class StreamChat:
                                         "arguments": slot["arguments"]})
 
     def _capture_usage(self, chunk):
-        """尾包（choices 为空）带 usage：OpenAI 需请求时开 include_usage。"""
+        """尾包（choices 为空）带 usage：OpenAI 需请求时开 include_usage。
+
+        同时抽取 prompt caching 字段（cache_read_input_tokens / cached_tokens，含
+        prompt_tokens_details.* 嵌套口径），供计费按折扣价结转（修复"计费漏算缓存命中"）。
+        """
         u = getattr(chunk, "usage", None)
         if u is None:
             return
         dump = u.model_dump() if hasattr(u, "model_dump") else (u if isinstance(u, dict) else {})
-        for k in ("prompt_tokens", "completion_tokens"):
+        if not isinstance(dump, dict):
+            return
+        for k in ("prompt_tokens", "completion_tokens",
+                  "cache_read_input_tokens", "cache_creation_input_tokens",
+                  "cache_read_tokens", "cache_creation_tokens", "cached_tokens"):
             v = dump.get(k)
             if isinstance(v, int):
                 self._usage[k] = v
+        details = dump.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            for k in ("cached_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+                if isinstance(details.get(k), int):
+                    self._usage[k] = details[k]
 
     def __iter__(self):
         try:
@@ -335,8 +350,35 @@ def probe_ollama_context(model: str, base_url: str = "", timeout: float = 3.0,
     return win
 
 
+def _doc_context_resolver(query: str) -> str:
+    """LLMClient 默认文档检索回调：搜索官方资料并抓取首条结果正文。
+
+    延迟导入 tools，避免 llm <-> tools 循环依赖；任何失败都静默返回空串（文档解析
+    只是锦上添花，绝不能因联网失败阻断主流程）。
+    """
+    try:
+        from tools import web_search, web_fetch
+    except Exception:
+        return ""
+    try:
+        res = web_search(query) or ""
+    except Exception:
+        return ""
+    if not res:
+        return ""
+    urls = re.findall(r"https?://[^\s)\"'`]+", res)
+    for u in urls[:3]:
+        try:
+            body = web_fetch(u) or ""
+        except Exception:
+            body = ""
+        if body:
+            return body
+    return res
+
+
 class LLMClient:
-    def __init__(self, provider=None, model=None, api_key=None, base_url=None):
+    def __init__(self, provider=None, model=None, api_key=None, base_url=None, web_fn=None):
         self.provider = provider or get_runtime("llm_provider") or LLM_PROVIDER
         if self.provider not in PROVIDERS:
             # 未知 provider 不静默回退：明确报错，避免把请求发到意料之外的服务
@@ -379,6 +421,25 @@ class LLMClient:
         # 按真实窗口缩放的单轮 prompt token 预算（Agent 裁剪/压缩与 ollama num_ctx 共用）
         self.prompt_budget = prompt_token_budget(
             self.provider, self.model, context_window=self.capability["context_window"])
+        # 云端模型且静态画像只落到「厂商默认窗口」（没精确到具体模型）时，联网检索官方文档
+        # 校正真实窗口（如 DeepSeek 实际达 1M），结果缓存复用；local/mock 不触发联网。
+        self._web_fn = web_fn
+        if self._web_fn is None and self.capability.get("cloud"):
+            self._web_fn = _doc_context_resolver
+        if (self._web_fn
+                and self.capability.get("cloud")
+                and not get_context_window_override(self.provider, self.model)
+                and self.capability["context_window"] == _PROVIDER_CONTEXT_DEFAULT.get(self.provider, 0)):
+            docs_win = resolve_context_from_docs(self.provider, self.model, self._web_fn)
+            if docs_win:
+                self.context_source = "docs"
+                self.capability = model_capability(
+                    self.provider, self.model, context_window=docs_win)
+                self.prompt_budget = prompt_token_budget(
+                    self.provider, self.model, context_window=docs_win)
+        # 单次补全可输出上限：由真实窗口派生（大窗口云端模型给足预算，不再被 3072 限死）
+        self.output_budget = output_token_budget(
+            self.provider, self.model, context_window=self.capability["context_window"])
 
         if self.provider == "mock":
             # 离线演示模式：不发起任何网络请求
@@ -398,7 +459,7 @@ class LLMClient:
     def clone(self):
         """复制一份**独立**的客户端（同 provider/model/key），供并发子代理使用。"""
         return LLMClient(provider=self.provider, model=self.model, api_key=self.api_key,
-                         base_url=self.base_url or None)
+                         base_url=self.base_url or None, web_fn=getattr(self, "_web_fn", None))
 
     def _resolve_thinking(self, enable_thinking):
         """本次调用是否开启思考：显式参数 > 运行时开关 > 全局环境变量。
@@ -472,7 +533,8 @@ class LLMClient:
 
         # max_tokens 兜底：思考型模型偶发不按格式收尾而无限生成，到顶后由
         # finish_reason=length 触发 Agent 的续写纠偏，避免单轮烧几分钟/上万 token。
-        kwargs = {"max_tokens": LLM_MAX_TOKENS}
+        # 由模型真实窗口派生（output_budget），云端大模型给足输出余量，不再写死 3072。
+        kwargs = {"max_tokens": self.output_budget}
         # qwen3 toggle 家族（含 DashScope 兼容模式/自建端点）：按开关透传 enable_thinking。
         # 不支持思考的模型绝不带这个参数，避免 400；native 模型本身始终推理，无需传。
         if self.capability.get("thinking") == "toggle":
@@ -512,9 +574,17 @@ class LLMClient:
         u = getattr(resp, "usage", None)
         if u is not None:
             dump = u.model_dump() if hasattr(u, "model_dump") else (u if isinstance(u, dict) else {})
-            for k in ("prompt_tokens", "completion_tokens"):
-                if isinstance(dump.get(k), int):
-                    self.last_usage[k] = dump[k]
+            if isinstance(dump, dict):
+                for k in ("prompt_tokens", "completion_tokens",
+                          "cache_read_input_tokens", "cache_creation_input_tokens",
+                          "cache_read_tokens", "cache_creation_tokens", "cached_tokens"):
+                    if isinstance(dump.get(k), int):
+                        self.last_usage[k] = dump[k]
+                details = dump.get("prompt_tokens_details")
+                if isinstance(details, dict):
+                    for k in ("cached_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+                        if isinstance(details.get(k), int):
+                            self.last_usage[k] = details[k]
         msg = resp.choices[0].message
         self.last_tool_calls = normalize_tool_calls(getattr(msg, "tool_calls", None))
         return msg.content
@@ -576,15 +646,21 @@ class LLMClient:
         # num_ctx 按模型画像的真实窗口缩放：大窗口模型不再被 14.5k 限死，
         # 小窗口模型也不会盲目塞爆（被服务端拒绝或挤爆显存）。
         budget = int(getattr(self, "prompt_budget", 0) or PROMPT_TOKEN_BUDGET)
-        want_ctx = budget + LLM_MAX_TOKENS + 512
+        # 输出预算按模型真实窗口派生（大窗口模型给足，小窗口模型物理封顶）
+        out_budget = int(getattr(self, "output_budget", LLM_MAX_TOKENS))
+        want_ctx = budget + out_budget + 512
         win = int(self.capability.get("context_window") or 16384)
         num_ctx = min(want_ctx, win)
-        # 窗口放得下完整预算时输出给满 LLM_MAX_TOKENS；放不下（小窗口模型）时
+        # 窗口放得下完整预算时输出给满派生预算；放不下（小窗口模型）时
         # 至少保 512 输出，其余额度让给 prompt。
         if num_ctx >= want_ctx:
-            num_predict = LLM_MAX_TOKENS
+            num_predict = out_budget
         else:
-            num_predict = min(LLM_MAX_TOKENS, max(512, win - num_ctx + 512))
+            # 窗口放不下「完整 prompt 预算 + 派生输出预算」时：prompt 吃满其预算，
+            # 输出拿窗口剩余余量（窗口 - prompt预算 - 512 预留），至少保底 512。
+            # 注意用 budget 而非 num_ctx：num_ctx 已被窗口封顶，win - num_ctx 恒≈512，
+            # 会错误地把输出掐到地板；按真实 prompt 占用给输出留量才是正确裁剪。
+            num_predict = min(out_budget, max(512, win - budget - 512))
         payload = {
             "model": self.model,
             "messages": messages,

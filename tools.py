@@ -4,9 +4,14 @@
 新增工具：在 TOOLS 字典里追加一项即可，Agent 会自动识别。
 """
 import ast
+import base64
+import contextvars
+import io
+import ipaddress
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -16,6 +21,7 @@ import datetime
 import hashlib
 import time
 import mcp_client
+import mcp_capabilities
 from artifact_tools import create_artifact
 
 from config import (TOP_K, COLLECTION_NAME, CODE_COLLECTION_NAME, CODE_ROOT, get_runtime, set_runtime,
@@ -27,7 +33,7 @@ from embeddings import EmbeddingClient
 from vectorstore import pretty_source
 from agent_runtime.retrieval import get_retriever
 from ingest import _CODE_EXT, _SKIP_DIRS
-from agent_runtime.tools import ToolSpec, coerce_tool_spec, upgrade_registry
+from agent_runtime.tools import ToolResult, ToolSpec, coerce_tool_spec, upgrade_registry
 
 _emb = None
 
@@ -37,6 +43,96 @@ _WEB_CACHE_FILE = os.path.join(STATE_ROOT, ".docmind_web_search_cache.json")
 _WEB_CACHE_TTL = int(os.getenv("DOCMIND_WEB_CACHE_TTL", "600"))
 _WEB_CACHE_MAX = 64
 _WEB_CACHE_LOCK = threading.RLock()
+
+
+# ---------------------------------------------------------------------------
+# start_workflow 依赖注入
+#
+# 工具只负责解析参数/渲染指引；真正「组装项目、策略、LLM 回调并落工作流状态」
+# 的 launcher 由 api_routes 在 build_router 时注册（与 WORKFLOWS 的执行回调
+# 同风格）。tools 层不 import api_routes，避免循环依赖。
+# ---------------------------------------------------------------------------
+_WORKFLOW_LAUNCHER = None
+
+
+def set_workflow_launcher(fn):
+    """注册对话内发起工作流的 launcher：fn(goal, *, kind, web_enabled) -> 工作流 public dict。"""
+    global _WORKFLOW_LAUNCHER
+    _WORKFLOW_LAUNCHER = fn if callable(fn) else None
+
+
+# 对话 SSE 联动：start_workflow 成功后把有界摘要投递到「当前 chat 流」的持有者，
+# api.py 的 chat 流每轮工具执行后 take_pending_workflow(holder) 取走（取走即清），
+# 向前端补发结构化 workflow 事件，由对话内工作流卡片直接接管，无需独立面板。
+#
+# 为什么不用 contextvars：chat 是同步生成器，Starlette/anyio 在线程池里每次 next()
+# 都会 copy_context，工具线程里的 set 既可能对下一次迭代不可见、清除也可能不生效
+# （实测会重复补发）。模块级活动流栈是跨线程共享的真实对象，append/pop 确定生效；
+# 单机单用户桌面场景下并发发起工作流的竞态可忽略，工具固定投递到栈顶（最近注册）流。
+_pending_streams: list = []
+_orphan_pending: list = []
+
+
+def push_pending_stream() -> list:
+    """chat SSE 流开始时注册自己的待取队列，返回该队列持有者。"""
+    holder: list = []
+    _pending_streams.append(holder)
+    return holder
+
+
+def pop_pending_stream(holder) -> None:
+    """chat SSE 流结束时注销（finally 调用，残留条目转交兜底队列）。"""
+    try:
+        _pending_streams.remove(holder)
+    except ValueError:
+        pass
+    if holder:
+        _orphan_pending.extend(holder[-1:] if len(holder) > 1 else holder)
+
+
+def _notify_workflow_started(workflow: dict) -> None:
+    try:
+        summary = {
+            "workflow_id": str(workflow.get("workflow_id") or ""),
+            "status": str(workflow.get("status") or "awaiting_choice"),
+            "phase": str(workflow.get("phase") or "clarify"),
+            "kind": str(workflow.get("kind") or "generic"),
+            "options_count": len(workflow.get("options") or []),
+        }
+        (_pending_streams[-1] if _pending_streams else _orphan_pending).append(summary)
+    except Exception:
+        pass
+
+
+def take_pending_workflow(holder=None):
+    """取走并清除指定流（或兜底队列）内待通知的工作流摘要（无则 None）。"""
+    src = holder if holder is not None else _orphan_pending
+    try:
+        return src.pop(0)
+    except (IndexError, TypeError):
+        return None
+
+
+# 本轮会话联网开关：Agent.run 开始时注入。start_workflow 未显式给 web 时缺省继承，
+# 保证「对话里开了联网 → 工作流方案也能联网补资料」。
+_session_web_enabled = contextvars.ContextVar(
+    "docmind_session_web_enabled", default=False)
+
+
+def set_session_web_enabled(enabled):
+    """在当前 context 内设置会话联网缺省值，返回 reset token。"""
+    return _session_web_enabled.set(bool(enabled))
+
+
+# 本轮会话当前模型的视觉能力模式（native/unknown/none...）。云端按请求覆盖
+# llm 时全局 runtime/环境变量反映不出该模型能力，web 抓图门据此与本轮模型对齐。
+_session_vision_mode = contextvars.ContextVar(
+    "docmind_session_vision_mode", default=None)
+
+
+def set_session_vision_mode(mode):
+    """在当前 context 内设置本轮模型的视觉能力画像，返回 reset token。"""
+    return _session_vision_mode.set(mode or None)
 
 
 def _web_cache_key(prefix, query):
@@ -249,6 +345,436 @@ def dev_list_connector_tools(arg):
         return json.dumps(r, ensure_ascii=False)[:6000]
     except Exception as e:
         return f'工具清单失败：{e}（连接器可能未启用或引擎未运行，可先用 dev_route_connector 换一个）'
+
+
+# ---------------------------------------------------------------------------
+# MCP 连接器自助装配：搜索目录 → 审批后添加 → 探活 → 发现能力 → 审批路由
+#
+# 与设置页 UI 走同一套后端（mcp_capabilities / mcp_client），不另造逻辑。
+# 两道人工可审计的审批门（game_workbench 审批台账，30 分钟有效）：
+#   1) add/remove 连接器（action=mcp_server）：stdio 的 command 等于可执行任意命令，
+#      审批 target 绑定 key+command+args+url 的哈希，换命令必须重新审批；
+#   2) 批准能力路由（action=mcp_capability）：发现只生成 pending 候选，批准后才进路由器。
+# ---------------------------------------------------------------------------
+
+def _mcp_project_root():
+    return get_runtime('code_root') or CODE_ROOT
+
+
+def _mcp_server_approval_target(key, cfg):
+    """把 add 审批绑定到具体连接参数，防止同 key 审批被换成别的 command/url 复用。"""
+    raw = json.dumps({
+        "transport": cfg.get("transport"),
+        "command": (cfg.get("command") or "").strip(),
+        "args": [str(a) for a in (cfg.get("args") or [])],
+        "url": (cfg.get("url") or "").strip(),
+    }, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha1((key.strip().lower() + "|" + raw).encode("utf-8")).hexdigest()[:10]
+    return f"{key.strip()}:{digest}"
+
+
+def _mcp_gate_blocked(root, action, target):
+    """审批门未通过时返回统一阻断结构（None=放行）。"""
+    from game_workbench import require_approval
+    return require_approval(root, action, target)
+
+
+def dev_mcp_search(arg):
+    """搜索 MCP 连接方式的【离线安全目录】：按能力关键词（如 kicad / pcb / 数据库 / github）
+    返回匹配条目的能力清单、连接选项、安装步骤、可直接回填的连接模板。
+
+    输入：能力关键词（至少 2 个字符）。本工具不联网；需要最新第三方 MCP 时，在联网开启下
+    另行使用 web_search（如 '<软件名> MCP server uvx github'）与 web_fetch 读官方文档，
+    确认官方 command/URL 后再调用 dev_mcp_add——严禁把搜索摘要里未经验证的命令直接装配。
+
+    返回 JSON：ok / results[]（id,label,summary,capabilities,connection_options,
+    setup_steps,template{key,label,transport,command,args,url},source_status）。
+    注意 template.command 可能为空（离线指引类条目），此时必须以官方文档补全命令后再 add。
+    """
+    root = _mcp_project_root()
+    if not root:
+        return 'MCP 搜索失败：未配置代码库。'
+    query = str(arg or '').strip()
+    if query.lower().startswith("query:"):
+        query = query[6:].strip()
+    try:
+        result = mcp_capabilities.search_directory(query, web_enabled=False)
+    except Exception as e:  # noqa: BLE001
+        return f'MCP 搜索失败：{type(e).__name__}: {e}'
+    if not result.get("ok"):
+        return f'MCP 搜索失败：{result.get("error") or "未知错误"}'
+    items = []
+    for item in result.get("results") or []:
+        items.append({
+            "id": item.get("id"),
+            "label": item.get("label"),
+            "summary": item.get("summary"),
+            "capabilities": item.get("capabilities") or [],
+            "connection_options": item.get("connection_options") or [],
+            "setup_steps": item.get("setup_steps") or [],
+            "template": item.get("template") or {},
+            "source_status": item.get("source_status"),
+        })
+    return json.dumps({"ok": True, "query": query, "results": items},
+                      ensure_ascii=False)[:6000]
+
+
+def dev_mcp_add(arg):
+    """装配（新增/更新）一个 MCP 连接器配置。敏感操作：必须先通过 mcp_server 审批。
+
+    输入（多行 key: value）：
+      key: <连接器标识，仅字母数字/_/-，≤40>
+      label: <显示名，可选>
+      transport: <stdio|http，默认 stdio>
+      # stdio 必填：
+      command: <启动命令，如 uvx>
+      args: <空格分隔的参数，如 kicad-mcp-pro --transport stdio>
+      args_json: <可选，JSON 数组，优先于 args>
+      # http 必填：
+      url: <http(s)://.../mcp>
+      enabled: <true|false，默认 true>
+
+    首次调用未审批时返回 blocked/approval_required，其中含 action 与 target；
+    先调用 dev_approve(action: mcp_server, target: <阻断结构里给出的完整 target>)，
+    再用【完全相同的参数】重试本工具。target 已绑定命令/URL，改参数需重新审批。
+    成功返回 {ok, server:{key,transport,enabled,...}}，随后应调用 dev_mcp_probe 探活。
+    """
+    root = _mcp_project_root()
+    if not root:
+        return json.dumps({"ok": False, "error": "未配置代码库"}, ensure_ascii=False)
+    f = _parse_keyed(str(arg or ""), ["key", "label", "transport", "command",
+                                      "args", "args_json", "url", "enabled"])
+    key = (f.get("key") or "").strip()
+    if not key:
+        return json.dumps({"ok": False, "error": "缺少 key（连接器标识）。"}, ensure_ascii=False)
+    if not all(ch.isalnum() or ch in "_-" for ch in key) or len(key) > 40:
+        return json.dumps({"ok": False,
+                           "error": "key 仅允许字母数字、下划线、连字符（≤40）。"}, ensure_ascii=False)
+    transport = (f.get("transport") or "stdio").strip().lower()
+    if transport not in ("stdio", "http"):
+        return json.dumps({"ok": False, "error": "transport 仅支持 stdio 或 http。"}, ensure_ascii=False)
+    cfg = {"label": (f.get("label") or "").strip() or key}
+    if transport == "stdio":
+        command = (f.get("command") or "").strip()
+        if not command:
+            return json.dumps({"ok": False,
+                               "error": "stdio 连接器缺少 command；请先从官方文档确认启动命令。"},
+                              ensure_ascii=False)
+        cfg["command"] = command
+        raw_args = (f.get("args_json") or "").strip()
+        if raw_args:
+            try:
+                parsed = json.loads(raw_args)
+                args = [str(a) for a in parsed] if isinstance(parsed, list) else None
+            except ValueError:
+                args = None
+            if args is None:
+                return json.dumps({"ok": False, "error": "args_json 必须是 JSON 数组。"},
+                                  ensure_ascii=False)
+        else:
+            args = [a for a in (f.get("args") or "").split() if a]
+        cfg["args"] = args
+        cfg["env"] = {}
+    else:
+        url = (f.get("url") or "").strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return json.dumps({"ok": False, "error": "http 连接器需要合法 http(s) URL。"},
+                              ensure_ascii=False)
+        cfg["url"] = url
+    enabled_raw = (f.get("enabled") or "").strip().lower()
+    cfg["enabled"] = enabled_raw not in ("0", "false", "no", "off")
+    cfg["transport"] = transport
+
+    target = _mcp_server_approval_target(key, cfg)
+    gate = _mcp_gate_blocked(root, "mcp_server", target)
+    if gate:
+        gate["hint"] = ("先调用 dev_approve，输入 action: mcp_server 换行 target: "
+                        + target + "，审批通过后用完全相同的参数重试 dev_mcp_add。")
+        return json.dumps(gate, ensure_ascii=False)
+    try:
+        mcp_client.save_server(root, key, cfg)
+        server = mcp_client.get_server_config(root, key)
+    except mcp_client.MCPError as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+    return json.dumps({"ok": True, "action": "added",
+                       "next": "调用 dev_mcp_probe 测试连接（initialize + tools/list）",
+                       "server": {k: server.get(k) for k in
+                                  ("key", "label", "transport", "enabled", "engine")}},
+                      ensure_ascii=False)
+
+
+def dev_mcp_probe(arg):
+    """探活一个已装配连接器：完成 MCP initialize + tools/list，返回工具数量与名称。
+
+    输入：连接器 key（可带 'key: ' 前缀）。stdio 首次冷启动（如 uvx 下载依赖）可能耗时较久。
+    返回 {ok,server,transport,tool_count,tools[],elapsed_ms}；失败返回 {ok:false,error}，
+    据此修正 command/args/url 后重新 dev_mcp_add，或 dev_mcp_remove 移除。
+    """
+    root = _mcp_project_root()
+    if not root:
+        return json.dumps({"ok": False, "error": "未配置代码库"}, ensure_ascii=False)
+    key = str(arg or "").strip()
+    if key.lower().startswith("key:"):
+        key = key[4:].strip()
+    if not key:
+        return json.dumps({"ok": False, "error": "缺少连接器 key。"}, ensure_ascii=False)
+    try:
+        result = mcp_client.probe_server(root, key)
+        # 工具列表可能很长，只回传名称，schema 用 dev_list_connector_tools 看
+        result["tools"] = (result.get("tools") or [])[:60]
+        result["next"] = "探活成功后调用 dev_mcp_discover 生成能力候选"
+        return json.dumps(result, ensure_ascii=False)[:6000]
+    except mcp_client.MCPError as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+
+
+def dev_mcp_discover(arg):
+    """读取连接器工具并生成【待审批】能力候选（不会自动启用路由）。
+
+    输入：连接器 key。前置：dev_mcp_add 已添加且 dev_mcp_probe 成功（引擎类 stdio 还需
+    对应软件已打开）。返回候选摘要：domain/capabilities/tool_count/confidence/tool_mappings。
+    之后必须向用户说明该连接器能做什么，用户确认后：dev_approve(action: mcp_capability,
+    target: <key>) → dev_mcp_decide(decision: approve) 才允许 Agent 自动路由调用。
+    """
+    root = _mcp_project_root()
+    if not root:
+        return json.dumps({"ok": False, "error": "未配置代码库"}, ensure_ascii=False)
+    key = str(arg or "").strip()
+    if key.lower().startswith("key:"):
+        key = key[4:].strip()
+    if not key:
+        return json.dumps({"ok": False, "error": "缺少连接器 key。"}, ensure_ascii=False)
+    try:
+        result = mcp_capabilities.discover(root, key)
+    except mcp_client.MCPError as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+    if not result.get("ok"):
+        return json.dumps(result, ensure_ascii=False)
+    cand = result["candidate"]
+    return json.dumps({"ok": True, "candidate": {
+        "server": cand["server"], "domain": cand["domain"], "status": cand["status"],
+        "capabilities": cand["capabilities"], "tool_count": cand["tool_count"],
+        "confidence": cand["confidence"], "best_for": cand["best_for"],
+        "tool_mappings": cand["tool_mappings"][:40],
+    }, "next": ("向用户说明能力清单并取得确认；随后 dev_approve(action: mcp_capability, "
+                f"target: {key}) 再 dev_mcp_decide(decision: approve, key: {key})")},
+        ensure_ascii=False)[:6000]
+
+
+def dev_mcp_decide(arg):
+    """批准/拒绝连接器的能力候选。批准是敏感操作，需先通过 mcp_capability 审批。
+
+    输入（多行 key: value）：
+      decision: approve   # 或 reject
+      key: <连接器key>
+    批准后该连接器进入路由器，Agent 可经 dev_route_connector/dev_mcp_call 自动调用；
+    拒绝则候选作废（不影响已保存的连接器配置，可用 dev_mcp_remove 彻底移除）。
+    """
+    root = _mcp_project_root()
+    if not root:
+        return json.dumps({"ok": False, "error": "未配置代码库"}, ensure_ascii=False)
+    f = _parse_keyed(str(arg or ""), ["decision", "key", "approved"])
+    key = (f.get("key") or "").strip()
+    decision = (f.get("decision") or f.get("approved") or "").strip().lower()
+    approved = decision in ("approve", "approved", "1", "true", "yes", "on")
+    rejected = decision in ("reject", "rejected", "0", "false", "no", "off")
+    if not key or not (approved or rejected):
+        return json.dumps({"ok": False,
+                           "error": "需要 key 与 decision(approve|reject)。"}, ensure_ascii=False)
+    if approved:
+        gate = _mcp_gate_blocked(root, "mcp_capability", key)
+        if gate:
+            gate["hint"] = (f"先调用 dev_approve，输入 action: mcp_capability 换行 target: {key}，"
+                            "审批通过后重试 dev_mcp_decide。")
+            return json.dumps(gate, ensure_ascii=False)
+    try:
+        result = mcp_capabilities.approve(root, key, approved)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+    if not result.get("ok"):
+        return json.dumps(result, ensure_ascii=False)
+    return json.dumps({"ok": True, "decision": "approved" if approved else "rejected",
+                       "server": key,
+                       "routing_enabled": approved}, ensure_ascii=False)
+
+
+def dev_mcp_remove(arg):
+    """移除（自定义）或禁用（内置预设）一个 MCP 连接器。敏感操作：需先通过 mcp_server 审批。
+
+    输入：连接器 key（可带 'key: ' 前缀）。会先关闭活动会话。审批 target 即 key 本身：
+    dev_approve(action: mcp_server, target: <key>) 后重试。
+    """
+    root = _mcp_project_root()
+    if not root:
+        return json.dumps({"ok": False, "error": "未配置代码库"}, ensure_ascii=False)
+    key = str(arg or "").strip()
+    if key.lower().startswith("key:"):
+        key = key[4:].strip()
+    if not key:
+        return json.dumps({"ok": False, "error": "缺少连接器 key。"}, ensure_ascii=False)
+    gate = _mcp_gate_blocked(root, "mcp_server", key)
+    if gate:
+        gate["hint"] = (f"先调用 dev_approve，输入 action: mcp_server 换行 target: {key}，"
+                        "审批通过后重试 dev_mcp_remove。")
+        return json.dumps(gate, ensure_ascii=False)
+    try:
+        mcp_client.close_server(root, key)
+        result = mcp_client.remove_server(root, key)
+        servers = [{"key": s.get("key"), "enabled": s.get("enabled")}
+                   for s in result.get("servers", [])]
+        return json.dumps({"ok": True, "action": "removed_or_disabled",
+                           "server": key, "servers": servers}, ensure_ascii=False)
+    except mcp_client.MCPError as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+
+
+def dev_mcp_discover_from_need(arg):
+    """从自然语言需求发现可装配的 MCP 连接器候选（不写盘、不自动启用）。
+
+    输入：需求描述，如「我需要能查高铁票的 MCP / 数据库 MCP / github MCP」。
+    可选多行 web_enabled: true 开启联网（默认仅离线精选索引）。
+
+    流程（离线优先，联网仅走 GitHub 域）：
+      1) 离线精选索引命中已知热门 server；
+      2) web_enabled 时 GitHub 域限定搜索（platform:github）→ 仓库 README → 解析官方命令；
+    候选均过 R1-R9 信任闸门。返回后须向用户展示候选，逐条经 dev_mcp_add（审批）落盘。
+    """
+    root = _mcp_project_root()
+    if not root:
+        return json.dumps({"ok": False, "error": "未配置代码库"}, ensure_ascii=False)
+    raw = str(arg or "")
+    web_enabled = False
+    lines = []
+    for ln in raw.splitlines():
+        m = re.match(r"^\s*web_enabled\s*[:：]\s*(\S+)", ln, re.I)
+        if m:
+            web_enabled = m.group(1).lower() in ("1", "true", "yes", "on")
+        else:
+            lines.append(ln)
+    need = re.sub(r"^(?:need|需求)\s*[:：]\s*", "", " ".join(lines).strip(), flags=re.I).strip() or raw.strip()
+    if not need:
+        return json.dumps({"ok": False, "error": "需求描述为空"}, ensure_ascii=False)
+    try:
+        import mcp_autoconnect
+        result = mcp_autoconnect.discover_from_need(
+            root, need, web_enabled=web_enabled,
+            github_search_fn=(lambda q: web_search("platform:github " + q + " MCP server")))
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+    if not result.get("ok"):
+        return json.dumps({"ok": False, "candidates": [],
+                           "search_error": result.get("search_error") or "未找到匹配的 MCP 连接器",
+                           "next": "可换更具体的需求词，或 web_enabled: true 联网经 GitHub 搜索"},
+                          ensure_ascii=False)
+    cands = []
+    for c in result.get("candidates") or []:
+        cfg = c.get("config") or {}
+        cands.append({
+            "transport": cfg.get("transport"), "command": cfg.get("command"),
+            "args": cfg.get("args"), "url": cfg.get("url"),
+            "trust": c.get("trust"), "validation_errors": c.get("validation_errors"),
+            "provenance": cfg.get("provenance"),
+            "command_unresolved": cfg.get("command_unresolved"),
+        })
+    return json.dumps({"ok": True, "need": need, "source": result.get("source"),
+                       "candidates": cands, "search_error": result.get("search_error"),
+                       "next": "向用户展示候选；逐条 dev_mcp_add（key/command/args 或 url）经审批落盘，"
+                               "再 dev_mcp_probe 探活、dev_mcp_discover 生成能力候选"},
+                      ensure_ascii=False)[:8000]
+
+
+def _skill_pending_dir():
+    """待审批技能草稿目录；reload() 扫描排除以 '.' 开头的目录，故草稿不会自动生效。"""
+    import skills as _skills_mod
+    return os.path.join(os.path.abspath(_skills_mod.SKILLS_DIR), ".pending")
+
+
+def dev_skill_create(arg):
+    """起草用户技能（待审批，不会自动启用）—— skill 是*可执行行为*，必须经用户确认才激活。
+
+    输入（多行 key: value）：name / description / body（技能正文，markdown）。
+    写入 SKILLS_DIR/.pending/<name>/SKILL.md，返回完整正文供代理向用户展示。
+    用户明确同意后才调用 dev_skill_approve 激活；严禁未经确认直接激活。
+    """
+    f = _parse_keyed(str(arg or ""), ["name", "description", "body"])
+    name = (f.get("name") or "").strip()
+    desc = (f.get("description") or "").strip()
+    body = (f.get("body") or "").strip()
+    if not name or not body:
+        return json.dumps({"ok": False, "error": "name 与 body 必填"}, ensure_ascii=False)
+    import skills as _skills_mod
+    if _skills_mod.get(name):
+        return json.dumps({"ok": False, "error": f"技能 {name} 已存在（活动态），勿覆盖"}, ensure_ascii=False)
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "-", name)[:80].strip(".-")
+    if not clean:
+        return json.dumps({"ok": False, "error": "技能名清洗后为空"}, ensure_ascii=False)
+    pdir = _skill_pending_dir()
+    tdir = os.path.join(pdir, clean)
+    if os.path.exists(tdir):
+        return json.dumps({"ok": False, "error": f"草稿 {clean} 已存在待审批，先 dev_skill_approve 或 dev_skill_reject"},
+                          ensure_ascii=False)
+    os.makedirs(tdir, exist_ok=True)
+    raw = ("---\nname: %s\nversion: 0.1.0\ndescription: %s\nwhen_to_use: 用户确认后启用的复用工作流\n---\n\n%s\n"
+           % (clean, desc.replace("\n", " "), body))
+    try:
+        with open(os.path.join(tdir, "SKILL.md"), "w", encoding="utf-8", newline="\n") as s:
+            s.write(raw)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+    return json.dumps({"ok": True, "name": clean, "status": "pending", "body": body,
+                       "next": "向用户完整展示正文并取得明确同意后，调用 dev_skill_approve(name: %s) 激活" % clean},
+                      ensure_ascii=False)
+
+
+def dev_skill_approve(arg):
+    """激活一个待审批技能：从 .pending 移到 SKILLS_DIR 并 reload（变为可用）。仅当用户已确认。"""
+    name = str(arg or "").strip()
+    if name.lower().startswith("name:"):
+        name = name[5:].strip()
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "-", name)[:80].strip(".-")
+    if not clean:
+        return json.dumps({"ok": False, "error": "技能名无效"}, ensure_ascii=False)
+    import skills as _skills_mod
+    import shutil
+    src = os.path.join(_skill_pending_dir(), clean, "SKILL.md")
+    if not os.path.exists(src):
+        return json.dumps({"ok": False, "error": f"无待审批草稿 {clean}"}, ensure_ascii=False)
+    dst_dir = os.path.join(os.path.abspath(_skills_mod.SKILLS_DIR), clean)
+    if os.path.exists(dst_dir):
+        return json.dumps({"ok": False, "error": f"活动技能 {clean} 已存在"}, ensure_ascii=False)
+    os.makedirs(os.path.abspath(_skills_mod.SKILLS_DIR), exist_ok=True)
+    shutil.move(src, os.path.join(dst_dir, "SKILL.md"))
+    try:
+        os.rmdir(os.path.join(_skill_pending_dir(), clean))
+    except OSError:
+        pass
+    _skills_mod.reload()
+    return json.dumps({"ok": True, "name": clean, "status": "active",
+                       "next": "已激活，可经 dev_use_skill 调用"}, ensure_ascii=False)
+
+
+def dev_skill_reject(arg):
+    """丢弃一个待审批技能草稿（不激活、不保留）。"""
+    name = str(arg or "").strip()
+    if name.lower().startswith("name:"):
+        name = name[5:].strip()
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "-", name)[:80].strip(".-")
+    if not clean:
+        return json.dumps({"ok": False, "error": "技能名无效"}, ensure_ascii=False)
+    import shutil
+    tdir = os.path.join(_skill_pending_dir(), clean)
+    if not os.path.isdir(tdir):
+        return json.dumps({"ok": False, "error": f"无待审批草稿 {clean}"}, ensure_ascii=False)
+    shutil.rmtree(tdir)
+    return json.dumps({"ok": True, "name": clean, "status": "rejected"}, ensure_ascii=False)
 
 
 def _dedup_docs(docs, metas):
@@ -931,6 +1457,282 @@ def _baidu_search(q):
     lines = [_format_search_result(t, s, link) for (t, s, link) in results]
     return "\n".join(lines)
 
+# ---------------------------------------------------------------------------
+# 网页图片观察通道（仅 builtin 抓 HTML 时启用）
+#
+# 图片只是给视觉模型的【观察素材】，不是代码事实；下载与回传受四重约束：
+#   1) DOCMIND_WEB_IMAGES 开关（默认 1）且当前会话模型具备看图途径才下载；
+#   2) 仅 http/https，阻断内网/回环/链路本地地址（防 <img src=内网> SSRF）；
+#   3) Content-Type 白名单 + Pillow 真实图头校验 + ≤800KB + 8s 超时；
+#   4) web_fetch 单次 ≤2 张，web_research 跨源合计 ≤4，URL 去重。
+# 搜索摘要缓存仍只存文本，任何缓存命中分支都不带图。
+# ---------------------------------------------------------------------------
+_WEB_FETCH_IMAGE_LIMIT = 2
+_WEB_RESEARCH_IMAGE_LIMIT = 4
+_WEB_IMAGE_MAX_BYTES = 800 * 1024
+_WEB_IMAGE_TIMEOUT = 8.0
+_WEB_IMAGE_CONTENT_TYPES = ("image/png", "image/jpeg", "image/jpg", "image/webp")
+_WEB_IMAGE_UA = "Mozilla/5.0 (DocMind research; image-observation)"
+_IMG_ICON_WORDS = ("icon", "logo", "sprite", "avatar", "badge", "button", "1x1",
+                   "spacer", "pixel", "favicon", "thumb", "placeholder", "loading",
+                   "banner-ad", "advert", "ads/", "/ads", "tracker", "emoji")
+_IMG_EXT_RE = re.compile(r"\.(?:png|jpe?g|webp)(?:[?#]|$)", re.I)
+_TAG_IMG_RE = re.compile(r"<img\b[^>]*>", re.I | re.S)
+_ATTR_RE_TMPL = r"""{name}\s*=\s*["']([^"']*)["']"""
+
+
+def _web_images_enabled():
+    """开关 + 当前模型看图能力（能力判定必须复用 config 画像/vision 层配置）。"""
+    if os.getenv("DOCMIND_WEB_IMAGES", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    # 本轮会话模型优先（云端按请求 llm 覆盖时全局画像不代表当前模型）。
+    session_mode = _session_vision_mode.get()
+    if session_mode is not None:
+        return session_mode == "native" or bool(
+            (os.getenv("DOCMIND_VISION_MODEL") or "").strip())
+    try:
+        from llm import LLM_PROVIDER, LLM_MODEL
+        from config import model_capability
+        provider = get_runtime("llm_provider") or LLM_PROVIDER
+        model = get_runtime("llm_model") or LLM_MODEL
+        vision_mode = model_capability(provider, model).get("vision")
+        return vision_mode == "native" or bool((os.getenv("DOCMIND_VISION_MODEL") or "").strip())
+    except Exception:
+        return False
+
+
+def _ip_is_internal(addr):
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return True
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _image_host_blocked(host):
+    """图片目标 host 的 SSRF 守卫：回环/内网/链路本地/解析失败一律拒绝。
+
+    域名解析到的任一地址落在内网即拒绝（防 DNS 混地址 rebinding）。
+    """
+    host = (host or "").strip("[]").lower()
+    if not host or host == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        except OSError:
+            return True
+        addrs = {info[4][0] for info in infos}
+        return any(_ip_is_internal(addr) for addr in addrs) or not addrs
+    else:
+        return _ip_is_internal(host)
+
+
+def _img_attr(tag, name):
+    m = re.search(_ATTR_RE_TMPL.format(name=name), tag, re.I)
+    return m.group(1).strip() if m else ""
+
+
+def _query_terms(hint):
+    """英文按词、中文按二元字组切查询词，用于 alt/文件名相关性打分。"""
+    hint = (hint or "").lower()
+    terms = set(re.findall(r"[a-z0-9][a-z0-9+\-_.]{1,}", hint))
+    cjk = re.findall(r"[\u4e00-\u9fff]+", hint)
+    for run in cjk:
+        for i in range(len(run) - 1):
+            terms.add(run[i:i + 2])
+        if len(run) == 1:
+            terms.add(run)
+    return {t for t in terms if len(t) >= 2 or re.match(r"[\u4e00-\u9fff]", t)}
+
+
+def _looks_like_icon(url, alt):
+    blob = ((url or "") + " " + (alt or "")).lower()
+    return any(w in blob for w in _IMG_ICON_WORDS)
+
+
+def _extract_og_image(html):
+    for pattern in (
+        r'<meta\b[^>]*property\s*=\s*["\']og:image["\'][^>]*content\s*=\s*["\']([^"\']+)["\']',
+        r'<meta\b[^>]*content\s*=\s*["\']([^"\']+)["\'][^>]*property\s*=\s*["\']og:image["\']',
+        r'<meta\b[^>]*name\s*=\s*["\']twitter:image["\'][^>]*content\s*=\s*["\']([^"\']+)["\']',
+        r'<meta\b[^>]*content\s*=\s*["\']([^"\']+)["\'][^>]*name\s*=\s*["\']twitter:image["\']',
+    ):
+        m = re.search(pattern, html, re.I | re.S)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return ""
+
+
+def _extract_image_candidates(html, base_url, query_hint="", limit=2):
+    """从 HTML 选取正文相关图片绝对 URL，按相关度排序（og:image 优先）。
+
+    选取规则：og:image/twitter:image 头图优先并加分；正文 img 需有图片扩展名，
+    过滤 data-uri、图标/广告/占位词、显式小尺寸；alt/title/文件名与查询词重合
+    越多越靠前，同站加分；同 URL 去重。任何解析异常返回空列表。
+    """
+    if not html:
+        return []
+    terms = _query_terms(query_hint)
+    base_host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+    candidates = []  # (score, order, url)
+    seen = set()
+
+    def _consider(raw, order, og=False):
+        if not raw or raw.strip().lower().startswith("data:"):
+            return
+        abs_url = urllib.parse.urljoin(base_url, raw.strip())
+        ok, _ = _url_scheme_ok(abs_url)
+        if not ok or abs_url in seen:
+            return
+        path = urllib.parse.urlparse(abs_url).path.lower()
+        if not og and not _IMG_EXT_RE.search(path):
+            return
+        if _looks_like_icon(abs_url, ""):
+            return
+        seen.add(abs_url)
+        score = 2.0 if og else 0.0
+        host = (urllib.parse.urlparse(abs_url).hostname or "").lower()
+        if base_host and (host == base_host or host.endswith("." + base_host)):
+            score += 0.5
+        candidates.append((score, order, abs_url))
+
+    _consider(_extract_og_image(html), 0, og=True)
+    order = 1
+    for tag in _TAG_IMG_RE.findall(html):
+        src = _img_attr(tag, "src") or _img_attr(tag, "data-src")
+        if not src:
+            continue
+        alt = _img_attr(tag, "alt")
+        title = _img_attr(tag, "title")
+        if _looks_like_icon(src, alt + " " + title):
+            order += 1
+            continue
+        # 显式小尺寸（图标/sprite）直接丢；缺尺寸的不拦。
+        dims = []
+        for attr in ("width", "height"):
+            val = _img_attr(tag, attr)
+            if val.isdigit():
+                dims.append(int(val))
+        if dims and max(dims) < 64:
+            order += 1
+            continue
+        before = len(candidates)
+        _consider(src, order, og=False)
+        if len(candidates) > before and terms:
+            path = urllib.parse.urlparse(candidates[-1][2]).path.lower()
+            overlap = sum(1 for t in terms
+                          if t in (alt + " " + title).lower()
+                          or t in urllib.parse.unquote(path))
+            score, _order, url = candidates[-1]
+            candidates[-1] = (score + overlap, _order, url)
+        order += 1
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return [url for _s, _o, url in candidates[:limit]]
+
+
+def _encode_observation_image(data):
+    """Pillow 校验真实图头并缩放到最长边 1600、JPEG q82，返回 data URL 或 None。"""
+    try:
+        from PIL import Image, UnidentifiedImageError
+        try:
+            img = Image.open(io.BytesIO(data))
+            img.verify()
+        except (UnidentifiedImageError, OSError, ValueError):
+            return None
+        img = Image.open(io.BytesIO(data))
+        if img.format not in ("PNG", "JPEG", "WEBP"):
+            return None
+        img = img.convert("RGB") if img.mode not in ("RGB", "L") else img
+        if img.mode == "L":
+            img = img.convert("RGB")
+        img.thumbnail((1600, 1600), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=82, optimize=True)
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        return "data:image/jpeg;base64," + encoded
+    except Exception:
+        return None
+
+
+class _ImageRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """重定向每一跳都重新过 SSRF 守卫，禁止跨 scheme（防公网 302 到内网/file://）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        parsed = urllib.parse.urlparse(target)
+        if parsed.scheme not in ("http", "https") or _image_host_blocked(parsed.hostname or ""):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# 显式组装 opener：build_opener 默认还带 File/FTP/Data handler，
+# 图片下载通道不应有任何读本地文件/其它协议的能力（纵深防御，即使入口与
+# 逐跳 scheme 白名单已经挡住 file/ftp，也不把这些处理器装进链里）。
+_IMAGE_OPENER = urllib.request.OpenerDirector()
+for _handler in (
+    urllib.request.UnknownHandler(),
+    _ImageRedirectHandler(),
+    urllib.request.HTTPHandler(),
+    urllib.request.HTTPSHandler(),
+    urllib.request.HTTPDefaultErrorHandler(),
+    urllib.request.HTTPErrorProcessor(),
+):
+    _IMAGE_OPENER.add_handler(_handler)
+del _handler
+
+
+def _download_observation_image(url, base_url=""):
+    """下载并校验单张观察图片，成功返回 data URL；任何失败返回 None。"""
+    abs_url = urllib.parse.urljoin(base_url or "", url)
+    ok, _ = _url_scheme_ok(abs_url)
+    if not ok:
+        return None
+    parsed = urllib.parse.urlparse(abs_url)
+    if _image_host_blocked(parsed.hostname or ""):
+        return None
+    try:
+        req = urllib.request.Request(abs_url, headers={"User-Agent": _WEB_IMAGE_UA})
+        with _IMAGE_OPENER.open(req, timeout=_WEB_IMAGE_TIMEOUT) as resp:
+            final = urllib.parse.urlparse(resp.geturl())
+            # 服务器也可能不经过 302 而由代理层改写终点，终态再校验一次。
+            if final.scheme not in ("http", "https") or _image_host_blocked(final.hostname or ""):
+                return None
+            content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if content_type and content_type not in _WEB_IMAGE_CONTENT_TYPES:
+                return None
+            data = resp.read(_WEB_IMAGE_MAX_BYTES + 1)
+        if not data or len(data) > _WEB_IMAGE_MAX_BYTES:
+            return None
+        encoded = _encode_observation_image(data)
+        if not encoded:
+            return None
+        # 重编码 JPEG 必须仍是有界体积，防止原图绕过下载侧字节上限。
+        if len(encoded) * 3 // 4 > _WEB_IMAGE_MAX_BYTES:
+            return None
+        return encoded
+    except Exception:
+        return None
+
+
+def _collect_observation_images(html, base_url, query_hint, limit):
+    """抽取候选 → 下载 → 去重，返回 (images, sources) 两个等长列表。"""
+    images, sources = [], []
+    candidates = _extract_image_candidates(html, base_url, query_hint=query_hint, limit=limit)
+    for cand in candidates:
+        if len(images) >= limit:
+            break
+        encoded = _download_observation_image(cand, base_url)
+        if not encoded or encoded in images:
+            continue
+        images.append(encoded)
+        sources.append(cand)
+    return images, sources
+
+
 def web_fetch(url):
     """读取公开网页正文的简化研究工具，返回标题、来源和清理后的文本。
 
@@ -941,7 +1743,7 @@ def web_fetch(url):
     if not ok: return "网页读取失败：只允许 http/https。"
     provider = get_web_fetch_provider()
     if provider == "builtin":
-        return _builtin_fetch(url)
+        return _fetch_page(url, image_budget=_WEB_FETCH_IMAGE_LIMIT)
     key = get_web_fetch_api_key()
     api_url = get_web_fetch_api_url()
     if provider == "jina":
@@ -950,7 +1752,7 @@ def web_fetch(url):
         return _firecrawl_fetch(url, key, api_url)
     if provider == "custom":
         return _custom_fetch(url, key, api_url)
-    return _builtin_fetch(url)
+    return _fetch_page(url, image_budget=_WEB_FETCH_IMAGE_LIMIT)
 
 
 def _jina_fetch(url, key, api_url):
@@ -1011,8 +1813,13 @@ def _custom_fetch(url, key, api_url):
         return f"网页读取失败：{type(e).__name__}: {e}"
 
 
-def _builtin_fetch(url):
-    """原 urllib 直抓 HTML 并清理的实现（builtin 服务商）。"""
+def _fetch_page(url, *, image_budget=0, query_hint=""):
+    """原 urllib 直抓 HTML 并清理的实现（builtin 服务商）。
+
+    image_budget>0 且当前会话具备看图能力时，从同一份 HTML 抽取并下载相关图片，
+    经 ToolResult.data 回传给 Agent 的统一视觉能力门；无图时返回纯字符串，
+    保持与旧调用方的兼容。
+    """
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (DocMind research)"})
         with urllib.request.urlopen(req, timeout=12) as r:
@@ -1027,8 +1834,20 @@ def _builtin_fetch(url):
         text = re.sub(r'\s+', ' ', text).strip()
         clean_title = re.sub(r'<[^>]+>', '', title.group(1)).strip() if title else '未知'
         clipped = len(text) > 8000
-        return f"来源：{final_url}\n标题：{clean_title}\n正文：{text[:8000]}" + ("\n[正文已截断]" if clipped else "")
+        body = f"来源：{final_url}\n标题：{clean_title}\n正文：{text[:8000]}" + ("\n[正文已截断]" if clipped else "")
+        if image_budget and _web_images_enabled():
+            images, sources = _collect_observation_images(
+                raw, final_url, query_hint or clean_title, image_budget)
+            if images:
+                return ToolResult(ok=True, text=body,
+                                  data={"images": images, "image_sources": sources})
+        return body
     except Exception as e: return f"网页读取失败：{type(e).__name__}: {e}"
+
+
+def _builtin_fetch(url):
+    """builtin 抓取的兼容入口（不带图片）；新代码请用 _fetch_page。"""
+    return _fetch_page(url)
 
 def web_research(query):
     """搜索并抓取多个公开来源，供 Agent 直接做联网研究。
@@ -1042,6 +1861,9 @@ def web_research(query):
         return results
     out = [f"研究主题：{query}", "搜索摘要：", results, "\n来源正文："]
     seen = set()
+    # 图片只在 builtin（本地能看到 HTML）时聚合；jina/firecrawl/custom 返回纯文本。
+    collect_images = _web_images_enabled() and get_web_fetch_provider() == "builtin"
+    images, image_sources = [], []
     try:
         max_sources = max(1, min(8, int(os.getenv("DOCMIND_WEB_RESEARCH_MAX_SOURCES", "5"))))
     except (TypeError, ValueError):
@@ -1050,11 +1872,29 @@ def web_research(query):
         url = url.rstrip('.,')
         if url in seen: continue
         seen.add(url)
-        out.append(web_fetch(url))
+        if collect_images:
+            remaining = _WEB_RESEARCH_IMAGE_LIMIT - len(images)
+            # 预算耗尽后必须走无图分支，避免 web_fetch 自己再抓 2 张突破总上限。
+            page = (_fetch_page(url, image_budget=remaining, query_hint=query)
+                    if remaining > 0 else _fetch_page(url))
+            if isinstance(page, ToolResult):
+                for img, src in zip(page.data.get("images") or [],
+                                    page.data.get("image_sources") or []):
+                    if img not in images and src not in image_sources:
+                        images.append(img)
+                        image_sources.append(src)
+                page = page.text
+        else:
+            page = web_fetch(url)
+        out.append(page)
     conflict = _detect_source_conflicts(out[3:])
     if conflict:
         out.append("\n冲突提示（自动抽取，仅供复核）：\n" + conflict)
-    return "\n---\n".join(out)
+    text = "\n---\n".join(out)
+    if images:
+        return ToolResult(ok=True, text=text,
+                          data={"images": images, "image_sources": image_sources})
+    return text
 
 
 def _detect_source_conflicts(chunks):
@@ -3077,21 +3917,30 @@ def dev_add_region(arg):
 
 
 def dev_approve(arg):
-    """审批敏感操作（提交/回滚/应用分区方案）前必须调用：记录一次审批，30 分钟内该操作放行。
-    输入：action: <commit_region|commit_all|rollback_changeset|apply_regions> 换行 target: <对象>
+    """审批敏感操作（提交/回滚/应用分区方案/装配 MCP）前必须调用：记录一次审批，30 分钟内该操作放行。
+    输入：action: <commit_region|commit_all|rollback_changeset|apply_regions|mcp_server|mcp_capability> 换行 target: <对象>
     target 精确匹配、不是通配符：commit_region 传分区 key（逐区审批，不能用 *）、
-    rollback_changeset 传变更集 id、commit_all / apply_regions 固定传 *。
-    在调用 dev_commit / dev_commit_all / dev_rollback_changeset / dev_apply_regions / dev_add_region 之前先调用本工具完成审批。
+    rollback_changeset 传变更集 id、commit_all / apply_regions 固定传 *；
+    mcp_server 传 dev_mcp_add/dev_mcp_remove 阻断结构里给出的完整 target（add 的 target 已绑定命令/URL，必须原样照抄）；
+    mcp_capability 传连接器 key。
+    在调用 dev_commit / dev_commit_all / dev_rollback_changeset / dev_apply_regions / dev_add_region /
+    dev_mcp_add / dev_mcp_remove / dev_mcp_decide 之前先调用本工具完成审批。
     若这些工具返回 blocked / approval_required，先调用本工具再重试，不要绕过。"""
-    res, err = _require_regions()
-    if res is None:
-        return err
-    root, _ = res
     f = _parse_keyed(arg or "", ["action", "target"])
     action = (f.get("action") or "").strip()
     target = (f.get("target") or "*").strip() or "*"
     if not action:
-        return "参数缺失：请提供 action: <操作名>（如 commit_all / rollback_changeset / apply_regions）。"
+        return "参数缺失：请提供 action: <操作名>（如 commit_all / mcp_server / mcp_capability）。"
+    # MCP 审批只依赖代码库根，不要求初始化分区；分区类操作维持原前置。
+    if action in ("mcp_server", "mcp_capability"):
+        root = _get_code_root()
+        if not root:
+            return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    else:
+        res, err = _require_regions()
+        if res is None:
+            return err
+        root, _ = res
     from game_workbench import approval
     approval(root, action, "agent", approved=True, target=target)
     return f"已审批 {action}(target={target})，30 分钟内该操作放行。现在可执行对应的 dev_* 工具。"
@@ -3341,6 +4190,238 @@ def game_impact(arg):
 def game_playtest(arg):
     from game_workbench import playtest
     f=_parse_keyed(arg or "",["command","timeout"]); return json.dumps(playtest(_get_code_root(),f.get("command") or "",int(f.get("timeout") or 30)),ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# game_screenshot：运行画面截图观察
+#
+# 优先级：已启用连接器的截图类 MCP 工具 → 当前项目嵌入引擎窗口 → 系统前台窗口。
+# 截图是【观察素材】不是代码事实；无头/非 Windows/无窗口时返回明确文字失败，
+# Agent 应改用运行日志、playtest 事件等证据，不允许臆测画面。
+# ---------------------------------------------------------------------------
+_SCREENSHOT_TOOL_KEYWORDS = ("screenshot", "capture_screen", "screen_capture",
+                             "takescreenshot", "截图", "截屏", "抓屏", "画面捕获")
+_SCREENSHOT_TOOL_BLOCKERS = ("video", "record", "录制", "录像")
+
+
+def _is_screenshot_connector_tool(spec):
+    blob = ((spec.get("name") or "") + " " + (spec.get("description") or "")).lower()
+    if any(bad in blob for bad in _SCREENSHOT_TOOL_BLOCKERS):
+        return False
+    return any(k in blob for k in _SCREENSHOT_TOOL_KEYWORDS)
+
+
+def _try_mcp_screenshot(root):
+    """best-effort 调已启用连接器的截图类工具；任何失败/无图返回 None 降级。
+
+    list_tools 可能冷启动 stdio 连接器（各带超时），多个连接器串行探测时
+    用总时限封顶（DOCMIND_MCP_SHOT_PROBE_S，默认 8s）：连接器之间与截图调用
+    均受剩余预算约束；极端情况下单次 stdio 冷启动本身可能超出预算，超时即
+    回落本地抓窗，不影响截图主流程。
+    """
+    import time as _time
+    try:
+        probe_budget = float(os.getenv("DOCMIND_MCP_SHOT_PROBE_S", "8"))
+    except (TypeError, ValueError):
+        probe_budget = 8.0
+    deadline = _time.monotonic() + max(1.0, probe_budget)
+    try:
+        connectors = mcp_client.connector_directory(root) or []
+    except Exception:
+        return None
+    for conn in connectors:
+        if not conn.get("enabled"):
+            continue
+        key = conn.get("key")
+        if not key:
+            continue
+        remaining = deadline - _time.monotonic()
+        if remaining <= 1.0:
+            break
+        try:
+            listing = mcp_client.list_tools(root, key) or {}
+            shot = next((t for t in (listing.get("tools") or [])
+                         if _is_screenshot_connector_tool(t)), None)
+            if not shot:
+                continue
+            if _time.monotonic() >= deadline:
+                break
+            # 单次截图调用也夹在剩余探测预算内（下限 1s），避免挂死连接器
+            # 把整个截图动作拖到数分钟才回落本地抓窗。
+            call_timeout = max(1.0, min(float(mcp_client.CALL_TIMEOUT),
+                                        deadline - _time.monotonic()))
+            resp = mcp_client.call_tool_with_fallback(
+                root, key, shot["name"], {},
+                task_hint="截取当前引擎运行画面截图",
+                timeout=call_timeout)
+        except Exception:
+            continue
+        if not resp.get("ok") or not resp.get("images"):
+            continue
+        first = resp["images"][0] or {}
+        try:
+            raw = base64.b64decode(first.get("data") or "", validate=False)
+        except Exception:
+            continue
+        encoded = _encode_observation_image(raw)
+        if encoded:
+            return encoded, f"mcp:{key}/{shot['name']}"
+    return None
+
+
+def game_screenshot(arg=""):
+    """截取当前运行画面作为视觉观察。输入可选 `target: embedded|foreground`（默认 embedded）。
+
+    优先用已启用引擎连接器提供的截图能力；否则抓取工作台内嵌的引擎窗口，
+    再不行抓系统前台窗口。返回图片保存路径（.docmind/screenshots/ 下的 JPEG）
+    与图片观察内容。截图只反映某一瞬间的画面，不是代码事实；无窗口/无头环境会明确失败，
+    此时请改用运行日志、受控 playtest 输出等证据。
+    """
+    fields = _parse_keyed(arg or "", ["target"])
+    target = (fields.get("target") or "embedded").strip().lower()
+    if target not in ("embedded", "foreground"):
+        target = "embedded"
+    root = _get_code_root()
+
+    if root:
+        out_dir = os.path.join(root, ".docmind", "screenshots")
+    else:
+        out_dir = os.path.join(STATE_ROOT, "screenshots")
+
+    if target == "embedded":
+        hit = _try_mcp_screenshot(root) if root else None
+        if hit:
+            encoded, source = hit
+            try:
+                import screen_capture
+                tag = source.replace("mcp:", "").replace("/", "-")
+                saved_path = screen_capture.save_encoded_jpeg(encoded, out_dir, tag=tag)
+            except Exception:  # noqa: BLE001
+                saved_path = None
+            if not saved_path:
+                return "截图失败：连接器画面已返回但截图文件保存失败。请改用运行日志或受控 playtest 输出判断。"
+            return ToolResult(
+                ok=True,
+                text=(f"截图完成（来源：连接器 {source}），已保存：{saved_path}\n"
+                      "截图是观察素材，不是代码事实；请结合代码与日志复核。"),
+                data={"images": [encoded], "image_sources": [saved_path]})
+
+    try:
+        import screen_capture
+    except Exception as exc:  # noqa: BLE001
+        return f"截图失败：{type(exc).__name__}: {exc}（当前环境不支持画面捕获，请改用运行日志或受控 playtest 输出判断）"
+
+    # 嵌入窗登记表按 project_id（prj-<sha1>）分桶，不是文件路径：
+    # 传 root 会永不命中，多宿主时可能错截到别的项目窗口。
+    project_pid = None
+    try:
+        from projects import current_project_id
+        project_pid = current_project_id() or None
+    except Exception:  # noqa: BLE001
+        project_pid = None
+    frame = None
+    if target == "embedded":
+        frame = screen_capture.grab_embedded(project_pid)
+    if frame is None:
+        frame = screen_capture.grab_foreground()
+        source_kind = "foreground"
+    else:
+        source_kind = "embedded"
+    if frame is None:
+        return ("截图失败：未检测到可抓取的运行窗口（可能未运行、处于无头环境或非 Windows）。"
+                "请先启动并嵌入引擎，或改用运行日志、受控 playtest 事件等证据，不要假设画面内容。")
+    raw, width, height, _hwnd = frame
+    saved = screen_capture.encode_and_save(raw, width, height, out_dir)
+    if saved is None:
+        return "截图失败：画面编码或保存失败。请改用运行日志或受控 playtest 输出判断。"
+    encoded, path, size = saved
+    return ToolResult(
+        ok=True,
+        text=(f"截图完成（来源：{source_kind} 窗口，原始 {width}x{height}，"
+              f"输出 {size[0]}x{size[1]}）：{path}\n"
+              "截图是观察素材，不是代码事实；请结合代码与运行日志复核。"),
+        data={"images": [encoded], "image_sources": [path]})
+
+
+# ---------------------------------------------------------------------------
+# start_workflow：对话内发起【跨窗口持久开发工作流】
+#
+# 与 delegate / orchestrate 的边界：
+# - delegate：一个相对独立的子任务，一轮内取回结论；
+# - orchestrate：一轮内当场并行调度任务图并合成，会话结束即消散；
+# - start_workflow：多阶段/多角色/含副作用阶段/需要人工方案门+审批门+跨窗口
+#   恢复时才升级。只创建状态并停在方案选择门，绝不直接执行有副作用任务。
+# ---------------------------------------------------------------------------
+_BOOL_WORDS = {"1", "true", "yes", "on", "是", "要", "联网", "开"}
+
+
+def start_workflow(arg=""):
+    """发起一个跨窗口持久、带人工门的开发工作流（通用开发/游戏/EDA 等领域）。
+
+    输入（keyed 多行，也可直接把整段目标作为入参）：
+      goal: 完整目标（必填；未写字段名时整段入参即目标）
+      kind: generic|game|eda（缺省 generic 通用开发；game=游戏开发；eda=原理图/PCB 电子设计）
+      web:  true|false（缺省继承本轮会话联网开关）
+
+    工具只负责创建工作流：它停在「方案选择门」，用户在对话中选择方案、
+    确认任务 DAG 并审批后，多个子代理才会开始执行；本工具不会替用户
+    执行任何有副作用任务，也不能跳过人工审批。无代码库根目录时明确失败且不落任何记录。
+    """
+    fields = _parse_keyed(arg or "", ["goal", "request", "kind", "web", "web_enabled"])
+    goal = (fields.get("goal") or fields.get("request") or "").strip()
+    if not goal:
+        goal = (arg or "").strip()
+    if not goal:
+        return ("start_workflow 失败：缺少目标。请在 goal: 后写清要推进的完整目标"
+                "（多阶段、可验收），或直接把目标整段作为入参。")
+
+    kind_raw = (fields.get("kind") or "").strip().lower()
+    from agent_runtime.workflow_profiles import get_profile, normalize_kind
+    kind = normalize_kind(kind_raw) if kind_raw else "generic"
+    profile = get_profile(kind)
+
+    web_raw = fields.get("web")
+    if web_raw is None:
+        web_raw = fields.get("web_enabled")
+    if web_raw is not None and str(web_raw).strip():
+        web_enabled = str(web_raw).strip().lower() in _BOOL_WORDS
+    else:
+        web_enabled = _session_web_enabled.get()
+
+    root = _get_code_root()
+    if not root:
+        return ("start_workflow 失败：当前没有配置项目代码库根目录，无法创建可跨窗口"
+                "恢复的开发工作流。请先在工作台打开/索引项目后再发起；本次未创建任何工作流记录。")
+    if _WORKFLOW_LAUNCHER is None:
+        return ("start_workflow 失败：工作流启动通道未初始化（工作台路由未注册 launcher）。"
+                "请改由 AI 运行台的「开发工作流」面板手动发起。")
+
+    try:
+        workflow = _WORKFLOW_LAUNCHER(goal, kind=kind, web_enabled=bool(web_enabled))
+    except Exception as exc:  # noqa: BLE001 - 工具观察必须给出明确失败而不是抛断回合
+        return f"start_workflow 失败：{type(exc).__name__}: {exc}。请改由 AI 运行台手动发起。"
+    if not isinstance(workflow, dict) or not workflow.get("workflow_id"):
+        return "start_workflow 失败：启动器未返回有效工作流状态，请改由 AI 运行台手动发起。"
+
+    wid = workflow.get("workflow_id")
+    status = workflow.get("status") or "awaiting_choice"
+    _notify_workflow_started(workflow)
+    lines = [
+        f"已创建开发工作流（领域：{profile.display_name}；状态：{status}）。",
+        "工作流当前停在【方案选择门】：尚未执行任何任务，工具不会替你执行有副作用的操作。",
+        "请在对话中选择方案、确认任务 DAG 并审批后才会开始执行；",
+        "审批前可修改任务与依赖，执行失败会按策略重规划，进度可跨窗口恢复。",
+    ]
+    options = workflow.get("options") or []
+    if options:
+        lines.append("可选方案：")
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            lines.append("· %s：%s — %s" % (
+                opt.get("id", ""), opt.get("title", ""), opt.get("summary", "")))
+    lines.append(f"工作流卡片已在对话中展开（ID：{wid}），等待用户选择方案。")
+    return "\n".join(lines)
 
 
 # ===========================================================================
@@ -3689,6 +4770,16 @@ TOOLS = {
     "dev_list_connectors": {"description": "列出已配置 MCP 连接器（key/label/engine/transport/启用状态/能力标签/适用说明），供 Agent 自主挑选最合适的引擎连接器。输入留空。", "func": dev_list_connectors},
     "dev_route_connector": {"description": "按任务语义挑选最合适的【已启用】连接器：输入 hint（任务描述，如 'Godot 里打开 Main 场景并运行'），返回排序候选与匹配理由（top.key 即 dev_mcp_call 的 key）。某连接器不可用或调用失败时，用它重新挑选其它已启用连接器。", "func": dev_route_connector},
     "dev_list_connector_tools": {"description": "列出某连接器暴露的工具（name/description/input_schema），确定 dev_mcp_call 的 name 与参数。输入 key: <连接器key>；仅对打算调用的连接器使用（godot 等 stdio 需先建立会话）。", "func": dev_list_connector_tools},
+    "dev_mcp_search": {"description": "自助装配 MCP 第 1 步：按能力关键词（如 kicad/pcb/数据库/github）搜索离线安全连接目录，返回能力清单、安装步骤与可回填的连接模板。本工具不联网；查最新第三方 MCP 时先 web_search/web_fetch 核对官方 command/URL。输入能力关键词。", "func": dev_mcp_search},
+    "dev_mcp_add": {"description": "自助装配 MCP 第 2 步（敏感，需先 dev_approve(action: mcp_server)）：新增/更新连接器配置。多行输入 key/label/transport(stdio|http)，stdio 给 command+args（或 args_json），http 给 url。未审批时返回含 action/target 的 blocked，按 hint 审批后用相同参数重试。成功后调用 dev_mcp_probe。", "func": dev_mcp_add},
+    "dev_mcp_probe": {"description": "自助装配 MCP 第 3 步：探活已装配连接器（MCP initialize + tools/list），返回工具数量与名称。输入连接器 key；stdio 首次冷启动可能较慢。失败时按 error 修正参数后重新 dev_mcp_add。", "func": dev_mcp_probe},
+    "dev_mcp_discover": {"description": "自助装配 MCP 第 4 步：读取连接器工具并生成【待审批】能力候选（不会自动启用路由）。输入连接器 key。向用户说明候选能力并获确认后，dev_approve(action: mcp_capability, target: key) 再 dev_mcp_decide(decision: approve)。", "func": dev_mcp_discover},
+    "dev_mcp_decide": {"description": "自助装配 MCP 第 5 步：批准/拒绝能力候选（approve 需先 dev_approve(action: mcp_capability, target: key)）。多行输入 decision: approve|reject 与 key: <连接器key>。批准后 Agent 才能经 dev_route_connector/dev_mcp_call 自动调用该连接器。", "func": dev_mcp_decide},
+    "dev_mcp_remove": {"description": "移除自定义 MCP 连接器（内置预设则禁用），敏感操作需先 dev_approve(action: mcp_server, target: key)。输入连接器 key；会先关闭活动会话。", "func": dev_mcp_remove},
+    "dev_mcp_discover_from_need": {"description": "从自然语言需求发现可装配的 MCP 连接器候选（不写盘、不自动启用）。输入需求描述（如『我需要查高铁票的 MCP』），可选多行 web_enabled: true 开启联网。流程：离线精选索引 →（联网时）GitHub 域限定搜索取仓库 README 解析官方命令，候选过 R1-R9 信任闸门。返回后须向用户展示候选，逐条 dev_mcp_add（审批）落盘，再 dev_mcp_probe 探活、dev_mcp_discover 生成能力候选。", "func": dev_mcp_discover_from_need},
+    "dev_skill_create": {"description": "起草用户技能（待审批，不会自动启用）。skill 是*可执行行为*，必须经用户确认才激活。多行输入 name/description/body；写入 SKILLS_DIR/.pending/<name>/SKILL.md（草稿不生效）。返回完整正文，代理须向用户完整展示并取得明确同意后，再 dev_skill_approve 激活。", "func": dev_skill_create},
+    "dev_skill_approve": {"description": "激活待审批技能：把 .pending/<name>/SKILL.md 移到 SKILLS_DIR 并 reload 生效。仅当用户已明确确认该技能正文安全时调用。输入 name: <技能名>。", "func": dev_skill_approve},
+    "dev_skill_reject": {"description": "丢弃待审批技能草稿（不激活、不保留）。输入 name: <技能名>。", "func": dev_skill_reject},
     "search_knowledge": {
         "description": "在已上传的知识库中检索相关文档片段。输入应为检索关键词或问题。",
         "func": search_knowledge,
@@ -3795,6 +4886,19 @@ TOOLS = {
     "game_simulate": {"description": "模拟数值成长曲线（等级经验/经济平衡推演），输入 levels/base/growth，可选 model=geometric|linear|logistic|diminishing、k=承载上限。", "func": game_simulate},
     "game_impact": {"description": "按符号或关键词分析代码影响文件，输入 query。", "func": game_impact},
     "game_playtest": {"description": "在项目根目录运行 Playtest 命令，输入 command/timeout。", "func": game_playtest},
+    "game_screenshot": {"description": "截取当前引擎运行画面作为视觉观察：可选输入 target: embedded|foreground（默认 embedded，嵌入窗口不可用时自动改抓前台窗口）。优先使用已启用引擎连接器的截图能力，其次抓取工作台内嵌窗口；JPEG 保存到项目 .docmind/screenshots/ 并回传图片。截图只是某一瞬间的观察，不是代码事实；无窗口/无头环境会明确失败，那时改用运行日志或受控 playtest 证据，不要臆测画面。", "func": game_screenshot},
+    "start_workflow": {"description": (
+        "当目标是【长链路开发流程】时升级为跨窗口持久开发工作流：满足多阶段/多角色协作、"
+        "含写码或命令等副作用阶段、需要人工方案门与审批门、或可能跨窗口中断恢复之一即应使用"
+        "（通用开发、游戏、EDA 等任意领域，不局限于游戏）。输入 keyed 多行："
+        "goal: 完整可验收目标（也可不写字段名、整段作为目标）；"
+        "kind: generic|game|eda（缺省 generic 通用开发；game=游戏开发；eda=原理图/PCB 电子设计）；"
+        "web: true|false（缺省继承本轮联网开关）。"
+        "它只创建工作流并停在【方案选择门】：工作流卡片会直接在对话中展开，必须由用户在对话内选择方案、"
+        "确认任务 DAG 并审批后，多个子代理才开始执行；本工具不直接执行任何有副作用任务，人工门不可跳过。"
+        "边界：单个独立子任务用 delegate；一轮内当场并行出结果、无需持久化与人工门用 orchestrate；"
+        "需要持久化状态、人工方案/审批门、失败重规划与跨窗口恢复才用 start_workflow。子代理不得调用本工具。"
+    ), "func": start_workflow},
     "init_regions": {
         "description": "初始化「分区开发」结构：在代码库根目录建 assets/（素材区）、values/（数值区）、bugs/（bug 区）、behaviors/（角色行为区）等独立子目录（具体分区以 regions.json 为准），每个目录 git init 独立仓库，并生成 DEV_INDEX.md、DOCMIND_RULES.md（分区契约，会被注入 Agent 系统提示，强制越区写被拦截）。用于游戏等分工开发，防止代码堆叠与混乱。输入留空即可；需先配置代码库根目录（/api/ingest_code）。",
         "func": init_regions_tool,

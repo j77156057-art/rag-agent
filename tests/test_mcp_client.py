@@ -49,17 +49,18 @@ class PureHelperTest(unittest.TestCase):
         self.assertEqual(msgs[0]["id"], 1)
 
     def test_extract_text(self):
-        text, structured, blocks = mcp_client.extract_text({
+        text, structured, blocks, images = mcp_client.extract_text({
             "content": [
                 {"type": "text", "text": "hello"},
                 {"type": "text", "text": "world"},
-                {"type": "image", "data": "x"},
+                {"type": "image", "data": "x", "mimeType": "image/png"},
             ],
             "structuredContent": {"a": 1},
         })
         self.assertEqual(text, "hello\nworld")
         self.assertEqual(structured, {"a": 1})
         self.assertEqual(blocks, ["image"])
+        self.assertEqual(images, [{"data": "x", "mime_type": "image/png"}])
 
     def test_normalize_config(self):
         good = mcp_client.normalize_server_config(

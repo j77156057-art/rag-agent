@@ -2,15 +2,15 @@
 // GPU 协调面板：每卡显存/利用率/温度、近 20 分钟占用迷你曲线、
 // 持有者强制回收、FIFO 排队取消、Ollama 空闲卸载秒数设置。
 // 组件自管轮询（打开时 5s 一次），不进工作台全局状态。
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { gpuApi, type GpuStatus } from '../api'
+import { usePolling } from '../composables/polling'
 
 const open = ref(false)
 const st = ref<GpuStatus | null>(null)
 const error = ref('')
 const busy = ref(false)
 const idleInput = ref('')
-let timer: number | null = null
 
 const CHART_W = 380
 const CHART_H = 56
@@ -119,20 +119,11 @@ async function saveIdle() {
   })
 }
 
-watch(open, async (v) => {
-  if (v) {
-    idleInput.value = String(st.value?.ollama_idle.unload_seconds ?? 0)
-    await refresh()
-    timer = window.setInterval(refresh, 5000)
-  } else if (timer !== null) {
-    window.clearInterval(timer)
-    timer = null
-  }
+// 打开面板且页面可见时 5s 轮询；关闭或切后台立即停止，重新打开立即补一次
+watch(open, (v) => {
+  if (v) idleInput.value = String(st.value?.ollama_idle.unload_seconds ?? 0)
 })
-
-onBeforeUnmount(() => {
-  if (timer !== null) window.clearInterval(timer)
-})
+usePolling(refresh, 5000, { active: open })
 </script>
 
 <template>

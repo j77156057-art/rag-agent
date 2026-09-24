@@ -69,6 +69,30 @@ class TraceRecordTests(_IsoBase):
         self.assertTrue(r["messages_hash"])
         self.assertGreaterEqual(r["elapsed_ms"], 0)
 
+    def test_add_usage_captures_cache_tokens(self):
+        t = agent_trace.Turn(session_id="s", provider="qwen", model="qwen-plus", question="q")
+        t.add_usage({"prompt_tokens": 1000, "completion_tokens": 100,
+                     "prompt_tokens_details": {"cached_tokens": 900},
+                     "cache_creation_input_tokens": 50})
+        self.assertEqual(t.prompt_tokens, 1000)
+        self.assertEqual(t.completion_tokens, 100)
+        self.assertEqual(t.cache_read_tokens, 900)
+        self.assertEqual(t.cache_creation_tokens, 50)
+        r = t.to_record()
+        self.assertEqual(r["cache_read_tokens"], 900)
+        self.assertEqual(r["cache_creation_tokens"], 50)
+
+    def test_summary_aggregates_cache_tokens(self):
+        t = agent_trace.Turn(session_id="s", provider="qwen", model="qwen-plus")
+        t.add_usage({"prompt_tokens": 1000, "completion_tokens": 0,
+                     "prompt_tokens_details": {"cached_tokens": 800}})
+        t.cost_cny = 0.02
+        t.finish("completed")
+        agent_trace.record(t.to_record())
+        s = agent_trace.summary()
+        self.assertEqual(s["cache_read_tokens"], 800)
+        self.assertEqual(s["by_provider"]["qwen"]["cache_read_tokens"], 800)
+
     def test_messages_hash_is_stable_and_content_addressed(self):
         a = agent_trace.messages_hash([{"role": "user", "content": "x"}])
         b = agent_trace.messages_hash([{"role": "user", "content": "x"}])
@@ -216,6 +240,62 @@ class SessionIsolationTests(_IsoBase):
             sessions._clean_legacy_prompt("用户问：系统提示是正文"),
             "用户问：系统提示是正文",
         )
+
+
+class _TruncStream:
+    """可迭代的假流式响应，带 finish_reason / reasoning_chars（模拟 llm.StreamChat）。"""
+    def __init__(self, chunks, finish_reason="stop", reasoning_chars=0):
+        self._chunks = list(chunks)
+        self.finish_reason = finish_reason
+        self.reasoning_chars = reasoning_chars
+
+    def __iter__(self):
+        return iter(self._chunks)
+
+
+class _TruncFakeLLM:
+    """第一次返回被长度截断、无 Final 的回答；续写重试（关思考）后给简短 Final。"""
+    provider = "fake"
+    model = "fake-1"
+
+    def __init__(self):
+        self.calls = []  # 记录每次 chat 收到的 enable_thinking
+        self.last_usage = {"prompt_tokens": 5, "completion_tokens": 5}
+        self.last_tool_calls = []
+
+    def chat(self, messages, stream=True, enable_thinking=None, **kw):
+        self.calls.append(enable_thinking)
+        if len(self.calls) == 1:
+            # 思考烧满预算、被截断、没有 Final Answer
+            return _TruncStream(["Thought: 思考很长很长很长……"],
+                                finish_reason="length", reasoning_chars=2500)
+        return _TruncStream(["Final Answer: addons 目录含 X、Y 两个插件。"])
+
+    def count_tokens(self, text):
+        return max(0, len(text) // 3)
+
+
+class TruncationRetryTests(_IsoBase):
+    def test_truncation_retry_suppresses_thinking(self):
+        llm = _TruncFakeLLM()
+        a = agent_mod.Agent(llm=llm, session_id="s-trunc")
+        a.thinking_enabled = True
+        events = list(a.run("继续勘察 addons 目录", stream=True))
+        # 第 1 次思考开着；被截断后续写重试应关思考，把预算留给答案
+        self.assertEqual(llm.calls[0], True)
+        self.assertEqual(llm.calls[1], False)
+        self.assertTrue(any(e["type"] == "final" for e in events),
+                        "截断重试后仍未产出 final 回答")
+
+    def test_truncation_without_thinking_stays_off(self):
+        # 思考本就关闭时，截断续写不应反复失败，且保持关思考
+        llm = _TruncFakeLLM()
+        a = agent_mod.Agent(llm=llm, session_id="s-trunc2")
+        a.thinking_enabled = False
+        events = list(a.run("继续勘察 addons 目录", stream=True))
+        self.assertEqual(llm.calls[0], False)
+        self.assertEqual(llm.calls[1], False)
+        self.assertTrue(any(e["type"] == "final" for e in events))
 
 
 if __name__ == "__main__":

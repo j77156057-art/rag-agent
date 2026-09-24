@@ -405,12 +405,12 @@ async function postJson<T>(url: string, payload: unknown): Promise<T> {
  * stale / rolled_back / warnings 才能正确分支，所以这里单独给一条原始通道；
  * 只有网络不可达或响应不是 JSON 才抛错。
  */
-async function rawJson<T>(url: string, payload?: unknown): Promise<T> {
+async function rawJson<T>(url: string, payload?: unknown, signal?: AbortSignal): Promise<T> {
   let res: Response
   try {
     res = await fetch(url, withProject(payload === undefined
-      ? { method: 'GET' }
-      : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }))
+      ? { method: 'GET', signal }
+      : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal }))
   } catch {
     throw new FsApiError(0, '无法连接本地服务（127.0.0.1:8000），请确认 DocMind 已启动。')
   }
@@ -1455,6 +1455,64 @@ async function postSse(url: string, init: RequestInit, h: SseStreamHandlers): Pr
   }
 }
 
+/**
+ * 以 GET 订阅 SSE（工作流实时事件用）：预检错误读成 JSON 抛 FsApiError；
+ * AbortError 原样上抛，由调用方区分"主动退订/终态自关"与真实故障。
+ */
+async function openSse(
+  url: string,
+  signal: AbortSignal,
+  onEvent: (ev: SseEvent) => void,
+): Promise<void> {
+  let res: Response
+  try {
+    res = await fetch(url, withProject({
+      method: 'GET',
+      headers: { Accept: 'text/event-stream' },
+      signal,
+    }))
+  } catch (e) {
+    if ((e as Error).name === 'AbortError') throw e
+    throw new FsApiError(0, '无法连接本地服务（127.0.0.1:8000），请确认 DocMind 已启动。')
+  }
+  const ctype = res.headers.get('content-type') || ''
+  if (!res.ok || !ctype.includes('text/event-stream')) {
+    let body: { error?: string } | null = null
+    try {
+      body = await res.json()
+    } catch {
+      /* 非 JSON 错误体 */
+    }
+    throw new FsApiError(res.status, body?.error || `请求失败（HTTP ${res.status}）`, (body as Record<string, unknown>) || {})
+  }
+  if (!res.body) throw new FsApiError(0, '服务未返回数据流。')
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let sep: number
+    while ((sep = buf.indexOf('\n\n')) >= 0) {
+      const chunk = buf.slice(0, sep)
+      buf = buf.slice(sep + 2)
+      for (const raw of chunk.split('\n')) {
+        const line = raw.trimStart()
+        if (!line.startsWith('data:')) continue
+        const payload = line.slice(5).trim()
+        if (!payload || payload === '[DONE]') continue
+        try {
+          onEvent(JSON.parse(payload) as SseEvent)
+        } catch {
+          /* 忽略半条/非 JSON 心跳 */
+        }
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------- 会话 id
 // Shared browser lock is acquired before either page mounts (public/session.js).
 interface BrowserSession {
@@ -1778,6 +1836,15 @@ export interface ModelConfigInfo {
   context_source?: 'custom' | 'probe' | 'profile'
   /** AI 越界访问模式：safe=仅限项目内；high=允许受控越界读写（须配置白名单） */
   external_access_mode?: 'safe' | 'high'
+  // 以下字段问答页（/）使用，后端 /api/config 始终返回；工作台类型里保留为可选
+  /** 已入库资料文档文件名列表（/api/ingest 上传的 PDF/MD/TXT） */
+  ingested_files?: string[]
+  /** 当前代码库切片条数 */
+  code_sources?: number
+  /** 当前代码库根目录 */
+  code_root?: string
+  /** AI 改文件前是否需要人工确认 */
+  edit_confirm?: boolean
 }
 
 export interface SaveModelReq {
@@ -1831,6 +1898,43 @@ export const modelApi = {
   /** 联网搜索模型公开的上下文窗口（返回候选列表，不自动写配置） */
   lookupModelContext(provider: string, model: string): Promise<ContextLookupResult> {
     return rawJson<ContextLookupResult>('/api/model_context_lookup', { provider, model })
+  },
+}
+
+// ---------------------------------------------------------------- 问答页：资料摄取 / 提示词增强
+export interface IngestResult {
+  ok: boolean
+  chunks?: number
+  error?: string
+}
+
+export interface EnhancePromptResult {
+  ok: boolean
+  enhanced?: string
+  /** llm=模型重写；local=本地规则兜底 */
+  mode?: 'llm' | 'local' | string
+  note?: string
+  error?: string
+}
+
+export const kbApi = {
+  /** 上传 PDF/MD/TXT 资料文档入向量库（multipart，字段名 file）。 */
+  ingest(file: File): Promise<IngestResult> {
+    const fd = new FormData()
+    fd.append('file', file, file.name)
+    return fetch('/api/ingest', withProject({ method: 'POST', body: fd }))
+      .then(async (res) => {
+        const body = (await res.json().catch(() => null)) as IngestResult | null
+        if (!res.ok && body === null) throw new FsApiError(res.status, `请求失败（HTTP ${res.status}）`)
+        return body as IngestResult
+      })
+  },
+}
+
+export const promptApi = {
+  /** 把草稿重写为更清晰的提问；无可用模型时后端本地规则兜底（mode=local）。 */
+  enhance(prompt: string): Promise<EnhancePromptResult> {
+    return rawJson<EnhancePromptResult>('/api/enhance_prompt', { prompt })
   },
 }
 
@@ -1902,6 +2006,55 @@ export interface McpDirectoryResult {
   source_status: 'web_sources' | 'offline_guide'
 }
 
+// P1：MCP 自动连接向导（设置 → MCP 链路重做）
+export interface McpAutoConnectConfig {
+  transport: 'stdio' | 'http'
+  command: string
+  args: string[]
+  url: string
+  env: Record<string, string>
+  headers: Record<string, string>
+  provenance: { url: string; domain: string }
+  command_unresolved: boolean
+}
+export interface McpAutoConnectCandidate {
+  config: McpAutoConnectConfig
+  trust: 'trusted' | 'source_untrusted'
+  validation_errors: string[]
+}
+export interface McpAutoConnectSearchRes {
+  ok: boolean
+  candidates: McpAutoConnectCandidate[]
+  search_error?: string
+  error?: string
+}
+export interface McpProbeRes {
+  ok: boolean
+  probe_ok: boolean
+  tools?: string[]
+  error?: string
+}
+export interface McpRegisterStartRes {
+  ok: boolean
+  task_id?: string
+  tier: 'L0' | 'L1' | 'L2'
+  url?: string
+  note?: string
+  error?: string
+}
+export interface McpRegisterStatusRes {
+  ok: boolean
+  tier?: string
+  status?: string
+  prompt?: string
+  resume_token?: string
+}
+export interface McpRegisterCommitRes {
+  ok: boolean
+  stored?: string[]
+  error?: string
+}
+
 export interface GodotAddonStatus {
   ok: boolean
   is_godot_project: boolean
@@ -1953,6 +2106,44 @@ export const mcpApi = {
   },
   status(): Promise<{ ok: boolean; active?: string[]; error?: string }> {
     return request('/api/mcp/status')
+  },
+  // ---- P1：MCP 自动连接 ----
+  // search / probe / vision 的「没找到候选」属于业务数据（ok:false + 可选 error），
+  // 不是传输失败。若走会抛错的 request 通道，HTTP 200 会被误报成「请求失败（HTTP 200）」，
+  // 所以这里统一走 rawJson（不抛业务错，只有网络不可达/非 JSON 才抛）。
+  async autoConnectSearch(query: string, webEnabled = true, timeoutMs = 60000): Promise<McpAutoConnectSearchRes> {
+    // 联网搜索+多页抓取可能较慢；加硬超时，避免后端卡住时向导无限转圈。
+    const ctrl = new AbortController()
+    const timer = window.setTimeout(() => ctrl.abort(), timeoutMs)
+    try {
+      return await rawJson('/api/mcp/autoconnect/search', { query, web_enabled: webEnabled }, ctrl.signal)
+    } catch (e) {
+      if (ctrl.signal.aborted) {
+        return { ok: false, candidates: [], search_error: `联网搜索超时（>${Math.round(timeoutMs / 1000)}s），请关闭“允许联网”后重试或手动添加。` }
+      }
+      throw e
+    } finally {
+      window.clearTimeout(timer)
+    }
+  },
+  probeCandidate(config: McpAutoConnectConfig): Promise<McpProbeRes> {
+    return rawJson('/api/mcp/autoconnect/probe', { config })
+  },
+  confirmConnect(key: string, config: McpAutoConnectConfig):
+      Promise<{ ok: boolean; servers?: McpServer[]; error?: string }> {
+    return postJson('/api/mcp/autoconnect/confirm', { key, config, user_ack: true })
+  },
+  registerStart(key: string, config: McpAutoConnectConfig, provider: string): Promise<McpRegisterStartRes> {
+    return postJson('/api/mcp/autoconnect/register/start', { key, config, provider })
+  },
+  registerStatus(taskId: string): Promise<McpRegisterStatusRes> {
+    return request(`/api/mcp/autoconnect/register/status?task_id=${encodeURIComponent(taskId)}`)
+  },
+  registerCommit(taskId: string, credentials: Record<string, string>): Promise<McpRegisterCommitRes> {
+    return postJson('/api/mcp/autoconnect/register/commit', { task_id: taskId, credentials })
+  },
+  visionExtract(imageBase64: string): Promise<McpAutoConnectSearchRes> {
+    return rawJson('/api/mcp/autoconnect/vision/extract', { image_base64: imageBase64 })
   },
   addonStatus(): Promise<GodotAddonStatus> {
     return request('/api/engine/addon/status')
@@ -2029,6 +2220,8 @@ export interface TraceItem {
   messages_count: number
   prompt_tokens: number
   completion_tokens: number
+  cache_read_tokens?: number
+  cache_creation_tokens?: number
   total_tokens: number
   cost_cny: number
   llm_calls: number
@@ -2045,6 +2238,8 @@ export interface TraceSummary {
   turns: number
   prompt_tokens: number
   completion_tokens: number
+  cache_read_tokens?: number
+  cache_creation_tokens?: number
   total_tokens: number
   total_cost_cny: number
   avg_elapsed_ms: number
@@ -2054,6 +2249,8 @@ export interface TraceSummary {
     turns: number
     prompt_tokens: number
     completion_tokens: number
+    cache_read_tokens?: number
+    cache_creation_tokens?: number
     tokens: number
     cost_cny: number
   }>
@@ -2161,9 +2358,36 @@ export interface WorkflowOption {
   id: string; title: string; summary: string; recommended?: boolean
   source?: string; requires_web?: boolean
 }
-export interface WorkflowEvent { ts?: string; kind?: string; [key: string]: unknown }
+export interface WorkflowEvent {
+  ts?: string; kind?: string
+  /** 持久事件的单调序号；SSE 重连按 after=seq 去重重放 */
+  seq?: number
+  // subagent_step / subagent_start / subagent_complete 实时轨迹字段
+  task_id?: string; role?: string; step_type?: string; text?: string
+  task?: string; status?: string; phase?: string; elapsed_ms?: number
+  conclusion?: string; error?: string; trace?: WorkflowChildTrace
+  /** 部分事件（如 langsmith 导出状态）直接携带 LangSmith 状态体 */
+  langsmith?: LangSmithStatus
+  [key: string]: unknown
+}
 export interface WorkflowTraceStep {
   action?: string; obs?: string; ok?: boolean; tool?: string; error?: string
+  [key: string]: unknown
+}
+/** 子代理单条实时轨迹（step_sink → subagent_step SSE 事件），文本后端已按类型裁剪。 */
+export interface WorkflowStepItem {
+  type: 'thought' | 'action' | 'observation' | string
+  text: string
+}
+/** 子代理完成时回传的有界轨迹（subagent_complete.trace / state.results[].trace）。 */
+export interface WorkflowChildTrace {
+  steps?: WorkflowTraceStep[]
+  n_steps?: number
+  thoughts?: string[]
+  reflections?: string[]
+  tokens?: { in?: number; out?: number; total?: number; [k: string]: unknown }
+  elapsed_ms?: number
+  cost?: number
   [key: string]: unknown
 }
 export interface WorkflowBackendStatus {
@@ -2207,12 +2431,15 @@ export interface WorkflowEvaluation {
 }
 export interface WorkflowState {
   workflow_id: string; status: string; phase: string; request?: string
+  kind?: 'generic' | 'game' | 'eda' | string
   options?: WorkflowOption[]; selected_option?: WorkflowOption | null
   tasks?: Array<Record<string, unknown>>; pending_tasks?: Array<Record<string, unknown>>
   subagents?: Array<{
     id?: string; role?: string; status?: string; persona?: string
     tools?: string[]; mcp?: string; reflection?: boolean
     task_thread?: string
+    /** 子代理当前任务描述与终态结论（对话流团队面板展示用） */
+    task?: string; conclusion?: string; trace?: WorkflowChildTrace
     reflection_result?: { ok?: boolean; source?: string; issues?: string[]; next_step?: string }
     steps?: number; elapsed_ms?: number; error?: string
     retry_count?: number
@@ -2230,6 +2457,17 @@ export interface WorkflowState {
   }
 }
 export interface WorkflowResp { ok?: boolean; workflow?: WorkflowState; error?: string }
+/** GET /api/agent/workflows 列表项：仅摘要，不含 tasks/options/events 大对象。 */
+export interface WorkflowSummary {
+  workflow_id: string
+  project_id?: string; project_root?: string
+  status: string; phase: string; kind?: string; request?: string
+  task_count?: number; task_done?: number
+  error?: string; interrupt_reason?: string
+  created_at?: string; updated_at?: string
+}
+export interface WorkflowListResp { ok?: boolean; items?: WorkflowSummary[]; error?: string }
+export interface WorkflowDeleteResp { ok?: boolean; workflow_id?: string; error?: string }
 export interface RetrievalEvalCase {
   id?: string; query: string; relevant_ids?: string[]
   relevant_sources?: string[]; relevant_terms?: string[]
@@ -2313,11 +2551,26 @@ export const agentApi = {
   workflowEvaluation(id: string): Promise<{ ok?: boolean; evaluation?: WorkflowEvaluation; error?: string }> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/evaluation`)
   },
-  workflowStart(prompt: string, options: { use_llm?: boolean; web_enabled?: boolean } = {}): Promise<WorkflowResp> {
+  workflowStart(
+    prompt: string,
+    options: { use_llm?: boolean; web_enabled?: boolean; kind?: 'generic' | 'game' | 'eda' } = {},
+  ): Promise<WorkflowResp> {
     return rawJson('/api/agent/workflow/start', { prompt, ...options })
   },
   workflow(id: string): Promise<WorkflowResp> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}`)
+  },
+  /** 当前项目进程内未终结的工作流；无则 workflow=null（孤儿卡片发现用）。 */
+  workflowActive(): Promise<{ ok?: boolean; workflow?: WorkflowState | null; error?: string }> {
+    return rawJson('/api/agent/workflow/active')
+  },
+  /** 当前项目最近工作流摘要（工作台「工作流历史」）。 */
+  workflowList(limit = 50): Promise<WorkflowListResp> {
+    return rawJson(`/api/agent/workflows?limit=${encodeURIComponent(String(limit))}`)
+  },
+  /** 删除终态工作流并清理磁盘文件；运行中需先 workflowInterrupt。 */
+  workflowDelete(id: string): Promise<WorkflowDeleteResp> {
+    return request(`/api/agent/workflow/${encodeURIComponent(id)}`, { method: 'DELETE' })
   },
   workflowChoice(id: string, choice: string, custom_request = ''): Promise<WorkflowResp> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/choice`, { choice, custom_request })
@@ -2355,6 +2608,47 @@ export const agentApi = {
   workflowSubagentRetry(id: string, taskId: string, session_id = 'workflow'): Promise<WorkflowResp> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/subagents/${encodeURIComponent(taskId)}/retry`, { session_id })
   },
+}
+
+export interface WorkflowEventHandlers {
+  onEvent: (ev: WorkflowEvent) => void
+  /** 后端推完终态事件并发 __stream_done__ 自关时回调（卡片此时拉一次完整状态 hydrate）。 */
+  onDone?: () => void
+  /** 网络/服务错误；AbortError（主动退订）不上报。 */
+  onError?: (e: unknown) => void
+}
+
+/**
+ * 订阅工作流实时事件 SSE（GET /api/agent/workflow/{id}/events?after=seq）。
+ * 连接先重放 seq>after 的持久事件，再推送实时事件；终态收到 __stream_done__ 后
+ * 自动断流并回调 onDone。返回退订函数（AbortController 断开），可安全重复调用。
+ */
+export function workflowEvents(
+  workflowId: string,
+  after = 0,
+  handlers: WorkflowEventHandlers,
+): () => void {
+  const ctrl = new AbortController()
+  let alive = true
+  const url = `/api/agent/workflow/${encodeURIComponent(workflowId)}/events?after=${Math.max(0, Math.floor(after) || 0)}`
+  void openSse(url, ctrl.signal, (raw) => {
+    const ev = raw as unknown as WorkflowEvent
+    if (ev.kind === '__stream_done__') {
+      alive = false
+      ctrl.abort()
+      handlers.onDone?.()
+      return
+    }
+    handlers.onEvent(ev)
+  }).catch((e: unknown) => {
+    if ((e as Error)?.name === 'AbortError') return
+    handlers.onError?.(e)
+  })
+  return () => {
+    if (!alive) return
+    alive = false
+    ctrl.abort()
+  }
 }
 
 // ---------------------------------------------------------------- 网络搜索 / URL 获取 设置

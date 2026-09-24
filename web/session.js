@@ -1,11 +1,23 @@
-/* Shared by the question page and workbench. Claim before loading history/sending. */
+/* Shared by the question page and workbench. Claim before loading history/sending.
+ *
+ * 会话按「页面域」隔离：问答首页（/）与代码工作台（/workbench）各自持有独立的
+ * session id（独立存储键、独立 Web Lock）。同标签页在两个页面间跳转不再读到同一
+ * 段对话——问答页的提问不会出现在工作台历史里，反之亦然。工作台沿用旧存储键，
+ * 已有历史对话无缝保留。 */
 (() => {
-  const key = 'docmind_session_id';
+  // 路径判定不依赖构建产物名：/workbench（含 /workbench/...）= 工作台域，其余=问答域
+  const scope = location.pathname.replace(/\/+$/, '').startsWith('/workbench') ? 'wb' : 'ask';
+  // wb 保持历史键名（旧会话不丢）；ask 使用独立命名空间
+  const key = scope === 'wb' ? 'docmind_session_id' : 'docmind_session_id:ask';
+  const lockPrefix = scope === 'wb' ? 'docmind-session:' : 'docmind-session:ask:';
   const locks = navigator.locks;
   const hasLocks = !!locks?.request;
   let id = '', release = null, hidden = false;
   let serial = Promise.resolve();
-  const fresh = () => 'web-' + (crypto.randomUUID?.().replaceAll('-', '') ||
+  // id 前缀即作用域：ask- 问答页 / web- 工作台。会话历史列表据此互不展示
+  // （后端按 id 落盘，slug 允许字母数字与 _-.）
+  const fresh = () => (scope === 'wb' ? 'web-' : 'ask-') +
+    (crypto.randomUUID?.().replaceAll('-', '') ||
     Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2)).slice(0, 24);
   function save(value) {
     id = value;
@@ -13,7 +25,7 @@
   }
   function claim(value) {
     return new Promise((resolve, reject) => {
-      locks.request('docmind-session:' + value, { ifAvailable: true }, lock => {
+      locks.request(lockPrefix + value, { ifAvailable: true }, lock => {
         if (!lock || hidden) { resolve(null); return; }
         return new Promise(done => { resolve(done); });
       }).catch(reject);
@@ -44,6 +56,7 @@
     return id;
   });
   window.DocMindSession = {
+    scope,
     ready,
     get() { return id; },
     set(value) {

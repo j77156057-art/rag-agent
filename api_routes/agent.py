@@ -1,12 +1,17 @@
 """Agent policy, approvals and connector discovery endpoints."""
+import asyncio
 import json
+import queue
+import threading
 from dataclasses import replace
 
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from agent_runtime import langsmith
 from agent_runtime.game_workflow import (WORKFLOWS, StateGraph, WorkflowError,
                                           WorkflowPolicy, review_output)
+from agent_runtime.workflow_profiles import get_profile, normalize_kind
 from agent_runtime.retrieval import retrieve_context, status as retrieval_status
 from agent_runtime.retrieval_eval import compare_reports, evaluate_modes
 from agent_runtime.workflow_eval import DEFAULT_DATASET_NAME, dataset_cases
@@ -15,6 +20,7 @@ from agent_runtime.local_runtime import effective_subagent_limit, resource_profi
 from config import COLLECTION_NAME, LLM_MODEL, LLM_PROVIDER, PROVIDERS, get_runtime
 from game_workbench import require_approval
 import projects
+import tools
 from starlette.concurrency import run_in_threadpool
 from tools import web_research
 
@@ -32,6 +38,8 @@ class WorkflowStartReq(BaseModel):
     use_llm: bool = True
     experience_enabled: bool = True
     policy: dict = {}
+    # 领域画像：generic（默认）/ game；未知值由管理器归一为 generic，不报错。
+    kind: str = "generic"
 
 
 class WorkflowChoiceReq(BaseModel):
@@ -123,6 +131,13 @@ def build_router(ctx) -> APIRouter:
         sid = session_id or state.get("execution_session_id") or "workflow"
         agent = ctx._agent_for(sid, state.get("project_id") or None)
 
+        wid = str((state or {}).get("workflow_id") or "")
+
+        def _step_sink(task_id, role):
+            if not wid:
+                return None
+            return lambda item: WORKFLOWS.record_agent_step(wid, task_id, role, item)
+
         def runner(task, context):
             prompt = str(task.get("task") or "")
             out = agent._run_child(
@@ -130,7 +145,10 @@ def build_router(ctx) -> APIRouter:
                 persona=task.get("persona", ""),
                 tool_allowlist=task.get("tools"),
                 mcp_policy=task.get("mcp", "auto"),
-                reflect=bool(task.get("reflection", True)))
+                reflect=bool(task.get("reflection", True)),
+                max_steps=task.get("max_steps"),
+                step_sink=_step_sink(str(task.get("id") or ""),
+                                     str(task.get("role") or "coder")))
             check = review_output(out, max_tool_failures=int(
                 (state.get("policy") or {}).get("max_tool_failures", 3)))
             out = dict(out or {})
@@ -150,6 +168,100 @@ def build_router(ctx) -> APIRouter:
     # Approval may arrive after a process restart.  The manager persists only
     # the session identifier and asks this factory to recreate the callbacks.
     WORKFLOWS.set_execution_resolver(lambda state: workflow_callbacks(state))
+
+    def launch_workflow(*, prompt, kind, web_enabled, use_llm, experience_enabled,
+                        project_id, policy, schedule_options):
+        """HTTP 端点与对话内 start_workflow 工具共用的工作流组装入口。
+
+        schedule_options(wid) 决定方案生成在何处异步跑（端点用 BackgroundTasks，
+        工具线程内用守护线程）；工作流本身始终停在方案选择门，不直接执行。
+        """
+        root = ctx._project_root_or_error() or ""
+        policy = (policy or WorkflowPolicy()).normalized()
+        project_id = project_id or ctx._request_project_id()
+        profile = get_profile(kind)
+        provider = get_runtime("llm_provider") or LLM_PROVIDER
+        model = (get_runtime("llm_model") or LLM_MODEL or
+                 PROVIDERS.get(provider, {}).get("default_model", ""))
+        # The workflow may still expose several independent task records,
+        # but local inference should not launch more child generations than
+        # the selected model can reasonably sustain.
+        policy = replace(policy, max_subagents=effective_subagent_limit(
+            provider, model, policy.max_subagents)).normalized()
+        option_generator = None
+        task_generator = None
+        if use_llm:
+            # Option refinement is advisory.  The manager validates the
+            # JSON and falls back to deterministic choices on any failure.
+            def option_generator(prompt, context_plan):
+                llm_agent = ctx._agent_for("workflow-options", project_id or None)
+                source_hint = ", ".join(context_plan.sources) or "direct"
+                evidence = workflow_evidence(prompt, project_id, root)
+                instruction = (
+                    profile.option_instruction
+                    + "根据用户目标和已选检索来源，"
+                    "给出 2-4 个互斥、可执行的方案。只输出 JSON，不要 Markdown："
+                    '{"options":[{"id":"...","title":"...","summary":"...",'
+                    '"recommended":true,"source":"...","requires_web":false}]}。'
+                    "必须恰好标出一个 recommended；不要执行工具，不要编造检索结果。\n"
+                    f"检索来源：{source_hint}\n用户目标：{prompt}"
+                )
+                if evidence:
+                    instruction += ("\n本地检索证据（只能作为参考，不能补造未出现的事实）：\n"
+                                    + evidence)
+                return llm_agent.llm.chat([{"role": "user", "content": instruction}],
+                                          stream=False, temperature=0.1, timeout=20)
+
+            def task_generator(prompt, selected, context_plan):
+                llm_agent = ctx._agent_for("workflow-planner", project_id or None)
+                evidence = workflow_evidence(prompt, project_id, root)
+                instruction = (
+                    profile.task_instruction
+                    + "生成可并行执行的任务 DAG。只输出 JSON，不要 Markdown："
+                    '{"tasks":[{"id":"...","role":"' + profile.task_roles + '",'
+                    '"task":"具体且可验收的工作","depends_on":[],"optional":false,'
+                    '"parallel_safe":true,"persona":"本任务的专项人设",'
+                    '"tools":["工具名"],"mcp":"auto|allow|deny","reflection":true}]}。'
+                    "任务必须拆成单个子代理一轮可完成的粒度；id 唯一；依赖只能引用已有 id；dispatcher/planner 只读分析文件并提出分工，"
+                    "主 Agent 会汇总拆解结果和执行代理的结果并做最后检查；"
+                    "至少包含实现和验证任务；不要执行工具。\n"
+                    f"用户目标：{prompt}\n方案：{json.dumps(selected, ensure_ascii=False)}\n"
+                    f"上下文：{chr(10).join(context_plan.messages)}"
+                )
+                if evidence:
+                    instruction += "\n本地检索证据：\n" + evidence
+                return llm_agent.llm.chat([{"role": "user", "content": instruction}],
+                                          stream=False, temperature=0.1, timeout=25)
+
+        workflow = WORKFLOWS.start(
+            prompt, project_id=project_id, project_root=root,
+            web_enabled=web_enabled, experience_enabled=experience_enabled,
+            llm_enabled=use_llm, kind=kind, policy=policy,
+            option_generator=option_generator,
+            task_generator=task_generator,
+            # The research provider is invoked by the LangGraph research
+            # node after the user selects the web-research option.  It is
+            # kept as a callback so credentials/cache policy remain in the
+            # audited tool implementation and never enter a checkpoint.
+            research_runner=(web_research if web_enabled else None),
+            defer_option_generation=True)
+        if workflow.get("status") == "generating_options":
+            schedule_options(workflow["workflow_id"])
+        return workflow
+
+    def _workflow_launcher(goal, *, kind="generic", web_enabled=False):
+        """start_workflow 工具的注入实现：复用同一套组装，方案生成放守护线程。"""
+        def _spawn_options(wid):
+            threading.Thread(
+                target=WORKFLOWS.generate_options, args=(wid,),
+                name="workflow-options", daemon=True).start()
+
+        return launch_workflow(
+            prompt=goal, kind=normalize_kind(kind), web_enabled=bool(web_enabled),
+            use_llm=True, experience_enabled=True, project_id="", policy=None,
+            schedule_options=_spawn_options)
+
+    tools.set_workflow_launcher(_workflow_launcher)
 
     @router.post("/route")
     async def route(req: AgentRouteReq):
@@ -219,86 +331,49 @@ def build_router(ctx) -> APIRouter:
                 "persistent_checkpoint": WORKFLOWS.persistent_checkpoint,
                 "distributed_leases": WORKFLOWS.distributed_leases,
                 "llm_resource": resource_profile(provider, model).as_dict(),
-                "checkpoint_health": WORKFLOWS.checkpoint_health()}
+                "checkpoint_health": WORKFLOWS.checkpoint_health(),
+                "langsmith": langsmith.status()}
 
     @router.post("/workflow/start")
     async def workflow_start(req: WorkflowStartReq, background_tasks: BackgroundTasks):
-        root = ctx._project_root_or_error() or ""
         try:
-            policy = WorkflowPolicy(**(req.policy or {})).normalized()
-            project_id = req.project_id or ctx._request_project_id()
-            provider = get_runtime("llm_provider") or LLM_PROVIDER
-            model = (get_runtime("llm_model") or LLM_MODEL or
-                     PROVIDERS.get(provider, {}).get("default_model", ""))
-            # The workflow may still expose several independent task records,
-            # but local inference should not launch more child generations than
-            # the selected model can reasonably sustain.
-            policy = replace(policy, max_subagents=effective_subagent_limit(
-                provider, model, policy.max_subagents)).normalized()
-            option_generator = None
-            task_generator = None
-            if req.use_llm:
-                # Option refinement is advisory.  The manager validates the
-                # JSON and falls back to deterministic choices on any failure.
-                def option_generator(prompt, context_plan):
-                    llm_agent = ctx._agent_for("workflow-options", project_id or None)
-                    source_hint = ", ".join(context_plan.sources) or "direct"
-                    evidence = workflow_evidence(prompt, project_id, root)
-                    instruction = (
-                        "你是游戏开发 Harness 的需求澄清器。根据用户目标和已选检索来源，"
-                        "给出 2-4 个互斥、可执行的方案。只输出 JSON，不要 Markdown："
-                        '{"options":[{"id":"...","title":"...","summary":"...",'
-                        '"recommended":true,"source":"...","requires_web":false}]}。'
-                        "必须恰好标出一个 recommended；不要执行工具，不要编造检索结果。\n"
-                        f"检索来源：{source_hint}\n用户目标：{prompt}"
-                    )
-                    if evidence:
-                        instruction += ("\n本地检索证据（只能作为参考，不能补造未出现的事实）：\n"
-                                        + evidence)
-                    return llm_agent.llm.chat([{"role": "user", "content": instruction}],
-                                              stream=False, temperature=0.1, timeout=20)
-
-                def task_generator(prompt, selected, context_plan):
-                    llm_agent = ctx._agent_for("workflow-planner", project_id or None)
-                    evidence = workflow_evidence(prompt, project_id, root)
-                    instruction = (
-                        "你是游戏开发主 Agent，主要负责汇总规划、审核结果和最终决策。根据用户目标、用户选择的方案和上下文，"
-                        "自行判断任务复杂度：简单任务直接执行，复杂文件任务先派一个只读 dispatcher/planner 拆解文件与依赖；"
-                        "由它提出后续分工，主 Agent 校验后再动态决定执行型 Subagent 的数量；不要固定生成两个成员。"
-                        "生成可并行执行的任务 DAG。只输出 JSON，不要 Markdown："
-                        '{"tasks":[{"id":"...","role":"dispatcher|planner|designer|coder|artist|tester|researcher|reviewer",'
-                        '"task":"具体且可验收的工作","depends_on":[],"optional":false,'
-                        '"parallel_safe":true,"persona":"本任务的专项人设",'
-                        '"tools":["工具名"],"mcp":"auto|allow|deny","reflection":true}]}。'
-                        "任务必须拆成单个子代理一轮可完成的粒度；id 唯一；依赖只能引用已有 id；dispatcher/planner 只读分析文件并提出分工，"
-                        "主 Agent 会汇总拆解结果和执行代理的结果并做最后检查；"
-                        "至少包含实现和验证任务；不要执行工具。\n"
-                        f"用户目标：{prompt}\n方案：{json.dumps(selected, ensure_ascii=False)}\n"
-                        f"上下文：{chr(10).join(context_plan.messages)}"
-                    )
-                    if evidence:
-                        instruction += "\n本地检索证据：\n" + evidence
-                    return llm_agent.llm.chat([{"role": "user", "content": instruction}],
-                                              stream=False, temperature=0.1, timeout=25)
-
             workflow = await run_in_threadpool(
-                WORKFLOWS.start, req.prompt, project_id=project_id,
-                project_root=root, web_enabled=req.web_enabled,
-                experience_enabled=req.experience_enabled, llm_enabled=req.use_llm, policy=policy,
-                option_generator=option_generator,
-                task_generator=task_generator,
-                # The research provider is invoked by the LangGraph research
-                # node after the user selects the web-research option.  It is
-                # kept as a callback so credentials/cache policy remain in
-                # the audited tool implementation and never enter a
-                # checkpoint.
-                research_runner=(web_research if req.web_enabled else None),
-                defer_option_generation=True)
-            if workflow.get("status") == "generating_options":
-                background_tasks.add_task(WORKFLOWS.generate_options, workflow["workflow_id"])
+                launch_workflow,
+                prompt=req.prompt, kind=normalize_kind(req.kind),
+                web_enabled=req.web_enabled, use_llm=req.use_llm,
+                experience_enabled=req.experience_enabled,
+                project_id=req.project_id,
+                policy=WorkflowPolicy(**(req.policy or {})),
+                schedule_options=lambda wid:
+                    background_tasks.add_task(WORKFLOWS.generate_options, wid))
             return {"ok": True, "workflow": workflow}
         except (WorkflowError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
+
+    @router.get("/workflow/active")
+    async def workflow_active():
+        """当前项目进程内未终结的工作流（无则 workflow=null）。
+
+        页面刷新后工作流卡片随内存消息一起消失，但后端互斥仍然存活，
+        前端据此发现孤儿并提供「挂回卡片 / 中断」入口。必须注册在
+        /workflow/{workflow_id} 之前，否则会被路径参数吞掉。
+        """
+        root = ctx._project_root_or_error() or ""
+        project_id = ctx._request_project_id()
+        workflow = await run_in_threadpool(WORKFLOWS.active_for_project, project_id, root)
+        return {"ok": True, "workflow": workflow}
+
+    @router.get("/workflows")
+    async def workflow_list(limit: int = 50):
+        """当前项目最近的工作流摘要（含磁盘上的终态历史）。
+
+        复数路径刻意区别于 /workflow/{workflow_id}，供工作台「工作流历史」
+        弹层展示、中断运行中项、删除终态项。
+        """
+        root = ctx._project_root_or_error() or ""
+        project_id = ctx._request_project_id()
+        items = await run_in_threadpool(WORKFLOWS.list_workflows, project_id, root, limit)
+        return {"ok": True, "items": items}
 
     @router.get("/workflow/{workflow_id}")
     async def workflow_get(workflow_id: str):
@@ -306,6 +381,62 @@ def build_router(ctx) -> APIRouter:
             return {"ok": True, "workflow": WORKFLOWS.get(workflow_id)}
         except WorkflowError as exc:
             return {"ok": False, "error": str(exc)}
+
+    @router.get("/workflow/{workflow_id}/events")
+    async def workflow_events(workflow_id: str, request: Request, after: int = 0):
+        """工作流实时事件 SSE。
+
+        - 连接先重放 seq>after 的持久事件（含各 subagent_complete 的有界 trace）；
+        - 随后实时推送持久事件与内存 subagent_step；
+        - 15s 心跳；终态（completed/failed/interrupted）推完发 __stream_done__ 自关；
+        - 客户端断开即注销队列。注册先于重放，按 seq 去重，无丢事件/无裂缝。
+        """
+        try:
+            WORKFLOWS.get(workflow_id)
+        except WorkflowError:
+            return JSONResponse({"ok": False, "error": "工作流不存在"}, status_code=404)
+        q = WORKFLOWS.subscribe(workflow_id)
+        loop = asyncio.get_event_loop()
+
+        def _drain(timeout):
+            return q.get(timeout=timeout)
+
+        async def stream():
+            cursor = max(0, int(after or 0))
+            try:
+                replay, _latest = await run_in_threadpool(
+                    WORKFLOWS.events_since, workflow_id, cursor)
+                if replay:
+                    chunks = []
+                    for event in replay:
+                        cursor = max(cursor, int(event.get("seq") or 0))
+                        chunks.append("data: " + json.dumps(event, ensure_ascii=False) + "\n\n")
+                    yield "".join(chunks)
+                if await run_in_threadpool(WORKFLOWS.is_terminal, workflow_id):
+                    yield "data: " + json.dumps({"kind": "__stream_done__"}) + "\n\n"
+                    return
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        event = await loop.run_in_executor(None, _drain, 15)
+                    except queue.Empty:
+                        yield ": ping\n\n"
+                        continue
+                    seq = int(event.get("seq") or 0)
+                    if seq <= cursor:
+                        continue  # 重放/订阅交叉窗口的重复事件
+                    cursor = max(cursor, seq)
+                    yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+                    if await run_in_threadpool(WORKFLOWS.is_terminal, workflow_id):
+                        yield "data: " + json.dumps({"kind": "__stream_done__"}) + "\n\n"
+                        break
+            finally:
+                await run_in_threadpool(WORKFLOWS.unsubscribe, workflow_id, q)
+
+        return StreamingResponse(stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
 
     @router.get("/workflow/{workflow_id}/skill-candidate")
     async def workflow_skill_candidate(workflow_id: str):
@@ -505,6 +636,14 @@ def build_router(ctx) -> APIRouter:
     async def workflow_interrupt(workflow_id: str, req: WorkflowInterruptReq):
         try:
             return {"ok": True, "workflow": WORKFLOWS.interrupt(workflow_id, req.reason)}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @router.delete("/workflow/{workflow_id}")
+    async def workflow_delete(workflow_id: str):
+        """删除终态工作流并清理磁盘状态文件；非终态返回 ok:false（请先中断）。"""
+        try:
+            return await run_in_threadpool(WORKFLOWS.delete_workflow, workflow_id)
         except WorkflowError as exc:
             return {"ok": False, "error": str(exc)}
 

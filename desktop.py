@@ -71,8 +71,10 @@ def _log(msg: str):
 
 
 def _already_running() -> bool:
+    # 只用纯存活探针：/api/config 内部会探测 Ollama（未运行时本机回环
+    # 拒绝连接都可能耗时数秒），1s 超时下会被误判为「没有实例」。
     try:
-        with urllib.request.urlopen(f"{URL}api/config", timeout=1) as r:
+        with urllib.request.urlopen(f"{URL}api/health", timeout=1) as r:
             return r.status == 200
     except (urllib.error.URLError, OSError, TimeoutError):
         return False
@@ -82,7 +84,7 @@ def _wait_for_server(timeout: float = 20.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(f"{URL}api/config", timeout=1):
+            with urllib.request.urlopen(f"{URL}api/health", timeout=1):
                 return True
         except (urllib.error.URLError, OSError, TimeoutError):
             time.sleep(0.3)

@@ -107,10 +107,15 @@ def parse_sse_frames(data):
 
 
 def extract_text(result):
-    """从 tools/call 结果里抽取文本与结构化内容（图片等内容块仅标注类型）。"""
+    """从 tools/call 结果里抽取文本、结构化内容与图片块。
+
+    返回 ``(text, structured, blocks, images)``：blocks 记录非文本块的类型名
+    （含 "image"），images 是图片块的结构化副本 ``[{"data": base64, "mime_type": str}]``，
+    供截图类连接器把画面送入统一视觉观察通道；非图片块不在这里展开。
+    """
     if not isinstance(result, dict):
-        return "", None, []
-    texts, blocks = [], []
+        return "", None, [], []
+    texts, blocks, images = [], [], []
     for item in result.get("content") or []:
         if not isinstance(item, dict):
             continue
@@ -119,7 +124,14 @@ def extract_text(result):
             texts.append(item.get("text") or "")
         else:
             blocks.append(ctype or "unknown")
-    return "\n".join(t for t in texts if t).strip(), result.get("structuredContent"), blocks
+            if ctype == "image" and item.get("data"):
+                images.append({
+                    "data": str(item.get("data")),
+                    "mime_type": str(item.get("mimeType")
+                                     or item.get("mime_type") or "image/png"),
+                })
+    return ("\n".join(t for t in texts if t).strip(),
+            result.get("structuredContent"), blocks, images)
 
 
 def normalize_server_config(cfg):
@@ -396,6 +408,14 @@ class _StdioSession:
     """长驻 stdio MCP 子进程：reader 线程收 JSON 行，请求按 id 匹配响应。"""
 
     def __init__(self, cfg, cwd=None):
+        self.cfg = cfg
+        # 解析 @secret:<provider> 哨兵：写入 .docmind_mcp.json 时原样保存，
+        # 运行时在此替换为本机 secrets_store 明文（不落盘明文）。无 @secret 时原样返回。
+        from mcp_autoconnect import resolve_secret_refs
+        try:
+            cfg = resolve_secret_refs(cfg, cwd or os.getcwd())
+        except Exception as exc:
+            raise MCPError(f"凭证解析失败（@secret 引用无法解析）：{exc}")
         self.cfg = cfg
         command = resolve_command(cfg["command"])
         env = os.environ.copy()
@@ -729,10 +749,11 @@ def call_tool(root, key, name, arguments=None, timeout=CALL_TIMEOUT):
                 # view, even though the remote server may have completed it.
                 raise MCPError("MCP 结果未放行：%s" %
                                str(after.get("reason") or "需要人工审核")[:300])
-    text, structured, blocks = extract_text(result)
+    text, structured, blocks, images = extract_text(result)
     return {"ok": not result.get("isError", False), "server": key, "name": name,
             "is_error": bool(result.get("isError", False)),
-            "text": text, "structured": structured, "other_blocks": blocks}
+            "text": text, "structured": structured, "other_blocks": blocks,
+            "images": images}
 
 
 def call_tool_with_fallback(root, key, name, arguments=None, *, fallback_keys=None,

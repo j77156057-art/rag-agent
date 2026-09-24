@@ -1,6 +1,16 @@
-# 游戏开发 Harness 工作流
+# 开发工作流 Harness（通用 / 游戏 / EDA）
 
 工作流由 `agent_runtime.game_workflow.GameWorkflowManager` 管理。安装 LangGraph 时，choice、research、approval 三个人工门通过同一条带持久化 SQLite checkpointer 的真实线程使用 `interrupt()/Command(resume=...)` 暂停和恢复；`execute_wave → review → replan → execute_wave` 也由该状态图驱动，每个执行波再通过 LangGraph `Send` 把无依赖的 Subagent 扇出为独立节点。SQLite saver 不可用时降级为内存 checkpoint；LangGraph 不可用时使用原生编排器兼容执行，因此不会阻断 Harness。
+
+## 领域画像（kind）与对话入口
+
+工作流不局限于游戏。`agent_runtime.workflow_profiles` 注册三种领域画像，由工作流状态的 `kind` 字段区分（旧持久化状态无该字段时迁移为 `game`，不强制写回）：
+
+- `generic`（默认，通用开发）：方案与任务文案领域无关，兜底任务链为 research → implement → verify；适用于软件、数据工程、工具链和自动化等任意长链路任务。
+- `game`（游戏开发）：保持既有 2D/3D 澄清文案，兜底任务链为 design → prototype → verify。
+- `eda`（原理图/PCB 电子设计）：方案围绕 ERC/DRC 体检、原理图→PCB 流程组织；兜底任务链为 research（web 工具，`mcp=deny`）→ schematic（`schematic` 角色，`mcp=allow`）→ layout（`layout` 角色，`mcp=allow`）→ verify（`tester`，`mcp=allow`）。涉及 EDA 连接器（`dev_route_connector`/`dev_list_connector_tools`/`dev_mcp_call`）的任务必须带显式 `tools` 白名单，任务描述要求子代理先 `dev_list_connector_tools` 核实工具名再 `dev_mcp_call`，验收以 ERC/DRC 零错误或逐项列明豁免为准。
+
+除 HTTP 接口与工作台外，对话内主 Agent 还可通过 `start_workflow(goal, kind?, web?)` 工具把长链路目标升级为工作流：它只创建工作流并停在**方案选择门**，方案选择、任务 DAG 确认和执行审批都必须由用户在工作台完成，Agent 不能代审批。判据是多阶段/多角色协作、含副作用阶段、需要人工门或跨窗口恢复之一；单个独立子任务仍用 `delegate`，一轮内当场并行出结果用 `orchestrate`。子代理角色白名单不包含该工具，防止套娃。
 
 ## 检索组件边界
 
@@ -93,7 +103,16 @@ start
 - `GET /api/agent/workflow/backend`：查看当前使用 LangGraph 还是原生 fallback，以及 checkpoint 健康、schema 版本和严格模式诊断。
 - `GET /api/agent/retrieval/status`：查看当前检索模式、Reranker、BM25 持久化和 lexical snapshot 命中/重建统计。
 
-工作台右上角“AI 运行台”的“游戏工作流”标签提供同一组操作：启动方案、选择/自定义、自动联网检索、生成分工、审批、执行、中断、恢复和事件查看。
+工作台右上角“AI 运行台”的“开发工作流”标签提供同一组操作：启动前选择领域（通用开发/游戏开发/EDA 电子设计，默认通用），随后进行方案选择/自定义、自动联网检索、生成分工、审批、执行、中断、恢复和事件查看；详情头部会显示该工作流的领域标签。
+
+## 视觉观察通道
+
+工具回传的图片统一走 `agent_runtime.vision.attach_tool_observation` 能力门，任何调用方不得自行拼装多模态消息：
+
+- 当前模型能力画像为原生视觉（`vision=native`）时，图片作为 `images` 挂到 Observation 消息直接给模型，单条观察最多 4 张；上下文预算收窄时只保留最后一条带图观察，用户当轮上传的图片不受影响。
+- 非视觉模型绝不收到 image content：配置 `DOCMIND_VISION_MODEL`（及 provider/key/base_url）后，由 Harness 视觉模型把图片转成有界文字观察再回注主上下文；未配置或视觉层报错时追加明确提示并继续回合，不阻断任务。
+- `web_fetch`/`web_research`（builtin provider）在 `DOCMIND_WEB_IMAGES`（默认开）且具备看图能力时，从同一份 HTML 按 og 图/正文相关性抽取候选图，经 SSRF 回环与元数据守卫、大小/超时限制和 Pillow JPEG 压缩后回传；图片只活在当轮消息中，历史与持久化只存文本和来源 URL。
+- `game_screenshot` 工具按「MCP 连接器截图 → 嵌入窗 → 前台窗」顺序取帧（纯 ctypes `screen_capture`，不引入 pywin32，不向模型暴露任意 HWND/进程枚举），保存到项目 `.docmind/screenshots/` 并把缩略图作为观察过门；tester 等角色可在游戏运行过程中截图核对当前画面是否与预期一致、是否出现报错弹窗。
 
 工作流面板的“最近检索”区域显示本地检索事件，包括集合、模式、耗时、来源、Dense/BM25/Hybrid/Reranker 分数和有限片段；“工具与 MCP 轨迹”区域会展开每个 Subagent 的 action、观察结果、失败字段和任务线程；工作流事件也可展开查看重规划、审批、Hook 和恢复原因。LangSmith 启用时，同一查询会创建 `retrieval.query`、`retrieval.dense`、`retrieval.bm25` 和 `retrieval.reranker` 子 Span；只上传计数、分数和耗时等脱敏元数据，不上传查询或文档正文。
 
@@ -129,6 +148,8 @@ $env:DOCMIND_NO_TEST_ISOLATION="1"
 任务 DAG 可为每个 Subagent 指定 `persona`、`tools`、`mcp`（`auto|allow|deny`）和 `reflection`。主 Agent 不固定生成成员数量：简单任务可以直接派一个执行代理；复杂文件任务可以先派只读 `dispatcher`（兼容 `planner`，负责任务拆解与分工），由它分析目录、依赖和验收标准，并返回受限 `tasks` JSON。主 Agent 校验后才把这些任务动态加入 DAG，再决定实际执行成员数量。工具权限只能在角色白名单内进一步收窄，不能由模型扩大；`dispatcher/planner` 强制 `MCP=deny` 且不允许写文件，主 Agent 负责汇总、终审和最终写入决策。这些字段会经过白名单和长度校验，持久化到 `subagents`，执行后记录反思结论；反思失败会把任务交回主 Agent 的复核/重规划路径。
 
 本地 Ollama 还有一层资源调度：`max_parallel` 控制同时生成数，默认所有 4B/7B/14B/35B 模型均为 1，避免显存和上下文争抢；`max_subagents` 只限制整张 DAG 的任务总数，因此 4B 模型仍可串行完成设计→实现→验证三阶段，而不会被错误截断为一个任务。可用 `DOCMIND_LOCAL_LLM_MAX_CONCURRENCY` 和 `DOCMIND_LOCAL_SUBAGENT_MAX` 在实测有余量时显式提高上限。
+
+工作流的步数预算随任务规模动态放大：子代理默认最多 `SUBAGENT_MAX_STEPS=6` 步、硬顶 `SUBAGENT_STEPS_HARD_CAP=12`（环境变量可调）；工作流总预算为 `min(硬顶, max(下限, 任务数*6+4))`，内置默认区间 `[24, 200]`，可由部署侧环境变量覆盖：`DOCMIND_WORKFLOW_STEPS_MIN` 设置自动预算下限（同时是「未显式指定」的基准值，简单任务可下调）、`DOCMIND_WORKFLOW_STEPS_MAX` 设置硬顶（复杂任务可上调，颠倒或非法的配置会被安全回退/夹取）。规划时显式给出的 `max_steps`（含低于下限的值）会被尊重并透传到执行节点，但不超过硬顶；默认值与下限相同则视为未指定、走自动预算。多 Agent 并行波各自计步，因此长流程不会被单代理的小预算误截断。
 
 本机 Ollama 单次短 JSON smoke（`num_ctx=8192`，仅作相对参考）测得：`qwen3:4b` 约 13 秒、`qwen3:14b` 约 20 秒、`qwen3.6:35b-a3b` 约 32 秒。完整 Harness 仍建议 4B/14B/35B 默认串行；并发提升必须以目标机器实测显存、超时和失败率为依据。
 

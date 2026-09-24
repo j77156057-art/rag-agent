@@ -6,7 +6,7 @@ import { existsSync, readFileSync, rmSync } from 'node:fs'
 /**
  * 构建前清掉 web/assets。
  *
- * emptyOutDir 必须是 false（web/index.html 是手写的问答页，清了就没了），副作用是
+ * emptyOutDir 必须是 false（web/ 里有 trace.html 等非 Vite 托管文件，清了就没了），副作用是
  * 带哈希的旧产物会一直堆积——实测攒了 90 个文件，而冻结打包会把整个 web/ 拷进
  * 安装目录，等于白带一堆死文件。这里只删 assets 子目录：它纯粹是 Vite 产物，
  * 入口 HTML 每次构建都会重写引用，删掉安全。
@@ -39,10 +39,10 @@ function serveSessionScript(): Plugin {
   }
 }
 
-// DocMind 工作台前端工程配置
-// - 多页应用（MPA）：当前只有 workbench 一个入口，后续页面在 build.rollupOptions.input 追加
+// DocMind 前端工程配置
+// - 多页应用（MPA）：ask=AI 问答首页（/，产物 index.html）；workbench=代码工作台（/workbench）
 // - 产物直接写入后端静态目录 ../web（PyInstaller 的 ("web","web") 会原样带走）
-// - emptyOutDir 必须为 false：../web 里有问答页 index.html，构建时绝不能清空
+// - emptyOutDir 必须为 false：../web 里还有 trace.html 等非本工程托管的静态文件，构建时绝不能清空
 export default defineConfig({
   plugins: [
     vue({ template: { compilerOptions: { isCustomElement: (tag: string) => tag === 'model-viewer' } } }),
@@ -55,6 +55,8 @@ export default defineConfig({
     assetsDir: 'assets',
     rollupOptions: {
       input: {
+        // 入口文件名决定产物名：index.html 构建为 ../web/index.html，由后端 / 路由返回
+        ask: resolve(__dirname, 'index.html'),
         workbench: resolve(__dirname, 'workbench.html'),
       },
       output: {
@@ -69,9 +71,25 @@ export default defineConfig({
           // vendor-vue（@vue-flow 的路径里也含 "@vue"）。这里返回 undefined = 不做切分，
           // 让它跟画布一起留在 SceneCanvas 异步 chunk：JS 与 CSS 同批加载，且首屏不受影响。
           if (id.includes('@vue-flow')) return
-          // model-viewer + three 体积大且只有素材中心 3D 预览用到，保持动态 import 的独立懒 chunk
+          // model-viewer 3D 预览全家桶（three / lit / gainmap / d3-*）只有素材中心 3D 预览
+          // 用到，且仅被 ModelPreview.vue 里的 `await import('@google/model-viewer')` 引用，
+          // 整体归入同一个懒 chunk。
+          // 注意：不能只排除 @google/model-viewer 和 three——lit/gainmap/d3 若漏网落到下面
+          // 的兜底 vendor-misc（首屏），three 会作为它们的公共依赖被 Rollup 一起提升回首屏，
+          // 排除规则形同虚设。
           const norm = id.replaceAll('\\', '/')
-          if (id.includes('@google/model-viewer') || norm.includes('node_modules/three/')) return
+          if (
+            norm.includes('@google/model-viewer')
+            || norm.includes('/node_modules/three/')
+            || norm.includes('/node_modules/lit/')
+            || norm.includes('/node_modules/lit-')
+            || norm.includes('/node_modules/@lit/')
+            || norm.includes('/node_modules/@monogrid/gainmap-js/')
+            || norm.includes('/node_modules/promise-worker-transferable/')
+            || /\/node_modules\/d3-[a-z-]+\//.test(norm)
+          ) {
+            return 'vendor-model-viewer'
+          }
           if (id.includes('@vue') || id.includes('vue') || id.includes('@vitejs')) {
             return 'vendor-vue'
           }

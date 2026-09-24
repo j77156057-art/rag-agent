@@ -146,5 +146,21 @@ class NativeDispatchTests(unittest.TestCase):
         self.assertFalse(agent_mod.Agent(llm=llm, tool_mode="auto")._native_enabled())
 
 
+class DedupDocsTests(unittest.TestCase):
+    """回归：向量检索非空结果去重路径不得 NameError（review B-1）。"""
+
+    def test_non_empty_results_deduped(self):
+        import tools
+        docs = ["同一片段", "同一片段", "另一片段"]
+        metas = [{"source": "a.py"}, {"source": "a.py"}, {"source": "b.py"}]
+        out_d, out_m = tools._dedup_docs(docs, metas)
+        self.assertEqual(out_d, ["同一片段", "另一片段"])
+        self.assertEqual([m["source"] for m in out_m], ["a.py", "b.py"])
+
+    def test_empty_is_safe(self):
+        import tools
+        self.assertEqual(tools._dedup_docs([], []), ([], []))
+
+
 if __name__ == "__main__":
     unittest.main()

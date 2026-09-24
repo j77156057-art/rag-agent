@@ -2,6 +2,7 @@
 import json
 import contextvars
 import os
+import re
 import sys
 import tempfile
 
@@ -47,12 +48,26 @@ def _running_under_unittest():
     return getattr(spec, "name", None) == "unittest.__main__"
 
 
-# 最小、可解释的测试隔离：仅 `python -m unittest` 进程生效。打包 exe / dev 服务不
-# 满足该判据，行为不变；显式设置 DOCMIND_STATE_ROOT 优先于本默认；
+def _running_under_pytest():
+    """当前进程是否运行在 pytest 会话中。
+
+    pytest 引导后其自身包必然已在 sys.modules，随后才导入 conftest / 测试模块
+    （此时才 import config）；而桌面版、exe 与普通 python 运行都不会安装/导入
+    pytest，故该信号可靠。不能只看 sys.argv[0]：pytest 可被 python -m pytest、
+    console_script、IDE 插件等多种方式启动。
+    """
+    return "pytest" in sys.modules
+
+
+# 最小、可解释的测试隔离：`python -m unittest` 与 pytest 进程都生效。打包 exe /
+# dev 服务不满足该判据，行为不变；显式设置 DOCMIND_STATE_ROOT 优先于本默认；
 # DOCMIND_NO_TEST_ISOLATION=1 可关闭（例如想跑真实状态根时）。
+# 历史教训：只判 unittest 时，pytest 跑 tests/test_api_model_config.py 会把
+# llm_provider=mock / llm_model=zz-unit-ctx 等夹具值 save_state 进真实状态文件，
+# 用户重启后云端模型被悄悄打回离线 mock。
 _TEST_STATE_ISOLATED = bool(
     not os.getenv("DOCMIND_STATE_ROOT")
-    and _running_under_unittest()
+    and (_running_under_unittest() or _running_under_pytest())
     and os.getenv("DOCMIND_NO_TEST_ISOLATION") != "1"
 )
 if _TEST_STATE_ISOLATED:
@@ -200,6 +215,10 @@ MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "8"))
 # 仅在识别为代码/项目缺陷审查时使用更大的有界预算。显式环境变量优先。
 AUDIT_MAX_AGENT_STEPS = int(os.getenv("DOCMIND_AUDIT_MAX_STEPS", "16"))
 CODE_MAX_AGENT_STEPS = int(os.getenv("DOCMIND_CODE_MAX_STEPS", "12"))
+# 纯目录勘察（list_dir）每轮前若干次不计入工具步数：浏览目录结构是只读导航，
+# 不应挤占 read_file/grep 的取证预算；超过免费额度后照常计步。
+# 相同参数重复调用仍由 Agent 防重复护栏拦截，防止靠它无限空转。
+NAV_FREE_STEPS = int(os.getenv("DOCMIND_NAV_FREE_STEPS", "2"))
 # ---- Agent 上下文预算（防止长系统提示 + 多轮观察 + 思考模型 reasoning 撑爆 n_ctx）----
 # 多轮记忆回放的问答对【硬上限】：实际回放多少轮先按 token 窗口动态决定
 # （Agent._history_window，占 prompt 预算 COMPACT_KEEP_RATIO），此值只兜底防失控。
@@ -280,6 +299,9 @@ _NATIVE_VISION_HINTS = (
     "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl", "qwen3.6",
     "llava", "gemma-3", "gemma3", "gpt-4o", "gpt-4.1", "gpt-5",
     "claude-3", "claude-4", "glm-4v", "glm-4.5v", "kimi-vl", "deepseek-vl",
+    # DeepSeek-V4.1-Flash（2026-09-10 起，model id=deepseek-flash）原生多模态，
+    # 标准 OpenAI image_url 格式；旧名 deepseek-v4-flash(-vision-exp) 已路由到同一模型。
+    "deepseek-flash", "deepseek-v4-flash",
 )
 _NATIVE_VIDEO_HINTS = ("gemini", "gpt-4o", "gpt-4.1", "gpt-5", "qwen3-vl")
 
@@ -332,6 +354,34 @@ def prompt_token_budget(provider: str, model: str, context_window: int = None) -
     return budget
 
 
+# 单次补全（输出）上限：由模型上下文窗口派生，而非写死 3072。
+# 动机：云端大模型（DeepSeek 等）上下文常达 128k~1M，3072 的硬上限纯属"畏手畏脚"；
+# 本地小窗口模型则保底 LLM_MAX_TOKENS，避免单次生成撑爆显存/时延。
+OUTPUT_TOKEN_FRACTION = float(os.getenv("DOCMIND_OUTPUT_FRACTION", "0.33"))
+OUTPUT_TOKEN_MIN = int(os.getenv("DOCMIND_OUTPUT_MIN_TOKENS", str(LLM_MAX_TOKENS)))   # 默认保底 3072
+OUTPUT_TOKEN_MAX = int(os.getenv("DOCMIND_OUTPUT_MAX_TOKENS", "65536"))
+
+
+def output_token_budget(provider: str, model: str, context_window: int = None) -> int:
+    """单次补全可输出的最大 token，按模型真实窗口派生。
+
+    - 环境变量 LLM_MAX_TOKENS 显式设置时强制采用（排障/压测用，等价于旧硬上限）；
+    - 否则取「窗口 * OUTPUT_TOKEN_FRACTION」，夹在 [OUTPUT_TOKEN_MIN, OUTPUT_TOKEN_MAX] 之间，
+      且不超过窗口本身（减 512 余量）。1M 窗口 → ≈64k；131k → ≈43k；32k 本地 → ≈10k（仍≥保底 3k）。
+    """
+    env = os.getenv("LLM_MAX_TOKENS", "").strip()
+    if env:
+        try:
+            return max(256, int(env))
+        except ValueError:
+            pass
+    win = int(context_window) if context_window else model_context_window(provider, model)
+    out = int(win * OUTPUT_TOKEN_FRACTION)
+    out = max(OUTPUT_TOKEN_MIN, min(OUTPUT_TOKEN_MAX, out))
+    out = min(out, max(256, win - 512))   # 绝不越过窗口本身
+    return out
+
+
 def model_thinking_mode(provider: str, model: str) -> str:
     """思考能力画像：'native'（天生推理）/ 'toggle'（可开关）/ 'none'（不支持）。"""
     p = (provider or "").strip().lower()
@@ -380,6 +430,86 @@ def model_capability(provider: str, model: str, context_window: int = None) -> d
     if override:
         cap.update({k: v for k, v in override.items() if k in ("thinking", "vision", "video")})
     return cap
+
+
+# 模型上下文窗口文档检索缓存（避免每次请求都联网）
+_MODEL_CTX_CACHE_FILE = os.path.join(STATE_ROOT, ".docmind_model_context.json")
+_MODEL_CTX_CACHE = {}
+
+
+def _load_model_ctx_cache():
+    if not _MODEL_CTX_CACHE:
+        try:
+            if os.path.isfile(_MODEL_CTX_CACHE_FILE):
+                with open(_MODEL_CTX_CACHE_FILE, "r", encoding="utf-8") as f:
+                    _MODEL_CTX_CACHE.update(json.load(f))
+        except (OSError, ValueError):
+            pass
+    return _MODEL_CTX_CACHE
+
+
+def _save_model_ctx_cache(cache):
+    try:
+        with open(_MODEL_CTX_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+
+
+def _parse_context_from_text(text):
+    """从文档正文抽取上下文窗口 token 数；抽不到返回 None。
+
+    匹配数字（可选 K/M 后缀）前后 40 字符内出现 context/window/token 关键词，
+    两种词序都支持（"context length 32768" / "128K context" / "supports 1M tokens"）。
+    """
+    if not text:
+        return None
+    # web_search 等检索器可能返回带 .text 的对象（而非裸字符串），统一落地为 str
+    if not isinstance(text, str):
+        text = getattr(text, "text", "") or ""
+    lowered = text.lower()
+    best = None
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*([KkMm]?)", text):
+        try:
+            val = float(m.group(1))
+        except ValueError:
+            continue
+        unit = m.group(2).lower()
+        tok = int(val * (1_000 if unit == "k" else 1_000_000)) if unit else int(val)
+        if not (2048 <= tok <= 10_000_000):
+            continue
+        start, end = m.span()
+        around = lowered[max(0, start - 40):end + 40]
+        if any(k in around for k in ("context", "window", "token")):
+            best = tok if best is None else max(best, tok)
+    return best
+
+
+def resolve_context_from_docs(provider, model, web_fn, cache=None):
+    """联网检索官方文档判断模型最大上下文长度；命中则返回 token 数，否则 None。
+
+    web_fn(query) -> str（搜索/抓取到的文本，可能为空）。结果按 (provider,model)
+    缓存到 .docmind_model_context.json，避免重复联网。仅在静态画像未精确到具体模型时调用。
+    """
+    if not callable(web_fn):
+        return None
+    p = (provider or "").strip().lower()
+    m = (model or "").strip().lower()
+    cache = cache if cache is not None else _load_model_ctx_cache()
+    key = f"{p}:{m}"
+    if key in cache:
+        return cache[key] or None
+    try:
+        text = web_fn(f"{model} official maximum context window length tokens") or ""
+    except Exception:
+        text = ""
+    win = _parse_context_from_text(text)
+    try:
+        cache[key] = win
+        _save_model_ctx_cache(cache)
+    except OSError:
+        pass
+    return win
 
 CODE_ROOT = os.getenv("CODE_ROOT", "")  # 代码问答模式的代码库根目录；为空表示未配置
 CODE_CHUNK = int(os.getenv("CODE_CHUNK", "1200"))  # 单个代码切片的最大字符数

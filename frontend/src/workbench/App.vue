@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // DocMind 开发工作台 · P0 任务 4：多标签编辑 + 保存 + 新建/改名/删除。
-import { onMounted, onBeforeUnmount, computed, ref } from 'vue'
+import { onMounted, onBeforeUnmount, computed, defineAsyncComponent, reactive, ref, watch } from 'vue'
 import FileTree from './components/FileTree.vue'
 import CodeView from './components/CodeView.vue'
 import EditorTabs from './components/EditorTabs.vue'
@@ -8,28 +8,30 @@ import ContextMenu from './components/ContextMenu.vue'
 import AppDialog from './components/AppDialog.vue'
 import SymbolOutline from './components/SymbolOutline.vue'
 import SymbolMap from './components/SymbolMap.vue'
-import RelationGraph from './components/RelationGraph.vue'
-import UnityGraph from './components/UnityGraph.vue'
-import FlowCanvas from './components/FlowCanvas.vue'
 import SelectionToolbar from './components/SelectionToolbar.vue'
 import SelectionAiPanel from './components/SelectionAiPanel.vue'
 import GitHistoryDialog from './components/GitHistoryDialog.vue'
 import RewriteDiffDialog from './components/RewriteDiffDialog.vue'
-import RegionMapDialog from './components/RegionMapDialog.vue'
 import TaskEnginePanel from './components/TaskEnginePanel.vue'
 import SceneRuntimePanel from './components/SceneRuntimePanel.vue'
 import ChatDock from './components/ChatDock.vue'
 import AgentPolicyPanel from './components/AgentPolicyPanel.vue'
 import GpuPanel from './components/GpuPanel.vue'
 import HarnessPanel from './components/HarnessPanel.vue'
-import SettingsView from './components/SettingsView.vue'
 import SemanticLocateBar from './components/SemanticLocateBar.vue'
 import WorkspaceTabs from './components/WorkspaceTabs.vue'
-import AssetCenterView from './components/AssetCenterView.vue'
 import { useWorkbench, askConfirm } from './composables/workbench'
 import { probeBackend, demoMode, demoTagMap, demoRegionCards } from './composables/demo'
 import { regionColor } from './theme'
 import { projectApi, getProjectId, setProjectId, type ProjectInfo } from './api'
+
+// 重型弹层/视图按需加载：仅在首次打开时拉取独立 chunk（首屏不下载、不解析）
+const RelationGraph = defineAsyncComponent(() => import('./components/RelationGraph.vue'))
+const UnityGraph = defineAsyncComponent(() => import('./components/UnityGraph.vue'))
+const FlowCanvas = defineAsyncComponent(() => import('./components/FlowCanvas.vue'))
+const RegionMapDialog = defineAsyncComponent(() => import('./components/RegionMapDialog.vue'))
+const SettingsView = defineAsyncComponent(() => import('./components/SettingsView.vue'))
+const AssetCenterView = defineAsyncComponent(() => import('./components/AssetCenterView.vue'))
 
 // 演示侧栏的文件 → 业务标签（key 取文件名，与静态示例树对齐）
 const demoBadgeOf = (name: string) => {
@@ -44,6 +46,7 @@ const {
   openUnityGraph, openFlow,
   revertPath, openHistory,
   openRegionMap,
+  relationGraphOpen, unityGraphOpen, flowOpen, regionMapOpen,
   aiPanelOpen,
   workspace, setWorkspace, seedDemoRegionCards,
   closeAllTabs, closeRuntime,
@@ -54,6 +57,16 @@ const {
 const dirtyCount = computed(() => tabs.value.filter((t) => t.dirty).length)
 /** 统一设置页（用量费用 / 网络搜索 / MCP / 智能体）显隐 */
 const settingsVisible = ref(false)
+/**
+ * 重型弹层首次打开才挂载（异步 chunk 届时才下载）；挂载后常驻、关闭不销毁，
+ * 保留已加载数据与缩放状态——与原先"始终挂载 + 根 v-if 隐藏"的体验一致。
+ */
+const everMounted = reactive({ relation: false, unity: false, flow: false, region: false, settings: false })
+watch(relationGraphOpen, (v) => { if (v) everMounted.relation = true })
+watch(unityGraphOpen, (v) => { if (v) everMounted.unity = true })
+watch(flowOpen, (v) => { if (v) everMounted.flow = true })
+watch(regionMapOpen, (v) => { if (v) everMounted.region = true })
+watch(settingsVisible, (v) => { if (v) everMounted.settings = true })
 /** 当前标签可回滚：已纳入 git 且磁盘或编辑器存在改动 */
 const canRevertActive = computed(() => {
   const t = activeTab.value
@@ -586,12 +599,12 @@ onBeforeUnmount(() => {
     <AppDialog />
     <GitHistoryDialog />
     <RewriteDiffDialog />
-    <RegionMapDialog />
+    <RegionMapDialog v-if="everMounted.region" />
     <SymbolMap />
-    <RelationGraph />
-    <UnityGraph />
-    <FlowCanvas />
+    <RelationGraph v-if="everMounted.relation" />
+    <UnityGraph v-if="everMounted.unity" />
+    <FlowCanvas v-if="everMounted.flow" />
     <SelectionToolbar />
-    <SettingsView :visible="settingsVisible" @close="settingsVisible = false" />
+    <SettingsView v-if="everMounted.settings" :visible="settingsVisible" @close="settingsVisible = false" />
   </div>
 </template>

@@ -10,14 +10,16 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import sqlite3
 import sys
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Callable, Iterable, Mapping, TypedDict
@@ -29,6 +31,7 @@ from .context_router import (CONTEXT_LAYERS, ContextPlan, ContextRouter,
                              close_persistent_compression_worker, compress_layers_durable,
                              layer_snapshot_digest,
                              summarize_subagent_result)
+from .workflow_profiles import DEFAULT_KIND, VALID_KINDS, get_profile, normalize_kind
 
 try:  # optional dependency: the harness remains usable without LangGraph
     from langgraph.graph import END, START, StateGraph
@@ -79,6 +82,7 @@ CHECKPOINT_SCHEMA_VERSION = 1
 
 class WorkflowGraphState(TypedDict, total=False):
     workflow_id: str
+    kind: str
     request: str
     options: list[dict[str, Any]]
     phase: str
@@ -132,9 +136,74 @@ class TaskFanoutState(TypedDict, total=False):
     task_results: Annotated[dict[str, Any], _merge_result_maps]
 
 
+# 工作流级步数预算（多个子代理在波次内并行，工具调用总量随任务数放大）：
+# 未显式调高时按任务规模自动推算，但始终夹在 [下限, 硬顶]。
+# 内置默认 [24, 200]，可由部署侧环境变量覆盖：
+#   DOCMIND_WORKFLOW_STEPS_MIN  自动预算下限（也是「未显式指定」的基准值）
+#   DOCMIND_WORKFLOW_STEPS_MAX  硬顶（显式值与自动值都不得超过）
+WORKFLOW_STEPS_MIN = 24
+WORKFLOW_STEPS_MAX = 200
+# 单子代理默认步数——与 agent.SUBAGENT_MAX_STEPS 的默认值保持一致；
+# 仅在无法 import agent（极端裁剪安装）时作为回退。
+WORKFLOW_CHILD_DEFAULT_STEPS = 6
+
+
+def _env_int(name: str, default: int) -> int:
+    """读正整数环境变量；未设置/空白/非法时回退默认值。"""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def workflow_step_limits() -> tuple[int, int]:
+    """返回当前生效的步数预算 (下限, 硬顶)，每次调用实时读取环境变量。
+
+    下限至少 1；硬顶不小于下限（配置颠倒时抬到下限），保证区间恒有效。
+    """
+    lo = max(1, _env_int("DOCMIND_WORKFLOW_STEPS_MIN", WORKFLOW_STEPS_MIN))
+    hi = max(lo, _env_int("DOCMIND_WORKFLOW_STEPS_MAX", WORKFLOW_STEPS_MAX))
+    return lo, hi
+
+
+def effective_workflow_max_steps(task_count: int, *, child_default: int = 0,
+                                 explicit: int = 0) -> int:
+    """推算工作流生效步数预算（可解释、有界）。
+
+    - ``explicit`` 为策略里显式调高的值（>当前下限）时原样保留（夹到硬顶）；
+    - 否则 ``max(下限, 任务数 * 子代理默认步数 + 4)``——并行波次越多、链路越长，
+      需要的工具步数越大，但永远不会超过硬顶。
+    """
+    lo, hi = workflow_step_limits()
+    try:
+        explicit_value = int(explicit or 0)
+    except (TypeError, ValueError):
+        explicit_value = 0
+    if explicit_value > lo:
+        return max(lo, min(hi, explicit_value))
+    if not child_default:
+        try:
+            import agent as agent_mod
+            child_default = int(getattr(agent_mod, "SUBAGENT_MAX_STEPS",
+                                        WORKFLOW_CHILD_DEFAULT_STEPS))
+        except Exception:  # noqa: BLE001
+            child_default = WORKFLOW_CHILD_DEFAULT_STEPS
+    try:
+        count = max(0, int(task_count))
+    except (TypeError, ValueError):
+        count = 0
+    auto = max(lo, count * max(1, child_default) + 4)
+    return min(hi, auto)
+
+
 @dataclass(frozen=True)
 class WorkflowPolicy:
-    max_steps: int = 24
+    # 默认值跟随配置下限（DOCMIND_WORKFLOW_STEPS_MIN，内置 24）：不传策略时
+    # 「默认预算」与「自动预算基准」必须是同一个值，显式标记才不会误判。
+    max_steps: int = field(default_factory=lambda: workflow_step_limits()[0])
     max_replans: int = 2
     max_subagent_retries: int = 2
     max_subagents: int = 4
@@ -144,11 +213,19 @@ class WorkflowPolicy:
     provider_retries: int = 2
     hook_failure: str = "continue"  # continue | block
 
+    @classmethod
+    def from_state(cls, policy_dict: Mapping[str, Any] | None) -> "WorkflowPolicy":
+        """从持久化 policy dict 重建；忽略 step_budget_explicit 等辅助键。"""
+        keys = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in (policy_dict or {}).items() if k in keys}).normalized()
+
     def normalized(self) -> "WorkflowPolicy":
+        # 下限保持 1：显式低预算（m-4）必须能存活，只夹硬顶。
+        _lo, hi = workflow_step_limits()
         mode = self.approval_mode if self.approval_mode in {"safe", "high"} else "safe"
         hook_failure = self.hook_failure if self.hook_failure in {"continue", "block"} else "continue"
         return WorkflowPolicy(
-            max_steps=max(1, min(200, int(self.max_steps))),
+            max_steps=max(1, min(hi, int(self.max_steps))),
             max_replans=max(0, min(10, int(self.max_replans))),
             max_subagent_retries=max(0, min(5, int(self.max_subagent_retries))),
             max_subagents=max(1, min(16, int(self.max_subagents))),
@@ -175,6 +252,9 @@ class WorkflowState:
     workflow_id: str
     project_id: str = ""
     project_root: str = ""
+    # 领域画像：generic（通用开发，默认）/ game（游戏）/ eda 等；决定兜底选项、
+    # 兜底任务 DAG 与生成器口吻。旧状态文件无此字段时在 _load 迁移为 "game"。
+    kind: str = DEFAULT_KIND
     request: str = ""
     status: str = "awaiting_choice"
     phase: str = "clarify"
@@ -261,6 +341,17 @@ class GameWorkflowManager:
         self._execution_callbacks: dict[str, dict[str, Any]] = {}
         self._execution_resolver: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None
         self._lock = threading.RLock()
+        # ── 实时事件总线（进程内 SSE）─────────────────────────────────────
+        # 持久台账 state.events 仍是唯一事实源；这里只做进程内即时 fan-out：
+        # 每个 SSE 连接一个有界队列（满则丢最旧，绝不阻塞执行线程）。
+        # _event_seq 是单调序号：持久台账裁剪为最后 100 条后，events[0] 的
+        # 序号恒为 _event_seq-len(events)+1，SSE 重放据此计算 after 游标。
+        self._subscribers: dict[str, set[queue.Queue]] = {}
+        self._event_seq: int = 0
+        # 子代理逐步轨迹只存内存（不进持久 JSON）：每任务有界环形，终态即清；
+        # 迟到/刷新补全走 subagent_complete 事件里携带的有界 trace。
+        self._step_rings: dict[str, dict[str, deque]] = {}
+        self._step_ring_max = max(8, min(120, int(os.getenv("DOCMIND_WORKFLOW_STEP_RING", "30"))))
         self._checkpoint_conn: sqlite3.Connection | None = None
         self._checkpoint_pool: Any | None = None
         self._lease_owner = "wf-worker-" + uuid.uuid4().hex[:16]
@@ -561,7 +652,11 @@ class GameWorkflowManager:
         for path in paths:
             workflow_id = path.stem
             try:
-                state = self._load(workflow_id)
+                # 扫描只读、不注册：不合格的门控态绝不能因为启动扫描被塞进
+                # _states，否则每个历史 awaiting_choice 都会在重启后武装项目
+                # 互斥（旧实现这里是反复死锁的根因）。真正恢复时 execute()
+                # 内部的 _load 会重新注册。
+                state = self._load(workflow_id, register=False)
             except WorkflowError:
                 continue
             policy = state.policy or {}
@@ -662,7 +757,17 @@ class GameWorkflowManager:
             self._execution_callbacks.pop(state.workflow_id, None)
         return state
 
-    def _load(self, workflow_id: str) -> WorkflowState:
+    def _load(self, workflow_id: str, *, register: bool = True) -> WorkflowState:
+        """载入工作流状态。
+
+        register=True（变更路径专用）时把磁盘态注册进进程内 _states，从而
+        参与项目互斥；register=False（只读路径：GET/SSE 存在校验/启动扫描）
+        时只返回状态、不武装互斥。门控态（awaiting_choice 等）按既定策略不
+        随进程重启恢复（见 recover_pending），若只读访问也把它们塞进 _states，
+        旧标签页 SSE 重连或启动扫描就会让早已无人审批的历史工作流永久堵死
+        同项目的新请求。显式 POST（choose/approve/interrupt/execute…）表示
+        用户确实要继续它，这些方法仍走 register=True。
+        """
         with self._lock:
             if workflow_id in self._states:
                 return self._states[workflow_id]
@@ -671,7 +776,12 @@ class GameWorkflowManager:
                 raise WorkflowError("工作流不存在：%s" % workflow_id)
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
+                legacy = "kind" not in raw
                 state = WorkflowState(**raw)
+                if legacy:
+                    # 领域画像引入前的历史工作流全部按游戏领域处理，保证旧
+                    # 状态恢复后选项/兜底文案与创建时一致，可继续 choose/plan。
+                    state.kind = "game"
             except Exception as exc:
                 raise WorkflowError("工作流状态损坏：%s" % type(exc).__name__) from exc
             if self._rebuild_context_layers(state):
@@ -701,8 +811,230 @@ class GameWorkflowManager:
                                     encoding="utf-8")
                 except OSError:
                     pass
-            self._states[workflow_id] = state
+            self._tag_event_seqs(state)
+            # 终态不参与互斥（_active_workflow_for 显式跳过），但必须缓存：
+            # 否则刷新后打开历史终态卡片时 SSE 的 is_terminal() 读不到它，
+            # 连接无法自关，退化为永久心跳连接。
+            if register or state.status in self._TERMINAL_STATUSES:
+                self._states[workflow_id] = state
             return state
+
+    def _tag_event_seqs(self, state: WorkflowState) -> None:
+        """给历史台账（无 seq 字段的旧事件）补齐单调序号，并推进全局游标。"""
+        advanced = False
+        for event in state.events:
+            if isinstance(event, Mapping) and not event.get("seq"):
+                self._event_seq += 1
+                event["seq"] = self._event_seq
+                advanced = True
+        if advanced:
+            self._event_seq = max(self._event_seq, len(state.events))
+
+    def subscribe(self, workflow_id: str, *, maxsize: int = 256) -> queue.Queue:
+        """注册一个 SSE 订阅队列（每连接独立，有界，满则丢最旧）。"""
+        q: queue.Queue = queue.Queue(maxsize=max(32, min(2048, int(maxsize))))
+        with self._lock:
+            self._subscribers.setdefault(workflow_id, set()).add(q)
+        return q
+
+    def unsubscribe(self, workflow_id: str, q: queue.Queue) -> None:
+        with self._lock:
+            subs = self._subscribers.get(workflow_id)
+            if not subs:
+                return
+            subs.discard(q)
+            if not subs:
+                self._subscribers.pop(workflow_id, None)
+
+    def events_since(self, workflow_id: str, after: int = 0):
+        """重放 seq 大于 after 的持久事件；返回 (events|None, latest_seq)。
+
+        工作流不在内存时返回 (None, seq)，由调用方决定 404 或安静关闭。
+        """
+        with self._lock:
+            state = self._states.get(workflow_id)
+            if state is None:
+                return None, self._event_seq
+            self._tag_event_seqs(state)
+            after = max(0, int(after or 0))
+            events = [dict(event) for event in state.events
+                      if isinstance(event, Mapping) and int(event.get("seq") or 0) > after]
+            return events, self._event_seq
+
+    def is_terminal(self, workflow_id: str) -> bool:
+        with self._lock:
+            state = self._states.get(workflow_id)
+            return bool(state and state.status in {"completed", "failed", "interrupted"})
+
+    def active_for_project(self, project_id: str = "", project_root: str = "") -> dict[str, Any] | None:
+        """同项目进程内未终结工作流的公开状态（与 start() 互斥判定同源）。
+
+        供前端在页面刷新/会话切换后发现「后端仍存活、本地卡片已丢失」的孤儿
+        工作流。刻意不扫描磁盘 JSON：进程重启后门控态不参与互斥（见 start()
+        与 recover_pending），若此处 _load 会把 awaiting_choice 重新注册进
+        _states，反而重新制造死锁，故可见性必须与互斥口径完全一致。
+        """
+        with self._lock:
+            state = self._active_workflow_for(project_id, project_root)
+            return state.public() if state is not None else None
+
+    _TERMINAL_STATUSES = frozenset({"completed", "failed", "interrupted"})
+
+    def list_workflows(self, project_id: str = "", project_root: str = "",
+                       limit: int = 50) -> list[dict[str, Any]]:
+        """列出项目相关的最近工作流摘要（只读扫盘）。
+
+        工作台「工作流历史」消费：运行中可中断、终态可删除。与
+        recover_pending 同原则——纯扫描绝不 register，避免把门控态塞进
+        _states 武装互斥。已在内存中的状态（含当前活跃工作流）优先取内存，
+        保证看到最新的 status/updated_at。
+        """
+        limit = max(1, min(int(limit or 50), 200))
+        want_pid = str(project_id or "").strip()
+        want_root = str(project_root or "").strip().rstrip("/\\")
+        with self._lock:
+            paths = list(self.state_root.glob("*.json")) if self.state_root.is_dir() else []
+        items: list[dict[str, Any]] = []
+        for path in paths:
+            wid = path.stem
+            try:
+                with self._lock:
+                    state = self._states.get(wid)
+                    raw: Mapping[str, Any] = state.public() if state is not None \
+                        else json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(raw, Mapping):
+                continue
+            raw_pid = str(raw.get("project_id") or "").strip()
+            raw_root = str(raw.get("project_root") or "").strip().rstrip("/\\")
+            if (want_pid or want_root) and not (
+                (want_pid and raw_pid == want_pid) or (want_root and raw_root == want_root)
+            ):
+                continue
+            tasks = raw.get("tasks")
+            tasks = tasks if isinstance(tasks, list) else []
+            done = sum(1 for t in tasks
+                       if isinstance(t, Mapping) and str(t.get("status") or "") == "done")
+            items.append({
+                "workflow_id": str(raw.get("workflow_id") or wid),
+                "project_id": raw_pid,
+                "project_root": raw_root,
+                "status": str(raw.get("status") or ""),
+                "phase": str(raw.get("phase") or ""),
+                "kind": str(raw.get("kind") or ""),
+                "request": str(raw.get("request") or ""),
+                "task_count": len(tasks),
+                "task_done": done,
+                "error": str(raw.get("error") or ""),
+                "interrupt_reason": str(raw.get("interrupt_reason") or ""),
+                "created_at": str(raw.get("created_at") or ""),
+                "updated_at": str(raw.get("updated_at") or ""),
+            })
+        items.sort(key=lambda x: x.get("updated_at") or x.get("created_at") or "", reverse=True)
+        return items[:limit]
+
+    def delete_workflow(self, workflow_id: str) -> dict[str, Any]:
+        """删除终态工作流：弹出内存态并清理磁盘 JSON。
+
+        非终态（仍在等待审批/执行）拒绝删除，必须先 interrupt，避免删掉一个
+        后台还在跑、之后无 UI 可触达的孤儿。
+        """
+        with self._lock:
+            path = self._path(workflow_id)
+            state = self._states.get(workflow_id)
+            if state is None and not path.is_file():
+                raise WorkflowError("工作流不存在：%s" % workflow_id)
+            status = state.status if state is not None else None
+            if state is None:
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                    status = str(raw.get("status") or "") if isinstance(raw, Mapping) else ""
+                except (OSError, ValueError):
+                    status = ""
+            if status not in self._TERMINAL_STATUSES:
+                raise WorkflowError(
+                    "只能删除已结束（completed/failed/interrupted）的工作流，"
+                    "运行中请先中断")
+            self._states.pop(workflow_id, None)
+            self._subscribers.pop(workflow_id, None)
+            self._option_generators.pop(workflow_id, None)
+            self._research_runners.pop(workflow_id, None)
+            self._task_generators.pop(workflow_id, None)
+            self._execution_callbacks.pop(workflow_id, None)
+            try:
+                path.unlink()
+            except OSError as exc:
+                raise WorkflowError("工作流文件删除失败：%s" % exc) from exc
+        return {"ok": True, "workflow_id": workflow_id}
+
+    def _active_workflow_for(self, project_id: str, project_root: str) -> WorkflowState | None:
+        """同一项目下尚未终结的工作流；调用方须持 self._lock。
+
+        两条生产启动路径都会解析出真实 project_root（project_id 为补充匹配）。
+        两者皆空（直接实例化的测试/离线调用）时不做互斥，保持单 manager
+        多目标的既有用法。
+        """
+        if not project_root and not project_id:
+            return None
+        for state in self._states.values():
+            if state.status in self._TERMINAL_STATUSES:
+                continue
+            if (project_root and state.project_root == project_root) or \
+               (project_id and state.project_id == project_id):
+                return state
+        return None
+
+    def record_agent_step(self, workflow_id: str, task_id: str, role: str,
+                          item: Mapping[str, Any]) -> None:
+        """记录一条子代理实时轨迹（thought/action/observation）。
+
+        只进内存有界环 + 订阅 fan-out，不写持久台账（避免每步落盘/JSON 膨胀）；
+        持久与迟到补全由 subagent_complete 携带的 trace 负责。任何异常不得
+        影响子代理执行——本方法自身也不抛出。
+        """
+        step_type = str((item or {}).get("type") or "")
+        if step_type not in {"thought", "action", "observation"}:
+            return
+        text = _clean_text((item or {}).get("text") or "", 1200)
+        try:
+            with self._lock:
+                state = self._states.get(workflow_id)
+                if state is None:
+                    return
+                self._event_seq += 1
+                seq = self._event_seq
+                rings = self._step_rings.setdefault(workflow_id, {})
+                ring = rings.get(str(task_id))
+                if ring is None:
+                    ring = deque(maxlen=self._step_ring_max)
+                    rings[str(task_id)] = ring
+                ring.append({"seq": seq, "type": step_type, "text": text,
+                             "ts": _now()})
+                event = {"seq": seq, "ts": _now(), "kind": "subagent_step",
+                         "task_id": str(task_id or "")[:80],
+                         "role": str(role or "")[:60],
+                         "step_type": step_type, "text": text}
+                self._fanout_locked(workflow_id, event)
+        except Exception:
+            pass
+
+    def agent_steps(self, workflow_id: str) -> dict[str, list[dict[str, Any]]]:
+        with self._lock:
+            return {task_id: list(ring)
+                    for task_id, ring in (self._step_rings.get(workflow_id) or {}).items()}
+
+    def _fanout_locked(self, workflow_id: str, event: Mapping[str, Any]) -> None:
+        """非阻塞投递给所有订阅者；队列满则丢最旧，执行线程永不等待。"""
+        for q in list(self._subscribers.get(workflow_id, ())):
+            try:
+                q.put_nowait(event)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(event)
+                except Exception:
+                    pass
 
     @staticmethod
     def _rebuild_context_layers(state: WorkflowState) -> bool:
@@ -779,14 +1111,17 @@ class GameWorkflowManager:
         # event ledger so live UI polling and durable snapshots never observe
         # a torn list or lose an event during a parallel wave.
         with self._lock:
-            state.events.append({"ts": _now(), "kind": kind, **payload})
+            self._event_seq += 1
+            event = {"seq": self._event_seq, "ts": _now(), "kind": kind, **payload}
+            state.events.append(event)
             state.events = state.events[-100:]
             telemetry = dict(state.observability or {})
             now_epoch = time.time()
             telemetry.setdefault("started_epoch", now_epoch)
             for counter in ("events", "subagents_started", "subagents_completed",
                             "tool_events", "mcp_events", "failures", "elapsed_ms",
-                            "prompt_tokens", "completion_tokens", "total_tokens"):
+                            "prompt_tokens", "completion_tokens", "total_tokens",
+                            "subagent_tool_steps"):
                 telemetry.setdefault(counter, 0)
             telemetry["last_event_at"] = _now()
             telemetry["events"] = int(telemetry.get("events", 0)) + 1
@@ -796,6 +1131,20 @@ class GameWorkflowManager:
             # worker's ``subagent_complete`` event; count the worker event once.
             if kind == "subagent_complete":
                 telemetry["subagents_completed"] = int(telemetry.get("subagents_completed", 0)) + 1
+                # 子代理实际消耗的工具步数按任务归并（重试/重规划后同 id 以最近一次为准，
+                # 不重复累计），实时供 GET 状态展示；execute 收尾会再用最终结果校准一次。
+                by_task = telemetry.get("subagent_steps_by_task")
+                if not isinstance(by_task, dict):
+                    by_task = {}
+                task_key = str(payload.get("task_id") or "")
+                if task_key:
+                    try:
+                        by_task[task_key] = max(0, int(payload.get("steps") or 0))
+                    except (TypeError, ValueError):
+                        by_task[task_key] = 0
+                    telemetry["subagent_steps_by_task"] = by_task
+                    telemetry["subagent_tool_steps"] = int(
+                        sum(int(v or 0) for v in by_task.values()))
             if kind in {"before_tool", "after_tool", "tool_call"}:
                 telemetry["tool_events"] = int(telemetry.get("tool_events", 0)) + 1
             if kind in {"before_mcp", "after_mcp", "mcp_retry", "mcp_call"}:
@@ -824,6 +1173,11 @@ class GameWorkflowManager:
                         state.langsmith_trace.get("event_count", 0)) + 1
             except Exception:
                 pass
+            # SSE 实时 fan-out（最后做：此时事件已落台账，重放/实时两路顺序一致）
+            self._fanout_locked(state.workflow_id, event)
+            if state.status in {"completed", "failed", "interrupted"}:
+                # 终态后实时环不再需要（完整 trace 已随 subagent_complete 落台账）
+                self._step_rings.pop(state.workflow_id, None)
 
     def _workflow_hook(self, state: WorkflowState, kind: str, **payload: Any) -> None:
         """Run a lifecycle hook with the workflow's explicit failure policy."""
@@ -867,6 +1221,7 @@ class GameWorkflowManager:
     def _graph_payload(self, state: WorkflowState, **updates: Any) -> WorkflowGraphState:
         payload: WorkflowGraphState = {
             "workflow_id": state.workflow_id,
+            "kind": normalize_kind(state.kind),
             "request": state.request,
             "sources": list(state.sources),
             "options": list(state.options),
@@ -879,7 +1234,8 @@ class GameWorkflowManager:
             "results": dict(state.results.get("results") or {}) if state.results else {},
             "step_count": int(state.graph_state.get("step_count", state.steps or 0)),
             "replan_count": int(state.graph_state.get("replan_count", state.replans or 0)),
-            "max_steps": int((state.policy or {}).get("max_steps", 24)),
+            "max_steps": int((state.policy or {}).get(
+                "max_steps", workflow_step_limits()[0])),
             "max_replans": int((state.policy or {}).get("max_replans", 2)),
             "max_subagents": int((state.policy or {}).get("max_subagents", 4)),
             "max_context_chars": int((state.policy or {}).get("max_context_chars", 6000)),
@@ -945,7 +1301,7 @@ class GameWorkflowManager:
 
     def start(self, request: str, *, project_id: str = "", project_root: str = "",
               web_enabled: bool = False, experience_enabled: bool = False,
-              llm_enabled: bool = True,
+              llm_enabled: bool = True, kind: str | None = None,
               skill_items: Iterable[dict[str, Any]] = (),
               policy: WorkflowPolicy | None = None,
               option_generator: Callable[[str, ContextPlan], Any] | None = None,
@@ -955,11 +1311,30 @@ class GameWorkflowManager:
         request = _clean_text(request, 12000)
         if not request:
             raise WorkflowError("开发目标不能为空")
+        # 同一项目同时只允许一个未终结的工作流：HTTP 显式启动与对话内
+        # start_workflow 工具共用本入口，否则会出现多个人工审批门叠加、多组
+        # 子代理并发修改同一代码库，且其中一个卡片切走后审批永久失联。
+        with self._lock:
+            existing = self._active_workflow_for(project_id, project_root)
+        if existing is not None:
+            raise WorkflowError(
+                "该项目已有进行中的工作流（ID：%s，状态：%s）。请先在对话中完成它的"
+                "审批/执行或中断后，再启动新的工作流。"
+                % (existing.workflow_id, existing.status))
+        # 记录调用方是否显式指定步数预算（默认值与自动下限不可区分，视为未指定）；
+        # 规划时显式低值也必须尊重，不能被自动预算覆盖。
+        steps_lo, _steps_hi = workflow_step_limits()
+        steps_explicit = (policy is not None
+                          and int(getattr(policy, "max_steps", steps_lo) or steps_lo)
+                          != steps_lo)
         policy = (policy or WorkflowPolicy()).normalized()
+        kind = normalize_kind(kind)
+        profile = get_profile(kind)
         plan = self.router.route(request, code_root=project_root, web_enabled=web_enabled,
                                  experience_enabled=experience_enabled,
                                  skill_items=skill_items, token_budget=policy.max_context_chars)
-        options = self._options(request, plan)
+        options = [WorkflowOption(**row) for row in
+                   profile.option_dicts(request, plan.sources)]
         option_source = "deterministic"
         # With LangGraph available, option generation is performed by the
         # choice node and checkpointed alongside the first human gate.  Keep a
@@ -977,6 +1352,7 @@ class GameWorkflowManager:
         wid = "wf-" + uuid.uuid4().hex[:12]
         state = WorkflowState(
             workflow_id=wid, project_id=project_id, project_root=project_root,
+            kind=kind,
             request=request, sources=list(plan.sources), route_messages=list(plan.messages),
             options=[asdict(item) for item in options], policy=asdict(policy),
             experience_enabled=bool(experience_enabled),
@@ -987,6 +1363,7 @@ class GameWorkflowManager:
                             "budgets": allocate_layer_budgets(policy.max_context_chars),
                             "schema": "five-layer-v1"},
             created_at=_now(), updated_at=_now())
+        state.policy["step_budget_explicit"] = bool(steps_explicit)
         defer_options = bool(defer_option_generation and llm_enabled and option_generator is not None
                              and StateGraph is not None and graph_interrupt is not None)
         if defer_options:
@@ -1060,21 +1437,15 @@ class GameWorkflowManager:
 
     @staticmethod
     def _options(request: str, plan: ContextPlan) -> list[WorkflowOption]:
-        lower = request.lower()
-        game_kind = "2D" if any(x in lower for x in ("2d", "横版", "像素", "俯视")) else "3D"
-        first = WorkflowOption("recommended", f"按 {game_kind} 游戏原型推进",
-                               "先建立最小可运行原型，再按验证结果迭代。", True,
-                               "、".join(plan.sources))
-        second = WorkflowOption("design_first", "先完成设计与技术方案",
-                                "先拆玩法、场景、数据和验证标准，再开始改文件。", False, "local")
-        options = [first, second]
-        if "web" not in plan.sources:
-            options.append(WorkflowOption("web_research", "联网补充资料后再选",
-                                           "搜索引擎/插件/最新资料，再重新生成方案选项。",
-                                           False, "web", True))
-        options.append(WorkflowOption("custom", "我自己描述目标",
-                                      "由用户补充更具体的效果、限制或参考作品。", False, "user"))
-        return options
+        """历史兼容入口：等价于 game 画像（改造前逐字段行为）。"""
+        return [WorkflowOption(**row) for row in
+                get_profile("game").option_dicts(request, plan.sources)]
+
+    @staticmethod
+    def _profile_options(kind: str, request: str,
+                         sources: Iterable[str]) -> list[WorkflowOption]:
+        return [WorkflowOption(**row) for row in
+                get_profile(kind).option_dicts(request, tuple(sources or ()))]
 
     @staticmethod
     def _parse_generated_options(raw: Any, plan: ContextPlan) -> list[WorkflowOption]:
@@ -1157,9 +1528,8 @@ class GameWorkflowManager:
                 raise WorkflowError("自定义方案需要补充描述")
             state.request = custom_request
             state.status, state.phase = "awaiting_choice", "clarify"
-            state.options = [asdict(item) for item in self._options(custom_request, ContextPlan(
-                sources=("direct",), tool_groups=frozenset({"general", "orchestration"}),
-                skill_names=(), messages=(), budget_chars=800, used_chars=0))]
+            state.options = [asdict(item) for item in self._profile_options(
+                state.kind, custom_request, ("direct",))]
             self._resume_gate(state, "choice", {
                 "choice": choice, "request": custom_request, "options": state.options,
             })
@@ -1208,7 +1578,8 @@ class GameWorkflowManager:
             skill_names=(), messages=("【外部检索摘要】" + findings,),
             budget_chars=800, used_chars=min(800, len(findings)),
         )
-        options = self._options(state.request + "\n" + findings, research_plan)
+        options = self._profile_options(
+            state.kind, state.request + "\n" + findings, research_plan.sources)
         option_source = "deterministic"
         if state.llm_enabled and option_generator is not None:
             try:
@@ -1235,6 +1606,8 @@ class GameWorkflowManager:
         auditable task contract is retained; malformed/ambiguous graphs return
         an empty list so callers can use the deterministic fallback.
         """
+        from orchestrator import _strict_int_steps
+
         if isinstance(raw, str):
             text = raw.strip()
             if text.startswith("```"):
@@ -1284,6 +1657,11 @@ class GameWorkflowManager:
                     else:
                         value = _clean_text(value, 300)
                     task[key] = value
+            # 逐任务加步申请：只接受 1..12 的非布尔整数（上界与子代理硬顶同源）。
+            # 布尔/10.7 浮点/非数字串/越界值直接丢弃该字段，回退子代理默认步数。
+            steps_value = _strict_int_steps(item.get("max_steps"))
+            if steps_value is not None and 1 <= steps_value <= 12:
+                task["max_steps"] = steps_value
             out.append(task)
         if not out:
             return []
@@ -1319,6 +1697,7 @@ class GameWorkflowManager:
                 "tools": [str(item)[:80] for item in list(tools)[:16]],
                 "mcp": str(task.get("mcp") or "auto"),
                 "reflection": bool(task.get("reflection", True)),
+                "max_steps": task.get("max_steps"),
                 "status": "pending",
             })
         return rows
@@ -1332,7 +1711,7 @@ class GameWorkflowManager:
             return state.public()
         if state.status not in {"planning", "planned", "awaiting_approval", "interrupted"}:
             raise WorkflowError("当前工作流不能规划：%s" % state.status)
-        policy = WorkflowPolicy(**state.policy).normalized()
+        policy = WorkflowPolicy.from_state(state.policy)
         if task_generator is not None:
             self._task_generators[workflow_id] = task_generator
         task_source = "provided"
@@ -1354,15 +1733,26 @@ class GameWorkflowManager:
                 self._event(state, "plan_generation_failed", error=type(exc).__name__)
         if tasks is None:
             task_source = "deterministic"
-            tasks = [
-                {"id": "design", "role": "designer", "task": "明确玩法、场景、输入和验收标准", "depends_on": []},
-                {"id": "prototype", "role": "coder", "task": "创建最小可运行游戏原型", "depends_on": ["design"]},
-                {"id": "verify", "role": "tester", "task": "执行自测、Playtest 并反馈失败证据", "depends_on": ["prototype"]},
-            ]
+            tasks = get_profile(state.kind).fallback_tasks()
         state.tasks = [dict(t) for t in list(tasks)[:policy.max_subagents]]
+        # 步数预算随任务规模放大（几个 Agent 并行调工具，总调用次数成倍增加）：
+        # 调用方显式给过 max_steps（含低于自动下限的低值）时尊重显式值；
+        # 否则按 n*子代理默认+4 自动推算并夹在配置区间内。
+        _plan_lo, plan_hi = workflow_step_limits()
+        base_max_steps = max(1, min(plan_hi,
+                                    int((state.policy or {}).get("max_steps", _plan_lo))))
+        if (state.policy or {}).get("step_budget_explicit"):
+            effective_steps, budget_source = base_max_steps, "explicit"
+        else:
+            effective_steps = effective_workflow_max_steps(len(state.tasks))
+            budget_source = "auto"
+            state.policy["max_steps"] = effective_steps
         state.subagents = self._subagent_records(state.tasks)
         state.context_layers["task"] = {"count": len(state.tasks),
                                         "ids": [t.get("id") for t in state.tasks]}
+        state.context_layers["step_budget"] = {
+            "effective_max_steps": effective_steps, "source": budget_source,
+            "task_count": len(state.tasks)}
         state.status, state.phase = "planned", "execute"
         # The plan gate is a real LangGraph interrupt.  Resume it after the
         # manager has validated the task DAG so the durable graph owns the
@@ -1370,6 +1760,7 @@ class GameWorkflowManager:
         if StateGraph is not None and graph_interrupt is not None:
             self._resume_gate(state, "plan", {"tasks": state.tasks, "source": task_source})
         self._event(state, "plan", task_count=len(state.tasks), max_subagents=policy.max_subagents,
+                    max_steps=effective_steps, step_budget_source=budget_source,
                     task_source=task_source)
         return self._save(state).public()
 
@@ -1463,6 +1854,7 @@ class GameWorkflowManager:
                 "persona": _clean_text(task.get("persona") or "", 240),
                 "tools": list(task.get("tools") or [])[:16],
                 "mcp": str(task.get("mcp") or "auto"),
+                "max_steps": task.get("max_steps"),
                 "reflection_required": bool(task.get("reflection", True)),
                 "context_keys": list(context)[:16],
                 "context_chars": sum(len(str(value)) for value in context.values()),
@@ -1486,14 +1878,24 @@ class GameWorkflowManager:
             if task.get("_context_compression") is not None:
                 output["context_compression"] = dict(task.get("_context_compression") or {})
             output["elapsed_ms"] = int((time.monotonic() - began) * 1000)
+            # trace 为 _child_trace 产出的有界结构（≤6 步 action+obs 摘要、
+            # 少量 thoughts/reflections、用量），供 UI 在子代理完成后补全全过程。
+            complete_trace = output.get("trace")
+            if not isinstance(complete_trace, Mapping):
+                complete_trace = {}
             emit("subagent_complete", {
                 "task_id": task_id,
                 "role": str(task.get("role") or "coder")[:60],
+                "task": str(output.get("task") or task.get("task") or "")[:1200],
                 "status": str(output.get("status") or "unknown"),
                 "steps": int(output.get("steps") or 0),
+                "max_steps": int(output.get("max_steps") or 0),
                 "elapsed_ms": int(output.get("elapsed_ms") or 0),
+                "conclusion": _clean_text(output.get("conclusion") or "", 1600),
+                "error": _clean_text(output.get("error") or "", 400),
                 "reflection": dict(output.get("reflection") or {}),
                 "context_compression": dict(output.get("context_compression") or {}),
+                "trace": dict(complete_trace),
                 "task_thread": str(fanout_state.get("task_thread") or ""),
             })
             return {"task_results": {str(task.get("id")): output}}
@@ -1707,7 +2109,7 @@ class GameWorkflowManager:
             previous_status = str(previous.get("status") or "pending")
             if previous_status not in {"failed", "blocked"}:
                 raise WorkflowError("只有失败或阻塞的 Subagent 才能单独重试：%s" % task_id)
-            policy = WorkflowPolicy(**(state.policy or {})).normalized()
+            policy = WorkflowPolicy.from_state(state.policy)
             retries = dict(state.subagent_retries or {})
             attempt = int(retries.get(task_id, 0)) + 1
             if attempt > policy.max_subagent_retries:
@@ -1818,7 +2220,7 @@ class GameWorkflowManager:
         state = self._load(workflow_id)
         if state.status != "planned":
             raise WorkflowError("当前工作流不能执行：%s" % state.status)
-        policy = WorkflowPolicy(**state.policy).normalized()
+        policy = WorkflowPolicy.from_state(state.policy)
         # Keep callbacks process-local.  They may close over an Agent and are
         # deliberately never persisted; after a restart the configured
         # resolver rebuilds them from the durable session identifier.
@@ -1859,6 +2261,7 @@ class GameWorkflowManager:
                             "tools": [str(item)[:80] for item in list(payload.get("tools") or [])[:16]],
                             "mcp": str(payload.get("mcp") or "auto"),
                             "reflection": bool(payload.get("reflection_required", True)),
+                            "max_steps": payload.get("max_steps"),
                             "status": "pending",
                         }
                         state.subagents.append(row)
@@ -1881,6 +2284,8 @@ class GameWorkflowManager:
                             row["status"] = payload.get("status") or ("blocked" if kind == "task_blocked" else row.get("status"))
                             if payload.get("steps") is not None:
                                 row["steps"] = payload.get("steps")
+                            if payload.get("max_steps"):
+                                row["max_steps"] = payload.get("max_steps")
                             if payload.get("elapsed_ms") is not None:
                                 row["elapsed_ms"] = payload.get("elapsed_ms")
                             if payload.get("reason"):
@@ -2006,12 +2411,21 @@ class GameWorkflowManager:
             result = dict(result_map.get(str(row.get("id"))) or {})
             row["status"] = result.get("status", row.get("status"))
             row["steps"] = int(result.get("steps") or 0)
+            if result.get("max_steps"):
+                row["max_steps"] = int(result.get("max_steps") or 0) or row.get("max_steps")
             row["elapsed_ms"] = int(result.get("elapsed_ms") or 0)
             if result.get("error"):
                 row["error"] = _clean_text(result.get("error"), 300)
             if result.get("reflection"):
                 row["reflection_result"] = dict(result.get("reflection") or {})
         state.subagents = subagent_rows
+        # 用最终结果校准子代理工具步数总量（事件流按任务归并已是同值，这里防止
+        # 非 LangGraph 回退路径或事件丢失导致的偏差），GET 状态直接可读。
+        observability = dict(state.observability or {})
+        observability["subagent_tool_steps"] = int(sum(
+            max(0, int((item or {}).get("steps") or 0))
+            for item in result_map.values()))
+        state.observability = observability
         merged = report.get("merged") or "\n".join(
             str((item or {}).get("conclusion") or "")
             for item in result_map.values())
@@ -2041,7 +2455,7 @@ class GameWorkflowManager:
                 outcome = "success" if state.status == "completed" else "repeated-fail"
                 recorded = record_episode(
                     state.project_id or "default",
-                    "游戏工作流：" + state.request,
+                    get_profile(state.kind).experience_title + state.request,
                     "方案=%s；重规划=%s；复核=%s" % (
                         (state.selected_option or {}).get("id", "未选择"),
                         state.replans, state.review.get("ok", False)),
@@ -2052,18 +2466,17 @@ class GameWorkflowManager:
         if state.status == "completed" and state.experience_enabled and not state.skill_candidate:
             from .workflow_eval import evaluate_workflow
             skill_evaluation = evaluate_workflow(state.public())
+            profile = get_profile(state.kind)
             option_id = str((state.selected_option or {}).get("id") or "workflow")
             slug = re.sub(r"[^A-Za-z0-9_-]+", "-", option_id).strip("-") or "workflow"
             state.skill_candidate = {
                 "id": "skill-candidate-" + uuid.uuid4().hex[:12],
-                "name": "game-workflow-" + slug,
-                "description": "经用户审批后可复用的游戏开发工作流：" + _clean_text(
+                "name": profile.skill_name_prefix + slug,
+                "description": profile.skill_description_prefix + _clean_text(
                     (state.selected_option or {}).get("title") or "原型开发与验证", 120),
-                "body": "# 游戏开发工作流\n\n"
-                        "适用于：先澄清目标与方案，再拆分设计、实现和验证任务；\n"
-                        "执行前经过审批，失败后依据复核结果重规划。\n\n"
-                        "## 脱敏流程摘要\n\n"
-                        "- 任务数：%s\n- 重规划次数：%s\n- 复核通过：是\n" % (
+                "body": profile.skill_body
+                        + "\n## 脱敏流程摘要\n\n"
+                        + "- 任务数：%s\n- 重规划次数：%s\n- 复核通过：是\n" % (
                             len(state.tasks), state.replans),
                 "evaluation": {"passed": bool(skill_evaluation.get("passed")),
                                 "score": skill_evaluation.get("score"),
@@ -2141,7 +2554,7 @@ class GameWorkflowManager:
         state = self._load(workflow_id)
         if state.status not in {"planned", "awaiting_approval", "executing", "interrupted"}:
             raise WorkflowError("当前工作流不能修改任务 DAG：%s" % state.status)
-        policy = WorkflowPolicy(**state.policy).normalized()
+        policy = WorkflowPolicy.from_state(state.policy)
         parsed = self._parse_generated_tasks(list(tasks or []), max_tasks=policy.max_subagents)
         if not parsed:
             raise WorkflowError("新的任务 DAG 无效：请检查唯一 id、依赖和环")
@@ -2180,7 +2593,9 @@ class GameWorkflowManager:
         return self._save(state).public()
 
     def get(self, workflow_id: str) -> dict[str, Any]:
-        return self._load(workflow_id).public()
+        # 只读通道（GET 详情、SSE 建连校验、skill-candidate/evaluation）：
+        # 不得把磁盘门控态武装进互斥；终态仍会在 _load 内缓存以便 SSE 自关。
+        return self._load(workflow_id, register=False).public()
 
     def evaluate(self, workflow_id: str) -> dict[str, Any]:
         from .workflow_eval import evaluate_workflow
@@ -2371,8 +2786,10 @@ class GameWorkflowManager:
                 skill_names=(), messages=(("【外部检索摘要】" + findings,) if findings else ()),
                 budget_chars=800, used_chars=min(800, len(findings)),
             )
-            options = [asdict(item) for item in self._options(
-                str(state.get("request", "")) + ("\n" + findings if findings else ""), research_plan)]
+            options = [asdict(item) for item in self._profile_options(
+                state.get("kind") or DEFAULT_KIND,
+                str(state.get("request", "")) + ("\n" + findings if findings else ""),
+                research_plan.sources)]
             option_source = "deterministic"
             if findings and option_generator is not None:
                 attempts = 1 + max(0, int(state.get("max_provider_retries", 2)))
@@ -2416,8 +2833,9 @@ class GameWorkflowManager:
                 skill_names=(), messages=("【外部检索摘要】" + findings,),
                 budget_chars=800, used_chars=min(800, len(findings)),
             )
-            options = [asdict(item) for item in self._options(
-                str(state.get("request", "")) + "\n" + findings, plan)]
+            options = [asdict(item) for item in self._profile_options(
+                state.get("kind") or DEFAULT_KIND,
+                str(state.get("request", "")) + "\n" + findings, plan.sources)]
             option_source = "deterministic"
             error = ""
             provider_attempts: list[dict[str, Any]] = []
@@ -2532,14 +2950,8 @@ class GameWorkflowManager:
                         # An invalid model plan is recoverable inside the
                         # graph.  Keep the same deterministic contract used
                         # by the native manager and continue to approval.
-                        tasks = [
-                            {"id": "design", "role": "designer",
-                             "task": "明确玩法、场景、输入和验收标准", "depends_on": []},
-                            {"id": "prototype", "role": "coder",
-                             "task": "创建最小可运行游戏原型", "depends_on": ["design"]},
-                            {"id": "verify", "role": "tester",
-                             "task": "执行自测、Playtest 并反馈失败证据", "depends_on": ["prototype"]},
-                        ]
+                        tasks = get_profile(
+                            state.get("kind") or DEFAULT_KIND).fallback_tasks()
                         source = "deterministic"
                     else:
                         response = graph_interrupt({
@@ -2588,7 +3000,7 @@ class GameWorkflowManager:
                 steps = int(state.get("step_count", 0)) + 1
                 return {"phase": "review", "status": "reviewing", "event": "execute_wave",
                         "step_count": steps}
-            remaining = max(0, int(state.get("max_steps", 24)) - int(state.get("step_count", 0)))
+            remaining = max(0, int(state.get("max_steps", workflow_step_limits()[0])) - int(state.get("step_count", 0)))
             report = dict(provider_call(
                 state, "execute.wave", lambda: execute_wave(
                     list(state.get("tasks") or []),
@@ -2617,7 +3029,7 @@ class GameWorkflowManager:
                             "review": {"ok": True}}
                 failed = list(state.get("failed_tasks") or [])
                 if replan is not None and failed and int(state.get("replan_count", 0)) < int(state.get("max_replans", 2)) \
-                        and int(state.get("step_count", 0)) < int(state.get("max_steps", 24)):
+                        and int(state.get("step_count", 0)) < int(state.get("max_steps", workflow_step_limits()[0])):
                     return {"phase": "review", "status": "replanning", "event": "review_replan",
                             "review": {"ok": False}}
                 return {"phase": "review", "status": "failed", "event": "review_failed",
@@ -2627,7 +3039,7 @@ class GameWorkflowManager:
             failed = list(state.get("failed_tasks") or [])
             if review.get("ok") is False or failed:
                 max_replans = int(state.get("max_replans", 2))
-                max_steps = int(state.get("max_steps", 24))
+                max_steps = int(state.get("max_steps", workflow_step_limits()[0]))
                 if failed and int(state.get("replan_count", 0)) < max_replans \
                         and int(state.get("step_count", 0)) < max_steps:
                     return {"phase": "review", "status": "replanning", "event": "review_replan"}

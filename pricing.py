@@ -2,6 +2,9 @@
 
 - **单价表**：优先读 `<STATE_ROOT>/.docmind_pricing.json`（可随项目覆盖），缺省用内置表。
   单位：**元 / 1M tokens**。本地 provider（ollama / llamacpp / mock）默认 0（不产生 API 费用）。
+- **Prompt caching 折扣**：单价表每项含 `cache_read`（缓存命中读）/ `cache_creation`（首次写入）
+  单价，缺省按输入价的 1/10、1.25 倍推导。`cost_cny` 对 `in_tokens` 中的缓存命中部分按折扣价
+  计费并从全价输入中扣减，避免缓存命中被按全价高估（修复"计费没考虑缓存命中"）。
 - **预算熔断**：按「全局 + 每会话」累计花费，落 `<STATE_ROOT>/.docmind_budget.json`。
   单轮开始前 `check()` —— 已超限则直接拒绝该轮；单轮结束后 `charge()` 累计。
   离线工具/演示模式下费用恒为 0，熔断不会误伤。
@@ -20,18 +23,25 @@ PRICING_FILE = state_path("DOCMIND_PRICING_FILE", os.path.join(STATE_ROOT, ".doc
 BUDGET_FILE = state_path("DOCMIND_BUDGET_FILE", os.path.join(STATE_ROOT, ".docmind_budget.json"))
 
 # 内置单价（元 / 1M tokens）。仅为量级参考，正式使用请用 .docmind_pricing.json 覆盖。
+# cache_read / cache_creation 为 prompt caching 的命中读 / 首次写入单价；缺省时按
+# CACHE_READ_RATIO / CACHE_CREATION_RATIO 从输入价推导（行业惯例：缓存读≈输入 1/10，
+# 写入≈输入 1.25 倍）。这正是"计费没考虑缓存命中"的根因修复点。
 DEFAULT_PRICING = {
-    "qwen": {"in": 0.8, "out": 2.0,
+    "qwen": {"in": 0.8, "out": 2.0, "cache_read": 0.08, "cache_creation": 1.0,
              "models": {"qwen-plus": {"in": 0.8, "out": 2.0},
                         "qwen-turbo": {"in": 0.3, "out": 0.6},
                         "qwen-max": {"in": 2.4, "out": 9.6}}},
-    "deepseek": {"in": 1.0, "out": 2.0,
+    "deepseek": {"in": 1.0, "out": 2.0, "cache_read": 0.1, "cache_creation": 1.25,
                  "models": {"deepseek-chat": {"in": 1.0, "out": 2.0},
                             "deepseek-reasoner": {"in": 4.0, "out": 16.0}}},
     "ollama": {"in": 0.0, "out": 0.0},
     "llamacpp": {"in": 0.0, "out": 0.0},
     "mock": {"in": 0.0, "out": 0.0},
 }
+
+# Prompt caching 折扣比（行业惯例）。各 provider 亦可在 .docmind_pricing.json 显式覆盖。
+CACHE_READ_RATIO = 0.1
+CACHE_CREATION_RATIO = 1.25
 
 
 def _minute_key() -> str:
@@ -126,23 +136,50 @@ def _load_pricing() -> dict:
     return data
 
 
-def price_for(provider, model=""):
-    """返回 (in_price, out_price)，单位元 / 1M tokens。"""
+def price_detail(provider, model=""):
+    """返回 (in_price, out_price, cache_read_price, cache_creation_price)，单位元 / 1M tokens。
+
+    cache_read / cache_creation 缺失时按 CACHE_READ_RATIO / CACHE_CREATION_RATIO 从输入价
+    推导；本地 provider 恒为 0。各 provider 可在 .docmind_pricing.json 显式覆盖。
+    """
     table = _load_pricing()
     cfg = table.get(provider) or {}
     models = cfg.get("models") or {}
-    if model and isinstance(models.get(model), dict):
-        m = models[model]
-        return float(m.get("in", cfg.get("in", 0.0))), float(m.get("out", cfg.get("out", 0.0)))
-    return float(cfg.get("in", 0.0)), float(cfg.get("out", 0.0))
+    base = models.get(model) if (model and isinstance(models.get(model), dict)) else cfg
+    pin = float(base.get("in", cfg.get("in", 0.0)))
+    pout = float(base.get("out", cfg.get("out", 0.0)))
+    pcr = float(base.get("cache_read", cfg.get("cache_read", pin * CACHE_READ_RATIO)))
+    pcc = float(base.get("cache_creation", cfg.get("cache_creation", pin * CACHE_CREATION_RATIO)))
+    return pin, pout, pcr, pcc
 
 
-def cost_cny(provider, model, in_tokens, out_tokens) -> float:
-    """一次调用的费用（元）。本地 provider 恒为 0。"""
-    pin, pout = price_for(provider, model)
-    if pin == 0.0 and pout == 0.0:
+def price_for(provider, model=""):
+    """返回 (in_price, out_price)，单位元 / 1M tokens（向后兼容）。"""
+    pin, pout, _, _ = price_detail(provider, model)
+    return pin, pout
+
+
+def cost_cny(provider, model, in_tokens, out_tokens,
+             cache_read_tokens=0, cache_creation_tokens=0) -> float:
+    """一次调用的费用（元）。本地 provider 恒为 0。
+
+    in_tokens / out_tokens 为总输入 / 输出 token；prompt caching 命中（cache_read_tokens）
+    与首次写入（cache_creation_tokens）通常已计入 in_tokens，故按折扣价单独计费、并从全价
+    输入中扣减，避免缓存命中被按全价重复计费（这正是运行台"计费没考虑缓存命中"的根因）。
+    """
+    pin, pout, pcr, pcc = price_detail(provider, model)
+    if pin == 0.0 and pout == 0.0 and pcr == 0.0 and pcc == 0.0:
         return 0.0
-    return (int(in_tokens or 0) * pin + int(out_tokens or 0) * pout) / 1_000_000.0
+    in_t = int(in_tokens or 0)
+    cr_t = int(cache_read_tokens or 0)
+    cc_t = int(cache_creation_tokens or 0)
+    # 非缓存输入 = 总输入 - 缓存命中 - 缓存写入（下限 0，防 provider 口径差异致负数）
+    non_cached = max(0, in_t - cr_t - cc_t)
+    total = (non_cached * pin
+             + cr_t * pcr
+             + cc_t * pcc
+             + int(out_tokens or 0) * pout)
+    return total / 1_000_000.0
 
 
 # ---------------------------------------------------------------------------

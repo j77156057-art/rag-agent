@@ -118,11 +118,14 @@ class ToolSpec(Mapping[str, Any]):
 _NETWORK_TOOLS = {
     "web_search", "web_fetch", "web_research", "web_subtitles",
     "dev_http_request", "dev_mcp_call", "dev_list_connector_tools",
+    "dev_mcp_probe", "dev_mcp_discover",
 }
 _EXEC_TOOLS = {"python_exec", "run_command", "game_playtest", "self_verify"}
 _ADMIN_TOOLS = {
     "dev_approve", "dev_commit", "dev_commit_all", "dev_rollback_changeset",
     "dev_apply_regions", "dev_add_region", "init_regions", "dev_install_tool",
+    "dev_mcp_add", "dev_mcp_decide", "dev_mcp_remove",
+    "start_workflow",
 }
 _WRITE_TOOLS = {
     "apply_edit", "create_file", "create_artifact", "dev_region_edit",

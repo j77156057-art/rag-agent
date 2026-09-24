@@ -6,6 +6,7 @@
 // 会话分组、数值指标曲线、导出 JSON，以及点击事件跳到对应代码行。
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { runtimeApi } from '../api'
+import { createPoller } from '../composables/polling'
 import type { RuntimeSession } from '../api'
 
 const emit = defineEmits<{ (e: 'open-file', rel: string, line?: number): void }>()
@@ -78,11 +79,8 @@ async function refresh() {
   }
 }
 
-let timer: number | undefined
-function syncTimer() {
-  if (timer) { window.clearInterval(timer); timer = undefined }
-  if (autoRefresh.value) timer = window.setInterval(refresh, 2500)
-}
+// 自动刷新：勾选后才轮询，页面切后台自动暂停（旧实现切后台仍恒定 2.5s 请求）
+const timelinePoller = createPoller(refresh, 2500, { active: autoRefresh })
 
 async function clearAll() {
   if (!window.confirm('清空全部运行时事件（含已抓取的引擎日志）？此操作不可撤销。')) return
@@ -98,8 +96,8 @@ async function clearAll() {
   }
 }
 
-onMounted(() => { void refresh() })
-onUnmounted(() => { if (timer) window.clearInterval(timer) })
+onMounted(() => { void refresh(); timelinePoller.start() })
+onUnmounted(() => { timelinePoller.stop() })
 
 /* ------------------------------------------------------------------ 派生 */
 const typeCounts = computed(() => {
@@ -257,7 +255,7 @@ function exportJson() {
 <template>
   <div class="rt-wrap">
     <div class="rt-bar">
-      <label class="rt-check"><input v-model="autoRefresh" type="checkbox" @change="syncTimer" />自动刷新</label>
+      <label class="rt-check"><input v-model="autoRefresh" type="checkbox" />自动刷新</label>
       <button class="rt-btn" :disabled="loading" @click="refresh">{{ loading ? '刷新中…' : '刷新' }}</button>
       <span class="rt-sep" />
       <input v-model="keyword" class="rt-input" placeholder="关键字（类型/数据）" />
