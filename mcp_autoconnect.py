@@ -23,6 +23,7 @@ import time
 import concurrent.futures
 import base64
 import urllib.request
+import urllib.parse
 from typing import Any, Callable, Optional
 
 import mcp_client
@@ -30,6 +31,7 @@ import secrets_store
 import project_state
 from textutil import as_text as _as_text
 from mcp_server_index import match_curated_server, curated_entry_to_config
+import mcp_registry
 
 _log = logging.getLogger("docmind.mcp_autoconnect")
 
@@ -54,7 +56,7 @@ ALLOWED_KEYS: frozenset[str] = frozenset({
 
 SECRET_RE = re.compile(r"^@secret:(.+)$")
 SHELL_META_RE = re.compile(r"[;|&$><\n\r(){}\[\]*?~`#!]")
-ALLOWED_URL_RE = re.compile(r"^https://[a-z0-9.-]+(/[^\\s]*)?$", re.I)
+ALLOWED_URL_RE = re.compile(r"^https://[a-z0-9.-]+(?::\d{1,5})?(/[^\s]*)?$", re.I)
 HTTP_ENDPOINT_RE = re.compile(r"https://[^\s)'\"`]+/mcp[^\s)'\"`]*", re.I)
 
 # 诊断图默认 6 节点（Phase 2 C5 集合，非 Phase 1 §6.1 旧集合）
@@ -229,12 +231,18 @@ def validate_extracted_config(cand: dict[str, Any]) -> tuple[bool, list[str]]:
         url = cand.get("url") or ""
         if not url:
             errors.append("http 缺少 url")
-        elif not ALLOWED_URL_RE.match(url) or "@" in url:
-            errors.append("url 必须是 https 且无用户信息（拒绝 http://u:p@host）")
         else:
-            host = _domain_of(url)
-            if not is_trusted_domain(host):
-                errors.append(f"url 主机 {host} 不在可信来源域")
+            # 只拒绝 authority 段的 userinfo（http://u:p@host）；path 里的 "@"（如
+            # smithery 规范形态 /@scope/pkg/mcp）是合法的，不得误杀。
+            parts = urllib.parse.urlsplit(url)
+            if parts.username or parts.password:
+                errors.append("url 拒绝用户信息（http://u:p@host）")
+            elif (parts.scheme or "").lower() != "https" or not ALLOWED_URL_RE.match(url):
+                errors.append("url 必须是 https")
+            else:
+                host = parts.hostname or _domain_of(url)
+                if not is_trusted_domain(host):
+                    errors.append(f"url 主机 {host} 不在可信来源域")
 
     # R7 密钥不来自网页
     for sec in ("env", "headers"):
@@ -381,18 +389,67 @@ def _github_readme_markdown(url: str) -> str:
         return ""
 
 
+def registry_fn_for(root: str) -> Callable[[str], dict[str, Any]]:
+    """返回绑定 `root` 缓存 + 真 HTTP 的 Registry 检索可调用（供 api/tools 注入）。
+
+    缓存落 `project_state.path(root, "mcp_registry_cache.json")`（TTL 24h）；
+    缓存路径解析失败退化为无缓存直连，绝不上抛（外层 search_registry 亦全兜底）。
+    """
+    def _fn(need: str) -> dict[str, Any]:
+        try:
+            cache: Optional[Any] = mcp_registry.RegistryCache(
+                project_state.path(root, "mcp_registry_cache.json"))
+        except Exception:
+            cache = None
+        return mcp_registry.search_registry(need, cache=cache)
+    return _fn
+
+
+def _registry_layer(registry_fn: Optional[Callable[[str], dict[str, Any]]],
+                    need: str) -> tuple[list[dict[str, Any]], str, str]:
+    """调用 registry_fn 并把结果**强制过 R1-R9**，返回 (候选视图, 错误说明, 来源)。
+
+    来源 src ∈ registry/cache/cache-stale（沿用 search_registry 词表，供上层透传）。
+    Registry 是 preview 服务、数据形态可能漂移；此处任何异常/异常结构一律软降级，
+    交由调用方回落精选索引 —— 绝不打崩请求。
+    """
+    if not callable(registry_fn):
+        return [], "", ""
+    try:
+        res = registry_fn(need)
+    except Exception as exc:  # noqa: BLE001
+        return [], f"Registry 检索失败：{type(exc).__name__}: {exc}"[:300], ""
+    if not isinstance(res, dict):
+        return [], "", ""
+    if not res.get("ok"):
+        return [], str(res.get("error") or "")[:300], ""
+    src = str(res.get("source") or "registry")
+    views: list[dict[str, Any]] = []
+    for cfg in res.get("candidates") or []:
+        if not isinstance(cfg, dict):
+            continue
+        ok, errs = validate_extracted_config(cfg)
+        if not ok:                                        # registry 数据也绝不绕过信任闸门
+            continue
+        # 能过闸门的 registry 候选即视为可信（R6/R8 已对受信域/来源做了裁决）
+        views.append(_candidate_view(cfg, "trusted", errs))
+    return views, "", src
+
+
 def auto_connect_pipeline(root: str, query: str, *,
                           search_fn: Optional[Callable[[str], str]] = None,
                           fetch_fn: Optional[Callable[[str], str]] = None,
-                          llm_fn: Optional[Callable[[str, str], str]] = None) -> dict[str, Any]:
+                          llm_fn: Optional[Callable[[str, str], str]] = None,
+                          registry_fn: Optional[Callable[[str], dict[str, Any]]] = None) -> dict[str, Any]:
     """搜索 → fetch 官方正文 → 抽取 → 校验 → 返回候选。内部吞 search_fn/fetch_fn 异常。
 
     命中顺序（互补、互不阻塞）：
+      0) 官方 Registry（自主主路径；仅当调用方注入 registry_fn）；
       1) 离线精选索引（瞬时、可信、无需联网，对「未联网」路径也生效）；
       2) 联网搜索 → fetch 官方正文（github 链接兜底走 API readme，绕过 JS 渲染壳）；
       3) 仍无正文 → 退化 LLM 直给命令（若提供 llm_fn）。
 
-    返回 {'ok': bool, 'candidates': list[dict], 'search_error': str}。
+    返回 {'ok': bool, 'candidates': list[dict], 'search_error': str, 'source': str}。
     抛 AutoConnectError 仅用于致命配置错误（如 root 无效）。
     """
     if not root or not os.path.isdir(root):
@@ -401,7 +458,16 @@ def auto_connect_pipeline(root: str, query: str, *,
     search_error = ""
     sources: list[str] = []
 
-    # 1) 离线精选索引优先：已知 server 直接出候选，省去联网抓取与 JS 渲染失败。
+    # 0) 官方 Registry（自主发现主路径）：调用方注入 registry_fn 才联网，测试/离线不触发。
+    if registry_fn is not None:
+        reg_views, reg_err, reg_src = _registry_layer(registry_fn, query)
+        if reg_views:
+            return {"ok": True, "candidates": _dedupe(reg_views), "search_error": "",
+                    "source": reg_src or "registry"}
+        if reg_err:
+            search_error = reg_err
+
+    # 1) 离线精选索引兜底：已知 server 直接出候选，省去联网抓取与 JS 渲染失败。
     curated = match_curated_server(query)
     for entry in curated:
         cfg = curated_entry_to_config(entry)
@@ -411,7 +477,7 @@ def auto_connect_pipeline(root: str, query: str, *,
             trust = "trusted" if is_trusted_domain(domain) else "source_untrusted"
             candidates.append(_candidate_view(cfg, trust, errs))
     if candidates:
-        return {"ok": True, "candidates": _dedupe(candidates), "search_error": ""}
+        return {"ok": True, "candidates": _dedupe(candidates), "search_error": "", "source": "curated"}
 
     try:
         if search_fn:
@@ -485,14 +551,18 @@ def auto_connect_pipeline(root: str, query: str, *,
         else:
             search_error = "已读取官方文档，但未从中解析出可信的安装命令（请手动填写）"
 
-    return {"ok": bool(candidates), "candidates": _dedupe(candidates), "search_error": search_error}
+    source = "web" if candidates else "none"
+    return {"ok": bool(candidates), "candidates": _dedupe(candidates),
+            "search_error": search_error, "source": source}
 
 
 def discover_from_need(root: str, need: str, *, web_enabled: bool = False,
-                       github_search_fn: Optional[Callable[[str], str]] = None) -> dict[str, Any]:
+                       github_search_fn: Optional[Callable[[str], str]] = None,
+                       registry_fn: Optional[Callable[[str], dict[str, Any]]] = None) -> dict[str, Any]:
     """从自然语言需求发现可装配的 MCP 连接器候选（不写盘、不自动启用路由）。
 
-    命中顺序（离线优先；联网仅作长尾兜底，且严格走 GitHub 域 —— 规避弱泛搜索）：
+    命中顺序：
+      0) 官方 Registry（自主主路径；`web_enabled` 且注入 `registry_fn` 时）；
       1) 离线精选索引 match_curated_server(need)：已知热门 server 秒级、可信；
       2) web_enabled 且提供 github_search_fn 时：GitHub 域限定搜索（platform:github）→
          取仓库 URL → _github_readme_markdown 取 README 原文（绕过 JS 渲染壳）→
@@ -509,8 +579,18 @@ def discover_from_need(root: str, need: str, *, web_enabled: bool = False,
         return {"ok": False, "candidates": [], "search_error": "需求描述为空", "source": "none"}
 
     candidates: list[dict[str, Any]] = []
+    search_error = ""
 
-    # 1) 离线精选索引优先：已知 server 直接出候选，省去联网与 JS 渲染失败。
+    # 0) 官方 Registry（自主主路径）：registry 是联网源，故仍需 web_enabled 才触发。
+    if web_enabled and registry_fn is not None:
+        reg_views, reg_err, reg_src = _registry_layer(registry_fn, need)
+        if reg_views:
+            return {"ok": True, "candidates": _dedupe(reg_views),
+                    "search_error": "", "source": reg_src or "registry"}
+        if reg_err:
+            search_error = reg_err
+
+    # 1) 离线精选索引兜底：已知 server 直接出候选，省去联网与 JS 渲染失败。
     for entry in match_curated_server(need):
         cfg = curated_entry_to_config(entry)
         ok, errs = validate_extracted_config(cfg)

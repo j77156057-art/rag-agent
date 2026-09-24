@@ -178,7 +178,7 @@ import project_state
 from mcp_autoconnect import (
     auto_connect_pipeline, probe_candidate, browser_register,
     vision_extract_params, AutoConnectError,
-    register_resume, register_commit,
+    register_resume, register_commit, registry_fn_for,
 )
 from textutil import as_text
 import mcp_capabilities
@@ -3345,8 +3345,9 @@ class VisionExtractReq(BaseModel):
 async def mcp_autoconnect_search_ep(req: McpAutoConnectSearchReq):
     """搜索→抓官方正文→抽取→校验，返回候选（不执行、不写盘）。
 
-    web_enabled=False 时不联网：不传 search_fn/fetch_fn，管线仅走离线路径
+    web_enabled=False 时不联网：不传 search_fn/fetch_fn/registry_fn，管线仅走离线路径
     （当前会返回空候选 + 说明），绝不因用户关了联网还去请求网络。
+    web_enabled=True 时优先查官方 Registry（自主发现主路径），再回落精选索引 / 联网抓取。
     """
     root = _project_root_or_error()
     if not root: return {"ok": False, "error": "未配置代码库"}
@@ -3354,6 +3355,7 @@ async def mcp_autoconnect_search_ep(req: McpAutoConnectSearchReq):
         return await run_in_threadpool(
             auto_connect_pipeline, root, req.query,
             search_fn=web_search, fetch_fn=web_fetch,
+            registry_fn=registry_fn_for(root),
         )
     return await run_in_threadpool(auto_connect_pipeline, root, req.query)
 

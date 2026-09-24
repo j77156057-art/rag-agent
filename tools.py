@@ -643,7 +643,8 @@ def dev_mcp_discover_from_need(arg):
     输入：需求描述，如「我需要能查高铁票的 MCP / 数据库 MCP / github MCP」。
     可选多行 web_enabled: true 开启联网（默认仅离线精选索引）。
 
-    流程（离线优先，联网仅走 GitHub 域）：
+    流程（离线优先；联网时先查官方 Registry，再回落 GitHub 域）：
+      0) web_enabled 时查官方 MCP Registry（自主发现主路径，结果强制过 R1-R9）；
       1) 离线精选索引命中已知热门 server；
       2) web_enabled 时 GitHub 域限定搜索（platform:github）→ 仓库 README → 解析官方命令；
     候选均过 R1-R9 信任闸门。返回后须向用户展示候选，逐条经 dev_mcp_add（审批）落盘。
@@ -667,7 +668,8 @@ def dev_mcp_discover_from_need(arg):
         import mcp_autoconnect
         result = mcp_autoconnect.discover_from_need(
             root, need, web_enabled=web_enabled,
-            github_search_fn=(lambda q: web_search("platform:github " + q + " MCP server")))
+            github_search_fn=(lambda q: web_search("platform:github " + q + " MCP server")),
+            registry_fn=(mcp_autoconnect.registry_fn_for(root) if web_enabled else None))
     except Exception as e:  # noqa: BLE001
         return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
     if not result.get("ok"):

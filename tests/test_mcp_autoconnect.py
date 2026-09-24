@@ -113,6 +113,20 @@ class TrustGateTests(_TmpProject):
         ok, errs = mcp_autoconnect.validate_extracted_config(cand)
         self.assertTrue(ok, errs)
 
+    def test_r6_smithery_scope_at_in_path_allowed(self):
+        # 回归：path 含字母 s 的 URL 曾被 [^\\s] 笔误判非法；path 里 "@"（/@scope/...）
+        # 是 smithery 规范形态，非 authority userinfo，必须放行。
+        for url in (
+            "https://server.smithery.ai/@smithery-ai/github/mcp",
+            "https://server.smithery.ai/s",
+            "https://server.smithery.ai/mcp",
+        ):
+            cand = {"transport": "http", "command": "", "args": [], "url": url,
+                    "env": {}, "headers": {}, "provenance": {"domain": "server.smithery.ai"},
+                    "command_unresolved": False}
+            ok, errs = mcp_autoconnect.validate_extracted_config(cand)
+            self.assertTrue(ok, f"{url} 应通过，errs={errs}")
+
     def test_r6_url_with_credentials_rejected(self):
         cand = {"transport": "http", "command": "", "args": [],
                 "url": "https://u:p@github.com/x/y/mcp", "env": {}, "headers": {},
@@ -120,6 +134,31 @@ class TrustGateTests(_TmpProject):
         ok, errs = mcp_autoconnect.validate_extracted_config(cand)
         self.assertFalse(ok)
         self.assertTrue(any("用户信息" in e for e in errs))
+
+    def test_r6_http_scheme_and_untrusted_host_rejected(self):
+        for url in ("http://github.com/x/mcp", "https://evil.example/x/mcp"):
+            cand = {"transport": "http", "command": "", "args": [], "url": url,
+                    "env": {}, "headers": {}, "provenance": {"domain": "github.com"},
+                    "command_unresolved": False}
+            ok, errs = mcp_autoconnect.validate_extracted_config(cand)
+            self.assertFalse(ok, f"{url} 应被拒")
+
+    def test_r6_optional_port_allowed(self):
+        # 回归：带端口的合法 https remote 曾被 [a-z0-9.-]+ 静默拒绝（同源失败模式）；
+        # 仍只允许 https，且域匹配用 hostname（自动忽略端口）。
+        for url, dom in (("https://server.smithery.ai:8443/@scope/x", "server.smithery.ai"),
+                         ("https://github.com:8443/mcp", "github.com")):
+            cand = {"transport": "http", "command": "", "args": [], "url": url,
+                    "env": {}, "headers": {}, "provenance": {"domain": dom},
+                    "command_unresolved": False}
+            ok, errs = mcp_autoconnect.validate_extracted_config(cand)
+            self.assertTrue(ok, f"{url} 应通过，errs={errs}")
+        # 非 https 仍拦
+        cand = {"transport": "http", "command": "", "args": [],
+                "url": "http://github.com:8443/mcp", "env": {}, "headers": {},
+                "provenance": {"domain": "github.com"}, "command_unresolved": False}
+        ok, errs = mcp_autoconnect.validate_extracted_config(cand)
+        self.assertFalse(ok)
 
     def test_r7_secret_in_env_rejected(self):
         ok, errs = mcp_autoconnect.validate_extracted_config(
