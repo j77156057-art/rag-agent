@@ -540,6 +540,26 @@ class AdapterMisrouteRegressionTests(_TmpProject):
         self.assertIn("github.com/settings/tokens/new", res["url"])
 
 
+class RegistryErrorHumanizeTests(_TmpProject):
+    """回归：Registry/联网错误经 humanize 后给可行动中文，且不裸透 Python 异常名。"""
+
+    def test_registry_timeout_error_humanized(self):
+        # 真机复现：registry_fn 返回 ok=False 且 error 为裸 TimeoutError
+        res = mcp_autoconnect.auto_connect_pipeline(
+            self.project, "weather",
+            registry_fn=lambda need: {"ok": False,
+                                     "error": "TimeoutError: The read operation timed out"})
+        self.assertIn("联网检索超时", res["search_error"])
+        self.assertNotIn("TimeoutError: The read operation timed out", res["search_error"])
+
+    def test_registry_non_network_error_passthrough(self):
+        # 非网络类错误原样保留（不被误判为超时）
+        res = mcp_autoconnect.auto_connect_pipeline(
+            self.project, "weather",
+            registry_fn=lambda need: {"ok": False, "error": "Registry 结构异常"})
+        self.assertIn("Registry 结构异常", res["search_error"])
+
+
 class _FakeLocator:
     def __init__(self, page, selector):
         self.page = page

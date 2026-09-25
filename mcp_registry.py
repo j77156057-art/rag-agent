@@ -324,10 +324,17 @@ def search_registry(need: str, *, limit: int = 5,
                     http_get: Optional[Callable[[str], Any]] = None,
                     cache: Optional["RegistryCache"] = None,
                     ttl: int = DEFAULT_TTL,
-                    now: Optional[float] = None) -> dict[str, Any]:
+                    now: Optional[float] = None,
+                    attempts: int = 2, backoff: float = 0.5,
+                    sleep_fn: Callable[[float], None] = time.sleep) -> dict[str, Any]:
     """编排：缓存 → Registry → 过期缓存兜底。**任何异常都不上抛**。
 
     返回 `{ok, candidates, source, error}`；source ∈ registry/cache/cache-stale/none。
+
+    Registry preview 主机间歇性抖动（实测出现过 14s 收到 0 字节的读超时），故对
+    网络 getter 做**有界重试**：仅对异常重试、成功即返回绝不重试、两次尝试间
+    `sleep_fn(backoff)`；重试用尽仍失败才走原 except 分支（保持软降级语义）。
+    `attempts/backoff/sleep_fn` 为带默认值的关键字参数，向后兼容既有调用。
     """
     need = (need or "").strip()
     if not need:
@@ -339,7 +346,21 @@ def search_registry(need: str, *, limit: int = 5,
         return {"ok": bool(cands), "candidates": cands, "source": "cache", "error": ""}
     try:
         getter = http_get or _default_http_get
-        body = getter(registry_search_url(need, limit))
+        url = registry_search_url(need, limit)
+        n = max(int(attempts), 1)
+        last_exc: Optional[BaseException] = None
+        body: Any = None
+        for attempt in range(n):                  # 仅对 getter 异常做有界重试
+            try:
+                body = getter(url)
+                break
+            except Exception as exc:  # noqa: BLE001 — 瞬时抖动，重试一次即可
+                last_exc = exc
+                if attempt + 1 < n:
+                    sleep_fn(backoff)
+        else:
+            # 全部尝试失败：原样上抛，交由下方 except 统一软降级（含过期缓存兜底）
+            raise last_exc if last_exc is not None else RuntimeError("registry getter failed")
         payload = body if isinstance(body, (dict, list)) else json.loads(as_text(body) or "{}")
         servers = parse_registry_response(payload)
         if cache is not None:

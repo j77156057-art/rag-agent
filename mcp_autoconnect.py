@@ -406,6 +406,29 @@ def registry_fn_for(root: str) -> Callable[[str], dict[str, Any]]:
     return _fn
 
 
+_NET_ERROR_MARKERS = ("timeouterror", "timed out", "timeout", "urlerror", "connectionerror",
+                      "connectionreseterror", "remotedisconnected", "incompleteread",
+                      "sslerror", "socket", "oserror", "network")
+
+
+def humanize_registry_error(err: str) -> str:
+    """Registry/联网软降级错误 → 可行动中文；非网络类错误原样保留（截断 300）。
+
+    用于把「裸 TimeoutError: The read operation timed out」之类的底层异常，转成
+    前端可直读的中文提示（含重试仍失败说明 + 已回退离线索引的安抚），避免真机那样
+    直接把 Python 异常名透给用户。非网络类错误（如 Registry 结构异常）则原样截断返回。
+    """
+    text = (err or "").strip()
+    if not text:
+        return ""
+    low = text.lower()
+    if any(m in low for m in _NET_ERROR_MARKERS):
+        host = mcp_registry.REGISTRY_BASE.replace("https://", "")
+        return (f"联网检索超时：无法访问 MCP 官方 Registry（{host}），已重试仍失败。"
+                "请检查网络或配置代理后重试；本次已回退离线精选索引与联网抓取。")
+    return text[:300]
+
+
 def _registry_layer(registry_fn: Optional[Callable[[str], dict[str, Any]]],
                     need: str) -> tuple[list[dict[str, Any]], str, str]:
     """调用 registry_fn 并把结果**强制过 R1-R9**，返回 (候选视图, 错误说明, 来源)。
@@ -419,11 +442,11 @@ def _registry_layer(registry_fn: Optional[Callable[[str], dict[str, Any]]],
     try:
         res = registry_fn(need)
     except Exception as exc:  # noqa: BLE001
-        return [], f"Registry 检索失败：{type(exc).__name__}: {exc}"[:300], ""
+        return [], humanize_registry_error(f"{type(exc).__name__}: {exc}"), ""
     if not isinstance(res, dict):
         return [], "", ""
     if not res.get("ok"):
-        return [], str(res.get("error") or "")[:300], ""
+        return [], humanize_registry_error(str(res.get("error") or "")), ""
     src = str(res.get("source") or "registry")
     views: list[dict[str, Any]] = []
     for cfg in res.get("candidates") or []:

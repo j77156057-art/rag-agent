@@ -225,6 +225,35 @@ class SearchRegistryTests(unittest.TestCase):
         r = mcp_registry.search_registry("x", http_get=lambda url: "<html>nope</html>")
         self.assertFalse(r["ok"])
 
+    def test_transient_timeout_retried_then_ok(self):
+        # 首次超时、第二次成功：有界重试生效，getter 恰好被调用 2 次，结果来自 registry。
+        calls = {"n": 0}
+
+        def getter(url):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("The read operation timed out")
+            return json.dumps({"servers": [_entry(packages=[_npm_pkg()])]})
+
+        r = mcp_registry.search_registry(
+            "weather", http_get=getter, attempts=2, backoff=0.0)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["source"], "registry")
+        self.assertEqual(calls["n"], 2)      # 首次失败重试一次，成功即止，绝不第三次
+
+    def test_persistent_failure_gives_up(self):
+        # getter 恒超时：重试用尽（attempts 次）后放弃，仍走软降级返回 ok=False。
+        calls = {"n": 0}
+
+        def getter(url):
+            calls["n"] += 1
+            raise TimeoutError("The read operation timed out")
+
+        r = mcp_registry.search_registry(
+            "weather", http_get=getter, attempts=2, backoff=0.0)
+        self.assertFalse(r["ok"])
+        self.assertEqual(calls["n"], 2)      # 调用次数 == attempts，不无限重试
+
 
 class DiscoveryIntegrationTests(_TmpProject):
     def test_registry_hit_reported_source(self):
