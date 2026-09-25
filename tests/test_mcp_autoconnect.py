@@ -468,6 +468,78 @@ class BrowserRegisterTests(_TmpProject):
         self.assertEqual(res["tier"], "L2")
 
 
+class AdapterMisrouteRegressionTests(_TmpProject):
+    """回归：provenance（来源仓库）绝不能参与 provider 适配器匹配（真机 bug 修复）。
+
+    真机现象：设置→MCP 搜索 weather → 候选凭证 provider == smithery_api_key，
+    点击「需要凭证」→ 弹窗「去官网创建凭证」却打开 GitHub PAT 页。根因是
+    select_provider_adapter 把 provenance.domain/url 放进 haystack 做子串匹配，
+    而 github adapter 的 aliases 含 "github.com" 且排首位 → 凡是来源仓库是 GitHub
+    的候选（mcp_server_index curated 条目几乎都 provenance.domain == github.com）
+    都被误路由到 github adapter。
+    """
+
+    # ---- A. select_provider_adapter：provenance 不参与匹配 ----
+    def test_smithery_provider_not_misrouted_by_github_provenance(self):
+        # 真机复现：provider=smithery_api_key，但 provenance 是 github.com 仓库
+        adapter = mcp_autoconnect.select_provider_adapter(
+            "smithery_api_key",
+            {"provenance": {"domain": "github.com", "url": "https://github.com/x"},
+             "url": "https://server.smithery.ai/@a/b/mcp"})
+        self.assertIsNone(adapter)  # 关键：不得误匹配 github
+
+    def test_postgres_provider_not_misrouted_by_github_provenance(self):
+        # mcp_server_index 多数 curated 条目 provenance.domain == github.com
+        adapter = mcp_autoconnect.select_provider_adapter(
+            "postgres",
+            {"provenance": {"domain": "github.com",
+                            "url": "https://github.com/modelcontextprotocol/servers"}})
+        self.assertIsNone(adapter)
+
+    def test_github_provider_still_matches_by_name(self):
+        # provider 名匹配不受影响（正常路径）
+        adapter = mcp_autoconnect.select_provider_adapter(
+            "github",
+            {"provenance": {"domain": "github.com", "url": "https://github.com/owner/repo"}})
+        self.assertIsNotNone(adapter)
+        self.assertEqual(adapter["name"], "github")
+
+    def test_gdrive_and_figma_host_fallback(self):
+        # 仍能按 alias / 自身 URL 匹配（不依赖 provenance）
+        gdrive = mcp_autoconnect.select_provider_adapter("gdrive", {})
+        self.assertIsNotNone(gdrive)
+        self.assertEqual(gdrive["name"], "google_drive")
+        figma = mcp_autoconnect.select_provider_adapter("", {"url": "https://mcp.figma.com/x"})
+        self.assertIsNotNone(figma)
+        self.assertEqual(figma["name"], "figma")
+
+    # ---- B. browser_register：未收录 provider 的「去官网创建凭证」url 必须为空 ----
+    def test_unrecorded_provider_l2_url_is_empty(self):
+        # 端到端：provider=smithery_api_key + provenance.domain=github.com 候选
+        # 调用 browser_register → 必须 tier==L2 且 url==""（不得回退 provenance 仓库页）
+        res = mcp_autoconnect.browser_register(
+            self.project, "k",
+            {"provenance": {"domain": "github.com", "url": "https://github.com/x"},
+             "url": "https://server.smithery.ai/@a/b/mcp"},
+            "smithery_api_key")
+        self.assertEqual(res["tier"], "L2")
+        self.assertEqual(res["url"], "")
+        self.assertTrue(res["note"])
+
+    def test_github_provider_normal_path_opens_pat_page(self):
+        # 健全性：provider=github 候选 → browser_register 返回的 url 仍指向 GitHub PAT 页
+        # （确认正常路径未被本次修复破坏）
+        with patch.object(mcp_autoconnect, "_edge_available", lambda: False), \
+             patch.object(mcp_autoconnect, "_playwright_available", lambda: False):
+            res = mcp_autoconnect.browser_register(
+                self.project, "k",
+                {"provenance": {"domain": "github.com", "url": "https://github.com/owner/repo"},
+                 "url": "https://github.com/owner/repo/mcp"},
+                "github")
+        self.assertEqual(res["tier"], "L2")
+        self.assertIn("github.com/settings/tokens/new", res["url"])
+
+
 class _FakeLocator:
     def __init__(self, page, selector):
         self.page = page

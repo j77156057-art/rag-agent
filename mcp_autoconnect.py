@@ -904,14 +904,20 @@ def _new_task_id() -> str:
 
 
 def select_provider_adapter(provider: str, cand: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
-    """按 provider 名 / 来源域 / 产品名解析适配器；未收录返回 None（→ L2）。
+    """按 provider 名 / MCP server 自有 URL 解析适配器；未收录返回 None（→ L2）。
 
+    注意：cand["provenance"] 是**来源代码仓库**（如 github.com/...），并非凭证签发方，
+    因此**不参与** adapter 匹配——否则任何以 GitHub 为仓库的候选（mcp_server_index
+    多数 curated 条目 provenance.domain == "github.com"）都会被误路由到 github adapter
+    （其 aliases 含 "github.com" 且排在 PROVIDER_ADAPTERS 首位），导致「去官网创建凭证」
+    错误地打开 GitHub PAT 页。匹配只基于：
+      (1) 凭证 provider 名（如 "smithery_api_key" / "postgres" / "github"）
+      (2) MCP server 自身的 url 域（host 兜底）
     纯数据查找，无副作用。新增 provider 只需往 PROVIDER_ADAPTERS 加一条数据。
     """
     parts = [str(provider or "")]
     if isinstance(cand, dict):
-        prov = cand.get("provenance") or {}
-        parts += [str(prov.get("domain", "")), str(prov.get("url", "")), str(cand.get("url", ""))]
+        parts += [str(cand.get("url", ""))]
     hay = " ".join(parts).lower()
     for name, adapter in PROVIDER_ADAPTERS.items():
         for alias in adapter.get("aliases", ()):
@@ -1251,8 +1257,11 @@ def browser_register(root: str, key: str, cand: dict[str, Any], provider: str) -
     fallback_url = provenance.get("url") or cand.get("url") or ""
     adapter = select_provider_adapter(provider, cand)
     if adapter is None:
+        # 未收录 provider：降级 L2 手动回填。注意 url 必须为空字符串——不得用
+        # provenance.url/cand.url 冒充「去官网创建凭证」链接（provenance 是来源仓库，
+        # 不代表凭证签发方；否则会像本次 bug 那样把 GitHub 仓库页当成凭证创建页）。
         return _l2_result("未收录该 provider 的自动注册流程，已降级 L2 手动回填",
-                          fallback_url, provider=provider, root=root)
+                          "", provider=provider, root=root)
     if adapter.get("tier") == "L2":
         return _l2_result(adapter.get("note") or "该 provider 首版不做自动注册，已降级 L2",
                           adapter.get("register_url") or fallback_url,

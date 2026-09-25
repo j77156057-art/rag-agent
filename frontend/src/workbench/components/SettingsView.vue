@@ -644,7 +644,7 @@ async function openRegister(c: McpAutoConnectCandidate) {
   regOpen.value = true
   regTier.value = 'L2'
   regStatus.value = 'waiting_user'
-  regUrl.value = c.config.provenance?.url || ''
+  regUrl.value = '' // 后端未记录该 provider 的出证链接时返回空串；不再回退 provenance.url（那是源码仓库，会跳错站）
   regTaskId.value = `ac-${Date.now().toString(16)}` // 后端不可达时的本地兜底 id
   try {
     const r = await mcpApi.registerStart(candidateKey(c), c.config, regSecretKey.value)
