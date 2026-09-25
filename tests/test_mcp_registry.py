@@ -113,6 +113,31 @@ class PureFunctionTests(unittest.TestCase):
         self.assertEqual(cfg["headers"]["X-Trace"], "on")
         self.assertNotIn("REALPLAINTEXTKEY", json.dumps(cfg))
 
+    def test_remotes_header_placeholder_keeps_prefix_and_uses_placeholder_name(self):
+        # ①真机 bug：{"value":"Bearer {smithery_api_key}","isSecret":true}
+        # → provider 取占位名、保留 "Bearer " 前缀（旧口径丢前缀 + provider 取表头名）
+        rem = {"type": "streamable-http", "url": "https://server.smithery.ai/mcp",
+               "headers": [{"name": "Authorization", "value": "Bearer {smithery_api_key}",
+                            "isSecret": True, "isRequired": True}]}
+        cfg = mcp_registry.server_to_candidates(_entry(remotes=[rem])["server"])[0]
+        self.assertEqual(cfg["headers"]["Authorization"], "Bearer @secret:smithery_api_key")
+        self.assertIn("smithery_api_key", cfg["headers"]["Authorization"])   # provider = 占位名
+        self.assertNotIn("{", cfg["headers"]["Authorization"])               # 占位符已转引用
+        self.assertNotIn("{smithery_api_key}", json.dumps(cfg))
+
+    def test_remotes_secret_header_without_placeholder_uses_header_name(self):
+        # ③无占位但 isSecret → 回退 @secret:<header_name>（与 env 口径一致）
+        rem = {"type": "streamable-http", "url": "https://server.smithery.ai/mcp",
+               "headers": [{"name": "X-Api-Key", "value": "", "isSecret": True}]}
+        cfg = mcp_registry.server_to_candidates(_entry(remotes=[rem])["server"])[0]
+        self.assertEqual(cfg["headers"]["X-Api-Key"], "@secret:X-Api-Key")
+
+    def test_remotes_plain_header_passthrough(self):
+        rem = {"type": "streamable-http", "url": "https://server.smithery.ai/mcp",
+               "headers": [{"name": "X-Trace", "value": "on"}]}
+        cfg = mcp_registry.server_to_candidates(_entry(remotes=[rem])["server"])[0]
+        self.assertEqual(cfg["headers"]["X-Trace"], "on")
+
     def test_allowlist_parity_with_autoconnect(self):
         self.assertEqual(mcp_registry.ALLOWED_LAUNCHERS, mcp_autoconnect.ALLOWED_LAUNCHERS)
 

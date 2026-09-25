@@ -24,8 +24,15 @@
 字段：`type`(`"streamable-http"`)、`url`、`headers[]{name,value,isRequired,isSecret}`。
 
 推导：
-- `transport:"http"`, `url`(须过 R6：https + 受信域), `headers:{name: ("@secret:<name>" if isSecret else value)}`。
-- header 值含 `{...}` 占位（如 `Bearer {smithery_api_key}`）且 `isSecret` → 转 `@secret:<name>`（**绝不落明文**）。
+- `transport:"http"`，`url`（须过 R6：https + 受信域）。
+- **header 值处理（修正版，2026-09-25 真机暴露后）**：
+  1. 若 `value` 含 `{placeholder}`（如 `Bearer {smithery_api_key}`）→ **provider = 占位名（`smithery_api_key`）**，且**保留模板前后缀**：
+     `Authorization: "Bearer @secret:smithery_api_key"`（**绝不落明文**）。
+  2. 否则若 `isSecret` → 回退 provider = 表头名：`@secret:<header_name>`。
+  3. 否则原样 `value`。
+  > 旧口径 `@secret:<header_name>`（丢模板、provider 取表头名）**是错的**：`Bearer ` 前缀丢失 → 即便填了凭证，发出去也只是裸 token → 鉴权必失败。
+- `resolve_secret_refs` 相应支持**值内嵌 `@secret:`**（`re.sub`，不再要求整值匹配）——整值 `@secret:NAME` 仍等价，向后兼容。
+- 前端 `acSecretProviders`/`acHeadersMasked` 也须按**内嵌**规则提取 provider 与脱敏（不再用 `^...$` 锚定）。
 
 ## 3. 排序 / 去重 / 过滤（**算法，不靠人工条目**）
 1. 只留 `isLatest`；按 `server.name` 去重。

@@ -336,16 +336,16 @@ const acSources = (c: McpAutoConnectCandidate | null): AcSource[] => {
 }
 const acResolvedCmd = (c: McpAutoConnectCandidate | null) => c ? [c.config.command, ...(c.config.args || [])].filter(Boolean).join(' ') : ''
 /**
- * 把 key→value 映射渲染成 "k=v  k2=v2" 并脱敏：
- * - `maskAll`（env：一律脱敏，沿用既有口径）；
- * - 或值以 `@secret:` 开头（headers：引用钥匙串即脱敏）。
+ * 脱敏：`maskAll`（env：一律脱敏，沿用既有口径）或值**含** `@secret:` 引用。
+ * 后者兼容**内嵌形态**（如 header `Bearer @secret:smithery_api_key`）——只要含引用就整体脱敏，
+ * **绝不**把模板原文（连同 provider 名）显示出来。
  */
 const acMaskEntries = (entries: Record<string, string> | undefined, maskAll = false): string => {
   const keys = Object.keys(entries || {})
   if (keys.length === 0) return '无'
   return keys.map(k => {
     const v = (entries || {})[k] ?? ''
-    return (maskAll || v.startsWith('@secret:')) ? `${k}=已填写（脱敏）` : `${k}=${v}`
+    return (maskAll || v.includes('@secret:')) ? `${k}=已填写（脱敏）` : `${k}=${v}`
   }).join('  ')
 }
 const acEnvMasked = (c: McpAutoConnectCandidate | null) => (c ? acMaskEntries(c.config.env, true) : '无')
@@ -353,28 +353,31 @@ const acHeadersMasked = (c: McpAutoConnectCandidate | null) => (c ? acMaskEntrie
 /** http = 远程 MCP：连接信息在 url/headers，而非 stdio 的 command/args。 */
 const isHttpTransport = (c: McpAutoConnectCandidate | null) => !!c && c.config.transport === 'http'
 /**
- * 从候选的 env/headers 里取第一个 `@secret:<provider>` 引用的 provider 名（无则 ''）。
- * 这是「凭证最终要写进哪个 secrets_store 键」的权威来源——**优先于 provenance.domain**。
- */
-/**
  * 收集候选 env/headers 里**全部 distinct** `@secret:<provider>`（保序去重）。
- * 一个候选可引用多个 provider（如 slack → @secret:slack + @secret:slack_team），
+ * 值可为**内嵌形态**（`Bearer @secret:smithery_api_key`），故用**非锚定**全局匹配：
+ * `@secret:` 须位于串首或非标识符字符之后（避免 `foo@secret:` 这类标识符内部误匹配），
+ * provider 名限定 `[A-Za-z0-9_.-]+`（与后端 provider 命名一致）。
+ * 一个候选可引用多个 provider（如 slack → @secret:slack + @secret:slack_team）；
  * commit 必须一次全量覆盖，漏一个 spawn 时 resolve_secret_refs 就会抛错。
+ * 这是「凭证最终写进哪个 secrets_store 键」的权威来源（优先于 provenance.domain）。
  */
 const acSecretProviders = (c: McpAutoConnectCandidate | null): string[] => {
   if (!c) return []
+  const re = /(?:^|[^A-Za-z0-9_.-])@secret:([A-Za-z0-9_.-]+)/g
   const out: string[] = []
   for (const bag of [c.config.env, c.config.headers]) {
     for (const v of Object.values(bag || {})) {
-      const m = /^@secret:(.+)$/.exec((v || '').trim())
-      if (m && m[1] && !out.includes(m[1])) out.push(m[1])
+      for (const m of (v || '').matchAll(re)) {
+        const p = m[1]
+        if (p && !out.includes(p)) out.push(p)
+      }
     }
   }
   return out
 }
 /** 主 provider：用于 `register/start` 的 adapter 选择，以及无引用回退时的 env 键名。 */
 const acSecretProvider = (c: McpAutoConnectCandidate | null): string => acSecretProviders(c)[0] || ''
-/** 候选是否「需要凭证」：env 或 headers 任一值以 `@secret:` 开头（与 transport / command_unresolved 无关）。 */
+/** 候选是否「需要凭证」：env 或 headers 任一值**含** `@secret:`（锚定或内嵌皆可）。 */
 const acNeedsSecret = (c: McpAutoConnectCandidate | null): boolean => acSecretProviders(c).length > 0
 const acRawJson = (c: McpAutoConnectCandidate | null) =>
   c ? JSON.stringify({ key: candidateKey(c), ...c.config }, null, 2) : ''

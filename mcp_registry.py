@@ -188,6 +188,25 @@ def _package_to_config(pkg: Any, prov: dict[str, Any],
     }
 
 
+_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_.-]+)\}")
+
+
+def _remote_header_value(header: dict[str, Any]) -> str:
+    """remotes header 值推导（blueprint §2B 修正版），绝不落明文：
+
+    1. 值含 `{placeholder}`（如 `Bearer {smithery_api_key}`）→ provider = **占位名**，
+       并把占位符就地替换为 `@secret:<占位名>`，**保留模板前后缀**（`"Bearer @secret:smithery_api_key"`）；
+    2. 无占位但 `isSecret` → 回退 `@secret:<header_name>`（与 _package_to_config 的 env 口径一致）；
+    3. 否则原样返回 value。
+    """
+    value = str(header.get("value") or "")
+    if _PLACEHOLDER_RE.search(value):
+        return _PLACEHOLDER_RE.sub(lambda m: f"@secret:{m.group(1)}", value)
+    if header.get("isSecret"):
+        return f"@secret:{header['name']}"
+    return value
+
+
 def _remote_to_config(rem: Any, prov: dict[str, Any]) -> Optional[dict[str, Any]]:
     if not isinstance(rem, dict):
         return None
@@ -198,8 +217,7 @@ def _remote_to_config(rem: Any, prov: dict[str, Any]) -> Optional[dict[str, Any]
     for h in rem.get("headers") or []:
         if not isinstance(h, dict) or not h.get("name"):
             continue
-        nm = str(h["name"])
-        headers[nm] = f"@secret:{nm}" if h.get("isSecret") else str(h.get("value") or "")
+        headers[str(h["name"])] = _remote_header_value(h)
     return {
         "transport": "http", "command": "", "args": [], "url": url,
         "env": {}, "headers": headers, "provenance": dict(prov), "command_unresolved": False,

@@ -54,7 +54,8 @@ ALLOWED_KEYS: frozenset[str] = frozenset({
     "label", "key", "provenance", "command_unresolved",
 })
 
-SECRET_RE = re.compile(r"^@secret:(.+)$")
+# 值内嵌 @secret:<provider>（含整值形态，向后兼容）：provider 名为 token 字符集。
+SECRET_INLINE_RE = re.compile(r"@secret:([A-Za-z0-9_.-]+)")
 SHELL_META_RE = re.compile(r"[;|&$><\n\r(){}\[\]*?~`#!]")
 ALLOWED_URL_RE = re.compile(r"^https://[a-z0-9.-]+(?::\d{1,5})?(/[^\s]*)?$", re.I)
 HTTP_ENDPOINT_RE = re.compile(r"https://[^\s)'\"`]+/mcp[^\s)'\"`]*", re.I)
@@ -633,26 +634,28 @@ def discover_from_need(root: str, need: str, *, web_enabled: bool = False,
 def resolve_secret_refs(cfg: dict[str, Any], root: str) -> dict[str, Any]:
     """@secret:<provider> → secrets_store.load(root, provider) 明文。
 
-    仅返回新 dict，不改原 cfg。引用了未存入的 provider 时抛 AutoConnectError。
+    仅返回新 dict，不改原 cfg。支持**值内嵌** `@secret:`（如 `Bearer @secret:smithery_api_key`
+    → `Bearer <明文>`）；整值 `@secret:NAME` 仍等价（向后兼容）。env 与 headers 同走此规则。
+    引用了未存入的 provider 时抛 AutoConnectError（可读，不静默）。
     """
     out = dict(cfg)
     for sec in ("env", "headers"):
         src = cfg.get(sec) or {}
         if not src:
             continue
-        new_sec: dict[str, str] = {}
-        for k, v in src.items():
-            sm = SECRET_RE.match(str(v))
-            if sm:
-                provider = sm.group(1)
-                plain = secrets_store.load(root, provider)
-                if not plain:
-                    raise AutoConnectError(f"凭证提供方 {provider} 未存入 secrets_store，无法解析 @secret 引用")
-                new_sec[k] = plain
-            else:
-                new_sec[k] = str(v)
-        out[sec] = new_sec
+        out[sec] = {k: _substitute_secret_refs(v, root) for k, v in src.items()}
     return out
+
+
+def _substitute_secret_refs(value: Any, root: str) -> str:
+    """把值里所有 `@secret:<provider>` 就地替换为明文；缺失 provider 抛可读 AutoConnectError。"""
+    def _repl(m: re.Match[str]) -> str:
+        provider = m.group(1)
+        plain = secrets_store.load(root, provider)
+        if not plain:
+            raise AutoConnectError(f"凭证提供方 {provider} 未存入 secrets_store，无法解析 @secret 引用")
+        return plain
+    return SECRET_INLINE_RE.sub(_repl, str(value))
 
 
 def http_headers_for(cfg: dict[str, Any], root: str) -> dict[str, str]:

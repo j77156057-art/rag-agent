@@ -258,6 +258,27 @@ class ResolveSecretRefsTests(_TmpProject):
         with self.assertRaises(mcp_autoconnect.AutoConnectError):
             mcp_autoconnect.resolve_secret_refs(cfg, self.project)
 
+    def test_resolves_inline_secret_keeps_prefix(self):
+        # 值内嵌 @secret:（remotes header 形态）：前缀 "Bearer " 必须保留
+        secrets_store.save(self.project, "smithery_api_key", "PLAIN-TOKEN-999")
+        out = mcp_autoconnect.resolve_secret_refs(
+            {"headers": {"Authorization": "Bearer @secret:smithery_api_key"}}, self.project)
+        self.assertEqual(out["headers"]["Authorization"], "Bearer PLAIN-TOKEN-999")
+
+    def test_whole_value_secret_backward_compatible(self):
+        # 整值 @secret:NAME 仍等价（向后兼容），env 与 headers 同走
+        secrets_store.save(self.project, "github", "GHP-123")
+        out = mcp_autoconnect.resolve_secret_refs(
+            {"env": {"TOKEN": "@secret:github"}, "headers": {"X-K": "@secret:github"}}, self.project)
+        self.assertEqual(out["env"]["TOKEN"], "GHP-123")
+        self.assertEqual(out["headers"]["X-K"], "GHP-123")
+
+    def test_missing_inline_provider_raises_readable(self):
+        with self.assertRaises(mcp_autoconnect.AutoConnectError) as ctx:
+            mcp_autoconnect.resolve_secret_refs(
+                {"headers": {"Authorization": "Bearer @secret:nope_key"}}, self.project)
+        self.assertIn("nope_key", str(ctx.exception))
+
 
 class ProbeCandidateTests(_TmpProject):
     def test_unresolvable_command_raises_mcp_error(self):
