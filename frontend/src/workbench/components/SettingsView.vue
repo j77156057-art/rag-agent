@@ -161,7 +161,6 @@ const acCandidates = ref<McpAutoConnectCandidate[]>([])
 const acSelected = ref<McpAutoConnectCandidate | null>(null)
 const acProbing = ref(false)
 const acProbe = ref<McpProbeRes | null>(null)
-const acNeedRegister = ref(false)
 const acConfirmOpen = ref(false)
 const acConfirmBusy = ref(false)
 const acConfirmError = ref('')
@@ -593,7 +592,6 @@ async function finalizeAutoRegister() {
   applySecretToCandidate()
   notifyCredentialsSaved()
   regOpen.value = false
-  acNeedRegister.value = false
 }
 
 function applyRegStatus(r: McpRegisterStatusRes) {
@@ -718,7 +716,6 @@ async function commitRegister() {
     applySecretToCandidate()
     notifyCredentialsSaved()
     closeRegister()
-    acNeedRegister.value = false
   } catch (e) {
     regError.value = (e as { message?: string }).message || '凭证保存失败'
   } finally { regCommitting.value = false }
@@ -1036,7 +1033,7 @@ function close() { emit('close') }
                     <Icon v-if="acProbing && acSelected === c" name="loader" :size="16" class="dm-spin" />
                     <template v-else>测试连接</template>
                   </button>
-                  <button v-if="c.config.command_unresolved || acNeedRegister || acNeedsSecret(c)" class="sv-mini" @click="openRegister(c)">
+                  <button v-if="c.config.command_unresolved || acNeedsSecret(c)" class="sv-mini" @click="openRegister(c)">
                     <Icon name="lock" :size="16" />需要凭证
                   </button>
                   <button class="sv-mini" :disabled="acProbing" @click="acSelected === c ? (acSelected = null) : (acSelected = c)">
