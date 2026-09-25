@@ -2007,6 +2007,19 @@ export interface McpDirectoryResult {
 }
 
 // P1：MCP 自动连接向导（设置 → MCP 链路重做）
+export interface McpProvenance {
+  url: string
+  domain: string
+  /** registry server 名 / 精选索引 name，前端卡片标题优先用 */
+  server_name?: string
+  /** registry 命名空间，用于信任分档（官方命名空间判定） */
+  namespace?: string
+  /** 标记来自官方 Registry */
+  registry?: boolean
+  /** 标记来自离线精选索引 */
+  curated?: boolean
+  note?: string
+}
 export interface McpAutoConnectConfig {
   transport: 'stdio' | 'http'
   command: string
@@ -2014,7 +2027,7 @@ export interface McpAutoConnectConfig {
   url: string
   env: Record<string, string>
   headers: Record<string, string>
-  provenance: { url: string; domain: string }
+  provenance: McpProvenance
   command_unresolved: boolean
 }
 export interface McpAutoConnectCandidate {
