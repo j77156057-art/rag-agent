@@ -597,7 +597,8 @@ def active_servers(root):
 def _http_status_message(code):
     """把 HTTP 状态码清洗为可读信息；**绝不回传远端原始 body**（HTML/长 JSON 会上屏变乱码）。"""
     hints = {400: "请求被拒绝", 401: "需要鉴权", 403: "可能为反爬或鉴权拦截",
-             404: "端点不存在", 405: "方法不被允许", 429: "请求过于频繁"}
+             404: "端点不存在（服务可能已下线或地址已变更）", 405: "方法不被允许",
+             429: "请求过于频繁"}
     hint = hints.get(code, "远端服务错误" if code and code >= 500 else "请求被拒绝")
     return f"远端拒绝程序化试连（HTTP {code}，{hint}）"
 

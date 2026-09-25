@@ -2020,6 +2020,8 @@ export interface McpAutoConnectConfig {
 export interface McpAutoConnectCandidate {
   config: McpAutoConnectConfig
   trust: 'trusted' | 'source_untrusted'
+  /** 显示用信任分档：official（官方发布）/ community（受信域第三方）/ unknown（来源不可信）。R8 自动填参闸门仍看 trust。 */
+  trust_tier?: 'official' | 'community' | 'unknown'
   validation_errors: string[]
 }
 export interface McpAutoConnectSearchRes {

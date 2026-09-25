@@ -326,8 +326,36 @@ def build_candidate(parsed: list[str], *, provenance: Optional[dict[str, Any]] =
     }
 
 
+def _is_official_namespace(ns: str) -> bool:
+    """registry 官方命名空间判定（与 mcp_registry._is_official_namespace 口径一致）。
+
+    `io.modelcontextprotocol.*` / `io.github.*` 视为官方发布；第三方如 `222wcnm` 不算。
+    """
+    return bool(ns) and (ns.startswith("io.modelcontextprotocol") or ns.startswith("io.github."))
+
+
+def _trust_tier(prov: dict[str, Any], trust: str) -> str:
+    """显示用信任分档（不改动 R8 自动填参闸门语义，R8 仍看 `trust`）。
+
+    - unknown：不可信来源域（source_untrusted）
+    - official：registry 官方命名空间，或精选索引收录的官方 server
+    - community：受信来源域（如 github.com）但非官方命名空间的第三方 server
+    """
+    if trust == "source_untrusted":
+        return "unknown"
+    ns = str(prov.get("namespace") or "")
+    if prov.get("curated"):
+        return "official"
+    if _is_official_namespace(ns):
+        return "official"
+    return "community"
+
+
 def _candidate_view(cand: dict[str, Any], trust: str, errors: list[str]) -> dict[str, Any]:
-    return {"config": cand, "trust": trust, "validation_errors": errors}
+    prov = cand.get("provenance") or {}
+    return {"config": cand, "trust": trust,
+            "trust_tier": _trust_tier(prov, trust),
+            "validation_errors": errors}
 
 
 def _dedupe(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:

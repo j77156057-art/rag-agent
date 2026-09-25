@@ -3365,7 +3365,15 @@ async def mcp_autoconnect_probe_ep(req: McpAutoConnectProbeReq):
     root = _project_root_or_error()
     if not root: return {"ok": False, "error": "未配置代码库"}
     try: return await run_in_threadpool(probe_candidate, root, req.config)
-    except mcp_client.MCPError as e: return {"ok": True, "probe_ok": False, "tools": [], "error": str(e)}
+    except mcp_client.MCPError as e:
+        msg = str(e)
+        # 试连 404：多为 registry 收录条目失效（服务下线/地址变更），给可行动提示而非裸状态码。
+        if "404" in msg or "端点不存在" in msg:
+            url = (req.config or {}).get("url") or ""
+            msg = (f"连接地址返回 404，连接失败。该端点可能已下线或地址已变更"
+                   f"{('（' + url + '）') if url else ''}。"
+                   f"建议换一个候选，或在下方「手动添加连接器」填入正确的连接地址/命令。")
+        return {"ok": True, "probe_ok": False, "tools": [], "error": msg}
 
 @app.post("/api/mcp/autoconnect/confirm")
 async def mcp_autoconnect_confirm_ep(req: McpAutoConnectConfirmReq):

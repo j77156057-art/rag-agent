@@ -267,6 +267,7 @@ def curated_entry_to_config(entry: dict[str, Any]) -> dict[str, Any]:
         "provenance": {
             "url": official,
             "domain": _domain_of(official),
+            "server_name": entry.get("name", "") or "",
             "note": entry.get("note", "") or "",
             "curated": True,
         },

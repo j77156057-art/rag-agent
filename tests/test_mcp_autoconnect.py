@@ -571,6 +571,59 @@ class RegistryErrorHumanizeTests(_TmpProject):
         self.assertIn("Registry 结构异常", res["search_error"])
 
 
+class TrustTierTests(_TmpProject):
+    """信任分档：trust_tier（显示）与 trust（R8 闸门）语义分离。
+
+    官方 = registry 官方命名空间 / 精选索引；社区 = 受信域但第三方；未知 = 不可信域。
+    """
+
+    def test_registry_third_party_is_community_not_official(self):
+        # 真机复现根因：github.com 仓库的第三方 server 不得标「官方」
+        cfg = {"transport": "http", "command": "", "args": [],
+               "url": "https://server.smithery.ai/@222wcnm/bilistalkermcp/mcp",
+               "env": {}, "headers": {},
+               "provenance": {"url": "https://github.com/222wcnm/bilistalkermcp",
+                              "domain": "github.com", "registry": True,
+                              "server_name": "222wcnm/bilistalkermcp",
+                              "namespace": "222wcnm"}}
+        view = mcp_autoconnect._candidate_view(cfg, "trusted", [])
+        self.assertEqual(view["trust"], "trusted")            # R8 闸门不变
+        self.assertEqual(view["trust_tier"], "community")     # 显示分档 = 社区
+
+    def test_registry_official_namespace_is_official(self):
+        cfg = {"transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-fetch"],
+               "url": "", "env": {}, "headers": {},
+               "provenance": {"url": "https://github.com/modelcontextprotocol/servers",
+                              "domain": "github.com", "registry": True,
+                              "server_name": "io.modelcontextprotocol/server-fetch",
+                              "namespace": "io.modelcontextprotocol"}}
+        view = mcp_autoconnect._candidate_view(cfg, "trusted", [])
+        self.assertEqual(view["trust_tier"], "official")
+
+    def test_curated_is_official(self):
+        cfg = {"transport": "stdio", "command": "uvx", "args": ["mcp-server-github"],
+               "url": "", "env": {}, "headers": {},
+               "provenance": {"url": "https://github.com/github/github-mcp-server",
+                              "domain": "github.com", "curated": True, "server_name": "github"}}
+        view = mcp_autoconnect._candidate_view(cfg, "trusted", [])
+        self.assertEqual(view["trust_tier"], "official")
+
+    def test_untrusted_source_is_unknown(self):
+        cfg = {"transport": "stdio", "command": "x", "args": [],
+               "url": "", "env": {}, "headers": {},
+               "provenance": {"url": "https://evil.example", "domain": "evil.example"}}
+        view = mcp_autoconnect._candidate_view(cfg, "source_untrusted", [])
+        self.assertEqual(view["trust_tier"], "unknown")
+
+    def test_curated_server_name_flows_to_provenance(self):
+        # 精选索引候选应带 server_name，供前端卡片标题渲染（而非来源域）
+        from mcp_server_index import curated_entry_to_config, list_curated_names
+        name = list_curated_names()[0]
+        entry = next(e for e in __import__("mcp_server_index")._SERVER_INDEX if e["name"] == name)
+        cfg = curated_entry_to_config(entry)
+        self.assertEqual(cfg["provenance"]["server_name"], name)
+
+
 class _FakeLocator:
     def __init__(self, page, selector):
         self.page = page

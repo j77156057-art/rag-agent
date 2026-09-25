@@ -326,13 +326,22 @@ function acStepState(n: WizardStep): 'done' | 'active' | 'idle' | 'fail' {
   return 'idle'
 }
 
-const acTrustTag = (c: McpAutoConnectCandidate | null) => c && c.trust === 'source_untrusted' ? '未知来源' : '官方 / 可信'
+const acTrustTag = (c: McpAutoConnectCandidate | null) => {
+  if (!c) return '未知来源'
+  if (c.trust === 'source_untrusted') return '未知来源'
+  if (c.trust_tier === 'community') return '社区 / 可信'
+  return '官方'
+}
+/** 卡片标题优先用 MCP 服务名（registry 的 server_name / 精选索引 name），回退来源仓库域。 */
+const acCardTitle = (c: McpAutoConnectCandidate | null) =>
+  c ? (c.config.provenance?.server_name || c.config.provenance?.domain || 'server') : 'server'
 const acSources = (c: McpAutoConnectCandidate | null): AcSource[] => {
   if (!c) return []
   const url = c.config.provenance?.url || ''
   const domain = c.config.provenance?.domain || ''
   if (!domain) return []
-  return [{ domain, trust: c.trust === 'source_untrusted' ? 'unknown' : 'official', url }]
+  const tier = c.trust_tier || (c.trust === 'source_untrusted' ? 'unknown' : 'official')
+  return [{ domain, trust: tier, url }]
 }
 const acResolvedCmd = (c: McpAutoConnectCandidate | null) => c ? [c.config.command, ...(c.config.args || [])].filter(Boolean).join(' ') : ''
 /**
@@ -978,8 +987,8 @@ function close() { emit('close') }
                    :data-fill-state="acSelected === c ? 'registering' : (c.trust === 'source_untrusted' ? 'edge' : 'populated')"
                    v-show="fillState === 'populated' || (acSelected === c)">
                 <div class="sv-preview-head">
-                  <b>{{ c.config.provenance?.domain || 'server' }}</b>
-                  <span class="sv-cap-badge" :data-trust="c.trust === 'source_untrusted' ? 'unknown' : 'official'">{{ acTrustTag(c) }}</span>
+                  <b>{{ acCardTitle(c) }}</b>
+                  <span class="sv-cap-badge" :data-trust="c.trust_tier || (c.trust === 'source_untrusted' ? 'unknown' : 'official')">{{ acTrustTag(c) }}</span>
                 </div>
                 <!-- stdio：命令 / 参数 / 环境变量 -->
                 <template v-if="!isHttpTransport(c)">
@@ -1387,6 +1396,7 @@ function close() { emit('close') }
 .sv-preview-head b { font-size: 13px; }
 .sv-cap-badge { font-size: 11px; padding: 2px 9px; border-radius: var(--radius-pill); }
 .sv-cap-badge[data-trust="official"] { color: var(--trust-verified-fg); background: var(--trust-verified-bg); }
+.sv-cap-badge[data-trust="community"] { color: var(--trust-community-fg); background: var(--trust-community-bg); }
 .sv-cap-badge[data-trust="unknown"] { color: var(--trust-unknown-fg); background: var(--trust-unknown-bg); }
 
 .sv-cmd {
