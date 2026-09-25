@@ -868,7 +868,8 @@ PROVIDER_ADAPTERS: dict[str, dict[str, Any]] = {
         "aliases": ("smithery", "smithery.ai", "smithery api"),
         "domains": ("smithery.ai", "www.smithery.ai", "server.smithery.ai"),
         "register_url": "https://smithery.ai/account/api-keys",
-        "note": "Smithery 用统一 API Key 代理各 server 的第三方凭证，请在官网创建后手动回填。",
+        "note": "Smithery 用统一 API Key 代理各 server 的第三方凭证。请先登录 smithery.ai"
+                "（未登录点击会回到首页），再在「Account → API Keys」创建 Key 后回填。",
     },
 }
 
