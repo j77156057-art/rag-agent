@@ -863,6 +863,13 @@ PROVIDER_ADAPTERS: dict[str, dict[str, Any]] = {
         "register_url": "https://console.cloud.google.com/apis/credentials",
         "note": "Google Drive 需 Cloud Console 多步配置 + OAuth，首版不做自动注册，请手动创建后回填。",
     },
+    "smithery": {
+        "tier": "L2",  # Smithery 用统一 API Key 代理各 server 的第三方凭证，首版手动回填
+        "aliases": ("smithery", "smithery.ai", "smithery api"),
+        "domains": ("smithery.ai", "www.smithery.ai", "server.smithery.ai"),
+        "register_url": "https://smithery.ai/account/api-keys",
+        "note": "Smithery 用统一 API Key 代理各 server 的第三方凭证，请在官网创建后手动回填。",
+    },
 }
 
 # 挑战关键字（本地确定性匹配，只用于「停-继续」判定；页面正文绝不回传模型）。
@@ -1283,8 +1290,10 @@ def browser_register(root: str, key: str, cand: dict[str, Any], provider: str) -
         # 未收录 provider：降级 L2 手动回填。注意 url 必须为空字符串——不得用
         # provenance.url/cand.url 冒充「去官网创建凭证」链接（provenance 是来源仓库，
         # 不代表凭证签发方；否则会像本次 bug 那样把 GitHub 仓库页当成凭证创建页）。
-        return _l2_result("未收录该 provider 的自动注册流程，已降级 L2 手动回填",
-                          "", provider=provider, root=root)
+        return _l2_result(
+            "未收录该 provider 的自动注册流程，已降级 L2 手动回填。"
+            "请在对应服务官网的「Developer / API Keys」设置页创建凭证后回填。",
+            "", provider=provider, root=root)
     if adapter.get("tier") == "L2":
         return _l2_result(adapter.get("note") or "该 provider 首版不做自动注册，已降级 L2",
                           adapter.get("register_url") or fallback_url,

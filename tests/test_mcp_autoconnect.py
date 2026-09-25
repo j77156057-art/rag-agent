@@ -482,11 +482,13 @@ class AdapterMisrouteRegressionTests(_TmpProject):
     # ---- A. select_provider_adapter：provenance 不参与匹配 ----
     def test_smithery_provider_not_misrouted_by_github_provenance(self):
         # 真机复现：provider=smithery_api_key，但 provenance 是 github.com 仓库
+        # §df49458 不变量：不得误路由到 github；smithery 已收录 → 应命中自身适配器
         adapter = mcp_autoconnect.select_provider_adapter(
             "smithery_api_key",
             {"provenance": {"domain": "github.com", "url": "https://github.com/x"},
              "url": "https://server.smithery.ai/@a/b/mcp"})
-        self.assertIsNone(adapter)  # 关键：不得误匹配 github
+        self.assertIsNotNone(adapter)
+        self.assertEqual(adapter["name"], "smithery")  # 命中 smithery，而非误路由 github
 
     def test_postgres_provider_not_misrouted_by_github_provenance(self):
         # mcp_server_index 多数 curated 条目 provenance.domain == github.com
@@ -514,14 +516,23 @@ class AdapterMisrouteRegressionTests(_TmpProject):
         self.assertEqual(figma["name"], "figma")
 
     # ---- B. browser_register：未收录 provider 的「去官网创建凭证」url 必须为空 ----
-    def test_unrecorded_provider_l2_url_is_empty(self):
-        # 端到端：provider=smithery_api_key + provenance.domain=github.com 候选
-        # 调用 browser_register → 必须 tier==L2 且 url==""（不得回退 provenance 仓库页）
+    def test_smithery_provider_l2_returns_official_url(self):
+        # 端到端：provider=smithery_api_key 候选 → 命中 smithery 适配器，
+        # 返回官方取凭证页（解决真机「没有官方地址给我啊」——L2 弹窗现在可点链接）
         res = mcp_autoconnect.browser_register(
             self.project, "k",
             {"provenance": {"domain": "github.com", "url": "https://github.com/x"},
              "url": "https://server.smithery.ai/@a/b/mcp"},
             "smithery_api_key")
+        self.assertEqual(res["tier"], "L2")
+        self.assertEqual(res["url"], "https://smithery.ai/account/api-keys")
+        self.assertTrue(res["note"])
+
+    def test_truly_unrecorded_provider_l2_url_is_empty(self):
+        # 安全不变量保留：完全未收录的 provider 不得猜测/冒充官网链接（url 必须空，
+        # 不得回退 provenance 仓库页——否则会像历史 bug 那样把 GitHub 仓库页当凭证页）
+        res = mcp_autoconnect.browser_register(
+            self.project, "k", {"provenance": {}}, "totally-unknown-svc")
         self.assertEqual(res["tier"], "L2")
         self.assertEqual(res["url"], "")
         self.assertTrue(res["note"])
