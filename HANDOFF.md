@@ -1,5 +1,12 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-27 失败恢复方案接入自主开发舱
+
+- 工作流失败、子代理重试失败或进程恢复失败时，会从持久化结果生成脱敏的 `recovery` 计划，只暴露任务 ID、数量和错误类别，不暴露工具参数、文件内容或模型输出。
+- 计划最多提供三类可审核动作：先确认不确定副作用、按任务重试失败/阻塞任务、恢复执行前项目快照；没有安全动作时引导查看失败证据并重新规划。
+- `AutonomousCockpit.vue` 右侧新增“失败后的下一步”卡片，重试按顺序执行并保留确认框，快照恢复复用既有回滚接口，查看证据复用对话审核卡片。
+- 新增 `tests/test_recovery_plan.py` 覆盖失败任务、不确定副作用、快照和无证据场景；完整回归：**1637 passed / 6 skipped / 60 subtests passed**。前端 typecheck 与 `npm run build` 通过，仅保留既有非 module 脚本和大 chunk 警告。
+
 ## 2026-09-27 工具权限租约与自主开发舱能力范围
 
 - 工作流新增持久化 `capability_lease`：执行阶段默认临时授予完整的 `read_local`、`read_external`、`write_local`、`write_external`、`exec`、`network`、`admin` 能力，默认 30 分钟到期（可用 `DOCMIND_CAPABILITY_LEASE_S` 调整，范围 5 分钟至 2 小时）。

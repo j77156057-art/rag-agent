@@ -445,6 +445,27 @@ async function rollbackProject() {
   } catch (e) { error.value = (e as Error).message || '项目快照恢复失败' }
   finally { busy.value = false }
 }
+async function applyRecovery(option: NonNullable<NonNullable<WorkflowState['recovery']>['options']>[number]) {
+  if (!workflow.value || busy.value || !option) return
+  const action = option.action || ''
+  if (action === 'rollback') { await rollbackProject(); return }
+  if (action === 'inspect') { openChat(); return }
+  if (action !== 'retry_failed') { openChat(); return }
+  const taskIds = (option.task_ids || []).filter(Boolean)
+  if (!taskIds.length) { openChat(); return }
+  if (!window.confirm(`将按顺序重试 ${taskIds.length} 个失败任务，是否继续？`)) return
+  busy.value = true
+  error.value = ''
+  try {
+    for (const taskId of taskIds) {
+      const r = await agentApi.workflowSubagentRetry(workflow.value.workflow_id, taskId)
+      if (!r.workflow) throw new Error(r.error || `任务 ${taskId} 重试失败`)
+      workflow.value = r.workflow
+    }
+    await hydrate(workflow.value.workflow_id)
+  } catch (e) { error.value = (e as Error).message || '重试失败任务时发生错误' }
+  finally { busy.value = false }
+}
 async function approvePlan() {
   if (!workflow.value || busy.value) return
   busy.value = true
@@ -588,6 +609,17 @@ onBeforeUnmount(() => {
         <p v-else-if="workflow.status === 'completed'">执行已结束。请对照验收条件、任务结果和实际项目效果做最终验收。</p>
         <p v-else>模型正在使用当前项目内已授权的工具和能力推进任务。</p>
         <button @click="openChat">打开对话与审核卡片</button>
+        <div v-if="workflow.recovery?.status === 'required'" class="acp-recovery">
+          <div class="acp-recovery-head"><b>失败后的下一步</b><span>需要审核</span></div>
+          <p>{{ workflow.recovery.summary || '执行没有通过复核，请选择下一步。' }}</p>
+          <small v-if="workflow.recovery.evidence?.uncertain_task_ids?.length" class="acp-recovery-warning">
+            有 {{ workflow.recovery.evidence.uncertain_task_ids.length }} 个任务的副作用尚未确认，重试前请先核对外部状态。
+          </small>
+          <div v-for="option in (workflow.recovery.options || [])" :key="option.id || option.title" class="acp-recovery-option">
+            <div><b>{{ option.title }}</b><small>{{ option.detail }}</small></div>
+            <button :disabled="busy" @click="applyRecovery(option)">{{ option.action === 'retry_failed' ? '重试这些任务' : option.action === 'rollback' ? '恢复项目快照' : '查看并重新规划' }}</button>
+          </div>
+        </div>
         <div v-if="workflow.project_checkpoint?.id" class="acp-checkpoint">
           <b>执行前快照</b>
           <small>{{ workflow.project_checkpoint.file_count || 0 }} 个文件 · {{ Math.round((workflow.project_checkpoint.bytes || 0) / 1024) }} KB</small>
@@ -640,4 +672,13 @@ button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent);
 .acp-lease { display: grid; gap: 4px; padding: 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-hover); font-size: 11px; }
 .acp-lease-head { display: flex; justify-content: space-between; gap: 8px; }
 .acp-lease small { color: var(--text-faint); line-height: 1.45; }
+.acp-recovery { display: grid; gap: 7px; padding: 9px; border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--danger) 5%, var(--bg-hover)); font-size: 11px; }
+.acp-recovery-head { display: flex; justify-content: space-between; gap: 8px; }
+.acp-recovery-head span { color: var(--danger); font-size: 10px; }
+.acp-recovery p { margin: 0; }
+.acp-recovery-warning { color: var(--amber); line-height: 1.45; }
+.acp-recovery-option { display: grid; gap: 6px; padding-top: 7px; border-top: 1px solid var(--border); }
+.acp-recovery-option b { display: block; }
+.acp-recovery-option small { display: block; margin-top: 3px; color: var(--text-faint); line-height: 1.45; }
+.acp-recovery-option button { justify-self: start; padding: 5px 8px; font-size: 11px; }
 </style>

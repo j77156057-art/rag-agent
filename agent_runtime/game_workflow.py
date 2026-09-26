@@ -275,6 +275,8 @@ class WorkflowState:
     subagents: list[dict[str, Any]] = field(default_factory=list)
     results: dict[str, Any] = field(default_factory=dict)
     review: dict[str, Any] = field(default_factory=dict)
+    # Deterministic recovery choices derived from the failed execution evidence.
+    recovery: dict[str, Any] = field(default_factory=dict)
     acceptance_contract: dict[str, Any] = field(default_factory=dict)
     preview: dict[str, Any] = field(default_factory=dict)
     # Project files captured before the first side-effecting execution wave.
@@ -334,6 +336,95 @@ def review_output(result: Mapping[str, Any] | None, *, max_tool_failures: int = 
                                 require_evidence=require_evidence)
     report["failures"] = report.get("tool_failure_count", 0)
     return report
+
+
+def build_recovery_plan(state: Mapping[str, Any] | WorkflowState | None,
+                        *, error: str = "") -> dict[str, Any]:
+    """Build bounded, actionable recovery guidance from durable evidence.
+
+    Only task IDs, counts and error categories are exposed.  Tool arguments,
+    file contents and model output are deliberately excluded from this public
+    projection; the existing task trace remains the detailed evidence view.
+    """
+    raw = state.public() if isinstance(state, WorkflowState) else dict(state or {})
+    report = dict(raw.get("results") or {})
+    result_map = report.get("results") if isinstance(report.get("results"), Mapping) else report
+    failed: list[str] = []
+    uncertain: list[str] = []
+    failure_kinds: set[str] = set()
+    for task_id, item in (result_map or {}).items():
+        if not isinstance(item, Mapping):
+            continue
+        status = str(item.get("status") or "")
+        kind = str(item.get("error_kind") or "")
+        text = str(item.get("error") or "")
+        if status in {"failed", "blocked"}:
+            failed.append(str(task_id))
+            if kind:
+                failure_kinds.add(kind[:60])
+        trace = item.get("trace") if isinstance(item.get("trace"), Mapping) else {}
+        steps = trace.get("steps") if isinstance(trace, Mapping) else []
+        candidates = list(steps) if isinstance(steps, (list, tuple)) else []
+        candidates.append(item)
+        if any(isinstance(step, Mapping) and (
+                step.get("error_kind") == "idempotency_in_doubt" or
+                "不确定" in str(step.get("obs") or "") or
+                "idempotency_in_doubt" in str(step.get("error") or "")
+        ) for step in candidates) or kind == "idempotency_in_doubt" or "不确定执行" in text:
+            uncertain.append(str(task_id))
+    failed = list(dict.fromkeys(failed))[:32]
+    uncertain = list(dict.fromkeys(uncertain))[:32]
+    options: list[dict[str, Any]] = []
+    if uncertain:
+        options.append({
+            "id": "inspect_uncertain_side_effect",
+            "action": "inspect",
+            "title": "先确认不确定的副作用",
+            "detail": "工具可能已经执行但结果未落账，系统已阻止重放；请先检查外部状态，再决定是否继续。",
+            "task_ids": uncertain,
+            "requires_user": True,
+        })
+    if failed:
+        options.append({
+            "id": "retry_failed_tasks",
+            "action": "retry_failed",
+            "title": "重试失败任务",
+            "detail": "保留已完成任务，只重试失败或阻塞的任务；每个任务仍受原有重试上限约束。",
+            "task_ids": failed,
+            "requires_user": True,
+        })
+    if raw.get("project_checkpoint", {}).get("id"):
+        options.append({
+            "id": "restore_project_checkpoint",
+            "action": "rollback",
+            "title": "恢复执行前项目快照",
+            "detail": "恢复快照中已有文件，快照之后新建的文件会保留；恢复动作仍需用户确认。",
+            "task_ids": [],
+            "requires_user": True,
+        })
+    if not options:
+        options.append({
+            "id": "inspect_failure_evidence",
+            "action": "inspect",
+            "title": "查看失败证据后重新规划",
+            "detail": "当前没有可安全自动重试的任务，请先查看工具轨迹和验收条件，再修改计划。",
+            "task_ids": [],
+            "requires_user": True,
+        })
+    details = []
+    if failed:
+        details.append("失败/阻塞任务 %d 个" % len(failed))
+    if uncertain:
+        details.append("不确定副作用 %d 个" % len(uncertain))
+    if failure_kinds:
+        details.append("错误类别：" + "、".join(sorted(failure_kinds)[:4]))
+    return {
+        "status": "required",
+        "generated_at": _now(),
+        "summary": ("；".join(details) or _clean_text(error, 240) or "执行未通过复核"),
+        "evidence": {"failed_task_ids": failed, "uncertain_task_ids": uncertain},
+        "options": options[:3],
+    }
 
 
 class GameWorkflowManager:
@@ -705,6 +796,7 @@ class GameWorkflowManager:
                 error_name = type(exc).__name__
                 if not str(exc).startswith("workflow_lease_"):
                     self._event(state, "recovery_failed", error=error_name)
+                    state.recovery = build_recovery_plan(state, error="进程恢复失败：" + error_name)
                     self._save(state)
                     recovered.append({"workflow_id": workflow_id, "status": "retry_pending",
                                       "error": error_name})
@@ -2292,6 +2384,8 @@ class GameWorkflowManager:
                          for item in result_map.values())
             state.status = "completed" if all_ok and state.review.get("ok") else "failed"
             state.phase = "review"
+            state.recovery = (build_recovery_plan(state, error="单任务重试仍未通过")
+                              if state.status == "failed" else {})
             self._event(state, "subagent_retry_complete", task_id=task_id,
                         attempt=attempt, previous_status=previous_status,
                         status=retried.get("status"), workflow_status=state.status,
@@ -2544,6 +2638,8 @@ class GameWorkflowManager:
         }
         state.status = "completed" if state.review.get("ok") and report.get("ok") else "failed"
         state.phase = "review"
+        state.recovery = (build_recovery_plan(state, error="执行结果未通过复核")
+                          if state.status == "failed" else {})
         self._event(state, "review", ok=state.review.get("ok"), status=state.status)
         if state.experience_enabled and not any(e.get("kind") == "experience" for e in state.events):
             try:

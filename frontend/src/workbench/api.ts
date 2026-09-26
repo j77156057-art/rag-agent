@@ -2543,6 +2543,11 @@ export interface WorkflowState {
   results?: Record<string, Record<string, unknown>>; events?: WorkflowEvent[]
   dispatches?: Array<{ planner?: string; added?: string[]; kind?: string }>
   review?: Record<string, unknown>; interrupt_reason?: string
+  recovery?: {
+    status?: string; generated_at?: string; summary?: string
+    evidence?: { failed_task_ids?: string[]; uncertain_task_ids?: string[] }
+    options?: Array<{ id?: string; action?: string; title?: string; detail?: string; task_ids?: string[]; requires_user?: boolean }>
+  }
   acceptance_contract?: AcceptanceContract
   project_checkpoint?: {
     id?: string; created_at?: string; file_count?: number; bytes?: number
