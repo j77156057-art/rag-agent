@@ -9,6 +9,7 @@ the network.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -38,6 +39,7 @@ class ToolInstallManager:
         self.root = Path(project_root).resolve()
         self.env_root = (self.root / ".docmind" / "tool_envs").resolve()
         self.audit_path = (self.root / ".docmind" / "tool_installs.jsonl").resolve()
+        self.lock_path = (self.root / ".docmind" / "tool-lock.json").resolve()
         if self.root not in self.env_root.parents:
             raise ToolInstallError("工具沙箱路径必须位于项目目录内")
 
@@ -83,16 +85,74 @@ class ToolInstallManager:
                          "assert not %r or v == %r, (v, %r); "
                          "print(v)" % (spec["target"], spec["package"],
                                        expected, expected, expected))]
+            source = "https://pypi.org/project/%s/" % spec["package"]
+            launch = {"mode": "python_path", "target": spec["target"],
+                      "command": [sys.executable, "-m", spec["package"]]}
         else:
             command = ["npm", "install", "--prefix", spec["target"], "--ignore-scripts",
                        "--no-audit", "--no-fund", spec["spec"]]
             verifier = ["npm", "--prefix", spec["target"], "list", "--depth=0", spec["spec"]]
-        return {**spec, "command": command, "verifier": verifier,
+            source = "https://www.npmjs.com/package/%s" % spec["package"]
+            launch = {"mode": "node_prefix", "target": spec["target"],
+                      "command": ["npx", "--prefix", spec["target"], spec["package"]]}
+        return {**spec, "source": source, "launch": launch,
+                "command": command, "verifier": verifier,
                 "approval_action": "install_tool",
                 "approval_target": "%s:%s" % (spec["manager"], spec["spec"]),
                 "sandbox": True,
                 "network_required": True,
                 "alternatives": spec["fallback_tools"]}
+
+    @staticmethod
+    def _fingerprint(target: Path) -> dict[str, Any]:
+        """Hash an installed environment without following links or unbounded files."""
+        digest = hashlib.sha256()
+        count = 0
+        total = 0
+        partial = False
+        if not target.is_dir():
+            return {"sha256": "", "file_count": 0, "bytes": 0, "partial": True}
+        for path in sorted(target.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            try:
+                rel = path.relative_to(target).as_posix()
+                size = path.stat().st_size
+                if count >= 10000 or total + size > 50 * 1024 * 1024:
+                    partial = True
+                    break
+                digest.update(rel.encode("utf-8", "replace"))
+                digest.update(b"\0")
+                with path.open("rb") as handle:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                count += 1
+                total += size
+            except OSError:
+                partial = True
+        return {"sha256": digest.hexdigest(), "file_count": count,
+                "bytes": total, "partial": partial}
+
+    def _write_lock(self, entry: Mapping[str, Any]) -> dict[str, Any]:
+        existing: dict[str, Any] = {"version": 1, "tools": {}}
+        try:
+            if self.lock_path.is_file():
+                loaded = json.loads(self.lock_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing.update(loaded)
+                    existing["tools"] = dict(loaded.get("tools") or {})
+        except (OSError, ValueError):
+            existing = {"version": 1, "tools": {}}
+        key = "%s:%s" % (entry.get("manager"), entry.get("spec"))
+        existing["tools"][key] = dict(entry)
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.lock_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(self.lock_path)
+        return dict(existing["tools"][key])
 
     def _audit(self, row: Mapping[str, Any]) -> None:
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +180,7 @@ class ToolInstallManager:
         record = {"ts": int(time.time()), "package": plan["package"],
                   "manager": plan["manager"], "version": plan["version"],
                   "target": plan["target"], "approved": bool(approved),
+                  "source": plan["source"], "launch": plan["launch"],
                   "sandbox": True, "status": "planned"}
         if not approved:
             record["status"] = "approval_required"
@@ -167,7 +228,17 @@ class ToolInstallManager:
                       "version_ok": True, "command": plan["verifier"],
                       "stdout": stdout, "version_stdout": verify_stdout,
                       "version_stderr": verify_stderr}
-            record.update(status="installed", verify=verify)
+            fingerprint = self._fingerprint(target)
+            lock = self._write_lock({
+                "manager": plan["manager"], "package": plan["package"],
+                "spec": plan["spec"], "version": plan["version"],
+                "source": plan["source"], "target": plan["target"],
+                "launch": plan["launch"], "fingerprint": fingerprint,
+                "installed_at": int(time.time()),
+            })
+            verify["fingerprint"] = fingerprint
+            verify["lockfile"] = str(self.lock_path)
+            record.update(status="installed", verify=verify, lock=lock)
             self._audit(record)
             return {"ok": True, "plan": plan, "verify": verify, "audit": record}
         except Exception as exc:

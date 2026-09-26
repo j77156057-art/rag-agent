@@ -2380,12 +2380,20 @@ def _region_write_allowed(target):
 # 用于 apply_edit 的"先读后写"安全护栏：未确认过内容的文件不允许整体重写。
 _READ_FILES = set()
 _REGION_LOCKS = {}
+_FILE_LOCKS = {}
 _REGION_LOCKS_GUARD = threading.Lock()
 
 
 def _region_lock(key):
     with _REGION_LOCKS_GUARD:
         return _REGION_LOCKS.setdefault(key, threading.RLock())
+
+
+def _file_lock(target):
+    """Serialize final writes per absolute path across parallel subagents."""
+    key = os.path.normcase(os.path.abspath(target))
+    with _REGION_LOCKS_GUARD:
+        return _FILE_LOCKS.setdefault(key, threading.RLock())
 
 
 def _resolve_in_root(path):
@@ -2671,8 +2679,11 @@ def create_external_file(arg):
         except Exception as e:  # noqa: BLE001
             return f"创建目录失败: {e}"
     try:
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(content)
+        with _file_lock(target):
+            if os.path.exists(target):
+                return "并行创建冲突：目标文件已被另一个代理创建，请改用 apply_edit。"
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(content)
     except Exception as e:  # noqa: BLE001
         return f"写入失败: {e}"
     _READ_EXTERNAL_FILES.add(os.path.normcase(target))
@@ -2989,31 +3000,33 @@ def confirm_edit(pid):
 
     try:
         if kind == "create_file":
-            if os.path.exists(target):
-                return _discard(f"目标文件已存在：{e['rel']}（暂存后文件被创建，为避免覆盖已取消）。")
-            parent = os.path.dirname(target)
-            if parent and not os.path.isdir(parent):
-                os.makedirs(parent, exist_ok=True)
-            with open(target, "w", encoding="utf-8") as f:
-                f.write(e["new_content"])
+            with _file_lock(target):
+                if os.path.exists(target):
+                    return _discard(f"目标文件已存在：{e['rel']}（暂存后文件被创建，为避免覆盖已取消）。")
+                parent = os.path.dirname(target)
+                if parent and not os.path.isdir(parent):
+                    os.makedirs(parent, exist_ok=True)
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(e["new_content"])
             _READ_FILES.add(os.path.normcase(target))
         elif kind == "delete_external_file":
             if not os.path.isfile(target):
                 return _discard(f"目标文件已不存在：{e['rel']}（暂存后已被删除，已取消）。")
             os.remove(target)
         else:  # apply_edit
-            if not os.path.isfile(target):
-                return _discard(f"目标文件已不存在：{e['rel']}")
-            # 防「暂存后被改动」：内容不一致则拒绝，避免覆盖他人在暂存期间的修改
-            try:
-                with open(target, encoding="utf-8", errors="ignore") as f:
-                    cur = f.read()
-            except Exception as ex:  # noqa: BLE001
-                return False, f"读取目标失败: {ex}"
-            if cur != e["old_content"]:
-                return _discard("目标文件在暂存后被修改，内容已变化；请重新 read_file 后再改。")
-            with open(target, "w", encoding="utf-8") as f:
-                f.write(e["new_content"])
+            with _file_lock(target):
+                if not os.path.isfile(target):
+                    return _discard(f"目标文件已不存在：{e['rel']}")
+                # 防「暂存后被改动」：内容不一致则拒绝，避免覆盖他人在暂存期间的修改
+                try:
+                    with open(target, encoding="utf-8", errors="ignore") as f:
+                        cur = f.read()
+                except Exception as ex:  # noqa: BLE001
+                    return False, f"读取目标失败: {ex}"
+                if cur != e["old_content"]:
+                    return _discard("目标文件在暂存后被修改，内容已变化；请重新 read_file 后再改。")
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(e["new_content"])
             _READ_FILES.add(os.path.normcase(target))
     except Exception as ex:  # noqa: BLE001
         return False, f"写入/删除失败: {ex}"
@@ -3122,8 +3135,15 @@ def apply_edit(arg):
 
     # 写回
     try:
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(new_content)
+        with _file_lock(target):
+            # Parallel subagents may have written the file after the initial
+            # read. Re-check the base before writing to fail closed.
+            with open(target, encoding="utf-8", errors="ignore") as f:
+                current = f.read()
+            if current != old_content:
+                return "并行修改冲突：文件在本次编辑准备后已发生变化，请重新 read_file 后再改。"
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(new_content)
     except Exception as e:  # noqa: BLE001
         return f"写入失败: {e}"
 
@@ -3211,8 +3231,11 @@ def create_file(arg):
             return f"创建目录失败: {e}"
 
     try:
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(content)
+        with _file_lock(target):
+            if os.path.exists(target):
+                return "并行创建冲突：目标文件已被另一个代理创建，请改用 apply_edit。"
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(content)
     except Exception as e:  # noqa: BLE001
         return f"写入失败: {e}"
 

@@ -1,5 +1,17 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-27 项目级工具环境锁定
+
+- `ToolInstallManager` 在项目 `.docmind/tool_envs` 内安装后写入 `.docmind/tool-lock.json`，记录 PyPI/npm 来源、精确 spec、隔离目录、启动方式、安装时间和内容 SHA-256/文件统计。
+- 安装审计记录同步包含来源和启动方式；哈希计算有文件数和 50MB 上限，避免大型环境阻塞工作流。
+- `tests/test_tool_install.py` 已覆盖 lock manifest、来源、启动方式和 fingerprint；定向工具测试 **6 passed**。
+
+## 2026-09-27 并行代理文件冲突保护
+
+- `tools.py` 为每个绝对文件路径增加进程内写锁，`apply_edit` 在最终落盘前重新读取并比对基线；并行代理已修改文件时直接返回“并行修改冲突”，不会覆盖新内容。
+- `create_file` 和人工确认后的落盘也在同一文件锁下再次检查目标，避免两个代理同时创建或确认过期修改。
+- 新增 `tests/test_file_conflict.py` 覆盖落盘前文件变化的 fail-closed 行为；定向工具/并行测试 **11 passed**。
+
 ## 2026-09-27 任务时间线与安全续跑
 
 - `WorkflowState` 新增持久化 `timeline`，最多保留 500 条事件；原有 `events` 继续作为 100 条 SSE 重放窗口，旧状态读取时自动迁移。

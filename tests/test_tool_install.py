@@ -47,6 +47,10 @@ class ToolInstallTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertTrue(result["verify"]["sandbox_ok"])
             self.assertTrue(result["verify"]["version_ok"])
+            self.assertEqual(result["audit"]["source"], "https://pypi.org/project/ruff/")
+            self.assertEqual(result["audit"]["launch"]["mode"], "python_path")
+            self.assertTrue(result["verify"]["fingerprint"]["sha256"])
+            self.assertTrue(Path(root, ".docmind", "tool-lock.json").is_file())
             self.assertEqual(manager.audit()[-1]["status"], "installed")
             json.dumps(result, ensure_ascii=False)
 
