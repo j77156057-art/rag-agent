@@ -1,5 +1,13 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-27 项目级能力画像
+
+- 新增 `agent_runtime/project_profile.py`，每个项目在 `.docmind/project-profile.json` 保存脱敏的能力摘要：所用工具、MCP 连接器、运行命令、验收方法/脚本、预览适配器、来源和领域类型。
+- 工作流保存时自动合并当前任务、验收契约、预览 artifact 和已配置 MCP；工作流进程重启时从项目画像恢复。画像不会写入 MCP command、args、env、headers、token 或其他凭据。
+- 新增 `GET /api/agent/project-profile`，开发舱项目切换时重新读取；右侧“项目能力画像”卡片展示连接器、工具、运行命令、验收方式和预览适配器。
+- 新增 `tests/test_project_profile.py`，覆盖首次创建、工作流重启恢复、项目隔离和敏感字段脱敏。
+- 验证：全量后端测试 **1642 passed / 6 skipped / 60 subtests passed**；前端 typecheck 与 production build 通过，仅保留既有非 module 脚本和大 chunk 警告。
+
 ## 2026-09-27 项目级工具环境锁定
 
 - `ToolInstallManager` 在项目 `.docmind/tool_envs` 内安装后写入 `.docmind/tool-lock.json`，记录 PyPI/npm 来源、精确 spec、隔离目录、启动方式、安装时间和内容 SHA-256/文件统计。

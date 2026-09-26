@@ -31,6 +31,7 @@ from .acceptance_contract import (from_tasks as acceptance_from_tasks,
                                   on_plan_changed as acceptance_on_plan_changed,
                                   revise as revise_acceptance)
 from .preview_adapters import build_preview_bundle
+from .project_profile import load_profile, merge_profile
 from .project_checkpoint import create_checkpoint, restore_checkpoint
 from .tools import Capability
 from .context_router import (CONTEXT_LAYERS, ContextPlan, ContextRouter,
@@ -278,6 +279,8 @@ class WorkflowState:
     # Deterministic recovery choices derived from the failed execution evidence.
     recovery: dict[str, Any] = field(default_factory=dict)
     acceptance_contract: dict[str, Any] = field(default_factory=dict)
+    # 项目级可复用能力摘要；详细凭据和连接参数永不写入这里。
+    project_profile: dict[str, Any] = field(default_factory=dict)
     preview: dict[str, Any] = field(default_factory=dict)
     # Project files captured before the first side-effecting execution wave.
     # The orchestration checkpoint above is insufficient to restore files.
@@ -829,6 +832,13 @@ class GameWorkflowManager:
             self._release_capability_lease(state)
         if state.results or state.review:
             state.preview = build_preview_bundle(state.public())
+        if state.project_root:
+            try:
+                state.project_profile = merge_profile(state.project_root, state.public())
+            except (OSError, ValueError, TypeError):
+                # 画像是增强信息，不能让主工作流因项目目录暂时不可写而失败。
+                if not state.project_profile:
+                    state.project_profile = load_profile(state.project_root)
         # Persist bounded content snapshots, not only layer counters. This is
         # the cross-window handoff consumed after a process/checkpoint restart.
         raw_layers = dict(state.context_layers or {})
@@ -899,6 +909,8 @@ class GameWorkflowManager:
                 raw = json.loads(path.read_text(encoding="utf-8"))
                 legacy = "kind" not in raw
                 state = WorkflowState(**raw)
+                if state.project_root:
+                    state.project_profile = load_profile(state.project_root)
                 timeline_migrated = False
                 if not isinstance(state.timeline, list):
                     state.timeline = []

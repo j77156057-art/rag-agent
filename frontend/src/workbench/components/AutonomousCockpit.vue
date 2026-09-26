@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { agentApi, getProjectId, workflowEvents } from '../api'
-import type { VisualFeedbackRecord, WorkflowEvent, WorkflowEvaluation, WorkflowState, WorkflowSummary } from '../api'
+import type { ProjectProfile, VisualFeedbackRecord, WorkflowEvent, WorkflowEvaluation, WorkflowState, WorkflowSummary } from '../api'
 import { blobDataUrl } from '../previewFeedback'
 import { capturePreviewFrame, refreshPreviewFrame } from '../previewCapture'
 import type { PreviewFeedbackRequest } from '../previewFeedback'
@@ -10,6 +10,7 @@ import CockpitApprovalQueue from './CockpitApprovalQueue.vue'
 const goal = ref('')
 const workflow = ref<WorkflowState | null>(null)
 const evaluation = ref<WorkflowEvaluation | null>(null)
+const projectProfile = ref<ProjectProfile | null>(null)
 const selectedId = ref('')
 const history = ref<WorkflowSummary[]>([])
 const error = ref('')
@@ -86,6 +87,11 @@ function leaseStatusLabel(lease: WorkflowState['capability_lease']): string {
   if (lease.status === 'released') return '已释放'
   if (leaseIsExpired(lease)) return '已过期'
   return '当前有效'
+}
+function profileMcpLabel(item: { name?: string; key?: string; enabled?: boolean; capabilities?: string[] }): string {
+  const name = item.name || item.key || 'MCP'
+  const caps = item.capabilities?.length ? ` · ${item.capabilities.slice(0, 4).join('、')}` : ''
+  return `${name}${item.enabled === false ? '（已停用）' : ''}${caps}`
 }
 function previewSource(artifact: { uri?: string; path?: string; id?: string }): string {
   const uri = String(artifact.uri || '')
@@ -398,6 +404,13 @@ async function hydrate(id: string, ticket = generation) {
     else error.value = r.error || '无法读取工作流'
   } catch (e) { if (ticket === generation) error.value = (e as Error).message }
 }
+async function loadProjectProfile(ticket = generation) {
+  try {
+    const r = await agentApi.projectProfile()
+    if (ticket !== generation) return
+    projectProfile.value = r.ok && r.profile ? r.profile : null
+  } catch { if (ticket === generation) projectProfile.value = null }
+}
 function scheduleHydrate() {
   if (refreshTimer || !workflow.value) return
   refreshTimer = setTimeout(() => {
@@ -411,6 +424,7 @@ function select(id: string) {
   unsubscribe?.()
   selectedId.value = id
   workflow.value = null
+  projectProfile.value = null
   evaluation.value = null
   loadFeedbackHistory(id)
   error.value = ''
@@ -538,12 +552,15 @@ function onProjectChanged() {
   feedbackHistory.value = []
   feedbackOpenId.value = ''; feedbackText.value = ''; feedbackRegion.value = null; annotationId.value = ''; regionOwner.value = ''
   error.value = ''
+  void loadProjectProfile(generation)
   void loadList()
 }
 onMounted(() => {
+  void loadProjectProfile()
   void loadList()
   window.addEventListener('docmind:workflow-started', onStarted as EventListener)
   window.addEventListener('docmind:project-changed', onProjectChanged)
+  window.addEventListener('docmind:project-context-changed', onProjectChanged)
   pollTimer = setInterval(() => { if (workflow.value) void hydrate(workflow.value.workflow_id) }, 10000)
 })
 onBeforeUnmount(() => {
@@ -554,6 +571,7 @@ onBeforeUnmount(() => {
   stopResize()
   window.removeEventListener('docmind:workflow-started', onStarted as EventListener)
   window.removeEventListener('docmind:project-changed', onProjectChanged)
+  window.removeEventListener('docmind:project-context-changed', onProjectChanged)
 })
 </script>
 
@@ -664,6 +682,16 @@ onBeforeUnmount(() => {
           </div>
           <details class="acp-evaluation-checks"><summary>查看检查项</summary><div v-for="check in (evaluation.checks || [])" :key="check.name" :class="check.ok ? 'acp-ok' : 'acp-error'"><span>{{ check.ok ? '✓' : '!' }}</span>{{ check.name }}<small>{{ check.detail }}</small></div></details>
         </div>
+        <div v-if="projectProfile" class="acp-profile">
+          <div class="acp-profile-head"><b>项目能力画像</b><span>{{ projectProfile.kind || 'generic' }}</span></div>
+          <small class="acp-muted">自动记录当前项目可复用的工具、连接器和验收方式</small>
+          <div class="acp-profile-grid"><span>工具 <b>{{ projectProfile.tools?.length || 0 }}</b></span><span>MCP <b>{{ projectProfile.mcp?.length || 0 }}</b></span><span>运行命令 <b>{{ projectProfile.run_commands?.length || 0 }}</b></span><span>预览适配器 <b>{{ projectProfile.preview_adapters?.length || 0 }}</b></span></div>
+          <details v-if="projectProfile.mcp?.length"><summary>MCP 连接器</summary><small v-for="item in projectProfile.mcp" :key="item.key">{{ profileMcpLabel(item) }}</small></details>
+          <details v-if="projectProfile.tools?.length"><summary>已用工具</summary><small>{{ projectProfile.tools.join('、') }}</small></details>
+          <details v-if="projectProfile.run_commands?.length"><summary>运行命令</summary><small v-for="item in projectProfile.run_commands" :key="item">{{ item }}</small></details>
+          <details v-if="projectProfile.acceptance_methods?.length || projectProfile.acceptance_scripts?.length"><summary>验收方式</summary><small v-for="item in [...(projectProfile.acceptance_methods || []), ...(projectProfile.acceptance_scripts || [])]" :key="item">{{ item }}</small></details>
+          <details v-if="projectProfile.preview_adapters?.length"><summary>预览适配器</summary><small>{{ projectProfile.preview_adapters.join('、') }}</small></details>
+        </div>
         <div v-if="workflow.project_checkpoint?.id" class="acp-checkpoint">
           <b>执行前快照</b>
           <small>{{ workflow.project_checkpoint.file_count || 0 }} 个文件 · {{ Math.round((workflow.project_checkpoint.bytes || 0) / 1024) }} KB</small>
@@ -679,7 +707,13 @@ onBeforeUnmount(() => {
         <h3>本项目历史</h3><button v-for="item in history" :key="item.workflow_id" class="acp-history" @click="select(item.workflow_id)">{{ item.request || item.workflow_id }}<small>{{ statusLabel[item.status] || item.status }}</small></button>
       </aside>
     </div>
-    <div v-else class="acp-empty">本项目还没有工作流。写下目标后，模型会先提出方案和验收条件。</div>
+    <div v-else class="acp-empty">本项目还没有工作流。写下目标后，模型会先提出方案和验收条件。
+      <div v-if="projectProfile" class="acp-profile acp-empty-profile">
+        <div class="acp-profile-head"><b>项目能力画像</b><span>{{ projectProfile.kind || 'generic' }}</span></div>
+        <div class="acp-profile-grid"><span>工具 <b>{{ projectProfile.tools?.length || 0 }}</b></span><span>MCP <b>{{ projectProfile.mcp?.length || 0 }}</b></span><span>运行命令 <b>{{ projectProfile.run_commands?.length || 0 }}</b></span><span>预览适配器 <b>{{ projectProfile.preview_adapters?.length || 0 }}</b></span></div>
+        <small v-if="projectProfile.mcp?.length">连接器：{{ projectProfile.mcp.map(item => profileMcpLabel(item)).join('、') }}</small>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -701,6 +735,7 @@ button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent);
 .acp-timeline-item time { flex: 0 0 auto; color: var(--text-faint); font-size: 10px; }
 .acp-timeline-item p { margin: 6px 0; color: var(--text-muted); line-height: 1.45; }
 .acp-timeline-item button { padding: 4px 7px; font-size: 10px; }
+.acp-empty-profile { max-width: 420px; margin: 16px auto 0; text-align: left; }
 .acp-previews { display: grid; gap: 6px; }.acp-preview { border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px; font-size: 11px; }.acp-preview summary { display: flex; gap: 7px; cursor: pointer; }.acp-preview summary b { color: var(--accent); font-weight: 600; }.acp-preview p { margin: 7px 0; }.acp-preview img,.acp-preview video { display: block; max-width: 100%; max-height: 180px; margin-top: 7px; border-radius: 5px; }.acp-preview audio { width: 100%; margin-top: 7px; }.acp-preview pre { max-height: 150px; overflow: auto; padding: 7px; white-space: pre-wrap; background: var(--bg-hover); }.acp-preview small { display: block; color: var(--text-faint); margin-top: 4px; overflow-wrap: anywhere; }
 .acp-change-summary { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; font-size: 11px; color: var(--text-faint); }.acp-change-summary b { color: var(--text); margin-right: 3px; }
 .acp-live-frame { position: relative; margin-top: 8px; max-width: 100%; border: 1px solid var(--border); border-radius: 7px; overflow: visible; background: #101521; }.acp-live-bar { display: flex; align-items: center; gap: 6px; padding: 6px 8px; color: #dbe5f5; font-size: 10px; }.acp-live-bar i { width: 7px; height: 7px; border-radius: 50%; background: #43d17a; box-shadow: 0 0 8px #43d17a; }.acp-live-bar small { margin-left: auto; color: #93a4bd; }.acp-live-bar button { padding: 3px 7px; border-color: #52698b; color: #dbe5f5; background: #26344b; font-size: 10px; }.acp-live-viewport { position: relative; max-width: 100%; min-height: 220px; }.acp-live-viewport iframe { display: block; width: 100%; height: 100%; min-height: 220px; border: 0; border-radius: 0 0 7px 7px; background: #000; }.acp-annotation-layer { position: absolute; inset: 0; cursor: crosshair; background: rgba(24, 39, 64, .22); touch-action: none; }.acp-annotation-box { position: absolute; border: 2px solid #55a8ff; background: rgba(85,168,255,.18); pointer-events: none; }.acp-resize-handle { position: absolute; right: -1px; bottom: -1px; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 0 0 7px 0; background: linear-gradient(135deg, transparent 45%, #8fa4c4 46%, #8fa4c4 53%, transparent 54%, transparent 64%, #8fa4c4 65%, #8fa4c4 72%, transparent 73%); cursor: nwse-resize; }.acp-feedback-pop { position: absolute; z-index: 4; top: 35px; right: 8px; width: min(300px, calc(100% - 16px)); padding: 9px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg-raised); box-shadow: 0 12px 32px rgba(0,0,0,.28); }.acp-feedback-head,.acp-feedback-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }.acp-feedback-head button { border: 0; background: transparent; padding: 0 3px; font-size: 16px; }.acp-feedback-pop textarea { width: 100%; box-sizing: border-box; margin: 8px 0; resize: vertical; border: 1px solid var(--border); border-radius: 6px; padding: 7px; color: var(--text); background: var(--bg); font: inherit; font-size: 11px; }.acp-feedback-foot small { color: var(--text-faint); font-size: 10px; }.acp-feedback-foot button { padding: 5px 8px; background: var(--accent); color: #fff; border-color: var(--accent); }
@@ -714,6 +749,10 @@ button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent);
 .acp-feedback-record summary span { color: var(--accent); }
 .acp-feedback-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .acp-feedback-actions button { padding: 5px 7px; font-size: 11px; }
+.acp-profile { display: grid; gap: 6px; padding: 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-hover); font-size: 11px; }
+.acp-profile-head { display: flex; justify-content: space-between; gap: 8px; }.acp-profile-head span { color: var(--accent); font-size: 10px; }
+.acp-profile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; color: var(--text-muted); }.acp-profile-grid b { color: var(--text); }
+.acp-profile details { border-top: 1px solid var(--border); padding-top: 5px; }.acp-profile summary { cursor: pointer; color: var(--text-muted); }.acp-profile details small { display: block; margin-top: 4px; overflow-wrap: anywhere; color: var(--text-faint); }
 .acp-snapshot-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
 .acp-snapshot-pair figure { margin: 0; padding: 6px; border: 1px solid var(--border); border-radius: 6px; min-width: 0; }
 .acp-snapshot-pair figcaption { margin-bottom: 5px; font-size: 11px; color: var(--text-muted); }

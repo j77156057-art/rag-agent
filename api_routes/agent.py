@@ -17,6 +17,7 @@ from agent_runtime.retrieval import retrieve_context, status as retrieval_status
 from agent_runtime.retrieval_eval import compare_reports, evaluate_modes
 from agent_runtime.workflow_eval import DEFAULT_DATASET_NAME, dataset_cases
 from agent_runtime.tool_install import ToolInstallError, ToolInstallManager
+from agent_runtime.project_profile import load_profile
 from agent_runtime.local_runtime import effective_subagent_limit, resource_profile
 from config import COLLECTION_NAME, LLM_MODEL, LLM_PROVIDER, PROVIDERS, get_runtime
 from game_workbench import approval as record_user_approval
@@ -329,6 +330,17 @@ def build_router(ctx) -> APIRouter:
     @router.get("/routing")
     async def routing_status():
         return {"ok": True, **ctx.routing_status()}
+
+    @router.get("/project-profile")
+    async def project_profile():
+        """读取当前项目的脱敏能力画像。"""
+        root = ctx._project_root_or_error()
+        if not root:
+            return {"ok": False, "error": "未配置代码库"}
+        try:
+            return {"ok": True, "profile": load_profile(root)}
+        except (OSError, ValueError, TypeError) as exc:
+            return {"ok": False, "error": "项目画像读取失败：%s" % type(exc).__name__}
 
     @router.get("/langsmith")
     async def langsmith_status():

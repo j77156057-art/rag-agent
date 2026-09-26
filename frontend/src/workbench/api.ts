@@ -2422,6 +2422,17 @@ export interface CockpitApprovalRequest {
 }
 export interface AgentPermissionResp { ok?: boolean; recorded?: boolean; reason?: string }
 export interface AgentApprovalCreateResp { ok?: boolean; approval?: AgentApproval; error?: string }
+export interface ProjectProfileMcp {
+  key: string; name?: string; enabled?: boolean; transport?: string
+  capabilities?: string[]; summary?: string
+}
+export interface ProjectProfile {
+  version?: number; project_id?: string; project_root?: string; kind?: string
+  tools?: string[]; mcp?: ProjectProfileMcp[]; run_commands?: string[]
+  acceptance_methods?: string[]; acceptance_scripts?: string[]
+  preview_adapters?: string[]; sources?: string[]; updated_at?: string
+}
+export interface ProjectProfileResp { ok?: boolean; profile?: ProjectProfile; error?: string }
 
 export interface WorkflowOption {
   id: string; title: string; summary: string; recommended?: boolean
@@ -2549,6 +2560,7 @@ export interface WorkflowState {
     options?: Array<{ id?: string; action?: string; title?: string; detail?: string; task_ids?: string[]; requires_user?: boolean }>
   }
   acceptance_contract?: AcceptanceContract
+  project_profile?: ProjectProfile
   project_checkpoint?: {
     id?: string; created_at?: string; file_count?: number; bytes?: number
     skipped?: Array<{ path?: string; reason?: string }>
@@ -2669,6 +2681,9 @@ export const agentApi = {
   },
   workflowEvaluation(id: string): Promise<{ ok?: boolean; evaluation?: WorkflowEvaluation; error?: string }> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/evaluation`)
+  },
+  projectProfile(): Promise<ProjectProfileResp> {
+    return rawJson('/api/agent/project-profile')
   },
   workflowStart(
     prompt: string,
