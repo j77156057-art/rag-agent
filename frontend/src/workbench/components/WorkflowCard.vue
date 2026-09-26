@@ -58,6 +58,12 @@ const EVENT_LABELS: Record<string, string> = {
   complete: '工作流完成', fail: '工作流失败', interrupt: '工作流中断', resume: '工作流恢复',
   approval_granted: '审批通过', approval_denied: '审批驳回', auto_execute_start: '自动开始执行',
   acceptance_revised: '验收条件已更新', acceptance_decided: '用户已完成验收决定',
+  task_complete: '任务完成', task_blocked: '任务阻塞',
+  before_tool: '调用工具前', after_tool: '调用工具后',
+  before_mcp: '调用 MCP 前', after_mcp: '调用 MCP 后',
+  project_checkpoint_created: '创建项目快照', project_checkpoint_restored: '恢复项目快照',
+  visual_snapshot_saved: '保存画面证据', subagent_step: '成员执行步骤',
+  capability_lease_created: '授予临时工具权限',
 }
 
 function roleMeta(role?: string) {
@@ -72,6 +78,7 @@ const cardOpen = ref(true)
 const gateDismissed = ref(false)
 const finalNote = ref('')
 const recoveryRiskAcknowledged = ref(false)
+const showAllTimeline = ref(false)
 const rootEl = ref<HTMLElement | null>(null)
 
 /** SSE 实时轨迹（task_id -> steps），仅内存；终态后由 state.results[].trace 补全。 */
@@ -251,6 +258,9 @@ const reviewFailures = computed(() => {
 
 const uncertainTaskIds = computed(() => state.value?.recovery?.evidence?.uncertain_task_ids || [])
 watch(() => state.value?.recovery?.generated_at, () => { recoveryRiskAcknowledged.value = false })
+
+const timelineEvents = computed(() => state.value?.timeline?.length ? state.value.timeline : (state.value?.events || []))
+const visibleTimeline = computed(() => timelineEvents.value.slice(showAllTimeline.value ? 0 : -30).reverse())
 
 // ---------------------------------------------------------------- SSE + hydrate
 function setState(wf: WorkflowState | null | undefined) {
@@ -544,9 +554,25 @@ function criterionTaskResult(evidence: string[]): { status: string; conclusion: 
   return result ? { status: String(result.status || 'unknown'),
     conclusion: String(result.conclusion || result.summary || result.error || '') } : null
 }
-function eventDetail(ev: WorkflowEvent): string {
-  const fields = ['task_id', 'role', 'option', 'task_count', 'attempt', 'reason', 'error', 'status', 'task_thread']
-  return fields.filter(k => ev[k] !== undefined && ev[k] !== '').map(k => `${k}=${String(ev[k])}`).join(' · ')
+function timelineDetail(ev: WorkflowEvent): string {
+  const parts: string[] = []
+  if (ev.task_id) parts.push('任务 ' + String(ev.task_id).slice(0, 80))
+  if (ev.role) parts.push('角色 ' + roleMeta(String(ev.role)).label)
+  if (ev.status) parts.push('状态 ' + String(ev.status).slice(0, 40))
+  if (typeof ev.attempt === 'number') parts.push('第 ' + ev.attempt + ' 次尝试')
+  if (typeof ev.file_count === 'number') parts.push(ev.file_count + ' 个文件')
+  return parts.join(' · ')
+}
+function timelineTime(ev: WorkflowEvent): string {
+  const date = new Date(String(ev.ts || ''))
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN')
+}
+function timelineCanReplay(ev: WorkflowEvent): boolean {
+  const id = String(ev.task_id || '')
+  const resultEvent = ['task_complete', 'task_blocked', 'subagent_complete', 'subagent_retry_complete']
+    .includes(String(ev.kind || ''))
+  return !!id && resultEvent && (status.value === 'failed' || status.value === 'interrupted')
+    && ['failed', 'blocked'].includes(taskStatusOf(id))
 }
 function focusTask(id: string) {
   cardOpen.value = true
@@ -770,13 +796,25 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <!-- 事件日志（透明：整个流程发生了什么） -->
-      <details v-if="state?.events?.length" class="wf-events">
-        <summary>流程事件（{{ state.events.length }}）</summary>
-        <div v-for="(ev, i) in state.events.slice(-16)" :key="i" class="wf-event">
-          <b>{{ EVENT_LABELS[String(ev.kind)] || ev.kind }}</b>
-          <small v-if="eventDetail(ev)">{{ eventDetail(ev) }}</small>
+      <!-- 持久时间线优先；旧工作流回退到事件窗口 -->
+      <details v-if="timelineEvents.length" class="wf-timeline">
+        <summary>任务时间线（{{ timelineEvents.length }}）</summary>
+        <div class="wf-timeline-list">
+          <details v-for="(ev, i) in visibleTimeline" :key="ev.seq || String(ev.kind) + String(ev.ts) + i" class="wf-timeline-item">
+            <summary>
+              <span><b>{{ EVENT_LABELS[String(ev.kind)] || ev.kind || '事件' }}</b><small v-if="ev.task_id">{{ ev.task_id }}</small></span>
+              <time v-if="timelineTime(ev)">{{ timelineTime(ev) }}</time>
+            </summary>
+            <div class="wf-timeline-detail">
+              <p v-if="timelineDetail(ev)">{{ timelineDetail(ev) }}</p>
+              <button v-if="timelineCanReplay(ev)" class="wf-mini-btn" :disabled="busy" @click.stop="retryMember(String(ev.task_id))">从此任务继续</button>
+              <button v-else-if="ev.task_id" class="wf-mini-btn" @click.stop="focusTask(String(ev.task_id))">查看任务</button>
+            </div>
+          </details>
         </div>
+        <button v-if="timelineEvents.length > 30" class="wf-mini-btn wf-timeline-more" @click.stop="showAllTimeline = !showAllTimeline">
+          {{ showAllTimeline ? '只看最近 30 条' : '查看全部 ' + timelineEvents.length + ' 条' }}
+        </button>
       </details>
     </div>
 
@@ -993,11 +1031,18 @@ onBeforeUnmount(() => {
 .wf-project-profile-tags { display: flex; flex-wrap: wrap; gap: 4px; }
 .wf-project-profile-tags span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid var(--border); border-radius: 99px; padding: 2px 7px; color: var(--text-muted); background: var(--bg-raised); }
 .wf-project-profile-tags .wf-profile-disabled { opacity: .55; text-decoration: line-through; }
-.wf-events { font-size: 11px; }
-.wf-events summary { cursor: pointer; color: var(--text-faint); }
-.wf-event { display: flex; gap: 8px; padding: 2px 0; }
-.wf-event b { font-weight: 600; color: var(--text-muted); flex: 0 0 auto; }
-.wf-event small { color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-timeline { font-size: 11px; }
+.wf-timeline > summary { cursor: pointer; color: var(--text-faint); }
+.wf-timeline-list { display: grid; gap: 5px; max-height: 360px; overflow-y: auto; margin-top: 7px; }
+.wf-timeline-item { padding: 6px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-hover); }
+.wf-timeline-item > summary { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; cursor: pointer; }
+.wf-timeline-item > summary span { display: flex; gap: 7px; min-width: 0; }
+.wf-timeline-item b { color: var(--text-muted); font-weight: 600; }
+.wf-timeline-item small { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-timeline-item time { color: var(--text-faint); font-size: 10px; flex: 0 0 auto; }
+.wf-timeline-detail { display: grid; justify-items: start; gap: 6px; padding-top: 6px; }
+.wf-timeline-detail p { margin: 0; color: var(--text-faint); overflow-wrap: anywhere; }
+.wf-timeline-more { margin-top: 7px; }
 .wf-dots { animation: wf-blink 1.1s infinite; }
 @keyframes wf-blink { 50% { opacity: .25; } }
 </style>
