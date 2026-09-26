@@ -682,6 +682,14 @@ onBeforeUnmount(() => {
           </div>
           <details class="acp-evaluation-checks"><summary>查看检查项</summary><div v-for="check in (evaluation.checks || [])" :key="check.name" :class="check.ok ? 'acp-ok' : 'acp-error'"><span>{{ check.ok ? '✓' : '!' }}</span>{{ check.name }}<small>{{ check.detail }}</small></div></details>
         </div>
+        <div v-if="workflow.self_review?.status === 'ready'" class="acp-self-review">
+          <div class="acp-self-review-head"><b>模型自我复盘</b><span>{{ Math.round((workflow.self_review.confidence || 0) * 100) }}% 可信度</span></div>
+          <p>{{ workflow.self_review.summary }}</p>
+          <details v-if="workflow.self_review.changed?.length"><summary>做了什么</summary><small v-for="item in workflow.self_review.changed" :key="item">✓ {{ item }}</small></details>
+          <details v-if="workflow.self_review.verified?.length"><summary>验证了什么</summary><small v-for="item in workflow.self_review.verified" :key="item">✓ {{ item }}</small></details>
+          <details v-if="workflow.self_review.uncertainties?.length" open><summary>仍不确定</summary><small v-for="item in workflow.self_review.uncertainties" :key="item">! {{ item }}</small></details>
+          <details v-if="workflow.self_review.next_steps?.length"><summary>建议下一步</summary><small v-for="item in workflow.self_review.next_steps" :key="item">→ {{ item }}</small></details>
+        </div>
         <div v-if="projectProfile" class="acp-profile">
           <div class="acp-profile-head"><b>项目能力画像</b><span>{{ projectProfile.kind || 'generic' }}</span></div>
           <small class="acp-muted">自动记录当前项目可复用的工具、连接器和验收方式</small>
@@ -753,6 +761,9 @@ button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent);
 .acp-profile-head { display: flex; justify-content: space-between; gap: 8px; }.acp-profile-head span { color: var(--accent); font-size: 10px; }
 .acp-profile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; color: var(--text-muted); }.acp-profile-grid b { color: var(--text); }
 .acp-profile details { border-top: 1px solid var(--border); padding-top: 5px; }.acp-profile summary { cursor: pointer; color: var(--text-muted); }.acp-profile details small { display: block; margin-top: 4px; overflow-wrap: anywhere; color: var(--text-faint); }
+.acp-self-review { display: grid; gap: 6px; padding: 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-hover); font-size: 11px; }
+.acp-self-review-head { display: flex; justify-content: space-between; gap: 8px; }.acp-self-review-head span { color: var(--accent); font-size: 10px; }.acp-self-review p { margin: 0; color: var(--text-muted); line-height: 1.45; }
+.acp-self-review details { border-top: 1px solid var(--border); padding-top: 5px; }.acp-self-review summary { cursor: pointer; color: var(--text-muted); }.acp-self-review details small { display: block; margin-top: 4px; line-height: 1.4; overflow-wrap: anywhere; }.acp-self-review details:nth-of-type(3) small { color: var(--amber); }
 .acp-snapshot-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
 .acp-snapshot-pair figure { margin: 0; padding: 6px; border: 1px solid var(--border); border-radius: 6px; min-width: 0; }
 .acp-snapshot-pair figcaption { margin-bottom: 5px; font-size: 11px; color: var(--text-muted); }

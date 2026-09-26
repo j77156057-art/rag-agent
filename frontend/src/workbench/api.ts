@@ -2509,6 +2509,11 @@ export interface WorkflowEvaluation {
   replans?: number
   metrics?: Record<string, number | boolean>
 }
+export interface WorkflowSelfReview {
+  status?: 'ready' | 'in_progress' | string
+  generated_at?: string; source?: string; confidence?: number; summary?: string
+  changed?: string[]; verified?: string[]; uncertainties?: string[]; next_steps?: string[]
+}
 export interface AcceptanceItem {
   id: string; statement: string; method: string; evidence: string[]
   required: boolean; user_approved: boolean
@@ -2561,6 +2566,7 @@ export interface WorkflowState {
   }
   acceptance_contract?: AcceptanceContract
   project_profile?: ProjectProfile
+  self_review?: WorkflowSelfReview
   project_checkpoint?: {
     id?: string; created_at?: string; file_count?: number; bytes?: number
     skipped?: Array<{ path?: string; reason?: string }>

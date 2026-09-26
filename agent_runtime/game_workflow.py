@@ -32,6 +32,7 @@ from .acceptance_contract import (from_tasks as acceptance_from_tasks,
                                   revise as revise_acceptance)
 from .preview_adapters import build_preview_bundle
 from .project_profile import load_profile, merge_profile
+from .workflow_reflection import build_self_review
 from .project_checkpoint import create_checkpoint, restore_checkpoint
 from .tools import Capability
 from .context_router import (CONTEXT_LAYERS, ContextPlan, ContextRouter,
@@ -281,6 +282,8 @@ class WorkflowState:
     acceptance_contract: dict[str, Any] = field(default_factory=dict)
     # 项目级可复用能力摘要；详细凭据和连接参数永不写入这里。
     project_profile: dict[str, Any] = field(default_factory=dict)
+    # 终态工作流的脱敏自我复盘，供续跑和用户验收使用。
+    self_review: dict[str, Any] = field(default_factory=dict)
     preview: dict[str, Any] = field(default_factory=dict)
     # Project files captured before the first side-effecting execution wave.
     # The orchestration checkpoint above is insufficient to restore files.
@@ -832,6 +835,8 @@ class GameWorkflowManager:
             self._release_capability_lease(state)
         if state.results or state.review:
             state.preview = build_preview_bundle(state.public())
+        if state.status in self._TERMINAL_STATUSES or state.status == "interrupted":
+            state.self_review = build_self_review(state.public())
         if state.project_root:
             try:
                 state.project_profile = merge_profile(state.project_root, state.public())
@@ -912,6 +917,10 @@ class GameWorkflowManager:
                 if state.project_root:
                     state.project_profile = load_profile(state.project_root)
                 timeline_migrated = False
+                self_review_migrated = False
+                if state.status in self._TERMINAL_STATUSES and not state.self_review:
+                    state.self_review = build_self_review(state.public())
+                    self_review_migrated = True
                 if not isinstance(state.timeline, list):
                     state.timeline = []
                     timeline_migrated = True
@@ -965,7 +974,7 @@ class GameWorkflowManager:
                 except OSError:
                     pass
             self._tag_event_seqs(state)
-            if timeline_migrated:
+            if timeline_migrated or self_review_migrated:
                 try:
                     path.write_text(json.dumps(state.public(), ensure_ascii=False, indent=2),
                                     encoding="utf-8")

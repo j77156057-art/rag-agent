@@ -8,6 +8,14 @@
 - 新增 `tests/test_project_profile.py`，覆盖首次创建、工作流重启恢复、项目隔离和敏感字段脱敏。
 - 验证：全量后端测试 **1642 passed / 6 skipped / 60 subtests passed**；前端 typecheck 与 production build 通过，仅保留既有非 module 脚本和大 chunk 警告。
 
+## 2026-09-27 工作流级模型自我复盘
+
+- 新增 `agent_runtime/workflow_reflection.py`，从任务结果、文件/预览 artifact、复核检查、验收契约、权限租约和子代理 reflection 生成有界、脱敏的 `self_review`。
+- 工作流完成、失败或暂停时自动持久化复盘；旧终态工作流首次读取时自动迁移。复盘分为“做了什么、验证了什么、仍不确定、建议下一步”，带可信度和证据来源，不额外调用模型，不把原始工具输出或凭据暴露给前端。
+- `AutonomousCockpit.vue` 右侧新增“模型自我复盘”卡片，用户可以直接看到未确定项和下一步，而不需要翻完整时间线。
+- 新增 `tests/test_workflow_self_review.py`，覆盖终态重启恢复、失败任务、不确定项、用户验收和敏感字段脱敏；补修 `WorkflowCard.vue` 缺失的 `cardOpen` 状态，前端 typecheck/build 恢复通过。
+- 验证：全量后端测试 **1647 passed / 6 skipped / 60 subtests passed**；前端 typecheck 与 production build 通过，仅保留既有非 module 脚本和大 chunk 警告。
+
 ## 2026-09-27 项目级工具环境锁定
 
 - `ToolInstallManager` 在项目 `.docmind/tool_envs` 内安装后写入 `.docmind/tool-lock.json`，记录 PyPI/npm 来源、精确 spec、隔离目录、启动方式、安装时间和内容 SHA-256/文件统计。
