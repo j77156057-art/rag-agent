@@ -45,6 +45,20 @@ def test_expired_lease_blocks_even_when_capability_is_declared():
     assert "过期" in reason
 
 
+def test_released_or_incomplete_lease_cannot_execute_tools():
+    agent = Agent(
+        llm=_LLM(),
+        tool_registry={"read_file": {"description": "read", "func": _tool("ok")}},
+        capability_lease={"status": "released", "capabilities": ["read_local"],
+                          "expires_at_epoch": time.time() + 60},
+    )
+    assert agent._lease_blocked("read_file")[0] is True
+    agent.capability_lease = {"status": "invalid"}
+    assert agent._lease_blocked("read_file")[0] is True
+    agent.capability_lease = {"status": "active", "expires_at_epoch": time.time() + 60}
+    assert agent._lease_blocked("read_file")[0] is True
+
+
 def test_workflow_capability_lease_persists_and_releases_on_terminal_state(tmp_path):
     manager = GameWorkflowManager(str(tmp_path))
     workflow_id = manager.start("临时工具权限测试")['workflow_id']

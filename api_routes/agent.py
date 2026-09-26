@@ -186,7 +186,8 @@ def build_router(ctx) -> APIRouter:
                 agent.capability_lease = dict(
                     (WORKFLOWS.get(wid).get("capability_lease") or {}) if wid else {})
             except Exception:
-                agent.capability_lease = dict(state.get("capability_lease") or {})
+                # A failed state read must not silently remove the boundary.
+                agent.capability_lease = {"status": "invalid"}
             out = agent._run_child(
                 task.get("role", "coder"), prompt, context=context,
                 persona=task.get("persona", ""),

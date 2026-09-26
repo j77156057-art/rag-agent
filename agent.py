@@ -1387,15 +1387,17 @@ class Agent:
         lease = self.capability_lease
         if not lease or spec is None:
             return False, ""
+        if lease.get("status", "active") != "active":
+            return True, "当前工作流的工具权限租约已释放或无效"
         try:
             expires_at = float(lease.get("expires_at_epoch") or 0)
         except (TypeError, ValueError):
             expires_at = 0.0
-        if expires_at and time.time() >= expires_at:
+        if expires_at <= time.time():
             return True, "当前工作流的工具权限租约已过期"
         allowed = {str(item) for item in (lease.get("capabilities") or []) if str(item)}
         capability = getattr(spec.capability, "value", str(spec.capability))
-        if allowed and capability not in allowed:
+        if capability not in allowed:
             return True, "当前工作流未租用 %s 能力" % capability
         return False, ""
 
