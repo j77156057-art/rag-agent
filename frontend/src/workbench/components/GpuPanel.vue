@@ -124,6 +124,9 @@ watch(open, (v) => {
   if (v) idleInput.value = String(st.value?.ollama_idle.unload_seconds ?? 0)
 })
 usePolling(refresh, 5000, { active: open })
+/** 供顶栏「工具」菜单外部唤起。 */
+function show() { open.value = true }
+defineExpose({ show })
 </script>
 
 <template>

@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 import os
 from unittest.mock import patch
@@ -11,6 +12,18 @@ from agent_runtime.context_router import (allocate_layer_budgets, compress_conte
                                            summarize_subagent_result,
                                            compress_layers_durable, persistent_compression_worker)
 from agent_runtime.workflow_eval import compare_evaluation, evaluate_workflow
+
+
+def _wait_terminal(manager, wid, timeout=10.0):
+    """Wait for a workflow whose execution runs on a manager daemon thread."""
+    deadline = time.time() + timeout
+    while True:
+        status = manager.get(wid)
+        if status["status"] in {"completed", "failed", "interrupted"}:
+            return status
+        if time.time() >= deadline:
+            raise AssertionError("workflow %s stuck in %s" % (wid, status["status"]))
+        time.sleep(0.01)
 
 
 class GameWorkflowTests(unittest.TestCase):
@@ -192,9 +205,58 @@ class GameWorkflowTests(unittest.TestCase):
         self.manager.plan(wid, [{"id": "a", "role": "tester", "task": "验证"}])
         self.manager.execute(wid, lambda _task, _context: {
             "status": "ok", "conclusion": "自动完成", "steps": 1})
-        done = self.manager.approve(wid, True, auto_execute=True)
+        approved = self.manager.approve(wid, True, auto_execute=True)
+        # The DAG now runs on a daemon thread: approval returns planned at once
+        # and completion arrives through state/events instead of blocking HTTP.
+        self.assertEqual(approved["status"], "planned")
+        self.assertTrue(any(event["kind"] == "auto_execute_start" for event in approved["events"]))
+        done = _wait_terminal(self.manager, wid)
         self.assertEqual(done["status"], "completed")
-        self.assertTrue(any(event["kind"] == "auto_execute_start" for event in done["events"]))
+
+    def test_choose_auto_execute_returns_planning_and_runs_to_completion(self):
+        from agent_runtime import game_workflow as gw
+        if gw.StateGraph is None:
+            self.skipTest("LangGraph not installed")
+        manager = self.manager
+        state = manager.start(
+            "选完就自动开干", policy=WorkflowPolicy(max_subagents=1),
+            task_generator=lambda prompt, selected, context_plan:
+                '{"tasks":[{"id":"a","role":"tester","task":"跑一遍校验",'
+                '"depends_on":[],"optional":false,"parallel_safe":true}]}')
+        wid = state["workflow_id"]
+        manager.set_execution_resolver(lambda _state: {
+            "runner": lambda _task, _context: {
+                "status": "ok", "conclusion": "自动跑完", "steps": 1}})
+        choosing = manager.choose(wid, "recommended", auto_execute=True)
+        # The choice HTTP call returns immediately with the planning state;
+        # planner + approval gate + execution all continue in the background.
+        self.assertEqual(choosing["status"], "planning")
+        done = _wait_terminal(manager, wid)
+        self.assertEqual(done["status"], "completed")
+        self.assertTrue(any(event["kind"] == "plan" for event in done["events"]))
+        self.assertTrue(any(event["kind"] == "execute_start" for event in done["events"]))
+
+    def test_choose_rules_while_options_still_generating(self):
+        from agent_runtime import game_workflow as gw
+        if gw.StateGraph is None:
+            self.skipTest("LangGraph not installed")
+        state = self.manager.start(
+            "方案精炼中也能直接选", policy=WorkflowPolicy(max_subagents=1),
+            option_generator=lambda prompt, plan: '{"options":[]}',
+            defer_option_generation=True, llm_enabled=True)
+        if state["status"] != "generating_options":
+            self.skipTest("deferred option generation unavailable")
+        wid = state["workflow_id"]
+        # Strict callers (tests/other integrations) still require ready options
+        with self.assertRaises(WorkflowError):
+            self.manager.choose(wid, "recommended")
+        # During refinement only an existing direct option is accepted
+        with self.assertRaises(WorkflowError):
+            self.manager.choose(wid, "web_research", auto_execute=True)
+        with self.assertRaises(WorkflowError):
+            self.manager.choose(wid, "custom", auto_execute=True, custom_request="自定义")
+        with self.assertRaises(WorkflowError):
+            self.manager.choose(wid, "missing-id", auto_execute=True)
 
     def test_successful_workflow_creates_skill_candidate_without_auto_saving(self):
         state = self.manager.start("沉淀可复用原型流程", experience_enabled=True,
@@ -251,7 +313,9 @@ class GameWorkflowTests(unittest.TestCase):
         restarted = GameWorkflowManager(state_root)
         restarted.set_execution_resolver(lambda _state: {
             "runner": lambda *_: {"status": "ok", "conclusion": "恢复后完成", "steps": 1}})
-        done = restarted.approve(wid, True, auto_execute=True)
+        approved = restarted.approve(wid, True, auto_execute=True)
+        self.assertEqual(approved["status"], "planned")
+        done = _wait_terminal(restarted, wid)
         self.assertEqual(done["status"], "completed")
         self.assertTrue(any(event["kind"] == "auto_execute_reconstructed"
                             for event in done["events"]))

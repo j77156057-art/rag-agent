@@ -605,37 +605,94 @@ button { font-family: inherit; }
   flex-wrap: nowrap;
   gap: 8px;
 }
-/* 面板容器：各占自然宽度，弹层 absolute 不受影响 */
-.wb-tool { display: inline-flex; align-items: center; }
-.wb-topbar-maps { display: inline-flex; align-items: center; gap: 8px; }
 /* 所有顶栏触发器单行显示，杜绝逐字竖排（只作用于触发器，不波及弹层内容） */
 .wb-topbar-right > a,
-.wb-topbar-right > button,
-.wb-topbar-maps .wb-map-btn,
-.te-trigger, .gp-trigger, .hp-trigger, .ap-trigger, .sr-trigger {
+.wb-topbar-right > span > button {
   white-space: nowrap;
   flex: 0 0 auto;
 }
 
-/* ---------- 顶栏窄屏分级降级 ----------
-   原则：先收定位框 → 面板/图谱按钮「图标化」（入口一个不丢，hover 看全名）
-   → 再隐藏低优先级文字入口 → 极端窄宽才减按钮。任何宽度下「保存」必须完整可见。
-   弹层均 teleport 到 body，图标化/隐藏触发器不影响面板功能。 */
-/* ≤2200（覆盖全部常见 1080P/2K 桌面）：5 个面板触发器 + 3 个图谱按钮仅留图标 */
-@media (max-width: 2200px) {
-  .wb-topbar .wb-tool .te-label,
-  .wb-topbar .wb-tool .gp-label,
-  .wb-topbar .wb-tool .hp-label,
-  .wb-topbar .wb-tool .ap-label,
-  .wb-topbar .wb-tool .sr-label,
-  .wb-topbar .wb-topbar-maps .wb-map-label { display: none; }
-  .wb-topbar .wb-tool .te-trigger,
-  .wb-topbar .wb-tool .gp-trigger,
-  .wb-topbar .wb-tool .hp-trigger,
-  .wb-topbar .wb-tool .ap-trigger,
-  .wb-topbar .wb-tool .sr-trigger,
-  .wb-topbar .wb-topbar-maps .wb-map-btn { gap: 0; padding-left: 8px; padding-right: 8px; }
+/* ---------- 顶栏收纳下拉（代码图 / 工具） ----------
+   低频分析视图与高级面板统一收进两个菜单，面板弹层仍 teleport 到 body。 */
+.wb-menu-wrap { position: relative; display: inline-flex; }
+.wb-menu-trigger {
+  border-color: var(--border-strong);
+  background: var(--bg-raised);
+  color: var(--text-muted);
 }
+.wb-menu-trigger:hover:not(:disabled),
+.wb-menu-trigger.wb-menu-on {
+  filter: none;
+  color: var(--accent);
+  border-color: #b9d0f5;
+  background: #eef4fe;
+}
+.wb-menu-caret { opacity: .65; }
+.wb-menu-backdrop { position: fixed; inset: 0; z-index: 60; }
+.wb-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  z-index: 61;
+  min-width: 244px;
+  padding: 6px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-pop);
+}
+.wb-menu-right { right: 0; }
+.wb-menu-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  background: transparent;
+  border-radius: 7px;
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+  color: var(--text);
+}
+.wb-menu-item:hover { background: var(--bg-hover); }
+.wb-menu-item-name { font-size: 12.5px; font-weight: 600; }
+.wb-menu-item small { font-size: 10.5px; color: var(--text-faint); line-height: 1.35; }
+.wb-menu-sep { height: 1px; background: var(--border); margin: 5px 4px; }
+/* 运行游戏触发钮 teleport 进菜单项：抹平组件自带描边，撑满整行 */
+.wb-menu-slot-item { padding: 0; }
+#wb-sr-slot { display: flex; width: 100%; }
+.wb-menu .wb-menu-slot-item .sr-trigger {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  padding: 7px 10px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.wb-menu .wb-menu-slot-item .sr-trigger:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+  border-color: transparent;
+}
+
+/* 高级工具面板隐藏宿主：只保留 teleport 到 body 的弹层，触发器经菜单 ref 唤起 */
+.wb-tool-host { position: absolute; width: 1px; height: 1px; overflow: hidden; pointer-events: none; }
+.wb-tool-host .te-trigger,
+.wb-tool-host .gp-trigger,
+.wb-tool-host .hp-trigger,
+.wb-tool-host .ap-trigger { display: none !important; }
+
+/* ---------- 顶栏窄屏分级降级 ----------
+   入口已收进两个短文字下拉，常规桌面宽度无需图标化；极端窄宽只让出次要项。
+   任何宽度下「保存」必须完整可见。 */
 /* ≤1280：分区 pill 让位（分区入口在概览驾驶舱仍可到达），项目选择器保留只收窄 */
 @media (max-width: 1280px) {
   .wb-topbar-meta .wb-region-pill { display: none; }
@@ -649,16 +706,6 @@ button { font-family: inherit; }
   .wb-question-link,
   .wb-save-btn kbd { display: none; }
 }
-/* ≤1024：再收 AI 运行台 / 运行游戏 / AI 设置（功能仍可从 AI 助手侧进入） */
-@media (max-width: 1024px) { .wb-tool-hp, .wb-tool-sr, .wb-tool-ap { display: none; } }
-/* ≤820：任务面板与 Unity 图收起，项目选择器再收窄 */
-@media (max-width: 820px) {
-  .wb-topbar { gap: 10px; padding: 0 10px; }
-  .wb-proj-btn { max-width: 120px; }
-  .wb-proj-name { max-width: 76px; }
-  .wb-tool-te,
-  .wb-topbar-maps .wb-map-btn:nth-child(3) { display: none; }
-}
 /* ≤760：历史/回滚按钮让位（文件标签右键与 Ctrl+S 仍可保存） */
 @media (max-width: 760px) { .wb-history-btn, .wb-revert-btn { display: none; } }
 .wb-question-link { color: var(--text-muted); text-decoration: none; font-size: 11.5px; line-height: 1; font-weight: 600;
@@ -666,20 +713,6 @@ button { font-family: inherit; }
   background: var(--bg-raised);
   transition: border-color .15s, background .15s, color .15s; }
 .wb-question-link:hover { color: var(--accent); border-color: #b9d0f5; background: #eef4fe; }
-.wb-map-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 10px;
-  border-radius: 6px;
-  border: 1px solid var(--border-strong);
-  background: var(--bg-raised);
-  color: var(--text-muted);
-  font-size: 12px;
-  cursor: pointer;
-}
-.wb-map-btn:hover { color: var(--accent); border-color: #b9d0f5; background: #eef4fe; }
 .wb-save-btn {
   position: relative;
   display: inline-flex;

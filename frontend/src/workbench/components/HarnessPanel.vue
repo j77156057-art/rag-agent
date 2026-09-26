@@ -266,7 +266,9 @@ async function removeHookBreakpoint(kind: string) {
   } catch (e) { actionMsg.value = (e as Error).message || '断点移除失败' }
 }
 
-
+/** 供顶栏「工具」菜单外部唤起。 */
+function show() { open.value = true }
+defineExpose({ show })
 </script>
 
 <template>

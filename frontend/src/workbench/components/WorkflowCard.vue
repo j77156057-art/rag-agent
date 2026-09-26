@@ -82,13 +82,16 @@ function roleMeta(role?: string) {
 const state = ref<WorkflowState | null>(null)
 const loadError = ref('')
 const busy = ref(false)
+// 初始收起门弹窗：hydrate 得到真实状态后再武装（避免无 seed 时闪一下）。
+const gateDismissed = ref(true)
 const cardOpen = ref(true)
-const gateDismissed = ref(false)
 const finalNote = ref('')
 const recoveryRiskAcknowledged = ref(false)
 const showAllTimeline = ref(false)
 const evaluation = ref<WorkflowEvaluation | null>(null)
 const rootEl = ref<HTMLElement | null>(null)
+/** 卡片头部状态行展示的最新一条实时动作（调用了什么工具 / 读写了什么）。 */
+const lastLive = ref<{ title: string; summary: string } | null>(null)
 
 /** SSE 实时轨迹（task_id -> steps），仅内存；终态后由 state.results[].trace 补全。 */
 const liveSteps = reactive(new Map<string, WorkflowStepItem[]>())
@@ -119,6 +122,12 @@ function flushSteps() {
     liveSteps.set(st.id, list)
     openNow.add(st.id)
   }
+  // 卡片头部始终展示最新一条动作（调用了什么工具、读写了什么文件）
+  const newest = queued[queued.length - 1]
+  if (newest) {
+    const step = { type: newest.type, text: newest.text }
+    lastLive.value = { title: stepTitle(step), summary: stepSummary(step) }
+  }
   openMembers.value = openNow
   // 一帧最多通知父级跟随一次
   emit('activity')
@@ -132,8 +141,23 @@ const terminal = computed(() => TERMINAL.has(status.value))
 const gateNeeded = computed(() => GATE_STATUSES.has(status.value) && !terminal.value)
 const gateOpen = computed(() => gateNeeded.value && !gateDismissed.value)
 watch(gateOpen, (open) => emit('gate', open), { immediate: true })
+/** 需要人工处理的门（选择/检索）立即弹窗；审批门在自动链路里只会毫秒穿过，延迟武装防闪。 */
+const DIRECT_GATE_STATUSES = new Set(['awaiting_choice', 'generating_options', 'awaiting_research'])
+let gateArmTimer: ReturnType<typeof setTimeout> | undefined
 watch(status, (next, prev) => {
-  if (next !== prev && GATE_STATUSES.has(next)) gateDismissed.value = false
+  if (next === prev) return
+  if (gateArmTimer) { clearTimeout(gateArmTimer); gateArmTimer = undefined }
+  // 进入新的人工门：重新武装弹窗（提交失败回滚 / 研究后回到选择门）
+  if (DIRECT_GATE_STATUSES.has(next)) {
+    gateDismissed.value = false
+  } else if (next === 'planned' || next === 'awaiting_approval') {
+    // 「选完自动开干」链路里规划→审批→执行在后台连续发生、毫秒穿过；
+    // 只有真正停留（挂回恢复的待审批 / 回调缺失）才在 500ms 后弹窗。
+    gateArmTimer = setTimeout(() => {
+      gateArmTimer = undefined
+      if (!destroyed && GATE_STATUSES.has(status.value)) gateDismissed.value = false
+    }, 500)
+  }
 }, { flush: 'post' })
 
 const stages = [
@@ -162,6 +186,13 @@ const latestEventLabel = computed(() => {
   const events = state.value?.events
   const kind = events?.length ? String(events[events.length - 1].kind || '') : ''
   return EVENT_LABELS[kind] || kind || '准备中'
+})
+/** 头部状态行的动态信息：执行中优先显示最新工具动作（调用/读写了什么）。 */
+const headDetail = computed(() => {
+  if (status.value === 'executing' && lastLive.value) {
+    return `${lastLive.value.title} · ${lastLive.value.summary}`
+  }
+  return latestEventLabel.value
 })
 
 interface MemberRow {
@@ -264,13 +295,10 @@ const reviewFailures = computed(() => {
   const failures = state.value?.review?.failures
   return Array.isArray(failures) ? failures as Array<{ kind?: string; message?: string; recovery?: string }> : []
 })
-
 const uncertainTaskIds = computed(() => state.value?.recovery?.evidence?.uncertain_task_ids || [])
 watch(() => state.value?.recovery?.generated_at, () => { recoveryRiskAcknowledged.value = false })
-
 const timelineEvents = computed(() => state.value?.timeline?.length ? state.value.timeline : (state.value?.events || []))
 const visibleTimeline = computed(() => timelineEvents.value.slice(showAllTimeline.value ? 0 : -30).reverse())
-
 const evaluationKey = computed(() => {
   const wf = state.value
   if (!wf || wf.workflow_id !== props.workflowId || !TERMINAL.has(wf.status)) return ''
@@ -414,66 +442,77 @@ async function withBusy(fn: () => Promise<void>) {
   catch (e) { loadError.value = (e as Error).message || '工作流操作失败' }
   finally { busy.value = false }
 }
-async function onChoose(choiceId: string, customText?: string) {
-  await withBusy(async () => {
-    const r = await agentApi.workflowChoice(props.workflowId, choiceId, customText || '')
-    if (r.workflow) setState(r.workflow)
-    else loadError.value = r.error || '方案选择失败'
-  })
+
+type GateResult = { ok?: boolean; workflow?: WorkflowState | null; error?: string } | null | undefined
+/**
+ * 门控提交（选方案 / 提交检索 / 审批 / 改任务）：点击瞬间就收起弹窗并释放父级
+ * 发送锁，请求在后台继续 —— 选择卡片只负责收集人的决定，绝不能把人锁在
+ * 「提交中」。成功后若后端仍停在某个门（如自定义目标后重新出方案），再重新
+ * 开门；失败则 hydrate 回真实状态、重新开门并在卡片上显示错误。
+ */
+async function submitGate(fn: () => Promise<GateResult>) {
+  gateDismissed.value = true
+  try {
+    const r = await fn()
+    if (r?.workflow) setState(r.workflow)
+    if (r && r.ok === false) throw new Error(r.error || '工作流操作失败')
+    const next = r?.workflow?.status || status.value
+    if (GATE_STATUSES.has(next)) gateDismissed.value = false
+  } catch (e) {
+    loadError.value = (e as Error).message || '工作流操作失败'
+    const ok = await hydrate()
+    if (ok && GATE_STATUSES.has(status.value)) gateDismissed.value = false
+  }
 }
-async function onResearchSubmit(findings: string) {
-  await withBusy(async () => {
-    const r = await agentApi.workflowResearch(props.workflowId, findings)
-    if (r.workflow) setState(r.workflow)
-  })
+function onChoose(choiceId: string, customText?: string) {
+  // 普通方案：选完模型立刻开干。乐观进入规划态，弹窗即时关闭、卡片自动收起，
+  // 后端在守护线程完成规划与执行，进度由 SSE 推进。
+  if (choiceId !== 'custom' && choiceId !== 'web_research') {
+    patchStatus('planning', 'plan')
+  }
+  void submitGate(() => agentApi.workflowChoice(props.workflowId, choiceId, customText || ''))
 }
-async function onResearchRun() {
-  await withBusy(async () => {
-    const r = await agentApi.workflowResearchRun(props.workflowId, state.value?.request)
-    if (r.workflow) setState(r.workflow)
-  })
+function onResearchSubmit(findings: string) {
+  void submitGate(() => agentApi.workflowResearch(props.workflowId, findings))
 }
-async function onApprove() {
-  await withBusy(async () => {
+function onResearchRun() {
+  void submitGate(() => agentApi.workflowResearchRun(props.workflowId, state.value?.request))
+}
+function onApprove() {
+  const wasWaiting = status.value === 'awaiting_approval'
+  // 批准即开跑：乐观进入执行态（后端审批后由守护线程真正运行 DAG），
+  // execute_start 等 SSE 事件随后把真实进度推到卡片。
+  patchStatus('executing', 'execute')
+  void submitGate(async () => {
     const id = props.workflowId
-    // planned=首次执行（后端会先落审批门）；awaiting_approval=批准后真正开跑
-    const r = status.value === 'awaiting_approval'
-      ? await agentApi.workflowApprove(id, true, true)
-      : await agentApi.workflowExecute(id)
-    if (r.workflow) setState(r.workflow)
+    if (wasWaiting) {
+      const r = await agentApi.workflowApprove(id, true, true)
+      // 后端秒回 planned（执行已转后台），不要用它盖掉乐观执行态
+      if (!r.workflow) return r
+      return { ok: true }
+    }
+    // planned=首次执行：execute 先落审批门（快），再批准并后台开跑
+    const r = await agentApi.workflowExecute(id)
     if (r.workflow && r.workflow.status === 'awaiting_approval') {
       const continued = await agentApi.workflowApprove(id, true, true)
-      if (continued.workflow) setState(continued.workflow)
-      else loadError.value = continued.error || '批准后启动失败'
+      return continued.workflow ? { ok: true } : continued
     }
+    return r.workflow ? { ok: true } : r
   })
 }
-async function onReject() {
-  await withBusy(async () => {
-    const r = await agentApi.workflowApprove(props.workflowId, false)
-    if (r.workflow) setState(r.workflow)
-  })
+function onReject() {
+  void submitGate(() => agentApi.workflowApprove(props.workflowId, false))
 }
-async function onRevise(taskId: string, task: string, deps: string[]) {
+function onRevise(taskId: string, task: string, deps: string[]) {
   const tasks = (state.value?.tasks || []).map(t =>
     String(t.id) === taskId ? { ...t, task, depends_on: deps } : t)
-  await withBusy(async () => {
-    const r = await agentApi.workflowRevise(props.workflowId, tasks)
-    if (r.workflow) setState(r.workflow)
-  })
+  void submitGate(() => agentApi.workflowRevise(props.workflowId, tasks))
 }
-async function onReviseApprove(approved: boolean) {
-  await withBusy(async () => {
-    const r = await agentApi.workflowReviseApprove(props.workflowId, approved)
-    if (r.workflow) setState(r.workflow)
-  })
+function onReviseApprove(approved: boolean) {
+  void submitGate(() => agentApi.workflowReviseApprove(props.workflowId, approved))
 }
-async function onAcceptanceSave(items: AcceptanceItem[]) {
-  await withBusy(async () => {
-    const r = await agentApi.workflowAcceptance(props.workflowId, items)
-    if (r.workflow) setState(r.workflow)
-    else loadError.value = r.error || '保存验收条件失败'
-  })
+function onAcceptanceSave(items: AcceptanceItem[]) {
+  void submitGate(() => agentApi.workflowAcceptance(props.workflowId, items))
 }
 async function onFinalAcceptance(approved: boolean) {
   await withBusy(async () => {
@@ -603,7 +642,6 @@ function timelineCanReplay(ev: WorkflowEvent): boolean {
     && ['failed', 'blocked'].includes(taskStatusOf(id))
 }
 function focusTask(id: string) {
-  cardOpen.value = true
   openMembers.value = new Set([...openMembers.value, id])
   requestAnimationFrame(() => {
     const target = [...(rootEl.value?.querySelectorAll<HTMLElement>('.wf-member') || [])]
@@ -628,6 +666,7 @@ onBeforeUnmount(() => {
   destroyed = true
   unsubscribe?.()
   scheduleReconnectStop()
+  if (gateArmTimer) clearTimeout(gateArmTimer)
   if (refreshTimer) clearTimeout(refreshTimer)
   if (stepRaf) { cancelAnimationFrame(stepRaf); stepRaf = 0 }
   stepQueue.length = 0
@@ -638,23 +677,26 @@ onBeforeUnmount(() => {
 
 <template>
   <div ref="rootEl" class="wf-card" :class="`wf-${status}`">
-    <header class="wf-head" @click="cardOpen = !cardOpen">
+    <header class="wf-head">
       <span class="wf-ico">🧭</span>
       <b class="wf-title">开发工作流</b>
       <span class="wf-kind">{{ KIND_LABEL[state?.kind || seed?.kind || 'generic'] || '开发流程' }}</span>
       <span class="wf-status" :class="`wf-status-${status}`">{{ STATUS_LABEL[status] || status }}</span>
+      <span
+        v-if="state?.tasks?.length && (status === 'executing' || status === 'completed')"
+        class="wf-count"
+      >{{ completedCount }}/{{ state.tasks.length }}</span>
       <span class="wf-sep">·</span>
-      <span class="wf-event">{{ latestEventLabel }}</span>
+      <span class="wf-event" :title="headDetail">{{ headDetail }}</span>
       <span class="wf-spacer" />
       <button
         v-if="gateNeeded"
         class="wf-gate-btn"
-        @click.stop="gateDismissed = false"
+        @click="gateDismissed = false"
       >{{ status === 'awaiting_approval' || status === 'planned' ? '待审批' : '待选择' }} ›</button>
-      <span class="wf-chevron">{{ cardOpen ? '▾' : '▸' }}</span>
     </header>
 
-    <div v-if="cardOpen" class="wf-body">
+    <div class="wf-body">
       <!-- 阶段条 -->
       <div class="wf-stages">
         <div v-for="(stage, i) in stages" :key="stage.key" class="wf-stage" :class="`wf-stage-${stageClass(i)}`">
@@ -773,7 +815,6 @@ onBeforeUnmount(() => {
           <span>{{ f.message }}</span><small v-if="f.recovery">建议：{{ f.recovery }}</small>
         </div>
       </div>
-
       <WorkflowPreview v-if="state && (state.preview || state.visual_feedback?.length)" :key="state.workflow_id" :workflow="state" @activity="emit('activity')" />
       <section v-if="state?.recovery?.status === 'required' && (status === 'failed' || status === 'interrupted')" class="wf-recovery">
         <div class="wf-recovery-head"><b>失败后的下一步</b><span>需要用户审核</span></div>
@@ -813,6 +854,30 @@ onBeforeUnmount(() => {
           </div>
         </details>
       </section>
+      <section v-if="state?.self_review?.status === 'ready'" class="wf-self-review">
+        <div class="wf-self-review-head">
+          <b>模型自我复盘</b>
+          <span>{{ Math.round((state.self_review.confidence || 0) * 100) }}% 可信度</span>
+        </div>
+        <p>{{ state.self_review.summary }}</p>
+        <details v-if="state.self_review.changed?.length">
+          <summary>做了什么</summary>
+          <small v-for="item in state.self_review.changed" :key="item">✓ {{ item }}</small>
+        </details>
+        <details v-if="state.self_review.verified?.length">
+          <summary>验证了什么</summary>
+          <small v-for="item in state.self_review.verified" :key="item">✓ {{ item }}</small>
+        </details>
+        <details v-if="state.self_review.uncertainties?.length" open>
+          <summary>仍不确定</summary>
+          <small v-for="item in state.self_review.uncertainties" :key="item">! {{ item }}</small>
+        </details>
+        <details v-if="state.self_review.next_steps?.length">
+          <summary>建议下一步</summary>
+          <small v-for="item in state.self_review.next_steps" :key="item">→ {{ item }}</small>
+        </details>
+      </section>
+
       <!-- 项目能力画像：只展示可复用能力摘要，不展示命令参数、环境变量或凭据 -->
       <section v-if="state?.project_profile" class="wf-project-profile">
         <div class="wf-project-profile-head">
@@ -899,10 +964,9 @@ onBeforeUnmount(() => {
 .wf-card.wf-completed { border-color: rgba(52,168,112,.45); }
 .wf-head {
   display: flex; align-items: center; gap: 8px;
-  padding: 9px 12px; cursor: pointer; user-select: none;
+  padding: 9px 12px; user-select: none;
   background: var(--bg-hover);
 }
-.wf-head:hover { filter: brightness(.985); }
 .wf-ico { font-size: 13px; }
 .wf-title { font-size: 13px; font-weight: 700; color: var(--text); }
 .wf-kind { font-size: 10.5px; color: var(--text-faint); border: 1px solid var(--border); border-radius: 99px; padding: 1px 7px; }
@@ -912,9 +976,12 @@ onBeforeUnmount(() => {
 .wf-status-failed { color: var(--danger); }
 .wf-status-awaiting_choice, .wf-status-awaiting_approval { color: var(--amber); }
 .wf-sep { color: var(--text-faint); font-size: 10px; }
-.wf-event { font-size: 11px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-event { font-size: 11px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 0 1 auto; }
+.wf-count {
+  font-size: 10.5px; font-weight: 600; color: var(--text-muted);
+  font-variant-numeric: tabular-nums; flex: 0 0 auto;
+}
 .wf-spacer { flex: 1; }
-.wf-chevron { color: var(--text-faint); font-size: 11px; }
 .wf-gate-btn {
   border: 1px solid var(--amber); color: var(--amber);
   background: rgba(214,158,46,.08); border-radius: 99px;
@@ -1077,6 +1144,10 @@ onBeforeUnmount(() => {
 .wf-evaluation details { border-top: 1px solid var(--border); padding-top: 6px; }
 .wf-evaluation summary { cursor: pointer; color: var(--text-muted); }
 .wf-evaluation-check { display: flex; gap: 7px; margin-top: 5px; }
+.wf-self-review { display: grid; gap: 6px; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-hover); font-size: 11px; }
+.wf-self-review-head { display: flex; justify-content: space-between; gap: 8px; }.wf-self-review-head span { color: var(--accent); font-size: 10px; }
+.wf-self-review p { margin: 0; color: var(--text-muted); line-height: 1.45; }.wf-self-review details { border-top: 1px solid var(--border); padding-top: 5px; }
+.wf-self-review summary { cursor: pointer; color: var(--text-muted); }.wf-self-review details small { display: block; margin-top: 4px; line-height: 1.4; overflow-wrap: anywhere; }.wf-self-review details:nth-of-type(3) small { color: var(--amber); }
 .wf-project-profile { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-hover); font-size: 11px; }
 .wf-project-profile-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .wf-project-profile-head span { color: var(--accent); font-size: 10px; border: 1px solid var(--border); border-radius: 99px; padding: 1px 7px; }

@@ -32,7 +32,6 @@ const FlowCanvas = defineAsyncComponent(() => import('./components/FlowCanvas.vu
 const RegionMapDialog = defineAsyncComponent(() => import('./components/RegionMapDialog.vue'))
 const SettingsView = defineAsyncComponent(() => import('./components/SettingsView.vue'))
 const AssetCenterView = defineAsyncComponent(() => import('./components/AssetCenterView.vue'))
-const AutonomousCockpit = defineAsyncComponent(() => import('./components/AutonomousCockpit.vue'))
 
 // 演示侧栏的文件 → 业务标签（key 取文件名，与静态示例树对齐）
 const demoBadgeOf = (name: string) => {
@@ -83,6 +82,20 @@ const canRevertActive = computed(() => {
   return !!t && t.writable && t.tracked === true && (t.gitDirty === true || t.dirty)
 })
 const canHistoryActive = computed(() => activeTab.value?.tracked === true)
+
+// ---------------------------------------------------------------- 顶栏收纳菜单
+// 低频入口统一收进两个下拉：「代码图」（4 张关系图）与「工具」
+// （任务与生成 / GPU / AI 运行台 / AI 运行设置 / 运行游戏 / 游戏引擎连接）。
+// 面板组件自带触发按钮已隐藏，仅保留 teleport 到 body 的弹层，经 ref 唤起。
+const mapMenuOpen = ref(false)
+const toolsMenuOpen = ref(false)
+const teRef = ref<InstanceType<typeof TaskEnginePanel> | null>(null)
+const gpRef = ref<InstanceType<typeof GpuPanel> | null>(null)
+const hpRef = ref<InstanceType<typeof HarnessPanel> | null>(null)
+const apRef = ref<InstanceType<typeof AgentPolicyPanel> | null>(null)
+function openEngineConnect() {
+  window.dispatchEvent(new CustomEvent('docmind:open-engine'))
+}
 
 // ---------------------------------------------------------------- P4 项目选择器
 const projects = ref<ProjectInfo[]>([])
@@ -283,7 +296,6 @@ function onWorkspaceHotkey(e: KeyboardEvent) {
   if (e.key === '1') { e.preventDefault(); setWorkspace('overview') }
   else if (e.key === '2' && tabs.value.length) { e.preventDefault(); setWorkspace('code') }
   else if (e.key === '3') { e.preventDefault(); setWorkspace('assets') }
-  else if (e.key === '4' && !demoMode.value) { e.preventDefault(); setWorkspace('cockpit') }
 }
 
 onMounted(() => {
@@ -398,70 +410,82 @@ onBeforeUnmount(() => {
           </svg>
           设置
         </button>
-        <!-- 引擎/生成类面板：窄屏按优先级分级隐藏（容器隐藏，不影响弹层逻辑） -->
-        <span class="wb-tool wb-tool-te"><TaskEnginePanel :key="currentProjectId" /></span>
-        <span class="wb-tool wb-tool-gp"><GpuPanel /></span>
-        <span class="wb-tool wb-tool-hp"><HarnessPanel /></span>
-        <span class="wb-tool wb-tool-ap"><AgentPolicyPanel /></span>
-        <!-- 运行游戏：触发按钮由唯一 SceneRuntimePanel 实例 teleport 到此槽位（保持原位置） -->
-        <span id="wb-sr-slot" class="wb-tool wb-tool-sr"></span>
-        <span class="wb-topbar-maps">
-        <button
-          v-if="tree"
-          class="wb-map-btn"
-          title="代码地图：全项目的函数/变量都在哪定义、被谁调用，一图看清"
-          @click="openSymbolMap"
-        >
-          <svg width="13" height="13" viewBox="0 0 13 13">
-            <circle cx="3.4" cy="3.4" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
-            <circle cx="9.6" cy="3" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
-            <circle cx="8.2" cy="10" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
-            <path d="M4.6 4.2 L8.4 3.6 M4.3 4.6 L7.3 9 M9 4.4 L8.5 8.6" stroke="currentColor" stroke-width="0.8" />
-          </svg>
-          <span class="wb-map-label">代码地图</span>
-        </button>
-        <button
-          v-if="tree"
-          class="wb-map-btn"
-          title="类的继承关系，以及场景里挂了哪些脚本组件"
-          @click="openRelationGraph"
-        >
-          <svg width="13" height="13" viewBox="0 0 13 13">
-            <circle cx="3.2" cy="3.6" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
-            <circle cx="10" cy="3.6" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
-            <circle cx="6.6" cy="10" r="1.4" fill="none" stroke="currentColor" stroke-width="1" />
-            <path d="M4.4 4.2 L8.8 4.2 M4 4.8 L5.8 8.8 M9.2 4.8 L7.4 8.8" stroke="currentColor" stroke-width="0.85" />
-          </svg>
-          <span class="wb-map-label">关系图</span>
-        </button>
-        <button
-          v-if="tree"
-          class="wb-map-btn"
-          title="Unity 引用图：场景/预制体/脚本/贴图之间谁引用谁，自动标红断掉的引用"
-          @click="openUnityGraph"
-        >
-          <svg width="13" height="13" viewBox="0 0 13 13">
-            <rect x="1.2" y="1.8" width="4.4" height="3.6" rx="0.8" fill="none" stroke="currentColor" stroke-width="0.9" />
-            <rect x="7.8" y="1.8" width="4.2" height="3.6" rx="0.8" fill="none" stroke="currentColor" stroke-width="0.9" />
-            <rect x="4.6" y="8.2" width="4.2" height="3.6" rx="0.8" fill="none" stroke="currentColor" stroke-width="0.9" />
-            <path d="M5.4 3.2 L8 2.8 M3.6 5.3 L5.8 8.1 M9.6 5.4 L7.8 8.2" fill="none" stroke="currentColor" stroke-width="0.8" />
-          </svg>
-          <span class="wb-map-label">Unity 图</span>
-        </button>
-        <button
-          v-if="tree || demoMode"
-          class="wb-map-btn"
-          title="AI 工作流：把每轮问答画成「提问→思考→调工具→回答」流水线，每步耗时/成败/token 一目了然"
-          @click="openFlow"
-        >
-          <svg width="13" height="13" viewBox="0 0 13 13">
-            <circle cx="3" cy="2.6" r="1.25" fill="none" stroke="currentColor" stroke-width="0.95" />
-            <rect x="1.6" y="5.6" width="2.8" height="1.9" rx="0.5" fill="none" stroke="currentColor" stroke-width="0.95" />
-            <circle cx="10" cy="10.2" r="1.25" fill="none" stroke="currentColor" stroke-width="0.95" />
-            <path d="M3 3.8 V5.6 M3 7.5 C3 9 5.6 8.7 7.2 9.3 C8.4 9.7 9 9.4 9.2 9" fill="none" stroke="currentColor" stroke-width="0.85" stroke-dasharray="1.8 1.6" />
-          </svg>
-          <span class="wb-map-label">流程图</span>
-        </button>
+        <!-- 低频分析视图收进「代码图」下拉 -->
+        <span v-if="tree || demoMode" class="wb-menu-wrap">
+          <button
+            type="button"
+            class="wb-save-btn wb-menu-trigger"
+            :class="{ 'wb-menu-on': mapMenuOpen }"
+            title="代码可视化：定义调用 / 继承挂载 / Unity 引用 / AI 问答流"
+            @click="mapMenuOpen = !mapMenuOpen"
+          >
+            代码图
+            <svg class="wb-menu-caret" width="9" height="9" viewBox="0 0 9 9" aria-hidden="true"><path d="M1.5 3.2 L4.5 6.2 L7.5 3.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div v-show="mapMenuOpen" class="wb-menu-backdrop" @click="mapMenuOpen = false" />
+          <div v-show="mapMenuOpen" class="wb-menu wb-menu-right" @click="mapMenuOpen = false">
+            <button v-if="tree" type="button" class="wb-menu-item" @click="openSymbolMap">
+              <span class="wb-menu-item-name">代码地图</span>
+              <small>函数/变量在哪定义、被谁调用</small>
+            </button>
+            <button v-if="tree" type="button" class="wb-menu-item" @click="openRelationGraph">
+              <span class="wb-menu-item-name">关系图</span>
+              <small>类的继承关系、场景挂载的脚本</small>
+            </button>
+            <button v-if="tree" type="button" class="wb-menu-item" @click="openUnityGraph">
+              <span class="wb-menu-item-name">Unity 图</span>
+              <small>场景/预制体/资源间的引用，断链标红</small>
+            </button>
+            <button type="button" class="wb-menu-item" @click="openFlow">
+              <span class="wb-menu-item-name">流程图</span>
+              <small>每轮问答「提问→思考→调工具→回答」</small>
+            </button>
+          </div>
+        </span>
+        <!-- 高级工具/引擎类面板收进「工具」下拉 -->
+        <span class="wb-menu-wrap">
+          <button
+            type="button"
+            class="wb-save-btn wb-menu-trigger"
+            :class="{ 'wb-menu-on': toolsMenuOpen }"
+            title="高级工具：任务生成、GPU、AI 运行台、运行游戏、引擎连接"
+            @click="toolsMenuOpen = !toolsMenuOpen"
+          >
+            工具
+            <svg class="wb-menu-caret" width="9" height="9" viewBox="0 0 9 9" aria-hidden="true"><path d="M1.5 3.2 L4.5 6.2 L7.5 3.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <!-- 菜单用 v-show 常驻 DOM：#wb-sr-slot 须始终可被运行游戏按钮 teleport 挂载 -->
+          <div v-show="toolsMenuOpen" class="wb-menu-backdrop" @click="toolsMenuOpen = false" />
+          <div v-show="toolsMenuOpen" class="wb-menu wb-menu-right" @click="toolsMenuOpen = false">
+            <button type="button" class="wb-menu-item" @click="teRef?.show()">
+              <span class="wb-menu-item-name">任务与生成</span>
+              <small>任务分支、Godot 控制、ComfyUI 画图、Unreal</small>
+            </button>
+            <button type="button" class="wb-menu-item" @click="gpRef?.show()">
+              <span class="wb-menu-item-name">GPU 监控</span>
+              <small>显存占用、任务排队、空闲自动释放</small>
+            </button>
+            <button type="button" class="wb-menu-item" @click="hpRef?.show()">
+              <span class="wb-menu-item-name">AI 运行台</span>
+              <small>花费、历史会话、操作记录、技能与断点</small>
+            </button>
+            <button type="button" class="wb-menu-item" @click="apRef?.show()">
+              <span class="wb-menu-item-name">AI 运行设置</span>
+              <small>本地/云端路由、项目外文件改动手动授权</small>
+            </button>
+            <template v-if="!runtimeResident">
+              <div class="wb-menu-sep" />
+              <div class="wb-menu-item wb-menu-slot-item">
+                <!-- 运行游戏触发按钮由唯一 SceneRuntimePanel 实例 teleport 到此槽位；
+                     docked 常驻态触发钮不渲染，整组隐藏避免空行 -->
+                <span id="wb-sr-slot" />
+              </div>
+            </template>
+            <button type="button" class="wb-menu-item" @click="openEngineConnect">
+              <span class="wb-menu-item-name">游戏引擎连接</span>
+              <small>Godot / Unity / Unreal 连接器与 MCP 服务</small>
+            </button>
+          </div>
         </span>
         <button
           v-if="activeTab && canHistoryActive"
@@ -567,8 +591,7 @@ onBeforeUnmount(() => {
           <template v-else-if="tree">
             <EditorTabs v-if="workspace === 'code'" />
             <div class="wb-editor-row">
-              <AutonomousCockpit v-if="workspace === 'cockpit'" />
-              <CodeView v-else :tab="workspace === 'code' ? activeTab : null" />
+              <CodeView :tab="workspace === 'code' ? activeTab : null" />
               <SelectionAiPanel v-if="aiPanelOpen && workspace === 'code'" />
               <SymbolOutline v-if="workspace === 'code'" />
             </div>
@@ -608,6 +631,15 @@ onBeforeUnmount(() => {
          docked 主体 teleport 进主区 #wb-playpane-slot；同实例仅切 mode，不重建，
          故 iframe 与引擎嵌入状态得以保留。触发按钮由该实例 teleport 回顶栏 #wb-sr-slot。 -->
     <SceneRuntimePanel :mode="runtimeResident ? 'docked' : 'popup'" />
+
+    <!-- 高级工具面板宿主：自带触发按钮隐藏（入口已收进顶栏「工具」菜单），
+         弹层 teleport 到 body，经模板 ref 调 show() 唤起。 -->
+    <div class="wb-tool-host" aria-hidden="true">
+      <TaskEnginePanel ref="teRef" :key="currentProjectId" />
+      <GpuPanel ref="gpRef" />
+      <HarnessPanel ref="hpRef" />
+      <AgentPolicyPanel ref="apRef" />
+    </div>
 
     <ContextMenu />
     <AppDialog />

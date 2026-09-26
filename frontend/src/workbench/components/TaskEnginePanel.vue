@@ -44,6 +44,9 @@ async function importOutput(o: Record<string, unknown>) { const v=await comfyApi
 async function loadComfyTemplate(id: string) { const meta = comfyTemplates.value.find(x => x.id === id); comfySelected.value = meta || null; const r = await comfyApi.template(id); if (r.ok && r.workflow) { workflow.value = JSON.stringify(r.workflow, null, 2); comfyResult.value = `已加载模板（${r.format || 'api'}）` } else comfyResult.value = r.error || '模板加载失败' }
 async function applyComfyParams() { try { const r=await comfyApi.apply(JSON.parse(workflow.value), comfyParams.value); if (r.ok && r.workflow) { workflow.value=JSON.stringify(r.workflow,null,2); comfyResult.value='参数已应用并完成节点校验' } else comfyResult.value=r.error||'参数应用失败' } catch { comfyResult.value='Workflow JSON 无效' } }
 async function showFailure(action: () => Promise<unknown>) { try { await action() } catch(e) { comfyResult.value='操作失败：'+(e as Error).message } }
+/** 供顶栏「工具」菜单外部唤起（自带触发按钮已隐藏）。 */
+function show() { open.value = true }
+defineExpose({ show })
 </script>
 <template>
   <div class="te-panel">

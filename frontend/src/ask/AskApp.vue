@@ -4,11 +4,15 @@
 // 重操作（建索引、分区开发）统一收口到工作台，本页只保留问答必需能力。
 import { computed, nextTick, onMounted, ref } from 'vue'
 import {
-  aiApi, agentApi, modelApi, modelResidencyApi, projectApi, kbApi, promptApi, harnessApi,
+  aiApi, modelResidencyApi, projectApi, kbApi, promptApi, harnessApi,
   getProjectId, setProjectId,
 } from '../workbench/api'
-import type { ModelConfigInfo, ModelStatus, ProjectInfo, SseEvent, WorkflowState } from '../workbench/api'
+import type { ModelStatus, ProjectInfo, SseEvent } from '../workbench/api'
 import { demoMode, probeBackend } from '../workbench/composables/demo'
+import { useModelConfig } from '../workbench/composables/useModelConfig'
+import { useWorkflowGate } from '../workbench/composables/useWorkflowGate'
+import { useOrphanWorkflow } from '../workbench/composables/useOrphanWorkflow'
+import { useChatStream } from '../workbench/composables/useChatStream'
 import AskSidebar from './components/AskSidebar.vue'
 import AskMessage from './components/AskMessage.vue'
 import FileViewer from './components/FileViewer.vue'
@@ -16,7 +20,6 @@ import ModelSettingsDialog from '../workbench/components/ModelSettingsDialog.vue
 import type { AskChatMsg, AskTraceItem } from './types'
 
 // ---------------- 全局状态 ----------------
-const config = ref<ModelConfigInfo | null>(null)
 const power = ref<ModelStatus | null>(null)
 const projects = ref<ProjectInfo[]>([])
 const currentPid = ref(getProjectId())
@@ -27,13 +30,25 @@ const sending = ref(false)
 const historyLoading = ref(false)
 
 const draft = ref('')
-const webOn = ref(false)
-const thinkingOn = ref(false)
 const attachmentError = ref('')
 interface PendingImg { file: File; url: string }
 const pendingImages = ref<PendingImg[]>([])
 
-const settingsVisible = ref(false)
+// 模型配置 / 联网 / 思考（与工作台对话台同一 composable，偏好本机共享）
+const {
+  modelConfig: config,
+  settingsOpen: settingsVisible,
+  webOn, thinkingOn,
+  thinkingSupported, thinkingNative, thinkingEffective, visionSupported,
+  loadModelConfig: loadConfig, onModelSaved,
+} = useModelConfig({
+  onSaved: (info) => {
+    void loadPower()
+    if (info.ollama_status?.guidance) showToast('设置已保存，但 Ollama 状态需要关注')
+    else showToast('模型设置已保存')
+  },
+})
+
 const viewer = ref<{ path: string; line: number } | null>(null)
 
 const ingestBusy = ref(false)
@@ -51,74 +66,30 @@ const SUGGESTIONS = [
 ]
 
 // ---------------- 派生 ----------------
-const thinkingMode = computed(() => config.value?.capability?.thinking || 'none')
-const thinkingSupported = computed(() => thinkingMode.value === 'native' || thinkingMode.value === 'toggle')
-const thinkingNative = computed(() => thinkingMode.value === 'native')
-const thinkingEffective = computed(() => thinkingNative.value || thinkingOn.value)
-const visionSupported = computed(() => (config.value?.capability?.vision || 'none') !== 'none')
 const guidance = computed(() => config.value?.ollama_status?.guidance || '')
 const canSend = computed(() => !sending.value && !historyLoading.value && !gateBlocking.value
   && (draft.value.trim().length > 0 || pendingImages.value.length > 0))
 
 // ---------------- 工作流门控 / 孤儿恢复 ----------------
-// 卡片审批门打开期间锁住发送（与工作台一致），避免门后又起新对话
-const gateWorkflowIds = ref<Set<string>>(new Set())
-const gateBlocking = computed(() => gateWorkflowIds.value.size > 0)
-function onWfGate(workflowId: string, open: boolean) {
-  const next = new Set(gateWorkflowIds.value)
-  if (open) next.add(workflowId); else next.delete(workflowId)
-  gateWorkflowIds.value = next
-}
+// 审批门互斥与孤儿工作流恢复均复用工作台 composable，保持两入口行为一致
+const { gateBlocking, onWfGate } = useWorkflowGate()
 function onWfActivity() { void nextTick(followScroll) }
 
-// 刷新/重开后历史只回灌纯文本，工作流卡片不重建；若后端仍有未终结工作流，
-// 给出挂回/中断入口（否则它停在审批门且本页没有任何可操作的地方）
-const orphanWf = ref<WorkflowState | null>(null)
-const orphanBusy = ref(false)
-const orphanError = ref('')
-async function detectOrphanWorkflow() {
-  if (demoMode.value) return
-  try {
-    const r = await agentApi.workflowActive()
-    const wf = r.ok ? (r.workflow ?? null) : null
-    orphanWf.value = wf && !messages.value.some(m => m.workflow?.workflowId === wf.workflow_id)
-      ? wf : null
-    orphanError.value = ''
-  } catch { /* 服务不可达时不显示 */ }
-}
-async function reattachOrphan() {
-  const wf = orphanWf.value
-  if (!wf || orphanBusy.value) return
-  orphanBusy.value = true
-  try {
-    orphanWf.value = null
+const {
+  orphanWf, orphanBusy, orphanError, orphanStatusLabel,
+  detectOrphanWorkflow, reattachOrphan, interruptOrphan,
+} = useOrphanWorkflow({
+  hasWorkflowCard: (id) => messages.value.some(m => m.workflow?.workflowId === id),
+  appendWorkflowCard: (wf) => {
     messages.value.push({
       id: msgSeq++, role: 'assistant', text: '', status: 'done',
       trace: [], reasoning: '', notices: [],
       workflow: { workflowId: wf.workflow_id, seed: wf },
       startedAt: Date.now(),
     })
-    stick.value = true
-    await nextTick(scrollToBottom)
-  } finally {
-    orphanBusy.value = false
-  }
-}
-async function interruptOrphan() {
-  const wf = orphanWf.value
-  if (!wf || orphanBusy.value) return
-  orphanBusy.value = true
-  orphanError.value = ''
-  try {
-    const r = await agentApi.workflowInterrupt(wf.workflow_id, '问答页恢复条中断孤儿工作流')
-    if (r.ok === false) throw new Error(r.error || '中断失败')
-    orphanWf.value = null
-  } catch (e) {
-    orphanError.value = (e as Error).message || '中断失败，请重试'
-  } finally {
-    orphanBusy.value = false
-  }
-}
+  },
+  onReattached: () => { stick.value = true; void scrollToBottom() },
+})
 
 function sid(): string { return window.DocMindSession.get() }
 function interruptedKey(): string { return `docmind.interrupted:${currentPid.value}:${sid()}` }
@@ -132,9 +103,6 @@ function showToast(msg: string) {
 }
 
 // ---------------- 启动加载 ----------------
-async function loadConfig() {
-  config.value = await modelApi.get()
-}
 async function loadPower() {
   if (demoMode.value) return
   try {
@@ -218,43 +186,23 @@ async function newSession() {
 let chatEpoch = 0
 let abortCtl: AbortController | null = null
 let partial: { user: string; assistant: string } | null = null
-let flushTurn: AskChatMsg | null = null
-let flushText = ''
-let flushReason = ''
-let rafId = 0
+// final 守卫：后端收尾异常时可能补发第二条非空 final（晚于真实 final 到达），
+// 只接受第一条作为正文，后续降级为通知，避免覆盖正确答案。每轮发送重置。
+let finalApplied = false
 
-function appendTrace(t: AskChatMsg, type: AskTraceItem['type'], text: string) {
-  const at = Date.now()
-  if (type === 'observation' || type === 'reflection') {
-    const pendingAct = [...t.trace].reverse().find((x) => x.type === 'action' && !x.elapsedMs)
-    if (pendingAct) pendingAct.elapsedMs = Math.max(0, at - pendingAct.at)
-  }
-  t.trace.push({ type, text, at })
-}
-
-function scheduleFlush() {
-  if (rafId) return
-  rafId = requestAnimationFrame(() => {
-    rafId = 0
-    if (flushTurn) {
-      if (flushText) flushTurn.text += flushText
-      if (flushReason) flushTurn.reasoning += flushReason
-    }
-    flushText = ''
-    flushReason = ''
+// 流式接收管线与工作台共用 useChatStream：rAF 帧合批、trace 计时、事件分类
+const { drain, appendTrace, dispatch } = useChatStream<AskChatMsg>({
+  onFrame: () => followScroll(),
+  onStructural: () => followScroll(),
+  onFinal: (t, text) => {
+    drain()
+    if (finalApplied) { t.notices.push(text); return }
+    finalApplied = true
+    t.text = text
+    if (partial) partial.assistant = text
     followScroll()
-  })
-}
-function drainFlush() {
-  if (rafId) { cancelAnimationFrame(rafId); rafId = 0 }
-  if (flushTurn) {
-    if (flushText) flushTurn.text += flushText
-    if (flushReason) flushTurn.reasoning += flushReason
-  }
-  flushTurn = null
-  flushText = ''
-  flushReason = ''
-}
+  },
+})
 
 function savePartial() {
   if (partial?.assistant) {
@@ -292,55 +240,17 @@ async function send(preset?: string) {
   }
 
   const epoch = ++chatEpoch
+  finalApplied = false
   const ac = new AbortController()
   abortCtl = ac
   partial = { user: userMsg.text, assistant: '' }
   try { sessionStorage.removeItem(interruptedKey()) } catch { /* ignore */ }
 
   const live = () => (epoch === chatEpoch ? turn : undefined)
-  // 后端在收尾异常时会补发一条「模型无响应…」error final（可能晚于真实 final 到达）。
-  // 只接受第一条非空 final 作为正文，后续 final 降级为通知，避免覆盖正确答案。
-  let finalApplied = false
+  // 事件分类/帧合批/首条 final 守卫都在 useChatStream（finalApplied/partial 经钩子闭包）
   const onEvent = (ev: SseEvent) => {
     if (epoch !== chatEpoch) return
-    const t = live()
-    if (!t || ev.type === 'context') return
-    if (ev.type === 'token' && typeof ev.text === 'string') {
-      flushTurn = t
-      flushText += ev.text
-      scheduleFlush()
-    } else if (ev.type === 'final' && typeof ev.text === 'string' && ev.text) {
-      if (finalApplied) {
-        t.notices.push(ev.text)
-        return
-      }
-      finalApplied = true
-      drainFlush()
-      t.text = ev.text
-      if (partial) partial.assistant = ev.text
-      followScroll()
-    } else if (ev.type === 'reasoning' && typeof ev.text === 'string') {
-      flushTurn = t
-      flushReason += ev.text
-      scheduleFlush()
-    } else if (ev.type === 'notice' && ev.text) {
-      t.notices.push(ev.text)
-    } else if (ev.type === 'thought' || ev.type === 'action'
-               || ev.type === 'observation' || ev.type === 'reflection') {
-      if (ev.text) appendTrace(t, ev.type, ev.text)
-      followScroll()
-    } else if (ev.type === 'workflow') {
-      // start_workflow 已执行：卡片直接挂在当前回合内（与工作台同一组件、同一 SSE），
-      // 方案选择 / 审批 / 实时进度都在问答页完成，不再只丢一条「转交工作台」通知。
-      const w = ev as unknown as { workflow_id?: string; status?: string; phase?: string; kind?: string; request?: string }
-      if (w.workflow_id && !t.workflow?.workflowId) {
-        t.workflow = {
-          workflowId: w.workflow_id,
-          seed: { status: w.status, phase: w.phase, kind: w.kind, request: w.request },
-        }
-        followScroll()
-      }
-    }
+    dispatch(ev, live())
   }
 
   try {
@@ -352,13 +262,13 @@ async function send(preset?: string) {
       thinking: thinkingOpt,
       images: imgs.map((i) => i.file),
     })
-    drainFlush()
+    drain()
     if (epoch === chatEpoch) {
       turn.status = turn.text ? 'done' : 'stopped'
       if (!turn.text) turn.text = '（没有返回内容）'
     }
   } catch (e) {
-    drainFlush()
+    drain()
     if (epoch !== chatEpoch) return
     if ((e as Error).name === 'AbortError') {
       turn.status = 'stopped'
@@ -384,7 +294,7 @@ async function send(preset?: string) {
 function stop() {
   abortCtl?.abort()
   chatEpoch++
-  drainFlush()
+  drain()
   const t = messages.value[messages.value.length - 1]
   if (t && t.role === 'assistant' && t.status === 'streaming') {
     t.status = 'stopped'
@@ -393,6 +303,7 @@ function stop() {
   savePartial()
   sending.value = false
   abortCtl = null
+  followScroll()
 }
 
 // ---------------- 演示模式脚本回答 ----------------
@@ -552,13 +463,6 @@ async function openSettings() {
     showToast('读取模型配置失败：' + (e as Error).message)
   }
 }
-function onSettingsSaved(info: ModelConfigInfo) {
-  config.value = info
-  void loadPower()
-  if (info.ollama_status?.guidance) showToast('设置已保存，但 Ollama 状态需要关注')
-  else showToast('模型设置已保存')
-}
-
 function openFile(path: string, line: number) {
   viewer.value = { path, line }
 }
@@ -673,7 +577,7 @@ onMounted(async () => {
       <div v-if="orphanWf" class="wf-orphan" role="alert">
         <span class="wf-orphan-glyph" aria-hidden="true">⚠</span>
         <div class="wf-orphan-body">
-          <div>该项目有一个未结束的工作流（{{ orphanWf.status }}），当前对话里没有它的审批卡片。</div>
+          <div>该项目有一个未结束的工作流（{{ orphanStatusLabel }}），当前对话里没有它的审批卡片。</div>
           <div v-if="orphanError" class="wf-orphan-err">{{ orphanError }}</div>
         </div>
         <button class="wf-orphan-btn" :disabled="orphanBusy" @click="reattachOrphan">挂回对话继续</button>
@@ -749,7 +653,7 @@ onMounted(async () => {
         :visible="settingsVisible"
         :config="config"
         @close="settingsVisible = false"
-        @saved="onSettingsSaved"
+        @saved="onModelSaved"
       />
       <FileViewer v-if="viewer" :path="viewer.path" :line="viewer.line" @close="viewer = null" />
     </main>

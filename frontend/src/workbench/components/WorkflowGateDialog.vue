@@ -146,20 +146,24 @@ function submitRevise() {
       <header class="wg-head">
         <h3>{{ title }}</h3>
         <span v-if="busy" class="wg-busy" aria-live="polite">
-          <span class="wg-busy-dot" />正在提交…
+          <span class="wg-busy-dot" />正在提交，可收起窗口等待
         </span>
-        <button class="wg-x" title="先看看对话，稍后可在卡片上继续" :disabled="busy" @click="emit('dismiss')">×</button>
+        <button class="wg-x" title="收起弹窗，选择会在后台继续，可随时从卡片重新打开" @click="emit('dismiss')">×</button>
       </header>
 
       <!-- 方案选择 -->
       <template v-if="isChoice">
         <p class="wg-goal">{{ state.request || '完整推进这个开发目标' }}</p>
+        <p v-if="state.status === 'generating_options'" class="wg-hint">
+          <span class="wg-hint-dot" />AI 仍在精炼方案，也可以直接点选一个方案立即开始
+        </p>
         <div class="wg-options">
           <button
             v-for="option in (state.options || [])"
             :key="option.id"
             class="wg-option"
-            :disabled="busy || state.status === 'generating_options'"
+            :disabled="busy"
+            :title="state.status === 'generating_options' ? '方案仍在精炼，可直接选择当前方案' : undefined"
             @click="emit('choose', option.id)"
           >
             <b>
@@ -319,6 +323,15 @@ function submitRevise() {
   border: 1px solid var(--border); border-radius: 8px;
   background: var(--bg-surface, var(--bg-hover));
   font-size: 12.5px; line-height: 1.6; color: var(--text);
+}
+.wg-hint {
+  margin: -4px 0 10px; display: flex; align-items: center; gap: 7px;
+  font-size: 11.5px; color: var(--accent);
+}
+.wg-hint-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+  border: 2px solid var(--accent); border-top-color: transparent;
+  animation: wg-busy-spin .7s linear infinite;
 }
 .wg-options { display: grid; gap: 8px; }
 .wg-option {

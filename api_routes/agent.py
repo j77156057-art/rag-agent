@@ -559,14 +559,17 @@ def build_router(ctx) -> APIRouter:
     @router.post("/workflow/{workflow_id}/choice")
     async def workflow_choice(workflow_id: str, req: WorkflowChoiceReq):
         try:
-            # Choosing an option may resume the graph and invoke a planner/LLM.
-            # Keep that synchronous work off the event loop so a slow model does
-            # not freeze unrelated UI requests (polling, chat, or file views).
+            # The choice request only records the decision: it returns the
+            # planning state immediately and lets a worker thread run the
+            # planner LLM, pass the execution gate and start the DAG. A slow
+            # model or a minutes-long run must never pin the card in
+            # "submitting" — progress arrives through SSE/polling instead.
             workflow = await run_in_threadpool(
                 WORKFLOWS.choose,
                 workflow_id,
                 req.choice,
                 custom_request=req.custom_request,
+                auto_execute=True,
             )
             return {"ok": True, "workflow": workflow}
         except WorkflowError as exc:
@@ -679,7 +682,11 @@ def build_router(ctx) -> APIRouter:
     @router.post("/workflow/{workflow_id}/approve")
     async def workflow_approve(workflow_id: str, req: WorkflowApprovalReq):
         try:
-            return {"ok": True, "workflow": WORKFLOWS.approve(
+            # Approving resumes the graph; keep it off the event loop. With
+            # auto_execute the real DAG run is scheduled on a manager worker
+            # thread, so this returns as soon as the gate is passed.
+            return {"ok": True, "workflow": await run_in_threadpool(
+                WORKFLOWS.approve,
                 workflow_id, req.approved, auto_execute=req.auto_execute)}
         except WorkflowError as exc:
             return {"ok": False, "error": str(exc)}

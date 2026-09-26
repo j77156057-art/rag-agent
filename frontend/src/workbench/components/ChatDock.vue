@@ -1,17 +1,24 @@
 <script setup lang="ts">
 // P0 底部 AI 对话台：全局代码问答/定位入口（ReAct agent，SSE）。
 // - 答案中的文件引用渲染为可点击卡片：跳转代码行 + 文件树展开闪烁 + 分区高亮；
-// - 头部「引擎」弹层：MCP 服务器连接状态（godot-ai stdio / unity / unreal HTTP）
-//   与 godot-ai 插件安装引导（安装前必须用户确认）。
+// - 引擎连接 / 会话历史 / 工作流历史均为独立弹层组件（components/*Popover.vue）；
+// - 模型配置、审批门、孤儿工作流恢复、SSE 流式管线在 composables/ 与问答页共用。
 import { nextTick, reactive, ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
-import { aiApi, agentApi, visionApi, mcpApi, modelApi, contextApi, harnessApi, getSessionId, getProjectId, setSessionId, startNewSession, startTabProbe } from '../api'
-import type { McpServer, ModelConfigInfo, ContextUsage, SessionInfo } from '../api'
+import { aiApi, agentApi, visionApi, contextApi, harnessApi, getSessionId, getProjectId, setSessionId, startNewSession, startTabProbe } from '../api'
+import type { ContextUsage, SessionInfo } from '../api'
 import type { SseEvent } from '../api'
 import { mdToHtml, extractFileRefs, extractWebRefs } from '../markdown'
 import type { FileRef } from '../markdown'
 import { demoMode } from '../composables/demo'
+import { useModelConfig } from '../composables/useModelConfig'
+import { useWorkflowGate } from '../composables/useWorkflowGate'
+import { useOrphanWorkflow } from '../composables/useOrphanWorkflow'
+import { useChatStream } from '../composables/useChatStream'
 import ModelSettingsDialog from './ModelSettingsDialog.vue'
+import EngineConnectPopover from './EngineConnectPopover.vue'
+import SessionHistoryPopover from './SessionHistoryPopover.vue'
+import WorkflowHistoryPopover from './WorkflowHistoryPopover.vue'
 import WorkflowCard from './WorkflowCard.vue'
 import WorkflowMembersDock from './WorkflowMembersDock.vue'
 import type { WorkflowState, WorkflowSummary } from '../api'
@@ -55,33 +62,10 @@ const wfActiveTeam = computed(() => {
 // 所有未终结的工作流（含停在方案门、成员尚为空的）——并发拦截与离开确认都以此为准
 const activeWorkflowIds = computed(() =>
   wfTeams.value.filter(t => t.active).map(t => t.workflowId))
-// 正打开人工审批门的工作流集合：此时锁定对话台操作区（发送/工具/头部按钮），
-// 但不锁聊天滚动与编辑器——审批可以边看代码边做
-const gateOpenIds = ref<Set<string>>(new Set())
-const gateBlocking = computed(() => gateOpenIds.value.size > 0)
-function onWfGate(workflowId: string, open: boolean) {
-  const next = new Set(gateOpenIds.value)
-  if (open) next.add(workflowId); else next.delete(workflowId)
-  gateOpenIds.value = next
-}
-/**
- * 离开当前对话（切换/新建/清空）前调用：有未终结工作流时必须先征得同意，
- * 并在用户确认后尽力中断它们——否则卡片随消息卸载，后端工作流会停在
- * 审批门成为无法操作的孤儿。文件改动不会回滚，需在文案里明示。
- */
-async function confirmLeaveWorkflows(): Promise<boolean> {
-  const ids = activeWorkflowIds.value
-  if (!ids.length) return true
-  const ok = await askConfirm({
-    title: '工作流仍在进行',
-    message: `有 ${ids.length} 个工作流正在等待审批或执行中。离开后将无法继续操作，系统会自动中断它（工作流已产生的文件改动不会自动回滚）。确定离开？`,
-    confirmText: '中断并离开',
-  })
-  if (!ok) return false
-  await Promise.allSettled(ids.map(id =>
-    agentApi.workflowInterrupt(id, '用户离开当前对话，自动中断')))
-  return true
-}
+// 审批门互斥与离开确认抽到 useWorkflowGate（问答页共用）：门开期间锁操作区，
+// 离开对话时确认并中断未终结工作流，避免卡片卸载后后端工作流停在门里成为孤儿。
+const { gateBlocking, onWfGate, resetGates, confirmLeaveWorkflows } = useWorkflowGate(
+  () => activeWorkflowIds.value)
 function onWfTeam(payload: WfTeam) {
   const rest = wfTeams.value.filter(t => t.workflowId !== payload.workflowId)
   if (payload.active) rest.push(payload)
@@ -95,71 +79,23 @@ function onWfTeam(payload: WfTeam) {
 }
 
 // ---------------------------------------------------------------- 孤儿工作流恢复
-// 页面刷新/会话切换后对话消息是纯文本回灌，工作流卡片不会重建，但后端同项目
-// 互斥仍然存活 → 新请求被拒且界面无任何操作入口。挂载/切会话/发送后探测一次，
-// 发现「后端未终结、本地无卡片」的工作流时给出恢复条（挂回卡片或中断）。
-const WF_STATUS_LABEL: Record<string, string> = {
-  generating_options: '正在生成方案', awaiting_choice: '等待选择方案',
-  awaiting_research: '等待联网检索', researching: '联网调研中',
-  planning: '任务规划中', awaiting_plan_approval: '等待计划审批',
-  awaiting_approval: '等待审核', planned: '待执行',
-  executing: '子代理执行中', reviewing: '汇总检查中',
-  completed: '已完成', failed: '已失败', interrupted: '已中断',
-}
-const orphanWf = ref<WorkflowState | null>(null)
-const orphanBusy = ref(false)
-const orphanError = ref('')
-const orphanStatusLabel = computed(() =>
-  orphanWf.value ? WF_STATUS_LABEL[orphanWf.value.status] || orphanWf.value.status : '')
-
-async function detectOrphanWorkflow() {
-  if (demoMode.value) return
-  try {
-    const r = await agentApi.workflowActive()
-    const wf = r.ok ? (r.workflow ?? null) : null
-    // 本地已有卡片在管的不算孤儿（卡片自身即可审批/中断）
-    orphanWf.value = wf && !messages.value.some(m => m.workflow?.workflowId === wf.workflow_id)
-      ? wf : null
-    orphanError.value = ''
-  } catch {
-    /* 服务未启动/不可达时不显示恢复条 */
-  }
-}
-/** 把孤儿工作流以卡片形式挂回当前对话流；卡片挂载后会自行拉完整状态并订阅 SSE。 */
-async function reattachOrphan() {
-  const wf = orphanWf.value
-  if (!wf || orphanBusy.value) return
-  orphanBusy.value = true
-  try {
-    orphanWf.value = null
+// 探测/挂回/中断抽到 useOrphanWorkflow（问答页共用）：页面刷新后卡片丢失但后端
+// 同项目互斥仍存活时，给出恢复条避免新请求被拒且无操作入口。
+const {
+  orphanWf, orphanBusy, orphanError, orphanStatusLabel,
+  detectOrphanWorkflow, reattachOrphan, interruptOrphan,
+} = useOrphanWorkflow({
+  hasWorkflowCard: (id) => messages.value.some(m => m.workflow?.workflowId === id),
+  appendWorkflowCard: (wf) => {
     messages.value.push({
       id: msgSeq++, role: 'assistant', text: '', status: 'done',
       trace: [], reasoning: '', notices: [], plan: [],
       workflow: { workflowId: wf.workflow_id, seed: wf },
       startedAt: Date.now(),
     })
-    stickToBottom.value = true
-    await nextTick(scrollToBottom)
-  } finally {
-    orphanBusy.value = false
-  }
-}
-async function interruptOrphan() {
-  const wf = orphanWf.value
-  if (!wf || orphanBusy.value) return
-  orphanBusy.value = true
-  orphanError.value = ''
-  try {
-    const r = await agentApi.workflowInterrupt(
-      wf.workflow_id, '页面刷新后卡片丢失，用户在孤儿恢复条中断')
-    if (r.ok === false) throw new Error(r.error || '中断失败')
-    orphanWf.value = null
-  } catch (e) {
-    orphanError.value = (e as { message?: string }).message || '中断失败，请重试'
-  } finally {
-    orphanBusy.value = false
-  }
-}
+  },
+  onReattached: () => { stickToBottom.value = true; void scrollToBottom() },
+})
 async function focusWfMember(taskId: string) {
   const team = wfActiveTeam.value
   if (!team) return
@@ -235,83 +171,6 @@ const input = ref(readDraft())
 watch(input, v => { try { sessionStorage.setItem(draftKey(), v) } catch {} }, { flush: 'sync' })
 const sending = ref(false)
 let abortCtl: AbortController | null = null
-const TASK_EXAMPLES = [
-  { id: 'feature', label: '实现一个功能', prompt: '在现有游戏项目中实现一个新功能，并先给我 2-4 个可选方案。' },
-  { id: 'bug', label: '修复一个问题', prompt: '定位并修复现有游戏项目中的一个问题，先给我推荐方案和验收标准。' },
-  { id: 'scene', label: '添加场景或 UI', prompt: '在现有游戏项目中添加一个场景或 UI，先给我推荐实现方案并说明影响范围。' },
-  { id: 'custom', label: '描述我的目标', prompt: '' },
-] as const
-
-function startTaskExample(example: typeof TASK_EXAMPLES[number]) {
-  if (example.id === 'custom') {
-    input.value = ''
-    void nextTick(() => inputEl.value?.focus())
-    return
-  }
-  void startWorkflowTurn(example.prompt)
-}
-
-/** 快捷入口直接发起工作流：卡片内联挂到对话流，不再跳独立面板。 */
-async function startWorkflowTurn(prompt: string) {
-  if (sending.value || demoMode.value) return
-  // 已有未终结工作流时禁止再启动（后端 /workflow/start 也有同项目互斥兜底）
-  if (activeWorkflowIds.value.length) {
-    await askAlert({
-      title: gateBlocking.value ? '工作流等待你的处理' : '已有工作流进行中',
-      message: gateBlocking.value
-        ? '请先在居中的审批窗口中选择方案、批准或调整任务（也可中断该工作流），再启动新的。'
-        : '请先在对话中的工作流卡片上完成审批、等待执行结束，或中断当前工作流后再启动新的。',
-    })
-    return
-  }
-  // 与普通问答共用 chatEpoch：启动阶段用户点「停止」会使 epoch 失效，
-  // 迟到响应不再挂卡片（并尽力中断可能已创建的孤儿工作流，见下）。
-  const epoch = ++chatEpoch
-  messages.value.push({ id: msgSeq++, role: 'user', text: prompt, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
-  const turn: ChatMsg = {
-    id: msgSeq++, role: 'assistant', text: '', status: 'streaming', trace: [], reasoning: '', notices: [], plan: [],
-    workflow: { workflowId: '', seed: { status: 'generating_options', kind: 'generic', request: prompt } },
-    startedAt: Date.now(), lastActivityAt: Date.now(),
-  }
-  messages.value.push(turn)
-  sending.value = true
-  stickToBottom.value = true
-  await nextTick(scrollToBottom)
-  try {
-    const r = await agentApi.workflowStart(prompt, { use_llm: true, web_enabled: webOn.value, kind: 'generic' })
-    if (epoch !== chatEpoch) {
-      // 启动已被用户取消：请求可能已在服务端创建工作流，挂卡片只会出现
-      // 无法审批的孤儿，因此尽力中断它；UI 上的回合由 stop() 标记为已停止。
-      if (r.ok && r.workflow) {
-        void agentApi.workflowInterrupt(r.workflow.workflow_id, '用户在启动阶段取消').catch(() => {})
-      }
-      return
-    }
-    if (r.ok && r.workflow) {
-      turn.workflow = { workflowId: r.workflow.workflow_id, seed: r.workflow }
-      turn.status = 'done'
-      window.dispatchEvent(new CustomEvent('docmind:workflow-started', { detail: { workflowId: r.workflow.workflow_id } }))
-    } else {
-      turn.workflow = undefined
-      turn.status = 'error'
-      turn.error = r.error || '工作流启动失败'
-    }
-  } catch (e) {
-    if (epoch !== chatEpoch) return
-    turn.workflow = undefined
-    turn.status = 'error'
-    turn.error = (e as Error).message || '工作流启动失败'
-  } finally {
-    // 仅当没有被更新的回合（停止/新发送）取代时才解除发送锁
-    if (epoch === chatEpoch) {
-      sending.value = false
-      // 启动被互斥拒绝时，发现已存在的那个工作流并提供挂回/中断入口
-      void detectOrphanWorkflow()
-    }
-    await nextTick(scrollToBottom)
-  }
-}
-
 /** 工作流主 Agent 的 start_workflow 动作行与其观察不在对话重复展示（卡片即反馈）。 */
 function visibleTrace(msg: ChatMsg) {
   const hidden = new Set<number>()
@@ -353,34 +212,14 @@ function toggleDock() {
 }
 
 // ---------------------------------------------------------------- 模型 / 联网 / 思考
-const modelConfig = ref<ModelConfigInfo | null>(null)
-const settingsOpen = ref(false)
-// 联网默认关（代码问答不外联），选择持久化在本机
-const webOn = ref(window.localStorage.getItem('docmind.chatWeb') === '1')
-// 深度思考：'1'/'0'，仅对支持思考的模型才发送
-const thinkingOn = ref(window.localStorage.getItem('docmind.chatThinking') === '1')
-watch(webOn, (v) => window.localStorage.setItem('docmind.chatWeb', v ? '1' : '0'))
-watch(thinkingOn, (v) => window.localStorage.setItem('docmind.chatThinking', v ? '1' : '0'))
-
-const modelLabel = computed(() => {
-  if (demoMode.value) return '离线演示模型'
-  const c = modelConfig.value
-  if (!c) return '模型加载中…'
-  const name = c.provider_meta?.[c.llm_provider]?.label || c.llm_provider
-  return `${name} · ${c.llm_model || '默认模型'}`
-})
-const thinkingMode = computed(() => modelConfig.value?.capability?.thinking || 'none')
-const thinkingSupported = computed(() => thinkingMode.value === 'native' || thinkingMode.value === 'toggle')
-// native 思考模型（reasoner 类）开关恒开且不可点；toggle 家族才允许用户切
-const thinkingNative = computed(() => thinkingMode.value === 'native')
-const thinkingEffective = computed(() => thinkingNative.value || thinkingOn.value)
-const visionMode = computed(() => modelConfig.value?.capability?.vision || 'unknown')
-const visionLabel = computed(() => {
-  if (visionMode.value === 'native') return '当前模型直接识图'
-  if (visionMode.value === 'harness') return 'Harness 视觉辅助'
-  if (visionMode.value === 'none') return '当前模型不支持识图'
-  return '识图能力待确认，可由 Harness 辅助'
-})
+// 模型配置、联网/思考开关及本地持久化抽到 useModelConfig（问答页共用）；
+// 后端切换模型会清空多轮上下文，保存后同步清空本地消息避免张冠李戴。
+const {
+  modelConfig, settingsOpen, webOn, thinkingOn,
+  modelLabel, thinkingMode, thinkingSupported, thinkingNative, thinkingEffective,
+  visionLabel,
+  loadModelConfig, openSettings, onModelSaved,
+} = useModelConfig({ onSaved: () => clearMessages() })
 
 // ---------------------------------------------------------------- 上下文窗口用量
 // 后端按当前模型真实窗口估算（含系统提示/历史摘要/历史回放/当前问题），
@@ -425,25 +264,6 @@ const usageTitle = computed(() => {
   }
   return line
 })
-
-async function loadModelConfig() {
-  if (demoMode.value) return
-  try {
-    modelConfig.value = await modelApi.get()
-  } catch {
-    /* 配置加载失败不阻塞聊天，芯片显示兜底文案 */
-  }
-}
-function openSettings() {
-  if (demoMode.value) return
-  void loadModelConfig().then(() => { settingsOpen.value = true })
-}
-function onModelSaved(info: ModelConfigInfo) {
-  modelConfig.value = info
-  // 后端切换模型会清空多轮上下文，前端消息同步清空避免张冠李戴
-  clearMessages()
-  // 是否关闭弹窗由弹窗自身决定（有告警时停留，让用户看到告警内容）
-}
 
 // ---------------------------------------------------------------- 发送 / 停止
 async function send(text?: string, attached?: File[], onAccepted?: () => void): Promise<boolean> {
@@ -496,55 +316,10 @@ async function send(text?: string, attached?: File[], onAccepted?: () => void): 
   let finished = false
 
   const live = () => epoch === chatEpoch ? messages.value.find((m) => m.id === turn.id) : undefined
+  // 事件分类与帧合批在 useChatStream 中（token/reasoning/plan/trace/workflow/context…）
   const onEvent = (ev: SseEvent) => {
     if (epoch !== chatEpoch) return
-    // 上下文用量是全局指示，不挂在某条消息上
-    if (ev.type === 'context') {
-      applyUsage(ev)
-      return
-    }
-    const t = live()
-    if (!t) return
-    t.lastActivityAt = Date.now()
-    if (ev.type === 'token' && typeof ev.text === 'string') {
-      // 进帧缓冲：同一帧内到达的多个 token 合并成一次响应式提交
-      let buf = streamBuffers.get(t.id)
-      if (!buf) { buf = { turn: t, text: '', reasoning: '' }; streamBuffers.set(t.id, buf) }
-      buf.text += ev.text
-      scheduleStreamFlush()
-    } else if (ev.type === 'final' && typeof ev.text === 'string' && ev.text) {
-      streamBuffers.delete(t.id)
-      t.text = ev.text
-      // 立即停止节流渲染并预热完成态 HTML，避免最后一帧与成稿之间格式闪一下
-      finishLiveMd(t.id, () => answerHtml(t))
-    } else if (ev.type === 'reasoning' && typeof ev.text === 'string') {
-      // 深度思考流：实时拼接到独立的思考窗口（与正文分开），同样按帧合批
-      let buf = streamBuffers.get(t.id)
-      if (!buf) { buf = { turn: t, text: '', reasoning: '' }; streamBuffers.set(t.id, buf) }
-      buf.reasoning += ev.text
-      if (!reasonOpen.value.has(t.id)) {
-        reasonOpen.value = new Set([...reasonOpen.value, t.id])
-      }
-      scheduleStreamFlush()
-    } else if (ev.type === 'notice' && ev.text) {
-      t.notices.push(ev.text)
-    } else if (ev.type === 'plan' && Array.isArray(ev.steps)) {
-      t.plan = ev.steps
-    } else if (ev.type === 'thought' || ev.type === 'action' ||
-               ev.type === 'observation' || ev.type === 'reflection') {
-      if (ev.text) appendTrace(t, ev.type, ev.text)
-    } else if (ev.type === 'workflow') {
-      // start_workflow 已执行：卡片直接挂在当前助手回合内，后续由卡片自己连 SSE。
-      const w = ev as unknown as { workflow_id?: string; status?: string; phase?: string; kind?: string; request?: string }
-      if (w.workflow_id && !t.workflow?.workflowId) {
-        t.workflow = {
-          workflowId: w.workflow_id,
-          seed: { status: w.status, phase: w.phase, kind: w.kind, request: w.request },
-        }
-      }
-    }
-    // 结构类事件（计划/工具轨迹/通知）出现时跟随一次；token 滚动已在帧合批里处理
-    if (ev.type !== 'token' && ev.type !== 'reasoning') scheduleFollow()
+    dispatch(ev, live())
   }
 
   try {
@@ -557,7 +332,7 @@ async function send(text?: string, attached?: File[], onAccepted?: () => void): 
       thinking: thinkingOpt,
       images: imgs,
     })
-    drainStreamNow()
+    drain()
     const t = live()
     if (t) {
       t.status = t.text ? 'done' : 'stopped'
@@ -566,7 +341,7 @@ async function send(text?: string, attached?: File[], onAccepted?: () => void): 
       finished = !!t.text
     }
   } catch (e) {
-    drainStreamNow()
+    drain()
     const t = live()
     if (!t) return false
     finishLiveMd(t.id, () => answerHtml(t))
@@ -595,7 +370,7 @@ async function send(text?: string, attached?: File[], onAccepted?: () => void): 
 function stop() {
   // 主动停止也保存现场，便于用户之后点击“继续上次任务”。
   preserveInterrupted()
-  drainStreamNow()
+  drain()
   const turn = messages.value[messages.value.length - 1]
   if (turn?.status === 'streaming' && !turn.workflow) turn.recoverable = true
   if (turn) finishLiveMd(turn.id, () => answerHtml(turn))
@@ -710,38 +485,33 @@ function clearMessages() {
   // 卡片随消息一起卸载，不会再发 team 事件；这里同步清掉左下角成员抽屉，
   // 否则会残留指向已消失卡片的幽灵成员
   wfTeams.value = []
-  gateOpenIds.value = new Set()
+  resetGates()
 }
 
-/** 头部「清空对话」：清空本地消息，并删除当前标签页会话在磁盘上的多轮历史。
+/** 清空本地消息，并删除当前标签页会话在磁盘上的多轮历史。
  *  会话 id 每标签页独立（见 api.ts::getSessionId），故这里只清理本标签页自己的会话，
- *  不影响其它标签页；删除失败（无会话文件 / 服务未启动）不阻塞清空 UI。 */
-async function clearConversation() {
-  if (!(await confirmLeaveWorkflows())) return
+ *  不影响其它标签页；删除失败（无会话文件 / 服务未启动）不阻塞清空 UI。
+ *  @returns 是否实际完成清空（用户在工作流确认框中点取消则为 false） */
+async function clearConversation(): Promise<boolean> {
+  if (!(await confirmLeaveWorkflows())) return false
   try { sessionStorage.removeItem(recoveryKey()) } catch {}
   clearMessages()
-  if (demoMode.value) return
+  if (demoMode.value) return true
   try {
     await harnessApi.deleteSession(getSessionId())
   } catch {
     /* 会话文件不存在或服务不可达：忽略，本地已清空 */
   }
   void refreshSessionList()
+  return true
 }
 
-function sessionTitle(item: SessionInfo): string {
-  return (item.title || item.preview || '').trim() || '未命名对话'
+/** 会话弹层内清空当前对话：完成后收起弹层。 */
+async function clearCurrentFromPop() {
+  if (await clearConversation()) sessionOpen.value = false
 }
-function sessionTime(value: string): string {
-  if (!value) return ''
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return ''
-  const delta = Math.max(0, Date.now() - date.getTime())
-  if (delta < 60_000) return '刚刚'
-  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟前`
-  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)} 小时前`
-  return date.toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })
-}
+
+
 async function refreshSessionList() {
   if (demoMode.value) return
   try {
@@ -861,25 +631,12 @@ async function deleteSessionItem(id: string) {
 // 快捷任务（不走对话 turns）与已结束工作流只落盘在 .docmind/workflows/，
 // 会话历史里永远找不到它们。这里提供独立弹层：查看（挂回卡片）、中断运行中、
 // 删除终态并清理磁盘文件。
-const WF_TERMINAL = new Set(['completed', 'failed', 'interrupted'])
 const wfHistoryOpen = ref(false)
 const wfHistoryItems = ref<WorkflowSummary[]>([])
 const wfHistoryBusy = ref(false)
 const wfHistoryError = ref('')
 const wfHistoryActingId = ref('')
 
-function wfStatusLabel(status: string): string {
-  return WF_STATUS_LABEL[status] || status
-}
-function wfTerminal(item: WorkflowSummary): boolean {
-  return WF_TERMINAL.has(item.status)
-}
-function wfDotKind(item: WorkflowSummary): 'run' | 'ok' | 'err' | 'stop' {
-  if (item.status === 'completed') return 'ok'
-  if (item.status === 'failed') return 'err'
-  if (item.status === 'interrupted') return 'stop'
-  return 'run'
-}
 async function refreshWfHistory() {
   if (demoMode.value) return
   wfHistoryBusy.value = true
@@ -1064,12 +821,6 @@ function demoReply(q: string): string {
 
 // 概览页「去问问 / 试试问 AI」：展开对话台、（可选）预填问题、定位输入框
 // 运行台「继续这段对话」：detail.reload=true 时按当前存储的会话 id 重新回灌历史
-function onStartWorkflow(ev: Event) {
-  const prompt = (ev as CustomEvent<{ prompt?: string }>).detail?.prompt?.trim()
-  if (!prompt) return
-  collapsed.value = false
-  void startWorkflowTurn(prompt)
-}
 function onFocusChat(ev?: Event) {
   const detail = (ev as CustomEvent<{ q?: string; reload?: boolean }> | undefined)?.detail
   const q = detail?.q
@@ -1112,7 +863,6 @@ async function onSendChat(ev: Event) {
 onMounted(() => {
   window.addEventListener('docmind:focus-chat', onFocusChat as EventListener)
   window.addEventListener('docmind:send-chat', onSendChat as EventListener)
-  window.addEventListener('docmind:start-workflow', onStartWorkflow as EventListener)
   window.addEventListener('docmind:project-context-changed', resetChatContext)
   window.addEventListener('pagehide', onPageHide)
   window.addEventListener('beforeunload', onBeforeLeave)
@@ -1130,7 +880,6 @@ onBeforeUnmount(() => {
   onPageHide()
   window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener)
   window.removeEventListener('docmind:send-chat', onSendChat as EventListener)
-  window.removeEventListener('docmind:start-workflow', onStartWorkflow as EventListener)
   window.removeEventListener('docmind:project-context-changed', resetChatContext)
   window.removeEventListener('pagehide', onPageHide)
   window.removeEventListener('beforeunload', onBeforeLeave)
@@ -1160,38 +909,25 @@ function followBottom() {
 }
 function scrollToBottom() { followBottom() }
 
-// 流式输出合批：SSE 一个数据帧常常只有 1~2 个 token。逐 token 触发响应式更新会让
-// Vue 每 token 重渲染整段答案（v-html 全量重建）并强制一次滚动布局——这就是输出
-// 「一卡一卡」的根因。增量文本先进缓冲，由单个 rAF 在每帧最多提交一次、滚动一次。
-interface StreamBuffer { turn: ChatMsg; text: string; reasoning: string }
-const streamBuffers = new Map<number, StreamBuffer>()
-let streamRaf = 0
-function flushStream() {
-  streamRaf = 0
-  if (!streamBuffers.size) return
-  for (const buf of streamBuffers.values()) {
-    if (buf.text) { buf.turn.text += buf.text; scheduleLiveMd(buf.turn) }
-    if (buf.reasoning) buf.turn.reasoning += buf.reasoning
-  }
-  streamBuffers.clear()
-  // Vue 的 DOM 刷新也排在微任务里，这里挂在其后：读到的就是本帧最新布局，
-  // 一次 scrollTop 写入完成跟随，不在 SSE 事件里做强制布局。
-  queueMicrotask(followBottom)
-}
-function scheduleStreamFlush() {
-  if (!streamRaf) streamRaf = requestAnimationFrame(flushStream)
-}
-/** 流结束时同步排空（取消未触发的帧回调），保证 final 文本不丢。 */
-function drainStreamNow() {
-  if (streamRaf) { cancelAnimationFrame(streamRaf); streamRaf = 0 }
-  if (streamBuffers.size) {
-    for (const buf of streamBuffers.values()) {
-      if (buf.text) buf.turn.text += buf.text
-      if (buf.reasoning) buf.turn.reasoning += buf.reasoning
-    }
-    streamBuffers.clear()
-  }
-}
+// 流式接收管线（帧合批/trace 计时/事件分类）抽到 useChatStream，问答页共用同一实现。
+const { drain, appendTrace, dispatch } = useChatStream<ChatMsg>({
+  onActivity: (t) => { t.lastActivityAt = Date.now() },
+  // 帧内正文增量提交后挂 125ms 节流的 markdown 重渲染
+  onTextFlushed: (t) => scheduleLiveMd(t),
+  // 一次 rAF 帧提交后跟随一次（微任务里读到本帧最新布局），不逐 token 强排
+  onFrame: () => queueMicrotask(followBottom),
+  // 首条 reasoning 到达时自动展开该回合的思考窗口（Set 判重）
+  onReasoning: (t) => {
+    if (!reasonOpen.value.has(t.id)) reasonOpen.value = new Set([...reasonOpen.value, t.id])
+  },
+  onContext: (ev) => applyUsage(ev),
+  onStructural: () => scheduleFollow(),
+  onFinal: (t, text) => {
+    t.text = text
+    // 立即停止节流渲染并预热完成态 HTML，避免最后一帧与成稿之间格式闪一下
+    finishLiveMd(t.id, () => answerHtml(t))
+  },
+})
 
 // 流式期的 markdown 是「节流富文本」折中：纯文本层最省，但用户想边出边看排版。
 // token 仍逐帧进 m.text（便宜），markdown 重渲染按消息限流到 ~8 次/秒——
@@ -1301,16 +1037,6 @@ watch(elapsedTicking, (on) => {
   }
 })
 
-function appendTrace(msg: ChatMsg, type: string, text: string) {
-  const at = Date.now()
-  // 观察/反思通常是前一个工具动作的返回，将两者之间的时间显示为动作耗时。
-  if (type === 'observation' || type === 'reflection') {
-    const pending = [...msg.trace].reverse().find((item) => item.type === 'action' && !item.elapsedMs)
-    if (pending?.at) pending.elapsedMs = Math.max(0, at - pending.at)
-  }
-  msg.trace.push({ type, text, at })
-}
-
 function activityKey(id: number, index: number) { return `${id}:${index}` }
 function toggleActivity(id: number, index: number) {
   const key = activityKey(id, index)
@@ -1401,151 +1127,6 @@ const webTitle = computed(() => webOn.value
   : '联网搜索已关闭：仅检索当前代码库，点击开启')
 
 // ---------------------------------------------------------------- 引擎 / MCP 弹层
-const enginePopOpen = ref(false)
-const servers = ref<McpServer[]>([])
-const probing = ref<string | null>(null)
-const probeResults = ref<Record<string, { ok: boolean; tool_count?: number; error?: string }>>({})
-const connected = ref<Record<string, boolean>>({})
-const addon = ref<Awaited<ReturnType<typeof mcpApi.addonStatus>> | null>(null)
-const installing = ref(false)
-const showAddForm = ref(false)
-const savingServer = ref(false)
-const newServer = ref<{ key: string; label: string; transport: 'stdio' | 'http'; command: string; url: string; enabled: boolean }>({
-  key: '', label: '', transport: 'stdio', command: '', url: '', enabled: true,
-})
-
-async function refreshEnginePop() {
-  try {
-    const [s, a, st] = await Promise.allSettled([mcpApi.servers(), mcpApi.addonStatus(), mcpApi.status()])
-    if (s.status === 'fulfilled') servers.value = s.value.servers
-    if (a.status === 'fulfilled') addon.value = a.value
-    if (st.status === 'fulfilled' && st.value.ok) {
-      const active = st.value.active || []
-      const next: Record<string, boolean> = {}
-      for (const k of active) next[k] = true
-      connected.value = next
-    }
-  } catch {
-    /* 弹层打开失败保持空态 */
-  }
-}
-
-watch(enginePopOpen, (open) => {
-  if (open) void refreshEnginePop()
-})
-
-// Esc 关闭弹层
-function onDocKey(ev: KeyboardEvent) {
-  if (ev.key === 'Escape' && enginePopOpen.value) {
-    enginePopOpen.value = false
-  }
-}
-if (typeof window !== 'undefined') window.addEventListener('keydown', onDocKey)
-onBeforeUnmount(() => window.removeEventListener('keydown', onDocKey))
-
-async function probe(key: string) {
-  probing.value = key
-  try {
-    const r = await Promise.race([
-      mcpApi.probe(key),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('连接超时：请先在 Godot 编辑器中打开项目并启用 godot-ai 插件')), 8000)),
-    ])
-    const ok = !!r.ok && !(r as { error?: string }).error
-    probeResults.value[key] = { ok, tool_count: r.tool_count, error: r.error }
-    // stdio 为长驻会话，连接成功后保持「已连接」；HTTP 无状态，不持有会话
-    if (ok && servers.value.find((x) => x.key === key)?.transport === 'stdio') connected.value[key] = true
-  } catch (e) {
-    probeResults.value[key] = { ok: false, error: (e as Error).message }
-  } finally {
-    probing.value = null
-  }
-}
-
-async function installAddon() {
-  const st = addon.value
-  const ok = await askConfirm({
-    title: st?.installed ? '重装 godot-ai 插件？' : '安装 godot-ai 插件',
-    message: st?.installed
-      ? '将从 GitHub Releases 重新下载并覆盖 addons/godot_ai/，并改写 project.godot 的插件启用项。'
-      : '将从 GitHub Releases 下载最新版插件到 addons/godot_ai/，并在 project.godot 中启用它。',
-    detail: '不会改动其它代码文件。安装后需打开/重启 Godot 编辑器一次，AI 对话台才能通过 MCP 连接引擎。',
-    confirmText: st?.installed ? '覆盖安装' : '安装',
-  })
-  if (!ok) return
-  installing.value = true
-  try {
-    const r = await mcpApi.addonInstall(!!st?.installed)
-    await askAlert({
-      title: r.ok ? 'godot-ai 安装完成' : 'godot-ai 安装失败',
-      message: r.ok ? `插件 v${r.version} 已安装并启用。${r.next || ''}` : (r.error || '未知错误'),
-    })
-    if (r.ok) await refreshEnginePop()
-  } catch (e) {
-    await askAlert({ title: 'godot-ai 安装失败', message: (e as Error).message })
-  } finally {
-    installing.value = false
-  }
-}
-
-function resultOf(s: McpServer) {
-  return probeResults.value[s.key]
-}
-
-async function closeServer(key: string) {
-  try {
-    await mcpApi.close(key)
-  } catch {
-    /* 断开失败保持原状 */
-  } finally {
-    connected.value[key] = false
-  }
-}
-
-async function removeServer(key: string) {
-  const ok = await askConfirm({
-    title: '移除连接器',
-    message: `确定移除「${key}」？内置预设会被禁用，自定义项会被删除。`,
-    confirmText: '移除',
-  })
-  if (!ok) return
-  try {
-    await mcpApi.remove(key)
-    connected.value[key] = false
-    await refreshEnginePop()
-  } catch {
-    /* 移除失败保持原状 */
-  }
-}
-
-async function addServer() {
-  const ns = newServer.value
-  if (!ns.key) return
-  savingServer.value = true
-  try {
-    const cfg: Record<string, unknown> = { transport: ns.transport, enabled: ns.enabled }
-    if (ns.label) cfg.label = ns.label
-    if (ns.transport === 'stdio') cfg.command = ns.command
-    else cfg.url = ns.url
-    const r = await mcpApi.save(ns.key, cfg)
-    if (!r.ok) {
-      await askAlert({ title: '新增连接器失败', message: r.error || '未知错误' })
-      return
-    }
-    showAddForm.value = false
-    newServer.value = { key: '', label: '', transport: 'stdio', command: '', url: '', enabled: true }
-    await refreshEnginePop()
-  } catch (e) {
-    await askAlert({ title: '新增连接器失败', message: (e as Error).message })
-  } finally {
-    savingServer.value = false
-  }
-}
-function connectorGuide(s: McpServer) {
-  if (s.key.includes('godot')) return '让 AI 读取场景、节点和运行日志；请先打开 Godot 项目。'
-  if (s.key.includes('unity')) return '让 AI 查看 Unity 场景和组件；需先启动 Unity 并运行 MCP 插件。'
-  if (s.key.includes('unreal')) return '让 AI 查询 Unreal 资产、Actor 和蓝图；需先启动 Editor Bridge。'
-  return '让 AI 连接外部工具并调用其能力。'
-}
 </script>
 
 <template>
@@ -1594,9 +1175,6 @@ function connectorGuide(s: McpServer) {
         </svg>
         <span>会话</span>
       </button>
-      <button class="cd-btn cd-new-session" title="开始一段新的独立对话" @click.stop="createConversation">
-        <span aria-hidden="true">＋</span><span>新对话</span>
-      </button>
       <button
         class="cd-btn"
         :class="{ 'cd-btn-on': wfHistoryOpen }"
@@ -1608,18 +1186,6 @@ function connectorGuide(s: McpServer) {
           <path d="M8.7 8.2l2.1 1.2-2.1 1.2z" fill="currentColor"/>
         </svg>
         <span>工作流</span>
-      </button>
-      <button
-        class="cd-btn"
-        :class="{ 'cd-btn-on': enginePopOpen }"
-        title="连接游戏引擎（Godot / Unity / Unreal）：连上后 AI 能读场景和运行日志"
-        @click.stop="enginePopOpen = !enginePopOpen"
-      >
-        <svg width="14" height="14" viewBox="0 0 14 14">
-          <path d="M5 1.5 H1.5 V5 M9 1.5 H12.5 V5 M5 12.5 H1.5 V9 M9 12.5 H12.5 V9" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
-          <circle cx="7" cy="7" r="2.1" fill="none" stroke="currentColor" stroke-width="1.2"/>
-        </svg>
-        <span>引擎</span>
       </button>
       <button
         class="cd-btn cd-size-btn"
@@ -1636,190 +1202,27 @@ function connectorGuide(s: McpServer) {
         </svg>
         <span>{{ expanded ? '收窄' : '展开' }}</span>
       </button>
-      <button class="cd-btn" title="清空对话" @click.stop="clearConversation">
-        <svg width="13" height="13" viewBox="0 0 13 13"><path d="M2.5 3.2 H10.5 M5.2 3.2 V2 Q5.2 1.5 5.7 1.5 H7.3 Q7.8 1.5 7.8 2 V3.2 M3.4 3.2 L3.8 11 Q3.8 11.6 4.4 11.6 H8.6 Q9.2 11.6 9.2 11 L9.6 3.2" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      </button>
     </header>
 
-    <!-- 会话历史弹层：Teleport 到 body，折叠态（33px + overflow:hidden）下也能完整显示，
-         且不会把输入栏挤出面板漏到编辑区 -->
-    <Teleport to="body">
-    <div v-if="sessionOpen" class="cd-pop-mask" @click="sessionOpen = false" />
-    <div v-if="sessionOpen" class="cd-session-pop" @click.stop>
-      <div class="cd-session-head">
-        <div>
-          <div class="cd-pop-title">会话历史</div>
-          <div class="cd-session-subtitle">当前项目的对话会单独保存，切换后会恢复完整问答。</div>
-        </div>
-        <button class="cd-mini" :disabled="sessionBusy" title="刷新会话列表" @click="refreshSessionList">刷新</button>
-      </div>
-      <button class="cd-session-new" :disabled="sessionBusy" @click="createConversation">
-        <span class="cd-session-new-icon">＋</span>
-        <span><b>新建对话</b><small>开启一段空白会话，不影响历史记录</small></span>
-      </button>
-      <div v-if="sessionError" class="cd-session-error">{{ sessionError }}</div>
-      <div v-if="!sessionItems.length && !sessionError" class="cd-session-empty">还没有已保存的对话</div>
-      <div v-for="item in sessionItems" :key="item.session_id" class="cd-session-item" :class="{ active: item.session_id === chatSession }">
-        <button class="cd-session-main" :disabled="sessionBusy" @click="switchSession(item.session_id)">
-          <span class="cd-session-current" aria-hidden="true">{{ item.session_id === chatSession ? '●' : '○' }}</span>
-          <span class="cd-session-copy">
-            <strong>{{ sessionTitle(item) }}</strong>
-            <small>{{ item.turns }} 轮<span v-if="sessionTime(item.updated_at)"> · {{ sessionTime(item.updated_at) }}</span></small>
-          </span>
-        </button>
-        <button
-          class="cd-session-delete"
-          :title="item.session_id === chatSession ? '清空当前会话' : '删除这条对话历史'"
-          :disabled="sessionBusy"
-          @click.stop="deleteSessionItem(item.session_id)"
-        >×</button>
-      </div>
-    </div>
-    </Teleport>
 
-    <!-- 工作流历史弹层：快捷任务/已结束工作流不在会话历史里，单独一个入口。
-         同样 Teleport 到 body，避免折叠态裁剪。 -->
-    <Teleport to="body">
-    <div v-if="wfHistoryOpen" class="cd-pop-mask" @click="wfHistoryOpen = false" />
-    <div v-if="wfHistoryOpen" class="cd-session-pop cd-wf-pop" @click.stop>
-      <div class="cd-session-head">
-        <div>
-          <div class="cd-pop-title">工作流历史</div>
-          <div class="cd-session-subtitle">当前项目发起过的工作流。点击条目可在对话中打开卡片；运行中可中断，已结束可删除记录与磁盘文件。</div>
-        </div>
-        <button class="cd-mini" :disabled="wfHistoryBusy" title="刷新工作流列表" @click="refreshWfHistory">刷新</button>
-      </div>
-      <div v-if="wfHistoryError" class="cd-session-error">{{ wfHistoryError }}</div>
-      <div v-if="wfHistoryBusy && !wfHistoryItems.length" class="cd-session-empty">加载中…</div>
-      <div v-else-if="!wfHistoryItems.length && !wfHistoryError" class="cd-session-empty">还没有发起过工作流</div>
-      <div v-for="item in wfHistoryItems" :key="item.workflow_id" class="cd-session-item cd-wf-item">
-        <button class="cd-session-main cd-wf-main" :disabled="!!wfHistoryActingId" @click="reattachWfHistory(item)">
-          <span class="cd-wf-dot" :class="'cd-wf-dot-' + wfDotKind(item)" aria-hidden="true" />
-          <span class="cd-session-copy">
-            <strong>{{ item.request || '未命名工作流' }}</strong>
-            <small>
-              <em class="cd-wf-state" :class="'cd-wf-state-' + wfDotKind(item)">{{ wfStatusLabel(item.status) }}</em>
-              <template v-if="item.task_count"> · {{ item.task_done ?? 0 }}/{{ item.task_count }} 个任务</template>
-              <span v-if="sessionTime(item.updated_at || '')"> · {{ sessionTime(item.updated_at || '') }}</span>
-            </small>
-            <small v-if="wfTerminal(item) && (item.error || item.interrupt_reason)" class="cd-wf-sub">
-              {{ item.error || item.interrupt_reason }}
-            </small>
-          </span>
-        </button>
-        <button
-          v-if="!wfTerminal(item)"
-          class="cd-session-delete cd-wf-act"
-          title="中断这个工作流"
-          :disabled="!!wfHistoryActingId"
-          @click.stop="interruptWfHistory(item)"
-        >{{ wfHistoryActingId === item.workflow_id ? '…' : '中断' }}</button>
-        <button
-          v-else
-          class="cd-session-delete cd-wf-act cd-wf-act-danger"
-          title="删除记录与磁盘文件"
-          :disabled="!!wfHistoryActingId"
-          @click.stop="deleteWfHistory(item)"
-        >{{ wfHistoryActingId === item.workflow_id ? '…' : '删' }}</button>
-      </div>
-    </div>
-    </Teleport>
+    <SessionHistoryPopover
+      :open="sessionOpen" :items="sessionItems" :busy="sessionBusy" :error="sessionError"
+      :current-id="chatSession" :can-clear="!!messages.length || demoMode"
+      @close="sessionOpen = false" @refresh="refreshSessionList" @create="createConversation"
+      @select="switchSession" @delete="deleteSessionItem" @clear="clearCurrentFromPop"
+    />
+    <WorkflowHistoryPopover
+      :open="wfHistoryOpen" :items="wfHistoryItems" :busy="wfHistoryBusy" :error="wfHistoryError"
+      :acting-id="wfHistoryActingId"
+      @close="wfHistoryOpen = false" @refresh="refreshWfHistory" @reattach="reattachWfHistory"
+      @interrupt="interruptWfHistory" @delete="deleteWfHistory"
+    />
 
-    <!-- 引擎 / MCP 弹层（同样 Teleport 到 body） -->
-    <!-- 点击外部关闭：透明遮罩截获弹层外点击 -->
-    <Teleport to="body">
-    <div v-if="enginePopOpen" class="cd-pop-mask" @click="enginePopOpen = false" />
-    <div v-if="enginePopOpen" class="cd-pop" @click.stop>
-      <div class="cd-pop-title">连接游戏引擎</div>
-      <div class="cd-pop-subtitle">连接后，AI 才能读取引擎中的场景、脚本和运行日志。</div>
-      <div v-if="addon && addon.is_godot_project" class="cd-addon">
-        <div class="cd-addon-row">
-          <span class="cd-dot" :class="addon.installed ? 'cd-dot-ok' : 'cd-dot-off'" />
-          godot-ai 插件
-          <span class="cd-addon-ver">{{ addon.installed ? 'v' + addon.version : '未安装' }}</span>
-          <span v-if="addon.installed && addon.enabled" class="cd-tag cd-tag-ok">已启用</span>
-          <span v-else-if="addon.installed" class="cd-tag cd-tag-warn">待在 Godot 中启用</span>
-          <span class="cd-spacer" />
-          <button class="cd-mini" :disabled="installing || !addon.uvx_available" @click="installAddon">
-            {{ installing ? '安装中…' : (addon.installed ? '重装' : '安装') }}
-          </button>
-        </div>
-        <div class="cd-preflight">
-          <span :class="addon.godot_available ? 'cd-ok-text' : 'cd-err-text'">
-            {{ addon.godot_available ? 'Godot 已发现' : 'Godot 未配置' }}
-          </span>
-          <span>·</span>
-          <span :class="addon.uvx_available ? 'cd-ok-text' : 'cd-err-text'">
-            {{ addon.uvx_available ? 'uvx 可用' : 'uvx 未安装' }}
-          </span>
-          <span class="cd-preflight-path" v-if="addon.godot">{{ addon.godot }}</span>
-        </div>
-        <div v-if="!addon.uvx_available" class="cd-warn-text">
-          需先安装 uv（提供 uvx）：docs.astral.sh/uv，装完重启服务。
-        </div>
-      </div>
-      <div v-for="s in servers" :key="s.key" class="cd-server">
-        <div class="cd-server-row">
-          <span class="cd-dot" :class="connected[s.key] ? 'cd-dot-ok' : (!s.enabled ? 'cd-dot-off' : 'cd-dot-idle')" />
-          <span class="cd-server-name">{{ s.label || s.key }}</span>
-          <span class="cd-server-meta">{{ s.transport === 'stdio' ? '本机插件' : '本机服务' }}</span>
-          <span class="cd-spacer" />
-          <button class="cd-mini" :disabled="probing === s.key || !s.enabled" @click="probe(s.key)">
-            {{ probing === s.key ? '连接中…' : (connected[s.key] ? '重连' : '连接') }}
-          </button>
-          <button class="cd-mini cd-mini-stop" :disabled="!connected[s.key] || s.transport !== 'stdio'"
-                  title="断开 stdio 长驻会话（HTTP 无状态服务无需断开）" @click="closeServer(s.key)">断开</button>
-        </div>
-        <div class="cd-server-guide">{{ connectorGuide(s) }}</div>
-        <div v-if="connected[s.key]" class="cd-server-result">
-          <span class="cd-ok-text">已连接{{ resultOf(s)?.tool_count != null ? ' · ' + resultOf(s)?.tool_count + ' 个工具可用' : '' }}</span>
-        </div>
-        <div v-else-if="resultOf(s)" class="cd-server-result">
-          <span v-if="resultOf(s)?.ok" class="cd-ok-text">已断开（上次连接成功）</span>
-          <span v-else class="cd-err-text" :title="resultOf(s)?.error">{{ resultOf(s)?.error || '连接失败（确认对应引擎/插件已运行）' }}</span>
-        </div>
-        <div v-if="s.help && !resultOf(s) && !connected[s.key]" class="cd-server-help">{{ s.help }}</div>
-        <div class="cd-server-actions">
-          <span class="cd-spacer" />
-          <button class="cd-mini cd-mini-danger" @click="removeServer(s.key)">移除</button>
-        </div>
-      </div>
-
-      <button class="cd-mini cd-add-toggle" @click="showAddForm = !showAddForm">+ 新增连接器</button>
-      <div v-if="showAddForm" class="cd-add-form">
-        <div class="cd-add-row">
-          <input v-model="newServer.key" class="cd-input-sm" placeholder="key（字母数字_-，≤40）" />
-          <input v-model="newServer.label" class="cd-input-sm" placeholder="显示名（可选）" />
-        </div>
-        <div class="cd-add-row">
-          <select v-model="newServer.transport" class="cd-input-sm">
-            <option value="stdio">stdio</option>
-            <option value="http">http</option>
-          </select>
-          <label class="cd-add-chk"><input type="checkbox" v-model="newServer.enabled" /> 启用</label>
-        </div>
-        <div class="cd-add-row">
-          <input v-if="newServer.transport === 'stdio'" v-model="newServer.command" class="cd-input-sm" placeholder="命令（如 uvx）" />
-          <input v-else v-model="newServer.url" class="cd-input-sm" placeholder="url（http://…）" />
-        </div>
-        <div class="cd-add-actions">
-          <button class="cd-mini" :disabled="savingServer || !newServer.key" @click="addServer">保存</button>
-          <button class="cd-mini" @click="showAddForm = false">取消</button>
-        </div>
-      </div>
-    </div>
-    </Teleport>
+    <EngineConnectPopover />
 
     <!-- 折叠时不再卸载对话区：靠高度过渡 + 裁剪做顺滑展开/收起，状态与滚动位置保留 -->
       <div ref="scroller" class="cd-body" @scroll="onScroll" @wheel="onWheel">
         <p v-if="historyError" role="alert">{{ historyError }}</p>
-        <div v-if="!messages.length && !sending" class="cd-task-entry">
-          <span class="cd-task-entry-title">从一个目标开始</span>
-          <button v-for="example in TASK_EXAMPLES" :key="example.id" class="cd-task-chip" @click="startTaskExample(example)">
-            {{ example.label }}
-          </button>
-          <small>点击后先看 AI 方案，再选择或微调</small>
-        </div>
         <div v-for="m in messages" :key="m.id" class="cd-msg" :class="`cd-msg-${m.role}`">
           <div v-if="m.role === 'user'" class="cd-user-bubble">
             <span v-if="m.imageCount" class="cd-msg-attachment">{{ m.imageCount }} 张图片</span>
@@ -2086,8 +1489,7 @@ function connectorGuide(s: McpServer) {
 /* 人工审批门打开：锁操作区与头部，但不锁聊天滚动（遮罩 pointer-events:none）。
    头部必须整体锁定（含折叠点击）：否则折叠后 33px 裁剪会把居中审批模态吞掉。 */
 .cd-dock.cd-gate-blocked .cd-inputbar,
-.cd-dock.cd-gate-blocked .cd-head,
-.cd-dock.cd-gate-blocked .cd-task-entry {
+.cd-dock.cd-gate-blocked .cd-head {
   pointer-events: none;
 }
 .cd-dock.cd-gate-blocked .cd-inputbar { opacity: .55; }
@@ -2173,83 +1575,7 @@ function connectorGuide(s: McpServer) {
   padding: 10px 12px;
   z-index: 60;
 }
-.cd-session-pop {
-  /* Teleport 到 body：相对视口固定（26px 状态栏 + 原 38px 间距） */
-  position: fixed;
-  right: 10px; bottom: 64px;
-  width: 360px; max-width: calc(100vw - 24px);
-  max-height: min(62vh, 430px); overflow-y: auto;
-  background: var(--bg-raised); border: 1px solid var(--border-strong);
-  border-radius: 8px; box-shadow: 0 14px 38px rgba(35,52,84,.2);
-  padding: 10px; z-index: 60;
-}
-.cd-session-head { display: flex; align-items: flex-start; gap: 8px; justify-content: space-between; }
-.cd-session-subtitle { color: var(--text-faint); font-size: 10.5px; line-height: 1.45; margin-top: -4px; }
-.cd-session-new {
-  width: 100%; display: flex; align-items: center; gap: 9px; margin: 8px 0;
-  padding: 8px 9px; border: 1px solid #c8dcfa; border-radius: 6px;
-  background: #f3f8ff; color: var(--accent); text-align: left; cursor: pointer;
-}
-.cd-session-new:hover { background: var(--bg-selected); border-color: var(--accent); }
-.cd-session-new:disabled { opacity: .55; cursor: default; }
-.cd-session-new-icon { width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid currentColor; border-radius: 50%; font-size: 16px; line-height: 1; }
-.cd-session-new b, .cd-session-new small { display: block; }
-.cd-session-new b { font-size: 11.5px; }
-.cd-session-new small { margin-top: 2px; color: var(--text-muted); font-size: 10px; }
-.cd-session-error { padding: 6px 8px; color: var(--danger); background: #fff4f4; border: 1px solid #f2caca; border-radius: 5px; font-size: 10.5px; }
-.cd-session-empty { padding: 12px 5px; color: var(--text-faint); font-size: 11px; text-align: center; }
-.cd-session-item { display: flex; align-items: stretch; border-top: 1px solid var(--border); }
-.cd-session-item.active { background: var(--bg-selected); }
-.cd-session-main { flex: 1; min-width: 0; display: flex; gap: 7px; align-items: center; padding: 8px 5px; border: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
-.cd-session-main:hover { background: var(--bg-hover); }
-.cd-session-main:disabled { opacity: .6; cursor: default; }
-.cd-session-current { flex: 0 0 14px; color: var(--text-faint); font-size: 10px; }
-.cd-session-item.active .cd-session-current { color: var(--accent); }
-.cd-session-copy { min-width: 0; display: block; }
-.cd-session-copy strong, .cd-session-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cd-session-copy strong { font-size: 11.5px; font-weight: 600; }
-.cd-session-copy small { margin-top: 2px; color: var(--text-faint); font-size: 10px; }
-.cd-session-delete { align-self: center; margin-right: 5px; width: 22px; height: 22px; border: 0; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 16px; }
-.cd-session-delete:hover { color: var(--danger); }
-.cd-session-delete:disabled { cursor: default; opacity: .5; }
-/* 工作流历史弹层 */
-.cd-wf-pop { max-height: min(70vh, 520px); }
-.cd-wf-dot { flex: 0 0 auto; align-self: center; width: 8px; height: 8px; border-radius: 50%; }
-.cd-wf-dot-run { background: var(--amber); box-shadow: 0 0 6px rgba(214,158,46,.6); animation: cd-wf-pulse 1.4s ease-in-out infinite; }
-.cd-wf-dot-ok { background: var(--green); }
-.cd-wf-dot-err { background: var(--danger); }
-.cd-wf-dot-stop { background: var(--text-faint); }
-@keyframes cd-wf-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
-.cd-wf-state { font-style: normal; }
-.cd-wf-state-run { color: var(--amber); }
-.cd-wf-state-ok { color: var(--green); }
-.cd-wf-state-err { color: var(--danger); }
-.cd-wf-state-stop { color: var(--text-faint); }
-.cd-wf-sub { display: block; color: var(--danger); margin-top: 2px; }
-.cd-wf-act {
-  width: auto; min-width: 34px; height: auto; align-self: center;
-  margin-right: 5px; padding: 3px 8px; border: 1px solid var(--border);
-  border-radius: 5px; font-size: 10.5px; color: var(--text-muted);
-}
-.cd-wf-act:hover:not(:disabled) { color: var(--amber); border-color: var(--amber); }
-.cd-wf-act-danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
-.cd-new-session { color: var(--accent); border-color: #c8dcfa; }
 .cd-pop-title { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
-.cd-pop-subtitle { font-size: 11px; color: var(--text-dim); line-height: 1.5; margin-bottom: 8px; }
-.cd-addon {
-  border: 1px solid var(--border); border-radius: 7px;
-  padding: 8px 10px; margin-bottom: 10px; background: var(--bg-hover);
-}
-.cd-addon-row, .cd-server-row { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text); }
-.cd-addon-ver { color: var(--text-muted); font-size: 11px; }
-.cd-preflight { display: flex; gap: 6px; align-items: center; margin-top: 6px; font-size: 11px; color: var(--text-faint); flex-wrap: wrap; }
-.cd-preflight-path { font-family: var(--font-mono); font-size: 10px; color: var(--text-faint); }
-.cd-tag { font-size: 10px; padding: 1px 6px; border-radius: 8px; }
-.cd-tag-ok { color: var(--green); background: rgba(69,201,140,.12); }
-.cd-tag-warn { color: var(--amber); background: rgba(227,168,58,.12); }
-.cd-ok-text { color: var(--green); }
-.cd-err-text { color: var(--danger); }
-.cd-warn-text { font-size: 11px; color: var(--amber); margin-top: 5px; }
 .cd-mini {
   height: 21px; padding: 0 9px; font-size: 11px;
   border: 1px solid var(--border-strong); border-radius: 5px;
@@ -2257,34 +1583,7 @@ function connectorGuide(s: McpServer) {
 }
 .cd-mini:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
 .cd-mini:disabled { opacity: .45; cursor: default; }
-.cd-mini-stop { border-color: var(--border-strong); }
-.cd-mini-stop:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
 .cd-mini-danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
-
-.cd-server-actions { display: flex; align-items: center; padding-top: 5px; }
-.cd-add-toggle { margin-top: 6px; }
-.cd-add-form { margin-top: 6px; padding: 8px; border: 1px dashed var(--border); border-radius: 6px; display: flex; flex-direction: column; gap: 6px; }
-.cd-add-row { display: flex; gap: 6px; align-items: center; }
-.cd-input-sm {
-  flex: 1; min-width: 0; height: 24px; padding: 0 7px;
-  background: var(--bg); color: var(--text);
-  border: 1px solid var(--border); border-radius: 5px;
-  font-size: 11px; font-family: inherit; outline: none;
-}
-.cd-input-sm:focus { border-color: var(--accent); }
-.cd-add-chk { font-size: 11px; color: var(--text-muted); display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
-.cd-add-actions { display: flex; gap: 6px; justify-content: flex-end; }
-
-.cd-server { padding: 7px 0; border-top: 1px dashed var(--border); }
-.cd-server-name { font-size: 12px; }
-.cd-server-meta { font-family: var(--font-mono); font-size: 10px; color: var(--text-faint); }
-.cd-server-result { margin-top: 4px; font-size: 11px; word-break: break-all; }
-.cd-server-help { margin-top: 3px; font-size: 10.5px; color: var(--text-faint); }
-.cd-server-guide { margin: 4px 0 0 20px; font-size: 10.5px; color: var(--text-dim); line-height: 1.45; }
-.cd-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 7px; }
-.cd-dot-ok { background: var(--green); box-shadow: 0 0 6px rgba(69,201,140,.6); }
-.cd-dot-idle { background: var(--amber); }
-.cd-dot-off { background: var(--text-faint); }
 
 /* 消息区 */
 .cd-jump-bottom {
@@ -2320,17 +1619,6 @@ function connectorGuide(s: McpServer) {
   background: transparent; color: var(--text-muted); cursor: pointer;
 }
 .cd-quick:hover { color: var(--accent); border-color: var(--accent); }
-.cd-task-entry {
-  display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
-  padding: 10px 6px 12px; color: var(--text-muted);
-}
-.cd-task-entry-title { width: 100%; font-size: 11px; color: var(--text-dim); }
-.cd-task-chip {
-  padding: 5px 9px; border: 1px solid var(--border); border-radius: 999px;
-  background: transparent; color: var(--text-muted); font-size: 11px; cursor: pointer;
-}
-.cd-task-chip:hover { color: var(--accent); border-color: var(--accent); background: var(--bg-selected); }
-.cd-task-entry small { color: var(--text-faint); font-size: 10px; }
 
 .cd-msg { margin-bottom: 10px; }
 .cd-user-bubble {
@@ -2602,8 +1890,6 @@ function connectorGuide(s: McpServer) {
   .cd-live { display: none; }
   .cd-btn { padding: 0 7px; }
   .cd-btn span { display: none; }
-  /* 「＋新对话」的图标本身也是 span，单独保回来 */
-  .cd-new-session > span:first-child { display: inline-flex; }
   .cd-size-btn span { display: none; }
 }
 /* 尊重系统「减少动态效果」：高度/箭头翻转改为瞬时，光标不闪烁 */

@@ -1719,11 +1719,16 @@ class GameWorkflowManager:
             out.append(WorkflowOption("web_research", "联网补充资料后再选", "搜索最新资料，再重新生成方案选项。", False, "web", True))
         return out
 
-    def choose(self, workflow_id: str, choice: str, *, custom_request: str = "") -> dict[str, Any]:
+    def choose(self, workflow_id: str, choice: str, *, custom_request: str = "",
+               auto_execute: bool = False) -> dict[str, Any]:
         state = self._load(workflow_id)
-        if state.status != "awaiting_choice":
+        allowed = {"awaiting_choice", "generating_options"} if auto_execute \
+            else {"awaiting_choice"}
+        if state.status not in allowed:
             raise WorkflowError("当前工作流不在等待方案选择：%s" % state.status)
         choice = (choice or "").strip()
+        if state.status == "generating_options" and choice in {"web_research", "custom"}:
+            raise WorkflowError("方案仍在生成中，请直接选择一个已有方案或稍候再试")
         if choice == "web_research":
             state.status, state.phase = "awaiting_research", "research"
             state.interrupt_reason = "等待联网检索结果"
@@ -1764,6 +1769,17 @@ class GameWorkflowManager:
             state.selected_option = selected
             state.status, state.phase = "planning", "plan"
             state.interrupt_reason = ""
+            if auto_execute:
+                # 选方案即授权：HTTP 立即返回 planning，LangGraph 规划（慢 LLM）
+                # 与后续审批/执行全部转入守护线程。规划耗时或整段子代理执行都
+                # 不能再把前端卡片锁在「提交中」——进度经 SSE/轮询自然推进。
+                self._event(state, "choice", option=selected)
+                self._save(state)
+                threading.Thread(
+                    target=self._auto_plan_and_execute,
+                    args=(workflow_id, choice, dict(selected)),
+                    name="workflow-auto-run", daemon=True).start()
+                return state.public()
             graph_view = self._resume_gate(state, "choice", {"choice": choice, "selected_option": selected})
             # A registered graph plan generator may have completed the plan
             # node during this resume. Mirror its durable result into the
@@ -1782,6 +1798,98 @@ class GameWorkflowManager:
                             task_source=graph_view.get("plan_source") or "llm", graph_node=True)
             self._event(state, "choice", option=selected)
         return self._save(state).public()
+
+    def _auto_plan_and_execute(self, workflow_id: str, choice: str,
+                               selected: Mapping[str, Any]) -> None:
+        """Worker for ``choose(auto_execute=True)``: plan, auto-approve, execute.
+
+        All slow work (planner LLM, task DAG execution) runs here so the HTTP
+        choice request returns immediately.  Progress reaches the card through
+        the durable SSE event stream; failures land in a durable ``failed``
+        state instead of hanging the UI in "submitting".
+        """
+        try:
+            state = self._load(workflow_id)
+            if state.status != "planning":
+                return  # interrupted or superseded while queued
+            graph_view = self._resume_gate(
+                state, "choice", {"choice": choice, "selected_option": dict(selected)})
+            # The planner LLM runs under the manager lock; an interrupt requested
+            # while waiting is applied as soon as it is released. Re-check
+            # before mirroring the plan so a user stop is not overwritten.
+            state = self._load(workflow_id)
+            if state.status == "interrupted":
+                return
+            if not (graph_view.get("tasks")
+                    and graph_view.get("status") in {"planned", "awaiting_approval"}):
+                # Without a usable plan the workflow simply stays in planning;
+                # the card still offers explicit planning/approval actions.
+                self._save(state)
+                return
+            state.tasks = [dict(item) for item in graph_view.get("tasks") or []]
+            state.acceptance_contract = acceptance_from_tasks(state.tasks)
+            state.status = "planned"
+            state.phase = "execute"
+            state.interrupt_reason = ""
+            state.subagents = self._subagent_records(state.tasks)
+            state.context_layers["task"] = {"count": len(state.tasks),
+                                             "ids": [t.get("id") for t in state.tasks]}
+            self._event(state, "plan", task_count=len(state.tasks),
+                        task_source=graph_view.get("plan_source") or "llm", graph_node=True)
+            self._save(state)
+            if self._load(workflow_id).status == "interrupted":
+                return
+            callbacks = self._execution_callbacks.get(workflow_id)
+            if callbacks is None and self._execution_resolver is not None:
+                try:
+                    resolved = self._execution_resolver(state.public())
+                    if isinstance(resolved, Mapping) and callable(resolved.get("runner")):
+                        callbacks = dict(resolved)
+                except Exception as exc:  # noqa: BLE001 - surfaced below as a gate
+                    self._event(state, "auto_execute_reconstruct_failed",
+                                error=type(exc).__name__)
+            if callbacks is None:
+                # Process-local runner is unavailable (e.g. unusual host): keep
+                # the plan gate so the user can still press execute manually.
+                self._event(state, "auto_execute_unavailable",
+                            reason="执行回调不可用，等待手动执行")
+                return
+            # Under the default (safe) policy execute() first parks at
+            # awaiting_approval; approve(auto_execute=True) passes the gate and
+            # moves the real DAG run onto its own worker thread.
+            self.execute(workflow_id, **callbacks)
+            state = self._load(workflow_id)
+            if state.status != "awaiting_approval":
+                return  # user interrupt landed while passing the gate
+            self.approve(workflow_id, True, auto_execute=True)
+        except Exception as exc:  # noqa: BLE001 - durable failure, never a dead UI
+            self._fail_background_workflow(workflow_id, exc, phase="plan")
+
+    def _run_approved_execution(self, workflow_id: str,
+                                callbacks: Mapping[str, Any]) -> None:
+        """Worker for ``approve(auto_execute=True)``: run the approved DAG."""
+        try:
+            if self._load(workflow_id).status == "interrupted":
+                return
+            self.execute(workflow_id, **dict(callbacks))
+        except Exception as exc:  # noqa: BLE001 - keep the terminal state durable
+            if self._load(workflow_id).status == "interrupted":
+                return
+            self._fail_background_workflow(workflow_id, exc, phase="execute")
+
+    def _fail_background_workflow(self, workflow_id: str, exc: Exception, *,
+                                  phase: str) -> None:
+        try:
+            state = self._load(workflow_id)
+        except Exception:
+            return
+        if state.status in self._TERMINAL_STATUSES:
+            return
+        state.status, state.phase = "failed", phase
+        state.interrupt_reason = "后台推进中断：" + type(exc).__name__
+        self._event(state, "fail", error=type(exc).__name__,
+                    reason=_clean_text(str(exc), 200))
+        self._save(state)
 
     def apply_research(self, workflow_id: str, findings: str, *, source: str = "web",
                        option_generator: Callable[[str, ContextPlan], Any] | None = None) -> dict[str, Any]:
@@ -2778,7 +2886,15 @@ class GameWorkflowManager:
                     self._workflow_hook(state, "after_approval", approved=True,
                                         task_count=len(state.tasks))
                     self._save(state)
-                    return self.execute(workflow_id, **callbacks)
+                    # The DAG run can take minutes (multiple child agents);
+                    # never hold the approval HTTP request until it finishes.
+                    # The worker publishes execute_start/subagent_*/complete
+                    # events that drive the card via SSE.
+                    threading.Thread(
+                        target=self._run_approved_execution,
+                        args=(workflow_id, dict(callbacks)),
+                        name="workflow-execute", daemon=True).start()
+                    return state.public()
         self._workflow_hook(state, "after_approval", approved=bool(approved),
                             task_count=len(state.tasks))
         return self._save(state).public()
