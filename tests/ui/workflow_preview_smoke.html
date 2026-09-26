@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><title>工作流预览交互检查</title>
+<style>
+:root{--bg:#111824;--bg-raised:#192234;--bg-hover:#232e43;--text:#e8eef9;--text-muted:#adbcd3;--text-faint:#8293ae;--border:#34445e;--border-strong:#637492;--accent:#70aaff;--danger:#ff8199;--green:#57d59a;--amber:#edc173}
+body{margin:0;padding:20px;font:14px sans-serif;background:var(--bg);color:var(--text)}#app{width:800px}
+</style><div id="app"></div>
+<script type="module">
+import { createApp, h, nextTick, reactive } from 'vue'
+import WorkflowPreview from '/src/workbench/components/WorkflowPreview.vue'
+import { agentApi, setProjectId } from '/src/workbench/api.ts'
+
+const checks = [], errors = [], requests = [], statusLog = [], images = new Map()
+window.addEventListener('error', event => errors.push(event.message))
+window.addEventListener('unhandledrejection', event => errors.push(String(event.reason)))
+const clone = value => JSON.parse(JSON.stringify(value))
+const workflow = reactive({
+  workflow_id: 'preview-smoke-wf', status: 'completed', phase: 'review',
+  preview: { artifacts: [{ id: 'live-1', kind: 'interactive', label: '测试画面', uri: '/.docmind/workflow-preview-test.html' }] },
+  visual_feedback: [],
+})
+setProjectId('preview-smoke-project')
+agentApi.workflowVisualFeedback = async (_wid, payload, projectId) => {
+  if (projectId !== 'preview-smoke-project') throw new Error('反馈项目绑定错误')
+  const row = { ...payload, status: 'pending', snapshots: {} }
+  workflow.visual_feedback.unshift(row)
+  return { ok: true, feedback: clone(row) }
+}
+agentApi.workflowFeedbackSnapshot = async (_wid, id, phase, data, projectId) => {
+  if (projectId !== 'preview-smoke-project') throw new Error('截图项目绑定错误')
+  const row = workflow.visual_feedback.find(item => item.id === id)
+  if (!row) throw new Error('截图反馈不存在')
+  images.set(id + ':' + phase, data)
+  row.snapshots[phase] = { width: 800, height: 360, bytes: data.length, captured_at: new Date().toISOString() }
+  row.screenshot = !!row.snapshots.before
+  return { ok: true, feedback: clone(row) }
+}
+agentApi.workflowFeedbackStatus = async (_wid, id, status, detail, projectId) => {
+  if (projectId !== 'preview-smoke-project') throw new Error('状态项目绑定错误')
+  const row = workflow.visual_feedback.find(item => item.id === id)
+  if (!row) throw new Error('状态反馈不存在')
+  Object.assign(row, { status, detail })
+  statusLog.push(status)
+  return { ok: true, feedback: clone(row) }
+}
+agentApi.workflowFeedbackSnapshotUrl = (_wid, _id, phase) => '/.docmind/workflow-preview-pixel.png?phase=' + phase
+window.addEventListener('docmind:send-chat', event => {
+  requests.push(event.detail)
+  event.detail.onStatus('processing')
+})
+let app = createApp({ render: () => h(WorkflowPreview, { workflow }) })
+app.mount('#app')
+const assert = (condition, label) => { if (!condition) throw new Error(label); checks.push(label) }
+const waitFor = async (predicate, label) => {
+  for (let i = 0; i < 180; i++) {
+    if (predicate()) return
+    await new Promise(resolve => setTimeout(resolve, 35))
+  }
+  throw new Error('等待超时：' + label + '；' + errors.join('; ') + '；' + document.body.innerText.slice(-800))
+}
+const click = text => {
+  const button = [...document.querySelectorAll('button')].find(item => item.textContent.trim() === text)
+  if (!button) throw new Error('按钮不存在：' + text)
+  button.click()
+}
+window.runSmoke = async () => {
+  await waitFor(() => document.querySelector('iframe')?.contentDocument?.querySelector('canvas'), '同源预览加载')
+  const viewport = document.querySelector('.vp-viewport'), handle = document.querySelector('.vp-resize')
+  handle.setPointerCapture = () => {}
+  handle.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 1, clientX: 150, clientY: 300 }))
+  window.dispatchEvent(new PointerEvent('pointermove', { pointerId: 1, clientX: 100, clientY: 340 }))
+  window.dispatchEvent(new PointerEvent('pointerup', { pointerId: 1, clientX: 100, clientY: 340 }))
+  await nextTick()
+  assert(viewport.style.width !== '100%' && viewport.style.height === '400px', '可拖动调整画面尺寸')
+  click('标注区域'); await nextTick()
+  const layer = document.querySelector('.vp-annotation'), rect = layer.getBoundingClientRect()
+  layer.setPointerCapture = () => {}
+  for (const [type, x, y] of [['pointerdown', .2, .3], ['pointermove', .6, .7], ['pointerup', .6, .7]]) {
+    layer.dispatchEvent(new PointerEvent(type, { bubbles: true, pointerId: 2, clientX: rect.left + rect.width * x, clientY: rect.top + rect.height * y }))
+  }
+  await nextTick()
+  assert(!!document.querySelector('.vp-feedback-pop') && !!document.querySelector('.vp-region'), '框选后打开反馈浮窗')
+  const textarea = document.querySelector('.vp-feedback-pop textarea')
+  textarea.value = '调整红色按钮的位置'
+  textarea.dispatchEvent(new Event('input', { bubbles: true }))
+  await nextTick()
+  click('发送并修改')
+  await waitFor(() => requests.length === 1, '反馈进入对话')
+  assert(requests[0].projectId === 'preview-smoke-project', '反馈绑定当前项目')
+  assert(requests[0].images.length === 1, '同源画面以图片送入对话')
+  assert(requests[0].prompt.includes('左 20%'), '反馈包含框选坐标')
+  const row = workflow.visual_feedback[0]
+  assert(!!row.snapshots.before && !!images.get(row.id + ':before'), '修改前截图单独保存')
+  const loadCount = window.previewLoads || 0
+  localStorage.setItem('preview-smoke-color', '#198754')
+  requests[0].onStatus('awaiting_review')
+  await waitFor(() => row.status === 'awaiting_review', '等待复验状态')
+  assert((window.previewLoads || 0) > loadCount, '回复后刷新项目画面')
+  assert(!!row.snapshots.after && !!images.get(row.id + ':after'), '复验截图单独保存')
+  assert(row.status !== 'accepted', '自动复验不会替用户确认满意')
+  assert([...document.querySelectorAll('.vp-snapshots img')].length === 2, '修改前后画面并排可见')
+  click('效果满意')
+  await waitFor(() => row.status === 'accepted', '用户确认效果')
+  assert(statusLog.includes('processing') && statusLog.includes('awaiting_review') && statusLog.includes('accepted'), '反馈状态顺序完整')
+  app.unmount()
+  app = createApp({ render: () => h(WorkflowPreview, { workflow }) })
+  app.mount('#app')
+  await waitFor(() => document.body.innerText.includes('效果已确认'), '重新挂载恢复反馈历史')
+  assert(errors.length === 0, '页面没有运行错误')
+  localStorage.removeItem('preview-smoke-color')
+  return { checks, statuses: statusLog }
+}
+</script></html>

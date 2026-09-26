@@ -7,6 +7,7 @@ import {
 } from '../api'
 import type { AcceptanceItem, WorkflowChildTrace, WorkflowEvaluation, WorkflowEvent, WorkflowState, WorkflowStepItem } from '../api'
 import WorkflowGateDialog from './WorkflowGateDialog.vue'
+import WorkflowPreview from './WorkflowPreview.vue'
 
 const props = defineProps<{
   workflowId: string
@@ -773,6 +774,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+      <WorkflowPreview v-if="state && (state.preview || state.visual_feedback?.length)" :key="state.workflow_id" :workflow="state" @activity="emit('activity')" />
       <section v-if="state?.recovery?.status === 'required' && (status === 'failed' || status === 'interrupted')" class="wf-recovery">
         <div class="wf-recovery-head"><b>失败后的下一步</b><span>需要用户审核</span></div>
         <p>{{ state.recovery.summary || '执行未通过复核，请选择下一步。' }}</p>
