@@ -2540,7 +2540,7 @@ export interface WorkflowState {
     steps?: number; elapsed_ms?: number; error?: string
     retry_count?: number
   }>
-  results?: Record<string, Record<string, unknown>>; events?: WorkflowEvent[]
+  results?: Record<string, Record<string, unknown>>; events?: WorkflowEvent[]; timeline?: WorkflowEvent[]
   dispatches?: Array<{ planner?: string; added?: string[]; kind?: string }>
   review?: Record<string, unknown>; interrupt_reason?: string
   recovery?: {

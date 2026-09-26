@@ -286,6 +286,10 @@ class WorkflowState:
     capability_lease: dict[str, Any] = field(default_factory=dict)
     visual_feedback: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
+    # Longer durable history for the workbench timeline.  ``events`` remains
+    # the bounded SSE replay window; timeline keeps enough context to inspect
+    # a long run without making the live stream unbounded.
+    timeline: list[dict[str, Any]] = field(default_factory=list)
     interrupt_reason: str = ""
     error: str = ""
     replans: int = 0
@@ -895,6 +899,26 @@ class GameWorkflowManager:
                 raw = json.loads(path.read_text(encoding="utf-8"))
                 legacy = "kind" not in raw
                 state = WorkflowState(**raw)
+                timeline_migrated = False
+                if not isinstance(state.timeline, list):
+                    state.timeline = []
+                    timeline_migrated = True
+                if not state.timeline and state.events:
+                    # Migrate states written before the durable timeline was
+                    # introduced.  Keep the same dict objects so sequence tags
+                    # added below are visible in both projections.
+                    state.timeline = list(state.events)
+                    timeline_migrated = True
+                elif state.events:
+                    known = {int(item.get("seq") or 0) for item in state.timeline
+                             if isinstance(item, Mapping)}
+                    missing = [item for item in state.events
+                               if isinstance(item, Mapping) and
+                               int(item.get("seq") or 0) not in known]
+                    if missing:
+                        state.timeline.extend(missing)
+                        state.timeline = state.timeline[-500:]
+                        timeline_migrated = True
                 if legacy:
                     # 领域画像引入前的历史工作流全部按游戏领域处理，保证旧
                     # 状态恢复后选项/兜底文案与创建时一致，可继续 choose/plan。
@@ -929,6 +953,12 @@ class GameWorkflowManager:
                 except OSError:
                     pass
             self._tag_event_seqs(state)
+            if timeline_migrated:
+                try:
+                    path.write_text(json.dumps(state.public(), ensure_ascii=False, indent=2),
+                                    encoding="utf-8")
+                except OSError:
+                    pass
             # 终态不参与互斥（_active_workflow_for 显式跳过），但必须缓存：
             # 否则刷新后打开历史终态卡片时 SSE 的 is_terminal() 读不到它，
             # 连接无法自关，退化为永久心跳连接。
@@ -1232,6 +1262,8 @@ class GameWorkflowManager:
             event = {"seq": self._event_seq, "ts": _now(), "kind": kind, **payload}
             state.events.append(event)
             state.events = state.events[-100:]
+            state.timeline.append(dict(event))
+            state.timeline = state.timeline[-500:]
             telemetry = dict(state.observability or {})
             now_epoch = time.time()
             telemetry.setdefault("started_epoch", now_epoch)

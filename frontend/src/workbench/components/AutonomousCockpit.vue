@@ -50,7 +50,7 @@ const taskResults = computed<Record<string, Record<string, unknown>>>(() => {
     || report as Record<string, Record<string, unknown>>
 })
 const doneCount = computed(() => Object.values(taskResults.value).filter(r => r.status === 'ok').length)
-const recentEvents = computed(() => (workflow.value?.events || []).slice(-12).reverse())
+const timelineEvents = computed(() => (workflow.value?.timeline || workflow.value?.events || []).slice().reverse())
 const previewArtifacts = computed(() => workflow.value?.preview?.artifacts || [])
 const previewKindLabel: Record<string, string> = {
   code: '代码', text: '文本', diff: '差异', image: '图片', audio: '音频',
@@ -59,6 +59,24 @@ const previewKindLabel: Record<string, string> = {
 const capabilityLabel: Record<string, string> = {
   read_local: '读取项目', read_external: '读取外部资料', write_local: '写入项目',
   write_external: '写入外部服务', exec: '执行命令', network: '联网 / MCP', admin: '管理操作',
+}
+const timelineLabel: Record<string, string> = {
+  execute_start: '开始执行', subagent_start: '子代理开始', subagent_complete: '子代理完成',
+  task_complete: '任务完成', task_blocked: '任务阻塞', before_tool: '工具调用前', after_tool: '工具调用后',
+  before_mcp: 'MCP 调用前', after_mcp: 'MCP 调用后', approval_required: '等待审批',
+  approval_granted: '已批准', approval_denied: '已拒绝', project_checkpoint_created: '创建项目快照',
+  project_checkpoint_restored: '恢复项目快照', visual_snapshot_saved: '保存视觉证据', review: '验收检查',
+  acceptance_decided: '用户验收决定', interrupt: '已暂停', resume: '已恢复', evaluation: '质量评估',
+}
+function timelineDetail(event: WorkflowEvent): string {
+  const task = event.task_id ? `任务 ${event.task_id} · ` : ''
+  const detail = event.error || event.conclusion || event.reason || event.summary || event.detail || event.status || ''
+  return `${task}${String(detail || '已记录').replace(/\s+/g, ' ').slice(0, 320)}`
+}
+function timelineCanReplay(event: WorkflowEvent): boolean {
+  const taskId = String(event.task_id || '')
+  const status = String(taskId ? taskResults.value[taskId]?.status || event.status || '' : '')
+  return !!taskId && ['failed', 'blocked'].includes(status)
 }
 function leaseIsExpired(lease: WorkflowState['capability_lease']): boolean {
   return !!lease?.expires_at_epoch && Date.now() / 1000 >= lease.expires_at_epoch
@@ -558,7 +576,15 @@ onBeforeUnmount(() => {
       <section class="acp-panel"><div class="acp-panel-head"><h3>执行现场</h3><span>{{ doneCount }}/{{ workflow.tasks?.length || 0 }} 个任务完成</span></div>
         <div v-if="workflow.tasks?.length" class="acp-list"><div v-for="task in workflow.tasks" :key="String(task.id)" class="acp-row"><em>{{ String(taskResults[String(task.id)]?.status || task.status || '待执行') }}</em><span>{{ task.task }}<small>{{ taskResults[String(task.id)]?.conclusion || '' }}</small></span></div></div>
         <p v-else class="acp-muted">方案确认后显示模型的任务分工。</p>
-        <h3>最近事件</h3><div class="acp-events"><div v-for="event in recentEvents" :key="event.seq || event.ts"><span>{{ event.kind }}</span><small>{{ event.ts }}</small></div></div>
+        <h3>任务时间线</h3>
+        <div v-if="timelineEvents.length" class="acp-timeline">
+          <details v-for="event in timelineEvents" :key="event.seq || `${event.kind}-${event.ts}`" class="acp-timeline-item">
+            <summary><span><b>{{ timelineLabel[event.kind || ''] || event.kind || '事件' }}</b><small v-if="event.task_id">{{ event.task_id }}</small></span><time>{{ event.ts }}</time></summary>
+            <p>{{ timelineDetail(event) }}</p>
+            <button v-if="timelineCanReplay(event)" :disabled="busy" @click.stop="applyRecovery({ id: 'timeline-retry', action: 'retry_failed', title: '从此任务继续', detail: '', task_ids: [String(event.task_id)] })">从此任务继续</button>
+          </details>
+        </div>
+        <p v-else class="acp-muted">模型开始执行后，这里会记录计划、工具、审批、修改和验收事件。</p>
         <h3>通用预览与证据</h3>
         <div v-if="workflow.preview?.changes?.total" class="acp-change-summary">
           <b>{{ workflow.preview.changes.total }} 个文件有变化</b>
@@ -666,6 +692,15 @@ onBeforeUnmount(() => {
 button { border: 1px solid var(--border); background: var(--bg-raised); color: var(--text); border-radius: 7px; padding: 7px 10px; cursor: pointer; font: inherit; font-size: 12px; }
 button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }button:disabled { opacity: .5; cursor: default; }.acp-compose button { background: var(--accent); color: white; border-color: var(--accent); }
 .acp-grid { display: grid; grid-template-columns: minmax(220px,1fr) minmax(270px,1.3fr) minmax(200px,.8fr); gap: 12px; }.acp-panel { min-width: 0; border: 1px solid var(--border); border-radius: 11px; padding: 13px; display: flex; flex-direction: column; gap: 9px; }.acp-panel h3 { margin: 0; font-size: 13px; }.acp-panel-head span,.acp-muted { color: var(--text-faint); font-size: 11px; }.acp-goal { margin: 0; }.acp-option,.acp-list { display: grid; gap: 8px; }.acp-option small,.acp-row small { display: block; color: var(--text-faint); font-size: 11px; margin-top: 3px; }.acp-row { display: flex; gap: 7px; padding-top: 7px; border-top: 1px solid var(--border); font-size: 12px; line-height: 1.5; }.acp-row em { font-size: 10px; color: var(--accent); font-style: normal; flex: 0 0 auto; }.acp-events { display: grid; gap: 5px; }.acp-events div { display: flex; justify-content: space-between; gap: 7px; font-size: 11px; color: var(--text-muted); }.acp-events small { color: var(--text-faint); }.acp-history { text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.acp-history small { display: block; color: var(--text-faint); }.acp-error { color: var(--danger) !important; }.acp-ok { color: var(--green) !important; }.acp-empty { padding: 35px; text-align: center; color: var(--text-faint); font-size: 12px; }
+.acp-timeline { display: grid; gap: 5px; max-height: 360px; overflow: auto; }
+.acp-timeline-item { border: 1px solid var(--border); border-radius: 6px; padding: 6px 7px; font-size: 11px; }
+.acp-timeline-item summary { display: flex; justify-content: space-between; gap: 8px; cursor: pointer; color: var(--text-muted); }
+.acp-timeline-item summary span { min-width: 0; display: flex; gap: 6px; overflow: hidden; }
+.acp-timeline-item summary b { color: var(--text); font-weight: 600; }
+.acp-timeline-item summary small { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acp-timeline-item time { flex: 0 0 auto; color: var(--text-faint); font-size: 10px; }
+.acp-timeline-item p { margin: 6px 0; color: var(--text-muted); line-height: 1.45; }
+.acp-timeline-item button { padding: 4px 7px; font-size: 10px; }
 .acp-previews { display: grid; gap: 6px; }.acp-preview { border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px; font-size: 11px; }.acp-preview summary { display: flex; gap: 7px; cursor: pointer; }.acp-preview summary b { color: var(--accent); font-weight: 600; }.acp-preview p { margin: 7px 0; }.acp-preview img,.acp-preview video { display: block; max-width: 100%; max-height: 180px; margin-top: 7px; border-radius: 5px; }.acp-preview audio { width: 100%; margin-top: 7px; }.acp-preview pre { max-height: 150px; overflow: auto; padding: 7px; white-space: pre-wrap; background: var(--bg-hover); }.acp-preview small { display: block; color: var(--text-faint); margin-top: 4px; overflow-wrap: anywhere; }
 .acp-change-summary { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; font-size: 11px; color: var(--text-faint); }.acp-change-summary b { color: var(--text); margin-right: 3px; }
 .acp-live-frame { position: relative; margin-top: 8px; max-width: 100%; border: 1px solid var(--border); border-radius: 7px; overflow: visible; background: #101521; }.acp-live-bar { display: flex; align-items: center; gap: 6px; padding: 6px 8px; color: #dbe5f5; font-size: 10px; }.acp-live-bar i { width: 7px; height: 7px; border-radius: 50%; background: #43d17a; box-shadow: 0 0 8px #43d17a; }.acp-live-bar small { margin-left: auto; color: #93a4bd; }.acp-live-bar button { padding: 3px 7px; border-color: #52698b; color: #dbe5f5; background: #26344b; font-size: 10px; }.acp-live-viewport { position: relative; max-width: 100%; min-height: 220px; }.acp-live-viewport iframe { display: block; width: 100%; height: 100%; min-height: 220px; border: 0; border-radius: 0 0 7px 7px; background: #000; }.acp-annotation-layer { position: absolute; inset: 0; cursor: crosshair; background: rgba(24, 39, 64, .22); touch-action: none; }.acp-annotation-box { position: absolute; border: 2px solid #55a8ff; background: rgba(85,168,255,.18); pointer-events: none; }.acp-resize-handle { position: absolute; right: -1px; bottom: -1px; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 0 0 7px 0; background: linear-gradient(135deg, transparent 45%, #8fa4c4 46%, #8fa4c4 53%, transparent 54%, transparent 64%, #8fa4c4 65%, #8fa4c4 72%, transparent 73%); cursor: nwse-resize; }.acp-feedback-pop { position: absolute; z-index: 4; top: 35px; right: 8px; width: min(300px, calc(100% - 16px)); padding: 9px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg-raised); box-shadow: 0 12px 32px rgba(0,0,0,.28); }.acp-feedback-head,.acp-feedback-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }.acp-feedback-head button { border: 0; background: transparent; padding: 0 3px; font-size: 16px; }.acp-feedback-pop textarea { width: 100%; box-sizing: border-box; margin: 8px 0; resize: vertical; border: 1px solid var(--border); border-radius: 6px; padding: 7px; color: var(--text); background: var(--bg); font: inherit; font-size: 11px; }.acp-feedback-foot small { color: var(--text-faint); font-size: 10px; }.acp-feedback-foot button { padding: 5px 8px; background: var(--accent); color: #fff; border-color: var(--accent); }
