@@ -32,6 +32,7 @@ from .acceptance_contract import (from_tasks as acceptance_from_tasks,
                                   revise as revise_acceptance)
 from .preview_adapters import build_preview_bundle
 from .project_checkpoint import create_checkpoint, restore_checkpoint
+from .tools import Capability
 from .context_router import (CONTEXT_LAYERS, ContextPlan, ContextRouter,
                              allocate_layer_budgets, compress_context,
                              compress_context_async, compress_layers,
@@ -279,6 +280,8 @@ class WorkflowState:
     # Project files captured before the first side-effecting execution wave.
     # The orchestration checkpoint above is insufficient to restore files.
     project_checkpoint: dict[str, Any] = field(default_factory=dict)
+    # Temporary capability boundary for the current execution wave.
+    capability_lease: dict[str, Any] = field(default_factory=dict)
     visual_feedback: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     interrupt_reason: str = ""
@@ -369,6 +372,8 @@ class GameWorkflowManager:
         self._checkpoint_pool: Any | None = None
         self._lease_owner = "wf-worker-" + uuid.uuid4().hex[:16]
         self._lease_ttl_s = max(30, min(3600, int(os.getenv("DOCMIND_WORKFLOW_LEASE_S", "120"))))
+        self._capability_lease_ttl_s = max(
+            300, min(7200, int(os.getenv("DOCMIND_CAPABILITY_LEASE_S", "1800"))))
         self._leases: dict[str, tuple[int, int]] = {}
         self._checkpoint_error = ""
         self._checkpoint_backend = "native"
@@ -724,6 +729,8 @@ class GameWorkflowManager:
     def _save(self, state: WorkflowState, *, register: bool = True,
               strict: bool = False) -> WorkflowState:
         state.updated_at = _now()
+        if state.status in self._TERMINAL_STATUSES:
+            self._release_capability_lease(state)
         if state.results or state.review:
             state.preview = build_preview_bundle(state.public())
         # Persist bounded content snapshots, not only layer counters. This is
@@ -1224,6 +1231,59 @@ class GameWorkflowManager:
             self._event(state, "hook_blocked", hook=kind, reason=reason)
             self._save(state)
             raise WorkflowError("workflow_hook_blocked:%s" % kind)
+
+    def _ensure_capability_lease(self, state: WorkflowState,
+                                 *, ttl_seconds: int | float | None = None,
+                                 capabilities: Iterable[str] | None = None) -> dict[str, Any]:
+        """Create or reuse the temporary capability scope for execution."""
+        now = time.time()
+        current = dict(state.capability_lease or {})
+        try:
+            current_expiry = float(current.get("expires_at_epoch") or 0)
+        except (TypeError, ValueError):
+            current_expiry = 0.0
+        if current.get("status") == "active" and current_expiry > now + 5:
+            return current
+        try:
+            ttl = float(ttl_seconds if ttl_seconds is not None else self._capability_lease_ttl_s)
+        except (TypeError, ValueError):
+            ttl = float(self._capability_lease_ttl_s)
+        ttl = max(300.0, min(7200.0, ttl))
+        selected = [str(item) for item in (capabilities or ()) if str(item)]
+        if not selected:
+            selected = [item.value for item in Capability]
+        expires = now + ttl
+        lease = {
+            "id": "lease-" + uuid.uuid4().hex[:16],
+            "capabilities": list(dict.fromkeys(selected)),
+            "created_at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
+            "expires_at": datetime.fromtimestamp(expires, timezone.utc).isoformat(timespec="seconds"),
+            "expires_at_epoch": expires,
+            "status": "active",
+            "source": "workflow",
+        }
+        state.capability_lease = lease
+        self._event(state, "capability_lease_created", lease_id=lease["id"],
+                    capabilities=lease["capabilities"], expires_at=lease["expires_at"])
+        return lease
+
+    def create_capability_lease(self, workflow_id: str, *, ttl_seconds: int | float | None = None,
+                                capabilities: Iterable[str] | None = None) -> dict[str, Any]:
+        """Explicitly arm a workflow capability lease for callers/tests."""
+        state = self._load(workflow_id)
+        if state.status in self._TERMINAL_STATUSES:
+            raise WorkflowError("终态工作流不能创建工具权限租约")
+        lease = self._ensure_capability_lease(state, ttl_seconds=ttl_seconds,
+                                              capabilities=capabilities)
+        return self._save(state).public().get("capability_lease") or dict(lease)
+
+    @staticmethod
+    def _release_capability_lease(state: WorkflowState) -> None:
+        lease = dict(state.capability_lease or {})
+        if lease and lease.get("status") != "released":
+            lease["status"] = "released"
+            lease["released_at"] = _now()
+            state.capability_lease = lease
 
     def _graph_config(self, state: WorkflowState) -> dict[str, Any]:
         return {
@@ -2145,6 +2205,7 @@ class GameWorkflowManager:
             state.status, state.phase = "executing", "execute"
             state.interrupt_reason = ""
             state.execution_session_id = _clean_text(session_id or state.execution_session_id, 160)
+            self._ensure_capability_lease(state)
             self._event(state, "subagent_retry_start", task_id=task_id,
                         attempt=attempt, previous_status=previous_status,
                         max_retries=policy.max_subagent_retries)
@@ -2269,6 +2330,8 @@ class GameWorkflowManager:
                 self._invoke_graph(state, self._graph_payload(state, approved=False))
             self._event(state, "approval_required", reason=state.interrupt_reason)
             return self._save(state).public()
+        self._ensure_capability_lease(state)
+        self._save(state)
         state.status = "executing"
         self._event(state, "execute_start", task_count=len(state.tasks))
         def emit(kind, payload):

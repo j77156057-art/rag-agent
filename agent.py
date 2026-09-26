@@ -1306,7 +1306,7 @@ def _extract_plan(text):
 class Agent:
     def __init__(self, llm=None, session_id=None, tool_mode=None, plan_mode=False,
                  depth=0, tool_allowlist=None, project_id=None, tool_registry=None,
-                 application_id="developer", system_prompt=None):
+                 application_id="developer", system_prompt=None, capability_lease=None):
         self.llm = llm or LLMClient()
         # session_id 为空 = 纯内存会话（测试/临时，行为与旧版一致）；
         # 非空则按会话落盘、跨重启恢复，并启用超阈值摘要压缩。
@@ -1345,6 +1345,9 @@ class Agent:
         self.plan_mode = bool(plan_mode)
         self.depth = int(depth or 0)
         self.tool_allowlist = list(tool_allowlist) if tool_allowlist else None
+        # 工作流可临时授予一组能力。它只收窄当前 Agent 的工具执行范围，
+        # 不替代用户审批、工具白名单或 execute_tool 的副作用保护。
+        self.capability_lease = dict(capability_lease or {})
         # 子代理逐任务步数覆盖（_run_child 按工作流任务 max_steps 注入）：
         # None = 沿用 _step_budget(question) 的动态预算。
         self.tool_step_override = None
@@ -1377,6 +1380,24 @@ class Agent:
         """Whether a tool crosses a network/MCP boundary for timeout hooks."""
         spec = self._tool_spec(action_name)
         return bool(spec and spec.capability == Capability.NETWORK)
+
+    def _lease_blocked(self, action_name):
+        """Return ``(blocked, reason)`` for an expired or insufficient lease."""
+        spec = self._tool_spec(action_name)
+        lease = self.capability_lease
+        if not lease or spec is None:
+            return False, ""
+        try:
+            expires_at = float(lease.get("expires_at_epoch") or 0)
+        except (TypeError, ValueError):
+            expires_at = 0.0
+        if expires_at and time.time() >= expires_at:
+            return True, "当前工作流的工具权限租约已过期"
+        allowed = {str(item) for item in (lease.get("capabilities") or []) if str(item)}
+        capability = getattr(spec.capability, "value", str(spec.capability))
+        if allowed and capability not in allowed:
+            return True, "当前工作流未租用 %s 能力" % capability
+        return False, ""
 
     def _tool_spec(self, name):
         value = self.tools.get(name)
@@ -2382,6 +2403,18 @@ class Agent:
                     executed.add(sig)  # 登记已「处理」签名：同参重复出现时可触发防重复升级
                     continue
 
+                # 租约是工作流的临时能力范围；过期或未包含当前能力时，
+                # 只回填 Observation，让模型自行收尾或申请新的工作流。
+                _lease_blocked, _lease_reason = self._lease_blocked(action_name)
+                if _lease_blocked:
+                    _obs = f"[权限租约] {action_name} 未执行：{_lease_reason}。"
+                    trail.append({"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)})
+                    trail.append({"role": "user", "content": f"Observation: {_obs}"})
+                    yield {"type": "action", "text": f"{action_name}({action_arg}) [已拦截：权限租约]"}
+                    yield {"type": "observation", "text": _obs}
+                    executed.add(sig)
+                    continue
+
                 # A project-bug question must be grounded in the current code or
                 # runtime before historical bug records can be consulted. This
                 # prevents a populated bugs/ directory from masquerading as a
@@ -2822,6 +2855,10 @@ class Agent:
 
         def _one(i, name, arg):
             try:
+                lease_blocked, lease_reason = self._lease_blocked(name)
+                if lease_blocked:
+                    out[i] = (name, arg, f"[权限租约] {name} 未执行：{lease_reason}。", False, None)
+                    return
                 blocked, reason, arg2 = _hooks.run_pre_tool(name, arg)
                 if blocked:
                     out[i] = (name, arg, f"[钩子拦截] {name} 未执行：{reason}", False, None)
@@ -3009,6 +3046,7 @@ class Agent:
             tool_registry=self.tools,
             application_id=self.application_id,
             system_prompt=self.system_prompt,
+            capability_lease=self.capability_lease,
         )
         # 子代理继承父代理的「联网 / 深度思考」开关：否则父代理已开联网时，
         # 子代理 web_enabled 仍为 False，researcher 等子任务的 web_* 会被 _web_blocked 全拦截。

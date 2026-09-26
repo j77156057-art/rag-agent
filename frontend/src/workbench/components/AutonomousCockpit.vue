@@ -55,6 +55,19 @@ const previewKindLabel: Record<string, string> = {
   code: '代码', text: '文本', diff: '差异', image: '图片', audio: '音频',
   video: '视频', interactive: '实时画面', model: '模型', structured: '结构化数据', binary: '文件', unknown: '证据',
 }
+const capabilityLabel: Record<string, string> = {
+  read_local: '读取项目', read_external: '读取外部资料', write_local: '写入项目',
+  write_external: '写入外部服务', exec: '执行命令', network: '联网 / MCP', admin: '管理操作',
+}
+function leaseIsExpired(lease: WorkflowState['capability_lease']): boolean {
+  return !!lease?.expires_at_epoch && Date.now() / 1000 >= lease.expires_at_epoch
+}
+function leaseStatusLabel(lease: WorkflowState['capability_lease']): string {
+  if (!lease) return '未启用'
+  if (lease.status === 'released') return '已释放'
+  if (leaseIsExpired(lease)) return '已过期'
+  return '当前有效'
+}
 function previewSource(artifact: { uri?: string; path?: string; id?: string }): string {
   const uri = String(artifact.uri || '')
   if (/^https?:\/\//i.test(uri) || /^\/(?!\/)/.test(uri)) return uri
@@ -580,6 +593,11 @@ onBeforeUnmount(() => {
           <small>{{ workflow.project_checkpoint.file_count || 0 }} 个文件 · {{ Math.round((workflow.project_checkpoint.bytes || 0) / 1024) }} KB</small>
           <button :disabled="busy" @click="rollbackProject">恢复执行前版本</button>
         </div>
+        <div v-if="workflow.capability_lease" class="acp-lease">
+          <div class="acp-lease-head"><b>工具权限租约</b><span :class="leaseStatusLabel(workflow.capability_lease) === '当前有效' ? 'acp-ok' : 'acp-muted'">{{ leaseStatusLabel(workflow.capability_lease) }}</span></div>
+          <small>{{ (workflow.capability_lease.capabilities || []).map(item => capabilityLabel[item] || item).join(' · ') }}</small>
+          <small v-if="workflow.capability_lease.expires_at">到期：{{ new Date(workflow.capability_lease.expires_at).toLocaleString() }}</small>
+        </div>
         <button v-if="workflow.status === 'executing'" :disabled="busy" @click="control('interrupt')">暂停工作流</button>
         <button v-if="workflow.status === 'interrupted'" :disabled="busy" @click="control('resume')">恢复工作流</button>
         <h3>本项目历史</h3><button v-for="item in history" :key="item.workflow_id" class="acp-history" @click="select(item.workflow_id)">{{ item.request || item.workflow_id }}<small>{{ statusLabel[item.status] || item.status }}</small></button>
@@ -619,4 +637,7 @@ button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent);
 .acp-checkpoint { display: grid; gap: 4px; padding: 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-hover); font-size: 11px; }
 .acp-checkpoint small { color: var(--text-faint); }
 .acp-checkpoint button { justify-self: start; color: var(--danger); }
+.acp-lease { display: grid; gap: 4px; padding: 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-hover); font-size: 11px; }
+.acp-lease-head { display: flex; justify-content: space-between; gap: 8px; }
+.acp-lease small { color: var(--text-faint); line-height: 1.45; }
 </style>

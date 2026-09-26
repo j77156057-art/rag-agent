@@ -1,0 +1,60 @@
+import time
+
+from agent import Agent
+from agent_runtime.game_workflow import GameWorkflowManager
+
+
+class _LLM:
+    provider = "mock"
+    model = "mock"
+
+
+def _tool(value):
+    return lambda _arg: value
+
+
+def test_agent_lease_allows_declared_capability_and_blocks_other_tools():
+    agent = Agent(
+        llm=_LLM(),
+        tool_registry={
+            "read_file": {"description": "read", "func": _tool("read ok")},
+            "web_search": {"description": "web", "func": _tool("web ok")},
+        },
+        capability_lease={
+            "capabilities": ["read_local"],
+            "expires_at_epoch": time.time() + 60,
+        },
+    )
+    assert agent._lease_blocked("read_file")[0] is False
+    blocked, reason = agent._lease_blocked("web_search")
+    assert blocked is True
+    assert "network" in reason
+    result = agent._run_batch([("web_search", "q")], None)[0]
+    assert result[3] is False
+    assert "权限租约" in result[2]
+
+
+def test_expired_lease_blocks_even_when_capability_is_declared():
+    agent = Agent(
+        llm=_LLM(),
+        tool_registry={"read_file": {"description": "read", "func": _tool("ok")}},
+        capability_lease={"capabilities": ["read_local"], "expires_at_epoch": time.time() - 1},
+    )
+    blocked, reason = agent._lease_blocked("read_file")
+    assert blocked is True
+    assert "过期" in reason
+
+
+def test_workflow_capability_lease_persists_and_releases_on_terminal_state(tmp_path):
+    manager = GameWorkflowManager(str(tmp_path))
+    workflow_id = manager.start("临时工具权限测试")['workflow_id']
+    lease = manager.create_capability_lease(
+        workflow_id, ttl_seconds=300, capabilities=["read_local", "network"])
+    assert lease["status"] == "active"
+    assert lease["capabilities"] == ["read_local", "network"]
+    reloaded = GameWorkflowManager(str(tmp_path)).get(workflow_id)
+    assert reloaded["capability_lease"]["id"] == lease["id"]
+    assert reloaded["capability_lease"]["status"] == "active"
+    interrupted = manager.interrupt(workflow_id, "测试结束")
+    assert interrupted["capability_lease"]["status"] == "released"
+    assert "released_at" in interrupted["capability_lease"]

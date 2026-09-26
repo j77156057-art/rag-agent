@@ -2548,6 +2548,11 @@ export interface WorkflowState {
     id?: string; created_at?: string; file_count?: number; bytes?: number
     skipped?: Array<{ path?: string; reason?: string }>
   }
+  capability_lease?: {
+    id?: string; capabilities?: string[]; status?: string
+    created_at?: string; expires_at?: string; expires_at_epoch?: number
+    released_at?: string; source?: string
+  }
   visual_feedback?: VisualFeedbackRecord[]
   preview?: WorkflowPreview
   steps?: number; replans?: number; subagent_retries?: Record<string, number>; context_layers?: Record<string, unknown>

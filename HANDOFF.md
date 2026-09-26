@@ -1,5 +1,12 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-27 工具权限租约与自主开发舱能力范围
+
+- 工作流新增持久化 `capability_lease`：执行阶段默认临时授予完整的 `read_local`、`read_external`、`write_local`、`write_external`、`exec`、`network`、`admin` 能力，默认 30 分钟到期（可用 `DOCMIND_CAPABILITY_LEASE_S` 调整，范围 5 分钟至 2 小时）。
+- `Agent` 在串行和并行工具执行边界检查租约；过期或不包含工具能力时只回填权限租约观察，不执行工具。子代理继承父 Agent 租约，现有用户审批、白名单、幂等和副作用保护仍是最终边界。
+- 工作流终态（完成、失败、中断）自动标记租约为 `released`；进程重启后的工作流回调按工作流 ID 重新读取租约。开发舱右侧显示能力、状态和到期时间。
+- 新增 `tests/test_capability_lease.py`；完整回归：**1632 passed / 6 skipped / 60 subtests passed**。前端 `npm run build` 通过，仅保留既有非 module 脚本和大 chunk 警告。
+
 ## 2026-09-26 非流式取消与预览重启持久化补充
 
 - `llm.py` 的云端 OpenAI 兼容调用在收到 `cancel_event` 时，会临时使用流式响应并在客户端聚合为原有字符串；取消会关闭 SDK 流、终止当前回合，不再受非流式 `resp` 阻塞限制。未提供取消事件的普通非流式调用保持原路径。

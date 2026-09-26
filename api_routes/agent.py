@@ -180,6 +180,13 @@ def build_router(ctx) -> APIRouter:
 
         def runner(task, context):
             prompt = str(task.get("task") or "")
+            # 租约在执行开始时才创建；回调可能早于执行阶段构造，
+            # 因此每个子任务都从持久工作流状态同步最新租约。
+            try:
+                agent.capability_lease = dict(
+                    (WORKFLOWS.get(wid).get("capability_lease") or {}) if wid else {})
+            except Exception:
+                agent.capability_lease = dict(state.get("capability_lease") or {})
             out = agent._run_child(
                 task.get("role", "coder"), prompt, context=context,
                 persona=task.get("persona", ""),
