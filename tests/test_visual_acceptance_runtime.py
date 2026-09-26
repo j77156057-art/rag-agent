@@ -40,6 +40,25 @@ class VisualAcceptanceRuntimeTests(unittest.TestCase):
         self.assertEqual(result.data["images"], ["aGVsbG8="])
         self.assertEqual(result.artifacts[0]["kind"], "image")
 
+    def test_failed_report_without_image_stays_a_tool_failure(self):
+        import tools
+
+        report = {
+            "passed": False,
+            "checks": {"page_loaded": False},
+            "runtime_errors": ["页面脚本异常"],
+            "artifacts": [],
+        }
+        with (
+            patch.object(tools, "_get_code_root", return_value="C:/project"),
+            patch("agent_runtime.visual_acceptance.capture_project_preview", return_value=report),
+        ):
+            result = tools.preview_project("entry: index.html")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_kind, "visual_acceptance_failed")
+        self.assertEqual(result.data["images"], [])
+        self.assertIn("未通过", result.text)
+
     def test_workflow_preview_keeps_visual_artifact(self):
         bundle = build_preview_bundle({
             "workflow_id": "wf-visual", "status": "completed",

@@ -4397,10 +4397,17 @@ def preview_project(arg=""):
     screenshot = report.get("screenshot") or ""
     text = json.dumps({key: value for key, value in report.items() if key != "image"},
                       ensure_ascii=False)
+    # A failed or domain-specific adapter may return a bounded report without
+    # an image. Keep the tool failure observable instead of raising a secondary
+    # KeyError while constructing the result, and never claim that a screenshot
+    # reached the model when it did not.
+    image = str(report.get("image") or "").strip()
+    data = {"images": [image] if image else [],
+            "image_sources": [screenshot] if screenshot else []}
     return ToolResult(
         bool(report.get("passed")),
-        "真实浏览器预览已完成：" + text,
-        data={"images": [report["image"]], "image_sources": [screenshot]},
+        ("真实浏览器预览已完成：" if report.get("passed") else "真实浏览器预览未通过：") + text,
+        data=data,
         artifacts=list(report.get("artifacts") or []),
         error_kind="" if report.get("passed") else "visual_acceptance_failed",
     )
