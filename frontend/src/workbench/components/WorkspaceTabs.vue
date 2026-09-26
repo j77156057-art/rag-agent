@@ -4,6 +4,7 @@
 // 点击打开「运行游戏」弹窗并切到对应 tab（场景画布 / 试玩）。
 import { useWorkbench } from '../composables/workbench'
 import type { WorkspaceView } from '../composables/workbench'
+import { demoMode } from '../composables/demo'
 
 const { workspace, setWorkspace, tabs, runtimeOpen, runtimeTab, runtimeResident, openRuntime, openRuntimeResident } = useWorkbench()
 
@@ -11,6 +12,7 @@ const real: { key: WorkspaceView; name: string; icon: string }[] = [
   { key: 'overview', name: '概览', icon: 'home' },
   { key: 'code', name: '代码', icon: 'code' },
   { key: 'assets', name: '素材', icon: 'assets' },
+  { key: 'cockpit', name: '自主开发舱', icon: 'cockpit' },
 ]
 
 // 真实功能入口：点开「运行游戏」弹窗并切到对应 tab
@@ -19,10 +21,11 @@ const soon = [
   { key: 'runtime', name: '运行', tip: '运行游戏：导出 / 启动 Godot，边玩边让 AI 改' },
 ] as const
 
-const HOTKEY: Record<string, number> = { overview: 1, code: 2, assets: 3 }
+const HOTKEY: Record<string, number> = { overview: 1, code: 2, assets: 3, cockpit: 4 }
 
 function pick(key: WorkspaceView) {
   if (key === 'code' && !tabs.value.length) return
+  if (key === 'cockpit' && demoMode.value) return
   setWorkspace(key)
 }
 
@@ -55,10 +58,10 @@ function soonActive(key: string) {
       class="ws-tab"
       :class="{
         'ws-active': workspace === item.key,
-        'ws-disabled': item.key === 'code' && !tabs.length,
+        'ws-disabled': (item.key === 'code' && !tabs.length) || (item.key === 'cockpit' && demoMode),
       }"
-      :disabled="item.key === 'code' && !tabs.length"
-      :title="item.key === 'code' && !tabs.length ? '先从左侧文件树打开一个文件（Alt+2 切回代码）' : `${item.name}（Alt+${HOTKEY[item.key]}）`"
+      :disabled="(item.key === 'code' && !tabs.length) || (item.key === 'cockpit' && demoMode)"
+      :title="item.key === 'code' && !tabs.length ? '先从左侧文件树打开一个文件（Alt+2 切回代码）' : item.key === 'cockpit' && demoMode ? '连接本地项目后使用自主开发舱' : `${item.name}（Alt+${HOTKEY[item.key]}）`"
       @click="pick(item.key)"
     >
       <svg v-if="item.icon === 'home'" width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
@@ -69,6 +72,10 @@ function soonActive(key: string) {
         <rect x="1.6" y="2.4" width="9.8" height="8.2" rx="1" fill="none" stroke="currentColor" stroke-width="1.05"/>
         <circle cx="4.3" cy="4.9" r="0.95" fill="none" stroke="currentColor" stroke-width="1.05"/>
         <path d="M2.6 9.6 L5.2 7 L7.2 8.8 L8.8 7.4 L10.4 9" fill="none" stroke="currentColor" stroke-width="1.05" stroke-linejoin="round"/>
+      </svg>
+      <svg v-else-if="item.icon === 'cockpit'" width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
+        <rect x="1.5" y="2" width="10" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.1"/>
+        <path d="M4 5.2 H9 M4 7.8 H7.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
       </svg>
       <svg v-else width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
         <path d="M4.6 4.4 L2.2 6.5 L4.6 8.6 M8.4 4.4 L10.8 6.5 L8.4 8.6" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>

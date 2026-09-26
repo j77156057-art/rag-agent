@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -144,14 +145,45 @@ class StreamChat:
     长度到 reasoning_chars，供上层判断"只有思考、没有正文"的情况。
     """
 
-    def __init__(self, stream, usage_sink=None, tool_sink=None, reasoning_sink=None):
+    def __init__(self, stream, usage_sink=None, tool_sink=None, reasoning_sink=None,
+                 cancel_event=None):
         self._stream = stream
         self._usage = usage_sink if usage_sink is not None else {}
         self._tool_sink = tool_sink if tool_sink is not None else []
         self._reasoning_sink = reasoning_sink
+        self._cancel_event = cancel_event
+        self._close_lock = threading.Lock()
+        self._watch_stop = threading.Event()
+        self._closed = False
         self._partial = {}          # index -> {"id":.., "name":.., "arguments":..}
         self.finish_reason = None
         self.reasoning_chars = 0
+        if cancel_event is not None:
+            threading.Thread(target=self._watch_cancel,
+                             name="openai-stream-cancel", daemon=True).start()
+
+    def _watch_cancel(self):
+        try:
+            while not self._watch_stop.is_set():
+                if self._cancel_event is not None and self._cancel_event.wait(0.25):
+                    self._close_stream()
+                    return
+        except Exception:
+            # 清理辅助线程不能覆盖主流的网络异常。
+            pass
+
+    def _close_stream(self):
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._watch_stop.set()
+        try:
+            close = getattr(self._stream, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
 
     def _capture_tool_deltas(self, choice):
         """OpenAI 流式 tool_calls 是按 index 分片的，逐片累加。"""
@@ -233,6 +265,7 @@ class StreamChat:
         finally:
             # 消费方提前中断（如客户端断连）也要把已收到的工具调用交给上层
             self._flush_tools()
+            self._close_stream()
 
 
 class _OllamaStream:
@@ -243,15 +276,45 @@ class _OllamaStream:
     """
 
     def __init__(self, resp, on_close=None, usage_sink=None, tool_sink=None,
-                 reasoning_sink=None):
+                 reasoning_sink=None, cancel_event=None):
         self._resp = resp
         self._on_close = on_close
         self._usage = usage_sink if usage_sink is not None else {}
         self._tool_sink = tool_sink if tool_sink is not None else []
         self._reasoning_sink = reasoning_sink
         self._seen_tools = set()
+        self._cancel_event = cancel_event
+        self._close_lock = threading.Lock()
+        self._watch_stop = threading.Event()
+        self._closed = False
         self.finish_reason = None
         self.reasoning_chars = 0
+        if cancel_event is not None:
+            # urllib 的响应迭代可能阻塞在 socket read；监听取消事件并关闭
+            # response，才能让底层 IO 尽快返回，而不是只在上层设置标记。
+            threading.Thread(target=self._watch_cancel,
+                             name="ollama-stream-cancel", daemon=True).start()
+
+    def _watch_cancel(self):
+        try:
+            while not self._watch_stop.is_set():
+                if self._cancel_event is not None and self._cancel_event.wait(0.25):
+                    self._close_response()
+                    return
+        except Exception:
+            # 取消监听是清理辅助线程，不能覆盖主流的异常。
+            pass
+
+    def _close_response(self):
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._watch_stop.set()
+        try:
+            self._resp.close()
+        except Exception:
+            pass
 
     def __iter__(self):
         try:
@@ -287,6 +350,7 @@ class _OllamaStream:
                 # ollama done_reason: stop/length；无该字段时按 stop 处理
                 self.finish_reason = obj.get("done_reason") or "stop"
         finally:
+            self._close_response()
             if self._on_close: self._on_close()
 
 
@@ -483,7 +547,7 @@ class LLMClient:
         return False
 
     def chat(self, messages, stream=False, temperature=LLM_TEMPERATURE, timeout=None, deadline=None, tools=None,
-             enable_thinking=None, reasoning_sink=None):
+             enable_thinking=None, reasoning_sink=None, cancel_event=None):
         """统一的对话入口。stream=True 时返回一个 token 生成器。
 
         timeout：单次调用超时（秒），默认 self.timeout。
@@ -493,6 +557,8 @@ class LLMClient:
                          的模型生效。
         reasoning_sink：可选 list，流式思考片段（reasoning_content / thinking）实时追加，
                         供 Agent 转成 SSE 事件给前端"深度思考"窗口。
+        cancel_event：可选 threading.Event；流式和带取消事件的非流式请求收到取消后
+                     会关闭底层响应并终止本轮生成。
         每次调用都重置 self.last_usage / self.last_tool_calls；成功后由 agent 读取。
         可重试错误（429/5xx/网络/超时）按指数退避自动重试。
         """
@@ -500,6 +566,8 @@ class LLMClient:
         self.last_tool_calls = []
         if reasoning_sink is not None:
             reasoning_sink.clear()
+        if cancel_event is not None and cancel_event.is_set():
+            raise GeneratorExit
         thinking_on = self._resolve_thinking(enable_thinking)
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("本轮已超出截止时间")
@@ -512,12 +580,18 @@ class LLMClient:
             # 被忽略、加载仍为 4096）和 chat_template_kwargs，长 prompt 会被截断。
             # 改走原生 /api/chat：num_ctx / think / num_predict 全部服务端生效。
             # 消息内的 images: [base64...] 也是 ollama 原生多模态格式，直接透传。
+            # 工作流子代理通常请求非流式结果，但用户仍可能在生成中点击停止。
+            # 这时用 Ollama 的 NDJSON 流聚合成原有的字符串返回值，才能在 socket
+            # read 阻塞时由 _OllamaStream 的 watcher 关闭连接。普通非流式调用仍走
+            # 单响应路径，保留原有延迟和兼容性。
+            wire_stream = bool(stream or cancel_event is not None)
             call = lambda: retry_call(
                 lambda: self._ollama_chat(
-                    messages, stream=stream, temperature=temperature,
+                    messages, stream=wire_stream, temperature=temperature,
                     timeout=timeout, usage_sink=self.last_usage,
                     tool_sink=self.last_tool_calls, tools=tools,
                     thinking_on=thinking_on, reasoning_sink=reasoning_sink,
+                    cancel_event=cancel_event,
                 ),
                 deadline=deadline, attempts=self.max_retries, base=self.retry_base,
             )
@@ -527,7 +601,10 @@ class LLMClient:
             if stream:
                 return call()
             with local_llm_slot(self.provider, self.model):
-                return call()
+                result = call()
+                if cancel_event is not None:
+                    return self._collect_cancelable_stream(result, cancel_event)
+                return result
 
         # OpenAI 兼容路径：把 ollama 风格的 images 字段转成多模态 content parts，
         # 否则 SDK 的 pydantic 序列化会因未知字段报错。
@@ -545,7 +622,7 @@ class LLMClient:
         if tools:
             kwargs["tools"] = tools
 
-        if stream:
+        if stream or cancel_event is not None:
             def _open(with_usage):
                 extra = {"stream_options": {"include_usage": True}} if with_usage else {}
                 resp = self.client.chat.completions.create(
@@ -554,16 +631,27 @@ class LLMClient:
                 )
                 return StreamChat(resp, usage_sink=self.last_usage,
                                   tool_sink=self.last_tool_calls,
-                                  reasoning_sink=reasoning_sink)
-            try:
-                return retry_call(lambda: _open(True), deadline=deadline,
-                                  attempts=self.max_retries, base=self.retry_base)
-            except Exception as e:  # noqa: BLE001
-                # 服务端不认 stream_options 这类参数错误：退回不带 usage 的调用；
-                # 网络/限流类错误则如实抛出（重试已用尽）。
-                if is_retryable(e):
-                    raise
-                return _open(False)
+                                  reasoning_sink=reasoning_sink,
+                                  cancel_event=cancel_event)
+            def _open_with_fallback():
+                try:
+                    return retry_call(lambda: _open(True), deadline=deadline,
+                                      attempts=self.max_retries, base=self.retry_base)
+                except Exception as e:  # noqa: BLE001
+                    # 服务端不认 stream_options 这类参数错误：退回不带 usage 的调用；
+                    # 网络/限流类错误则如实抛出（重试已用尽）。
+                    if is_retryable(e):
+                        raise
+                    return _open(False)
+
+            if stream:
+                return _open_with_fallback()
+            # 只有提供取消事件时才进入此分支；保持 chat(stream=False) 的
+            # 字符串返回值，并让 local_llm_slot 覆盖整个生成生命周期。
+            with local_llm_slot(self.provider, self.model):
+                wrapped = _open_with_fallback()
+                return self._collect_cancelable_stream(wrapped, cancel_event)
+
 
         with local_llm_slot(self.provider, self.model):
             resp = retry_call(
@@ -590,6 +678,32 @@ class LLMClient:
         msg = resp.choices[0].message
         self.last_tool_calls = normalize_tool_calls(getattr(msg, "tool_calls", None))
         return msg.content
+
+    @staticmethod
+    def _collect_cancelable_stream(stream, cancel_event):
+        """聚合可取消的流式响应，维持非流式 chat() 的返回语义。"""
+        chunks = []
+        try:
+            for token in stream:
+                chunks.append(token)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GeneratorExit
+        except BaseException:
+            # urllib/OpenAI SDK 关闭 socket 后可能把底层异常带回迭代器；
+            # 对调用方它仍然是一次用户取消，不应被记录成模型故障。
+            if cancel_event is not None and cancel_event.is_set():
+                raise GeneratorExit
+            raise
+        finally:
+            # StreamChat/_OllamaStream 自己负责关闭底层响应；这里仅确保消费方
+            # 提前退出时也触发迭代器的 finally。
+            if cancel_event is not None and cancel_event.is_set():
+                close = getattr(stream, "_close_stream", None) or getattr(stream, "_close_response", None)
+                if callable(close):
+                    close()
+        if cancel_event is not None and cancel_event.is_set():
+            raise GeneratorExit
+        return "".join(chunks)
 
     @staticmethod
     def _sniff_image_mime(b64):
@@ -640,7 +754,7 @@ class LLMClient:
 
     def _ollama_chat(self, messages, stream=False, temperature=LLM_TEMPERATURE, timeout=None,
                      usage_sink=None, tool_sink=None, tools=None,
-                     thinking_on=False, reasoning_sink=None):
+                     thinking_on=False, reasoning_sink=None, cancel_event=None):
         if not _gpu_acquire("ollama", 2): raise RuntimeError("GPU 正忙：ComfyUI 正在使用中，请稍后重试。")
         # 打点：空闲卸载计时器以"真正发起 Ollama 推理"为活动依据，
         # 仅持有租约（排队等待）不算活动，避免把等待误判成模型在用。
@@ -681,6 +795,18 @@ class LLMClient:
             # 不支持的模型给 false 也安全（实测 ollama 对无思考模板的模型忽略该字段）。
             "think": bool(thinking_on),
         }
+        # Ollama 会默认尝试把尽可能多的层放进 GPU。对 35B 级 MoE 模型，
+        # 这在显存接近临界值时可能直接触发 runner 启动失败；允许用户通过
+        # DocMind 的环境配置指定一个较小的 GPU 层数，剩余层由 CPU 承担。
+        # 这是请求级选项，不会改动 Ollama 守护进程的全局设置。
+        raw_num_gpu = os.getenv("DOCMIND_OLLAMA_NUM_GPU", "").strip()
+        if raw_num_gpu:
+            try:
+                num_gpu = int(raw_num_gpu)
+            except ValueError:
+                num_gpu = 0
+            if num_gpu >= 0:
+                payload["options"]["num_gpu"] = num_gpu
         if tools:
             # ollama 原生 /api/chat 的 tools 直接收 function 对象列表（不含 type 包装）
             payload["tools"] = [t.get("function", t) for t in tools]
@@ -702,7 +828,8 @@ class LLMClient:
                 _gpu_note_activity("ollama")
                 _gpu_release("ollama")
             return _OllamaStream(resp, _stream_done, usage_sink=usage_sink,
-                                 tool_sink=tool_sink, reasoning_sink=reasoning_sink)
+                                 tool_sink=tool_sink, reasoning_sink=reasoning_sink,
+                                 cancel_event=cancel_event)
         body = json.loads(resp.read().decode("utf-8"))
         _gpu_note_activity("ollama")
         _gpu_release("ollama")

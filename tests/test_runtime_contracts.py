@@ -12,6 +12,52 @@ from tests.test_agent import _ScriptedLLM, _act
 
 
 class RuntimeContracts(unittest.TestCase):
+    def test_auto_verification_uses_instance_checker(self):
+        checker = unittest.mock.Mock(return_value=json.dumps({
+            "ran": ["browser:layout", "browser:click"], "passed": True, "failures": []}))
+        registry = {"create_file": {"func": lambda value: "已创建 " + value},
+                    "self_verify": {"func": checker}}
+        with patch.object(agent, "self_verify", side_effect=AssertionError("global checker must not run")):
+            instance = agent.Agent(tool_registry=registry, llm=_ScriptedLLM([
+                _act("create_file", "index.html"), "Final Answer: 已完成浏览器验证。" ]))
+            events = list(instance.run("创建 index.html 页面"))
+        checker.assert_called_once_with("scope: auto\nfiles: index.html")
+        self.assertTrue(instance.last_turn_record["verified"])
+        self.assertTrue(any(event.get("type") == "observation" and "browser:click" in event.get("text", "") for event in events))
+
+    def test_instance_checker_failure_blocks_success_claim(self):
+        registry = {"create_file": {"func": lambda value: "已创建 " + value},
+                    "self_verify": {"func": lambda _: json.dumps({
+                        "ran": ["browser:click"], "passed": False,
+                        "failures": [{"scope": "browser", "file": "index.html", "error": "click did not work"}]})}}
+        instance = agent.Agent(tool_registry=registry, llm=_ScriptedLLM([
+            _act("create_file", "index.html"), "Final Answer: 所有功能都正常。" ]))
+        events = list(instance.run("创建 index.html 页面"))
+        self.assertFalse(instance.last_turn_record["verified"])
+        final = next(event for event in events if event.get("type") == "final")
+        self.assertEqual(final.get("verification_status"), "unverified")
+        self.assertNotIn("所有功能都正常", final["text"])
+
+    def test_successful_production_preview_closes_write_verification(self):
+        registry = {
+            "create_file": {"func": lambda value: "已创建 index.html"},
+            "self_verify": {"func": lambda _: json.dumps({
+                "ran": ["html:syntax"], "passed": True, "failures": []})},
+            "preview_project": {"func": lambda _: ToolResult(
+                True, "真实浏览器预览已完成",
+                data={"images": []},
+                artifacts=[{"id": "visual-preview", "kind": "image",
+                            "path": ".docmind/visual-evidence/preview.png"}])},
+        }
+        instance = agent.Agent(tool_registry=registry, llm=_ScriptedLLM([
+            _act("create_file", "path: index.html"),
+            _act("preview_project", "entry: index.html"),
+            "Final Answer: 已完成并通过真实画面验收。",
+        ]))
+        events = list(instance.run("创建网页并进行真实画面验收"))
+        self.assertTrue(instance.last_turn_record["verified"])
+        self.assertTrue(any(event.get("artifacts") for event in events))
+
     def test_structured_result_does_not_guess_status_from_text(self):
         result = ToolResult(True, "历史错误已修复")
         self.assertIs(execute_tool(lambda _: result, "", lambda _: True), result)

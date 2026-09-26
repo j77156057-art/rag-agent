@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>项目运行面板</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; background: #edf2f8; color: #17314f; font-family: Arial, sans-serif; }
+.card { width: 740px; height: 360px; margin: 80px auto; padding: 42px; border: 1px solid #cfdae8; border-radius: 20px; background: white; }
+h1 { margin: 0 0 16px; font-size: 34px; }
+p { font-size: 18px; color: #61738a; }
+.action { position: absolute; left: 850px; top: 265px; width: 150px; height: 24px; border: 0; background: #c5c8cc; color: #d2d4d6; font-size: 11px; cursor: pointer; }
+#status { margin-top: 95px; font-size: 18px; }
+</style></head>
+<body><main class="card">
+<h1>项目运行面板</h1><p>查看运行状态，并启动一次项目检查。</p>
+<button class="action" id="action">开始运行</button>
+<div id="status" aria-live="polite">尚未运行</div>
+</main><script>
+let count = 0;
+document.getElementById('action').addEventListener('click', () => {
+  count += 1;
+  document.getElementById('status').textContent = `已运行 ${count} 次`;
+});
+</script></body></html>

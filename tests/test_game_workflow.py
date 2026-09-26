@@ -43,6 +43,122 @@ class GameWorkflowTests(unittest.TestCase):
         self.assertEqual(done["status"], "completed")
         self.assertTrue(done["review"]["ok"])
 
+    def test_acceptance_contract_survives_restart_and_requires_user_decision(self):
+        state_root = tempfile.mkdtemp()
+        first = GameWorkflowManager(state_root)
+        wid = first.start("完成可检查的项目功能")["workflow_id"]
+        first.choose(wid, "recommended")
+        planned = first.plan(wid, [{"id": "a", "role": "tester", "task": "运行项目并检查功能"}])
+        self.assertEqual(planned["acceptance_contract"]["approved_revision"], 0)
+        item = dict(planned["acceptance_contract"]["items"][0],
+                    statement="项目运行成功且功能可用", method="运行自动测试",
+                    evidence=["tests/report.json"])
+        edited = first.set_acceptance_contract(wid, [item])
+        restarted = GameWorkflowManager(state_root)
+        self.assertEqual(restarted.get(wid)["acceptance_contract"]["items"][0]["statement"],
+                         "项目运行成功且功能可用")
+        self.assertEqual(edited["acceptance_contract"]["revision"], 2)
+        with self.assertRaises(WorkflowError):
+            restarted.decide_acceptance(wid, True)
+        restarted.execute(wid, lambda *_: {"status": "ok", "conclusion": "通过", "steps": 1})
+        approved = restarted.approve(wid, True)
+        self.assertEqual(approved["acceptance_contract"]["approved_revision"], 2)
+        self.assertTrue(approved["acceptance_contract"]["items"][0]["user_approved"])
+        with self.assertRaises(WorkflowError):
+            restarted.decide_acceptance(wid, True)
+        done = restarted.execute(wid, lambda *_: {"status": "ok", "conclusion": "通过", "steps": 1})
+        self.assertEqual(done["acceptance_contract"]["final_decision"], "pending")
+        decided = restarted.decide_acceptance(wid, False, "还需要检查界面效果")
+        self.assertEqual(decided["acceptance_contract"]["final_decision"], "rejected")
+        self.assertEqual(GameWorkflowManager(state_root).get(wid)["acceptance_contract"]["final_note"],
+                         "还需要检查界面效果")
+
+    def test_preview_artifacts_survive_manager_restart(self):
+        state_root = tempfile.mkdtemp()
+        project_root = tempfile.mkdtemp()
+        capture = os.path.join(project_root, "evidence", "screen.png")
+        os.makedirs(os.path.dirname(capture), exist_ok=True)
+        with open(capture, "wb") as fh:
+            fh.write(b"png-evidence")
+
+        first = GameWorkflowManager(state_root)
+        wid = first.start("验证项目画面", project_root=project_root)["workflow_id"]
+        state = first._load(wid)
+        state.results = {"results": {"visual": {
+            "status": "ok",
+            "artifacts": [{"id": "screen", "path": capture,
+                           "kind": "image", "mime": "image/png"}],
+        }}}
+        state.review = {"ok": True, "summary": "画面验收通过"}
+        first._save(state)
+
+        restarted = GameWorkflowManager(state_root)
+        preview = restarted.get(wid)["preview"]
+        self.assertEqual(preview["counts"]["artifacts"], 1)
+        self.assertEqual(preview["artifacts"][0]["id"], "screen")
+        self.assertTrue(os.path.isfile(preview["artifacts"][0]["path"]))
+
+    def test_acceptance_contract_rejects_empty_and_duplicate_criteria(self):
+        wid = self.manager.start("检查验收条件")["workflow_id"]
+        self.manager.choose(wid, "recommended")
+        self.manager.plan(wid, [{"id": "a", "task": "验证"}])
+        with self.assertRaises(WorkflowError):
+            self.manager.set_acceptance_contract(wid, [])
+        with self.assertRaises(WorkflowError):
+            self.manager.set_acceptance_contract(wid, [
+                {"id": "same", "statement": "条件一", "required": True},
+                {"id": "same", "statement": "条件二", "required": True},
+            ])
+
+    def test_plan_change_revokes_acceptance_approval_and_preserves_user_criteria(self):
+        wid = self.manager.start("改进项目功能")["workflow_id"]
+        self.manager.choose(wid, "recommended")
+        planned = self.manager.plan(wid, [{"id": "a", "task": "实现功能"}])
+        item = dict(planned["acceptance_contract"]["items"][0], statement="用户确认界面效果")
+        self.manager.set_acceptance_contract(wid, [item])
+        self.manager.execute(wid, lambda *_: {"status": "ok", "conclusion": "ok", "steps": 1})
+        self.manager.approve(wid, True)
+        self.manager.request_dag_revision(wid, [{"id": "b", "role": "coder", "task": "加入新功能"}])
+        revised = self.manager.approve_dag_revision(wid, True)
+        contract = revised["acceptance_contract"]
+        self.assertEqual(contract["items"][0]["statement"], "用户确认界面效果")
+        self.assertEqual(contract["approved_revision"], 0)
+        self.assertFalse(contract["items"][0]["user_approved"])
+        self.assertEqual(revised["policy"]["approval_mode"], "safe")
+
+    def test_workflow_persists_generic_preview_after_execution(self):
+        wid = self.manager.start("生成一个通用证据")["workflow_id"]
+        self.manager.choose(wid, "recommended")
+        self.manager.plan(wid, [{"id": "a", "role": "tester", "task": "验证资源"}])
+        runner = lambda *_: {
+            "status": "ok", "conclusion": "验证完成", "steps": 1,
+            "artifacts": [{"path": "reports/result.json", "kind": "structured",
+                           "after": '{"ok": true}', "evidence": ["report"]}],
+        }
+        self.manager.execute(wid, runner)
+        self.manager.approve(wid, True)
+        done = self.manager.execute(wid, runner)
+        self.assertEqual(done["preview"]["schema"], "docmind.preview.v1")
+        self.assertEqual(done["preview"]["counts"]["artifacts"], 1)
+        loaded = self.manager.get(wid)
+        self.assertEqual(loaded["preview"]["artifacts"][0]["kind"], "structured")
+
+    def test_visual_feedback_persists_with_workflow_and_bounds_region(self):
+        state_root = tempfile.mkdtemp()
+        manager = GameWorkflowManager(state_root)
+        wid = manager.start("调整画面")['workflow_id']
+        saved = manager.record_visual_feedback(wid, {
+            "id": "feedback-1", "label": "预览", "note": "按钮太靠右",
+            "region": {"x": 110, "y": 10, "width": 20, "height": 15},
+            "screenshot": True,
+        })
+        self.assertEqual(saved["feedback"]["region"]["x"], 100.0)
+        restored = GameWorkflowManager(state_root).get(wid)
+        self.assertEqual(restored["visual_feedback"][0]["note"], "按钮太靠右")
+        self.assertFalse(restored["visual_feedback"][0]["screenshot"])
+        with self.assertRaises(WorkflowError):
+            manager.record_visual_feedback(wid, {"note": "bad", "region": {"x": "oops"}})
+
     def test_approval_can_resume_and_execute_in_one_call_when_callback_survives(self):
         state = self.manager.start("自动审批后执行", policy=WorkflowPolicy(max_subagents=1))
         wid = state["workflow_id"]

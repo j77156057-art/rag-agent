@@ -10,12 +10,15 @@ import unittest
 from unittest.mock import patch
 
 import config
+import agent as agent_mod
 import mcp_capabilities
 import mcp_client
 from tools import (
     dev_mcp_search, dev_mcp_add, dev_mcp_probe, dev_mcp_discover,
     dev_mcp_decide, dev_mcp_remove, dev_approve,
+    set_session_web_enabled, _session_web_enabled,
 )
+from game_workbench import approval
 
 
 def _parse(text):
@@ -38,17 +41,113 @@ class McpSelfAssemblyTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _approve(self, action, target):
-        out = dev_approve(f"action: {action}\ntarget: {target}")
-        self.assertIn("已审批", out)
+        # 模拟工作台上的用户确认；Agent 的 dev_approve 不能写入 MCP 审批。
+        row = approval(self.root, action, "user", approved=True, target=target)
+        self.assertEqual(row["user"], "user")
+
+    def test_agent_cannot_self_approve_mcp(self):
+        result = dev_approve("action: mcp_server\ntarget: arbitrary")
+        self.assertIn("不能自行审批", result)
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".docmind_approvals.jsonl")))
 
     # ---- search ------------------------------------------------------------
     def test_search_offline_directory_returns_template(self):
-        r = _parse(dev_mcp_search("EDA"))
+        token = set_session_web_enabled(False)
+        try:
+            r = _parse(dev_mcp_search("EDA"))
+        finally:
+            _session_web_enabled.reset(token)
         self.assertTrue(r["ok"])
         item = r["results"][0]
         self.assertEqual(item["id"], "eda")
         self.assertIn("template", item)
         self.assertEqual(item["template"]["transport"], "stdio")
+
+    def test_agent_search_uses_registry_only_when_session_allows_web(self):
+        calls = []
+
+        def fake_registry(query):
+            calls.append(query)
+            if query != "easyeda":
+                return {"ok": False, "candidates": []}
+            return {"ok": True, "candidates": [{
+                "transport": "stdio", "command": "npx",
+                "args": ["-y", "@vlabsoft/easyeda-pro-mcp"], "url": "",
+                "env": {}, "headers": {}, "command_unresolved": False,
+                "provenance": {"server_name": "io.github.VLab-Software/easyeda-pro-mcp",
+                               "description": "EasyEDA Pro bridge",
+                               "url": "https://github.com/VLab-Software/easyeda_mcp",
+                               "domain": "github.com"},
+            }]}
+
+        with patch("mcp_registry_bridge.registry_fn_for", return_value=fake_registry):
+            token = set_session_web_enabled(True)
+            try:
+                result = _parse(dev_mcp_search("EDA"))
+            finally:
+                _session_web_enabled.reset(token)
+        self.assertIn("easyeda", calls)
+        options = result["results"][0]["connection_options"]
+        self.assertTrue(any(o.get("id") == "io.github.VLab-Software/easyeda-pro-mcp"
+                            for o in options))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".docmind_mcp.json")))
+
+        token = set_session_web_enabled(False)
+        try:
+            with patch("mcp_registry_bridge.registry_fn_for", side_effect=AssertionError("network")):
+                offline = _parse(dev_mcp_search("EDA"))
+        finally:
+            _session_web_enabled.reset(token)
+        self.assertEqual(offline["results"][0]["source_status"], "offline_guide")
+
+    def test_natural_language_agent_can_discover_mcp_without_preconfigured_server(self):
+        class ScriptedLLM:
+            def __init__(self):
+                self.calls = 0
+                self.first_messages = None
+                self.first_tool_names = None
+
+            def chat(self, messages, stream=True, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    self.first_messages = messages
+                    self.first_tool_names = agent._effective_tool_names()
+                response = ("Thought: 先查真实连接候选\nAction: dev_mcp_search\nAction Input: EDA"
+                            if self.calls == 1 else "Final Answer: 已找到候选，等待用户选择。")
+                return [response] if stream else response
+
+            def count_tokens(self, _text):
+                return 0
+
+        def fake_registry(query):
+            if query != "easyeda":
+                return {"ok": False, "candidates": []}
+            return {"ok": True, "candidates": [{
+                "transport": "stdio", "command": "npx",
+                "args": ["-y", "@vlabsoft/easyeda-pro-mcp"], "url": "",
+                "env": {}, "headers": {}, "command_unresolved": False,
+                "provenance": {"server_name": "io.github.VLab-Software/easyeda-pro-mcp",
+                               "description": "EasyEDA Pro bridge",
+                               "url": "https://github.com/VLab-Software/easyeda_mcp",
+                               "domain": "github.com"},
+            }]}
+
+        old_state_root = config.STATE_ROOT
+        config.STATE_ROOT = os.path.join(self.tmp.name, "state")
+        try:
+            llm = ScriptedLLM()
+            agent = agent_mod.Agent(llm=llm, session_id="mcp-natural-language", tool_mode="react")
+            with patch("mcp_registry_bridge.registry_fn_for", return_value=fake_registry):
+                events = list(agent.run("帮我连接 EDA 的 MCP", web_enabled=True, stream=True))
+            self.assertIn("dev_mcp_search", str(llm.first_messages))
+            self.assertIn("dev_mcp_search", llm.first_tool_names)
+            self.assertTrue(any(e.get("type") == "action" and "dev_mcp_search" in e.get("text", "")
+                                for e in events))
+            self.assertTrue(any(e.get("type") == "observation" and "easyeda-pro-mcp" in e.get("text", "")
+                                for e in events))
+            self.assertFalse(os.path.exists(os.path.join(self.root, ".docmind_mcp.json")))
+        finally:
+            config.STATE_ROOT = old_state_root
 
     def test_search_rejects_short_query(self):
         self.assertTrue(dev_mcp_search("e").startswith("MCP 搜索失败"))

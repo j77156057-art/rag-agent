@@ -17,8 +17,13 @@ import contextvars
 import tempfile
 import base64
 import io
+import queue
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
+
+# SSE 心跳仅提示前端连接仍活跃，不改变模型请求超时或单轮截止策略。
+CHAT_STREAM_HEARTBEAT_S = max(0.5, float(os.getenv("DOCMIND_CHAT_HEARTBEAT_S", "15")))
 
 from typing import Optional
 
@@ -98,6 +103,7 @@ from tools import (
     web_search,
     web_fetch,
     _run_region_cmd,
+    _mcp_server_approval_target,
 )
 from regions import (
     init_regions,
@@ -906,7 +912,13 @@ async def mcp_servers_ep():
 async def mcp_server_save_ep(req: McpServerReq):
     root = _project_root_or_error()
     if not root: return {"ok": False, "error": "未配置代码库"}
-    try: return mcp_client.save_server(root, req.key, req.config)
+    try:
+        result = mcp_client.save_server(root, req.key, req.config)
+        # 该端点只由设置页的用户确认操作调用；记录与具体连接参数绑定的
+        # 用户审批，使 Agent 后续重试 dev_mcp_add 时不能绕过确认。
+        approval(root, "mcp_server", "workbench-user",
+                 approved=True, target=_mcp_server_approval_target(req.key, req.config))
+        return result
     except mcp_client.MCPError as e: return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
 class McpServerKeyReq(BaseModel):
@@ -918,7 +930,9 @@ async def mcp_server_remove_ep(req: McpServerKeyReq):
     if not root: return {"ok": False, "error": "未配置代码库"}
     try:
         mcp_client.close_server(root, req.key)
-        return mcp_client.remove_server(root, req.key)
+        result = mcp_client.remove_server(root, req.key)
+        approval(root, "mcp_server", "workbench-user", approved=True, target=req.key)
+        return result
     except mcp_client.MCPError as e: return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
 class McpProbeReq(BaseModel):
@@ -942,9 +956,11 @@ class McpDirectorySearchReq(BaseModel):
 
 @app.post("/api/mcp/catalog/search")
 async def mcp_catalog_search_ep(req: McpDirectorySearchReq):
+    root = _project_root_or_error()
     return await run_in_threadpool(
         mcp_capabilities.search_directory, req.query,
         web_enabled=req.web_enabled, search_fn=web_search,
+        registry_fn=registry_fn_for(root) if root and req.web_enabled else None,
     )
 
 @app.get("/api/mcp/capabilities")
@@ -974,7 +990,11 @@ class McpCapabilityDecisionReq(BaseModel):
 async def mcp_capability_decision_ep(req: McpCapabilityDecisionReq):
     root = _project_root_or_error()
     if not root: return {"ok": False, "error": "未配置代码库"}
-    return mcp_capabilities.approve(root, req.key, req.approved)
+    result = mcp_capabilities.approve(root, req.key, req.approved)
+    if req.approved and result.get("ok"):
+        # 能力路由的用户点击是 Agent 自助装配流程的第二道确认门。
+        approval(root, "mcp_capability", "workbench-user", approved=True, target=req.key)
+    return result
 
 @app.get("/api/mcp/tools")
 async def mcp_tools_ep(key: str):
@@ -1787,6 +1807,9 @@ async def chat(
         # 注意：此处不得再申请 GPU 租约。llm.py 的 _ollama_chat 已以 owner="ollama"
         # 持租约，SSE 层若以别的 owner 再申请，serial 模式不可重入 → 必然自锁报"GPU 正忙"。
         gen = None
+        worker = None
+        worker_stop = threading.Event()
+        events = queue.Queue()
         # 注册本流的工作流待取队列：start_workflow 在 agent 生成器内部执行，
         # 必须用跨线程持久的持有者（不能用 contextvars，见 tools.py 注释）。
         wf_holder = push_pending_stream()
@@ -1794,22 +1817,50 @@ async def chat(
             yield f"data: {json.dumps({'type':'route','route':routing['route'],'complexity':routing['complexity'],'reason':routing['reason']}, ensure_ascii=False)}\n\n"
             if vision_audit.get("mode") not in ("none", "native"):
                 yield f"data: {json.dumps({'type':'notice','text':'图片已由 Harness 视觉链路处理：' + vision_audit.get('mode', 'unknown')}, ensure_ascii=False)}\n\n"
+            # 先把“已进入模型处理”送到前端；本地模型在首个 token 或工具调用前
+            # 可能需要较长时间加载/预填充，用户应能区分等待模型与请求无响应。
+            yield f"data: {json.dumps({'type':'notice','text':'已进入模型处理；如果一段时间没有新事件，仍会保留现场，可停止后继续。'}, ensure_ascii=False)}\n\n"
             cloud_question = redact_for_cloud(question) if is_cloud else question
             cloud_context = tuple(redact_for_cloud(item) for item in request_context) if is_cloud else request_context
-            # 逐请求覆盖（含云端 llm）全部随 run(...) 传入：run 在 finally 里还原，
-            # 不污染共享单例；本地路由时 llm=None（用回会话自身的本地 client）。
-            gen = selected_agent.run(
-                cloud_question, stream=True, images=vision_images,
-                llm=cloud_llm,
-                system_context=cloud_context,
-                ingested_sources=tuple(sorted(_INGESTED)),
-                web_enabled=web_enabled_override,
-                thinking_enabled=thinking_enabled_override,
-                tool_mode=tool_mode_override,
-                plan_mode=plan_mode_override,
-            )
-            for ev in gen:
-                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+            def produce():
+                """在独立线程消费同步 Agent，让 SSE 可在模型无 token 时发心跳。"""
+                nonlocal gen
+                try:
+                    # 逐请求覆盖（含云端 llm）全部随 run(...) 传入：run 在 finally 里还原，
+                    # 不污染共享单例；本地路由时 llm=None（用回会话自身的本地 client）。
+                    gen = selected_agent.run(
+                        cloud_question, stream=True, images=vision_images,
+                        llm=cloud_llm,
+                        system_context=cloud_context,
+                        ingested_sources=tuple(sorted(_INGESTED)),
+                        web_enabled=web_enabled_override,
+                        thinking_enabled=thinking_enabled_override,
+                        tool_mode=tool_mode_override,
+                        plan_mode=plan_mode_override,
+                        cancel_event=worker_stop,
+                    )
+                    for ev in gen:
+                        if worker_stop.is_set():
+                            break
+                        events.put(("event", ev))
+                except BaseException as exc:  # propagate to the streaming owner
+                    events.put(("error", exc))
+                finally:
+                    events.put(("done", None))
+
+            worker = threading.Thread(target=produce, name="docmind-chat-agent", daemon=True)
+            worker.start()
+            while True:
+                try:
+                    kind, payload = events.get(timeout=CHAT_STREAM_HEARTBEAT_S)
+                except queue.Empty:
+                    yield f"data: {json.dumps({'type':'notice','text':'模型仍在处理，暂时没有新事件；请等待或停止后继续。'}, ensure_ascii=False)}\n\n"
+                    continue
+                if kind == "done":
+                    break
+                if kind == "error":
+                    raise payload
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 # start_workflow 工具成功后补发结构化事件：前端据此在对话内
                 # 直接挂载工作流卡片并连接 SSE（取走即清，最多补发一次）。
                 pending_wf = take_pending_workflow(wf_holder)
@@ -1829,7 +1880,8 @@ async def chat(
         finally:
             # 客户端断连时 Starlette 关闭本生成器（抛 GeneratorExit）：显式关闭内层
             # agent 生成器，触发其 aborted 分支 —— 落一条 trace 并停止后续工具调用。
-            if gen is not None:
+            worker_stop.set()
+            if gen is not None and (worker is None or not worker.is_alive()):
                 try:
                     gen.close()
                 except Exception:  # noqa: BLE001
@@ -2817,11 +2869,21 @@ def _ollama_keep_alive(model: str, keep_alive, timeout: float = 600.0):
       改走 /api/embeddings，用一次极小的嵌入计算完成加载/卸载。
     冷加载 22GB 模型可能要 1-2 分钟，超时给到 600s。
     """
-    ok, err, code = _ollama_http_post(
-        "/api/generate",
-        {"model": model, "keep_alive": keep_alive, "stream": False},
-        timeout,
-    )
+    payload = {"model": model, "keep_alive": keep_alive, "stream": False}
+    # 预加载必须和实际聊天请求使用同一套分层参数，否则 GPU 面板会按
+    # Ollama 默认值加载较少层，界面显示的驻留显存也会明显偏低。
+    raw_num_gpu = os.getenv("DOCMIND_OLLAMA_NUM_GPU", "").strip()
+    if raw_num_gpu:
+        try:
+            num_gpu = int(raw_num_gpu)
+        except ValueError:
+            num_gpu = 0
+        if num_gpu >= 0:
+            payload.setdefault("options", {})["num_gpu"] = num_gpu
+    ctx_override = get_context_window_override("ollama", model)
+    if isinstance(ctx_override, int) and ctx_override >= 512:
+        payload.setdefault("options", {})["num_ctx"] = ctx_override
+    ok, err, code = _ollama_http_post("/api/generate", payload, timeout)
     if ok:
         return True, ""
     if code == 400 and "does not support generate" in err:

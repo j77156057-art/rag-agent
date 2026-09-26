@@ -119,6 +119,7 @@ _NETWORK_TOOLS = {
     "web_search", "web_fetch", "web_research", "web_subtitles",
     "dev_http_request", "dev_mcp_call", "dev_list_connector_tools",
     "dev_mcp_probe", "dev_mcp_discover",
+    "dev_mcp_search",
 }
 _EXEC_TOOLS = {"python_exec", "run_command", "game_playtest", "self_verify"}
 _ADMIN_TOOLS = {
@@ -226,7 +227,7 @@ def coerce_tool_spec(name: str, value: Any) -> ToolSpec:
     if name in _IRREVERSIBLE_TOOLS:
         side_effect = SideEffect.IRREVERSIBLE
         parallel_safe = False
-    if name in {"orchestrate"}:
+    if name in {"orchestrate", "preview_project"}:
         parallel_safe = False
     schema = value.get("input_schema") or value.get("schema") or _SCHEMA_OVERRIDES.get(name)
     if schema is None:
@@ -258,7 +259,7 @@ class ToolResult:
     text: str
     data: Any = None
     error_kind: str = ""
-    artifacts: dict = field(default_factory=dict)
+    artifacts: Any = field(default_factory=dict)
     idempotency_key: str = ""
     replayed: bool = False
 

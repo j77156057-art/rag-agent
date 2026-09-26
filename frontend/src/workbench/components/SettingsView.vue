@@ -9,12 +9,12 @@ import {
   type SettingsConfigInfo, type ModelConfigInfo, type ProviderOption, type McpServer,
   type McpCapabilityCandidate,
   type BudgetStatus, type TraceSummary,
-  type McpAutoConnectCandidate, type McpAutoConnectConfig, type McpProbeRes,
+  type McpAutoConnectCandidate, type McpAutoConnectConfig, type McpProbeRes, type McpDirectoryResult,
   type McpRegisterStatusRes, type McpRegisterTier, type McpRegisterState,
 } from '../api'
 import Icon from './Icon.vue'
 
-const props = defineProps<{ visible: boolean }>()
+const props = defineProps<{ visible: boolean; initialTab?: 'usage' | 'search' | 'mcp' | 'agent' }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
 
 type Tab = 'usage' | 'search' | 'mcp' | 'agent'
@@ -148,6 +148,7 @@ const mcpDiscovering = ref('')
 const mcpWebLearn = ref(true)
 const mcpSearch = ref('')
 const mcpSearching = ref(false)
+const mcpDirectoryResults = ref<McpDirectoryResult[]>([])
 
 // ---------------- P1：MCP 自动连接向导状态机 ----------------
 type WizardStep = 1 | 2 | 3 | 4 | 5
@@ -173,7 +174,7 @@ const regTaskId = ref('')
 const regUrl = ref('')
 // L2 手动回填：一个候选可能引用多个 provider（如 @secret:slack + @secret:slack_team），
 // 逐项填写、逐项非空校验，commit 时一次全量提交（漏一个 spawn 就解析失败）。
-const regFields = ref<{ provider: string; value: string }[]>([])
+const regFields = ref<{ provider: string; value: string; required: boolean }[]>([])
 /** 候选是否「本就带 @secret 引用」：带引用时按 provider 逐项填；否则回退单字段（旧行为）。 */
 const regHasRefs = ref(false)
 const regSecretKey = ref('')
@@ -369,26 +370,35 @@ const isHttpTransport = (c: McpAutoConnectCandidate | null) => !!c && c.config.t
  * commit 必须一次全量覆盖，漏一个 spawn 时 resolve_secret_refs 就会抛错。
  * 这是「凭证最终写进哪个 secrets_store 键」的权威来源（优先于 provenance.domain）。
  */
-const acSecretProviders = (c: McpAutoConnectCandidate | null): string[] => {
+const acSecretSpecs = (c: McpAutoConnectCandidate | null): { name: string; required: boolean }[] => {
   if (!c) return []
+  if (c.secrets?.length) {
+    return c.secrets.filter(s => s && s.name).map(s => ({ name: s.name, required: !!s.required }))
+  }
   const re = /(?:^|[^A-Za-z0-9_.-])@secret:([A-Za-z0-9_.-]+)/g
-  const out: string[] = []
+  const out: { name: string; required: boolean }[] = []
   for (const bag of [c.config.env, c.config.headers]) {
     for (const v of Object.values(bag || {})) {
       for (const m of (v || '').matchAll(re)) {
         const p = m[1]
-        if (p && !out.includes(p)) out.push(p)
+        if (p && !out.some(s => s.name === p)) out.push({ name: p, required: true })
       }
     }
   }
   return out
 }
+/** 必填 provider：可选密钥只作为候选元数据，不阻塞注册或连接。 */
+const acSecretProviders = (c: McpAutoConnectCandidate | null): string[] =>
+  acSecretSpecs(c).filter(s => s.required).map(s => s.name)
 /** 主 provider：用于 `register/start` 的 adapter 选择，以及无引用回退时的 env 键名。 */
 const acSecretProvider = (c: McpAutoConnectCandidate | null): string => acSecretProviders(c)[0] || ''
 /** 候选是否「需要凭证」：env 或 headers 任一值**含** `@secret:`（锚定或内嵌皆可）。 */
 const acNeedsSecret = (c: McpAutoConnectCandidate | null): boolean => acSecretProviders(c).length > 0
 const acRawJson = (c: McpAutoConnectCandidate | null) =>
   c ? JSON.stringify({ key: candidateKey(c), ...c.config }, null, 2) : ''
+const directorySourceLabel = (url: string): string => {
+  try { return new URL(url).hostname.replace(/^www\./, '') || '官方来源' } catch { return '官方来源' }
+}
 const candidateKey = (c: McpAutoConnectCandidate | null): string => {
   if (!c) return 'server'
   const p = c.config.provenance || {}
@@ -416,6 +426,7 @@ async function autoConnectSearch() {
   wizardStep.value = 2
   mcpError.value = ''
   acCandidates.value = []
+  mcpDirectoryResults.value = []
   acSelected.value = null
   acProbe.value = null
   try {
@@ -429,6 +440,11 @@ async function autoConnectSearch() {
       wizardStep.value = 2
       // search_error 是后端给出的可展示原因（未联网/无链接/读取失败/无命令）
       mcpError.value = r.search_error || r.error || ''
+      try {
+        const catalog = await mcpApi.searchCatalog(query, mcpWebLearn.value)
+        mcpDirectoryResults.value = catalog.results || []
+        mcpError.value = catalog.results?.length ? (catalog.search_error || '') : (mcpError.value || catalog.search_error || '')
+      } catch { /* 保留自动连接原始诊断 */ }
     } else {
       fillState.value = 'populated'
       wizardStep.value = 3
@@ -438,6 +454,50 @@ async function autoConnectSearch() {
     mcpError.value = (e as { message?: string }).message || '搜索失败'
     fillState.value = 'error'
   } finally { mcpSearching.value = false }
+}
+
+function useDirectoryOption(item: McpDirectoryResult, option: McpDirectoryResult['connection_options'][number]) {
+  const config = option.config
+  if (config?.transport && config.command !== undefined && config.url !== undefined) {
+    const rawSpecs = option.secrets || (config.provenance as (McpAutoConnectConfig['provenance'] & {
+      secret_specs?: { name: string; required: boolean }[]
+    }) | undefined)?.secret_specs || []
+    const candidate: McpAutoConnectCandidate = {
+      config: {
+        transport: config.transport,
+        command: String(config.command || ''),
+        args: Array.isArray(config.args) ? config.args.map(String) : [],
+        url: String(config.url || ''),
+        env: { ...(config.env || {}) } as Record<string, string>,
+        headers: { ...(config.headers || {}) } as Record<string, string>,
+        provenance: config.provenance || { url: '', domain: '', server_name: option.label || item.label },
+        command_unresolved: Boolean(config.command_unresolved),
+      },
+      trust: 'trusted',
+      trust_tier: option.trust_tier || 'community',
+      secrets: rawSpecs.map(s => ({ name: s.name, required: !!s.required })),
+      validation_errors: [],
+    }
+    acCandidates.value = [candidate]
+    acSelected.value = candidate
+    fillState.value = 'populated'
+    wizardStep.value = 3
+    mcpDirectoryResults.value = []
+    mcpError.value = ''
+    if (candidate.secrets?.some(s => s.required)) void openRegister(candidate)
+    return
+  }
+  mcpForm.value = {
+    key: item.template.key || item.id,
+    label: item.label,
+    transport: option.transport,
+    command: item.template.command || '',
+    args: item.template.args.join(' '),
+    url: item.template.url || '',
+  }
+  mcpDirectoryResults.value = []
+  mcpError.value = `${item.label}：请补充官方连接信息后测试连接。`
+  document.querySelector<HTMLInputElement>('[data-mcp-manual-key]')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
 async function probeCandidate(c: McpAutoConnectCandidate) {
@@ -521,7 +581,7 @@ const regL1Extra = computed(() =>
 
 /** L2 可提交：至少一项且**每一项都非空**（后端逐项写入，漏一个 spawn 会解析失败）。 */
 const regCanCommit = computed(() =>
-  regFields.value.length > 0 && regFields.value.every(f => !!f.value.trim()))
+  regFields.value.length > 0 && regFields.value.every(f => !f.required || !!f.value.trim()))
 
 function stopRegPoll() {
   if (regPollTimer !== null) { window.clearInterval(regPollTimer); regPollTimer = null }
@@ -639,10 +699,12 @@ async function openRegister(c: McpAutoConnectCandidate) {
   acSelected.value = c
   // provider 名以候选已有的 `@secret:<provider>` 引用为准（写回/写钥匙串都用它）；
   // 无引用（命令未解析等着新建凭证）时才回退 provenance.domain —— 兼容既有行为。
-  const providers = acSecretProviders(c)
-  regHasRefs.value = providers.length > 0
-  regFields.value = (providers.length ? providers : [acSecretProvider(c) || c.config.provenance?.domain || 'provider'])
-    .map(p => ({ provider: p, value: '' }))
+  const specs = acSecretSpecs(c)
+  regHasRefs.value = specs.length > 0
+  regFields.value = (specs.length
+    ? specs
+    : [{ name: acSecretProvider(c) || c.config.provenance?.domain || 'provider', required: true }])
+    .map(s => ({ provider: s.name, value: '', required: s.required }))
   regSecretKey.value = regFields.value[0]?.provider || 'provider'
   regError.value = ''
   regUserPrompt.value = ''
@@ -653,6 +715,8 @@ async function openRegister(c: McpAutoConnectCandidate) {
   regStatus.value = 'waiting_user'
   regUrl.value = '' // 后端未记录该 provider 的出证链接时返回空串；不再回退 provenance.url（那是源码仓库，会跳错站）
   regTaskId.value = `ac-${Date.now().toString(16)}` // 后端不可达时的本地兜底 id
+  // Registry 标注为可选的密钥不应触发自动注册浏览器流程；直接展示可选回填表单。
+  if (specs.length && !specs.some(s => s.required)) return
   try {
     const r = await mcpApi.registerStart(candidateKey(c), c.config, regSecretKey.value)
     if (!r.ok) { regTier.value = 'L2'; return }
@@ -705,9 +769,15 @@ async function resumeRegister() {
  */
 async function commitRegister() {
   if (!regFields.value.length) { regError.value = '没有需要填写的凭证'; return }
-  if (regFields.value.some(f => !f.value.trim())) { regError.value = '请填写全部凭证后再提交'; return }
+  if (regFields.value.some(f => f.required && !f.value.trim())) { regError.value = '请填写全部必填凭证后再提交'; return }
   const credentials: Record<string, string> = {}
-  for (const f of regFields.value) credentials[f.provider] = f.value.trim()
+  for (const f of regFields.value) {
+    if (f.value.trim()) credentials[f.provider] = f.value.trim()
+  }
+  if (!Object.keys(credentials).length && regFields.value.every(f => !f.required)) {
+    closeRegister()
+    return
+  }
   regCommitting.value = true
   regError.value = ''
   try {
@@ -736,7 +806,11 @@ async function addMcp() {
   mcpAdding.value = true
   mcpError.value = ''
   try {
-    const config: Record<string, unknown> = { label: label.trim() || key.trim() }
+    const config: Record<string, unknown> = {
+      label: label.trim() || key.trim(),
+      transport,
+      enabled: true,
+    }
     if (transport === 'stdio') {
       config.command = command.trim()
       config.args = args.split(/\s+/).filter(Boolean)
@@ -773,10 +847,13 @@ watch(() => props.visible, async (v) => {
   if (!v) { stopRegPoll(); return } // 关掉设置即停轮询，绝不让定时器泄漏
   await Promise.all([loadConfig(), loadMcp(), loadUsage()])
   loadAgents()
-  tab.value = 'usage'
+  tab.value = props.initialTab || 'usage'
   savedMsg.value = ''
   usageSaved.value = ''
 }, { immediate: true })
+watch(() => props.initialTab, (value) => {
+  if (props.visible && value) tab.value = value
+})
 
 // 注册弹窗关闭 → 立即停轮询
 watch(regOpen, (open) => { if (!open) stopRegPoll() })
@@ -971,7 +1048,7 @@ function close() { emit('close') }
               <!-- 无候选 -->
               <div v-else-if="fillState === 'empty'" class="sv-ac-state">
                 <Icon name="circle-alert" :size="20" />
-                <span>没找到可直接连的能力，换个说法，或用下方「手动添加连接器」。</span>
+                <span>暂时没有完整连接参数，下面列出这个领域可选择的 MCP 连接方式。</span>
               </div>
               <!-- 抽取失败 -->
               <div v-else-if="fillState === 'error'" class="sv-ac-state">
@@ -1033,19 +1110,45 @@ function close() { emit('close') }
                     <Icon v-if="acProbing && acSelected === c" name="loader" :size="16" class="dm-spin" />
                     <template v-else>测试连接</template>
                   </button>
-                  <button v-if="c.config.command_unresolved || acNeedsSecret(c)" class="sv-mini" @click="openRegister(c)">
-                    <Icon name="lock" :size="16" />需要凭证
+                  <button v-if="c.config.command_unresolved || acNeedsSecret(c) || acSecretSpecs(c).length" class="sv-mini" @click="openRegister(c)">
+                    <Icon name="lock" :size="16" />{{ acNeedsSecret(c) || c.config.command_unresolved ? '填写凭证' : '填写可选凭证' }}
                   </button>
                   <button class="sv-mini" :disabled="acProbing" @click="acSelected === c ? (acSelected = null) : (acSelected = c)">
                     {{ acSelected === c ? '收起' : '编辑' }}
                   </button>
                 </div>
                 <p v-if="acSelected === c && acProbe && acProbe.probe_ok" class="sv-ok">
-                  连上了，发现 {{ acProbe.tools?.length || 0 }} 个工具。
+                  MCP 服务已连接，发现 {{ acProbe.tools?.length || 0 }} 个工具。
+                </p>
+                <p v-if="acSelected === c && acProbe?.readiness_message" class="sv-ac-state">
+                  {{ acProbe.readiness_message }}
                 </p>
                 <button v-if="acSelected === c && acProbe && acProbe.probe_ok" class="sv-btn sv-primary sv-block" @click="openConfirm">
                   <Icon name="shield-check" :size="16" />确认添加并启用
                 </button>
+              </div>
+
+              <div v-for="item in mcpDirectoryResults" :key="`directory-${item.id}`" class="sv-directory-card" data-role="mcp-directory-results">
+                <div class="sv-directory-head">
+                  <div>
+                    <b>{{ item.label }}</b>
+                    <p>{{ item.summary }}</p>
+                  </div>
+                  <span class="sv-cap-badge" data-trust="community">领域连接方式</span>
+                </div>
+                <div class="sv-directory-options">
+                  <div v-for="option in item.connection_options" :key="`${item.id}-${option.id || option.transport}`" class="sv-directory-option">
+                    <div class="sv-list-main">
+                      <span class="sv-list-name">{{ option.label || option.transport.toUpperCase() }}</span>
+                      <span class="sv-list-sub">{{ option.when }} · {{ option.value }}</span>
+                    </div>
+                    <button class="sv-mini" @click="useDirectoryOption(item, option)">选择此方式</button>
+                  </div>
+                </div>
+                <ol class="sv-guide"><li v-for="step in item.setup_steps" :key="step">{{ step }}</li></ol>
+                <div v-if="item.sources.length" class="sv-source-list">
+                  <a v-for="source in item.sources.slice(0, 3)" :key="source" :href="source" target="_blank" rel="noreferrer">{{ directorySourceLabel(source) }}</a>
+                </div>
               </div>
             </div>
 
@@ -1139,9 +1242,9 @@ function close() { emit('close') }
                     </a>
                     <!-- 候选已带 @secret 引用：按 provider 逐项填写（可能多项，如 slack + slack_team） -->
                     <template v-if="regHasRefs">
-                      <p class="sv-list-sub">该连接器引用了 {{ regFields.length }} 项凭证，请逐项填写后提交。</p>
+                      <p class="sv-list-sub">该连接器引用了 {{ regFields.length }} 项凭证，必填项需填写，可选项可留空。</p>
                       <template v-for="f in regFields" :key="f.provider">
-                        <label class="sv-label">凭证 · {{ f.provider }}</label>
+                        <label class="sv-label">凭证 · {{ f.provider }}（{{ f.required ? '必填' : '可选' }}）</label>
                         <div class="sv-input-wrap">
                           <Icon name="lock" :size="20" />
                           <input v-model="f.value" class="sv-input" type="password" placeholder="粘贴凭证" autocomplete="off" spellcheck="false" />
@@ -1199,7 +1302,7 @@ function close() { emit('close') }
             <h4 class="sv-h4">手动添加连接器（高级）</h4>
             <p class="sv-hint">自动连接没覆盖时，可手动填写并添加；命令与参数需以官方文档为准。</p>
             <label class="sv-label">标识 key</label>
-            <input v-model="mcpForm.key" class="sv-input" placeholder="my-server" spellcheck="false" />
+            <input v-model="mcpForm.key" class="sv-input" data-mcp-manual-key placeholder="my-server" spellcheck="false" />
             <label class="sv-label">名称</label>
             <input v-model="mcpForm.label" class="sv-input" placeholder="我的服务" spellcheck="false" />
             <label class="sv-label">传输方式</label>
@@ -1360,6 +1463,8 @@ function close() { emit('close') }
 .sv-directory-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
 .sv-directory-head p { margin: 3px 0 0; color: var(--text-muted); }
 .sv-directory-card ol { margin: 8px 0; padding-left: 20px; color: var(--text-muted); line-height: 1.65; }
+.sv-directory-options { display: flex; flex-direction: column; gap: 6px; margin: 9px 0; }
+.sv-directory-option { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-raised); }
 .sv-source-list { display: flex; flex-direction: column; gap: 3px; overflow-wrap: anywhere; }
 .sv-source-list a { color: var(--accent); }
 .sv-list-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }

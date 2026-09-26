@@ -4,10 +4,11 @@ import json
 import queue
 import threading
 from dataclasses import replace
+from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 from agent_runtime import langsmith
 from agent_runtime.game_workflow import (WORKFLOWS, StateGraph, WorkflowError,
                                           WorkflowPolicy, review_output)
@@ -18,7 +19,9 @@ from agent_runtime.workflow_eval import DEFAULT_DATASET_NAME, dataset_cases
 from agent_runtime.tool_install import ToolInstallError, ToolInstallManager
 from agent_runtime.local_runtime import effective_subagent_limit, resource_profile
 from config import COLLECTION_NAME, LLM_MODEL, LLM_PROVIDER, PROVIDERS, get_runtime
-from game_workbench import require_approval
+from game_workbench import approval as record_user_approval
+from game_workbench import list_approval_records, require_approval
+from agent_runtime.cockpit_policy import QUEUE_APPROVABLE, pending_gate_requests
 import projects
 import tools
 from starlette.concurrency import run_in_threadpool
@@ -71,6 +74,34 @@ class WorkflowApprovalReq(BaseModel):
     auto_execute: bool = False
 
 
+class WorkflowAcceptanceReq(BaseModel):
+    items: list[dict]
+
+
+class WorkflowFinalAcceptanceReq(BaseModel):
+    approved: bool = False
+    note: str = ""
+
+
+class WorkflowVisualFeedbackReq(BaseModel):
+    id: str = ""
+    label: str = "实时画面"
+    note: str = ""
+    region: dict | None = None
+    screenshot: bool = False
+    sent_at: str = ""
+    artifact_id: str = ""
+
+
+class WorkflowVisualSnapshotReq(BaseModel):
+    image_base64: str = Field(max_length=11184900)
+
+
+class WorkflowVisualFeedbackStatusReq(BaseModel):
+    status: str
+    detail: str = ""
+
+
 class WorkflowCheckpointReq(BaseModel):
     approved: bool | None = None
 
@@ -110,6 +141,11 @@ class ToolInstallReq(BaseModel):
     version: str = ""
     fallback_tools: list[str] = []
     approved: bool = False
+
+
+class CockpitApprovalDecisionReq(BaseModel):
+    id: str
+    approved: bool
 
 
 def build_router(ctx) -> APIRouter:
@@ -624,6 +660,107 @@ def build_router(ctx) -> APIRouter:
         except WorkflowError as exc:
             return {"ok": False, "error": str(exc)}
 
+    @router.get("/workflow/{workflow_id}/preview")
+    async def workflow_preview(workflow_id: str):
+        try:
+            state = WORKFLOWS.get(workflow_id)
+            return {"ok": True, "preview": state.get("preview") or {}}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @router.get("/workflow/{workflow_id}/preview/artifact/{artifact_id}")
+    async def workflow_preview_artifact(workflow_id: str, artifact_id: str):
+        """Serve one preview file from the current project, after two checks.
+
+        The artifact must be present in the persisted preview bundle and its
+        resolved path must stay below that workflow's project root.  This
+        keeps media previews useful for any domain while preventing an
+        arbitrary path from becoming a file server.
+        """
+        try:
+            state = WORKFLOWS.get(workflow_id)
+        except WorkflowError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+        preview = state.get("preview") or {}
+        artifact = next((item for item in preview.get("artifacts", [])
+                         if str(item.get("id") or "") == artifact_id), None)
+        root_text = str(state.get("project_root") or "").strip()
+        raw_path = str((artifact or {}).get("path") or "").strip()
+        if not artifact or not root_text or not raw_path:
+            return JSONResponse({"ok": False, "error": "预览资源不存在"}, status_code=404)
+        try:
+            root = Path(root_text).resolve()
+            candidate = Path(raw_path)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            candidate = candidate.resolve()
+            if candidate != root and root not in candidate.parents:
+                return JSONResponse({"ok": False, "error": "预览资源不在当前项目内"}, status_code=403)
+            if not candidate.is_file():
+                return JSONResponse({"ok": False, "error": "预览资源尚未生成"}, status_code=404)
+        except (OSError, ValueError):
+            return JSONResponse({"ok": False, "error": "预览资源路径无效"}, status_code=404)
+        return FileResponse(candidate, media_type=str(artifact.get("mime") or "application/octet-stream"))
+
+    @router.post("/workflow/{workflow_id}/acceptance")
+    async def workflow_acceptance(workflow_id: str, req: WorkflowAcceptanceReq):
+        try:
+            return {"ok": True, "workflow": WORKFLOWS.set_acceptance_contract(
+                workflow_id, req.items)}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @router.post("/workflow/{workflow_id}/acceptance/decide")
+    async def workflow_acceptance_decide(workflow_id: str, req: WorkflowFinalAcceptanceReq):
+        try:
+            return {"ok": True, "workflow": WORKFLOWS.decide_acceptance(
+                workflow_id, req.approved, req.note)}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @router.post("/workflow/{workflow_id}/visual-feedback")
+    async def workflow_visual_feedback(workflow_id: str, req: WorkflowVisualFeedbackReq):
+        try:
+            feedback_project(workflow_id)
+            saved = WORKFLOWS.record_visual_feedback(workflow_id, req.model_dump())
+            return {"ok": True, **saved}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def feedback_project(workflow_id: str):
+        state = WORKFLOWS.get(workflow_id)
+        current_root = ctx._project_root_or_error()
+        workflow_root = str(state.get("project_root") or "")
+        if not current_root or not workflow_root or Path(current_root).resolve() != Path(workflow_root).resolve():
+            raise WorkflowError("反馈不属于当前项目")
+        return state
+
+    @router.post("/workflow/{workflow_id}/visual-feedback/{feedback_id}/status")
+    async def workflow_visual_feedback_status(workflow_id: str, feedback_id: str, req: WorkflowVisualFeedbackStatusReq):
+        try:
+            feedback_project(workflow_id)
+            return {"ok": True, **WORKFLOWS.update_visual_feedback(workflow_id, feedback_id, req.status, req.detail)}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @router.post("/workflow/{workflow_id}/visual-feedback/{feedback_id}/snapshot/{phase}")
+    async def workflow_visual_snapshot_save(workflow_id: str, feedback_id: str, phase: str, req: WorkflowVisualSnapshotReq):
+        try:
+            feedback_project(workflow_id)
+            return {"ok": True, **await run_in_threadpool(
+                WORKFLOWS.save_visual_snapshot, workflow_id, feedback_id, phase, req.image_base64)}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @router.get("/workflow/{workflow_id}/visual-feedback/{feedback_id}/snapshot/{phase}")
+    async def workflow_visual_snapshot_file(workflow_id: str, feedback_id: str, phase: str):
+        try:
+            feedback_project(workflow_id)
+            path = WORKFLOWS.visual_snapshot_path(workflow_id, feedback_id, phase)
+            return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+        except WorkflowError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+
     @router.post("/workflow/{workflow_id}/checkpoint")
     async def workflow_checkpoint(workflow_id: str, req: WorkflowCheckpointReq):
         try:
@@ -717,6 +854,29 @@ def build_router(ctx) -> APIRouter:
         root = ctx._project_root_or_error()
         return {"ok": bool(root),
                 "approvals": ctx.list_approvals(root) if root else []}
+
+    @router.get("/approval-requests")
+    async def approval_requests():
+        root = ctx._project_root_or_error()
+        if not root:
+            return {"ok": False, "error": "未配置代码库", "items": []}
+        return {"ok": True, "items": pending_gate_requests(
+            root, list_approval_records(root))}
+
+    @router.post("/approval-requests/decide")
+    async def approval_request_decide(req: CockpitApprovalDecisionReq):
+        root = ctx._project_root_or_error()
+        if not root:
+            return {"ok": False, "error": "未配置代码库"}
+        item = next((row for row in pending_gate_requests(
+            root, list_approval_records(root)) if row["id"] == req.id), None)
+        if not item:
+            return {"ok": False, "error": "待审核请求不存在或已处理"}
+        if item["action"] not in QUEUE_APPROVABLE:
+            return {"ok": False, "error": "MCP 连接与能力只能在设置页确认"}
+        decision = record_user_approval(root, item["action"], "workbench-user",
+                                        approved=req.approved, target=item["target"])
+        return {"ok": True, "decision": decision}
 
     @router.post("/approvals")
     async def create_approval(payload: dict):

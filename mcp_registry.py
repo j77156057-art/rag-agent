@@ -52,6 +52,25 @@ def _domain_of(url: str) -> str:
     return m.group(1).lower() if m else ""
 
 
+_EDA_QUERY_RE = re.compile(r"(?<![a-z0-9])(?:eda|pcb|kicad|altium|easyeda)(?![a-z0-9])|电路板|电路图|原理图|印制板", re.I)
+_EDA_PRODUCT_RE = re.compile(r"kicad|altium|easyeda|(?<![a-z0-9])(?:eda|pcb|gerber|netlist|spice)(?![a-z0-9])", re.I)
+_EDA_DESIGN_RE = re.compile(r"schematic", re.I)
+_EDA_CONTEXT_RE = re.compile(r"circuit|electroni|electrical|hardware|pcb|board", re.I)
+
+
+def is_eda_query(query: str) -> bool:
+    """领域词需要语义过滤；Registry 的 search 也会返回 jeda 等子串误命中。"""
+    return bool(_EDA_QUERY_RE.search(query or ""))
+
+
+def is_eda_candidate(cfg: dict[str, Any]) -> bool:
+    """只把有电路设计证据的 Registry 条目展示为 EDA 候选。"""
+    prov = cfg.get("provenance") or {}
+    info = " ".join(str(prov.get(k) or "") for k in ("server_name", "description", "url"))
+    return bool(_EDA_PRODUCT_RE.search(info) or
+                (_EDA_DESIGN_RE.search(info) and _EDA_CONTEXT_RE.search(info)))
+
+
 # ---------------------------------------------------------------- 纯函数：URL / 解析
 
 def registry_search_url(need: str, limit: int = 5) -> str:
@@ -167,21 +186,30 @@ def _package_to_config(pkg: Any, prov: dict[str, Any],
     args: list[str] = []
     for a in pkg.get("runtimeArguments") or []:
         args.extend(_arg_values(a))
+    # stdio 没有交互终端；首次下载时 npx 的确认提示会挡住 MCP initialize。
+    # 用户点「测试连接」即明确触发试连，命令仍在确认启用前临时运行。
+    if launcher == "npx" and not any(a in ("-y", "--yes", "-n", "--no") for a in args):
+        args.insert(0, "-y")
     args.append(identifier)
     for a in pkg.get("packageArguments") or []:
         args.extend(_arg_values(a))
     env: dict[str, str] = {}
     required: list[str] = []
+    secret_specs: list[dict[str, Any]] = []
     for ev in pkg.get("environmentVariables") or []:
         if not isinstance(ev, dict) or not ev.get("name"):
             continue
         nm = str(ev["name"])
         env[nm] = f"@secret:{nm}" if ev.get("isSecret") else ""   # 密钥只留引用，绝无明文
+        if ev.get("isSecret"):
+            secret_specs.append({"name": nm, "required": bool(ev.get("isRequired"))})
         if ev.get("isRequired"):
             required.append(nm)
     p = dict(prov)
     if required:
         p["required_env"] = required
+    if secret_specs:
+        p["secret_specs"] = secret_specs
     return {
         "transport": "stdio", "command": launcher, "args": args, "url": "",
         "env": env, "headers": {}, "provenance": p, "command_unresolved": False,
@@ -214,13 +242,25 @@ def _remote_to_config(rem: Any, prov: dict[str, Any]) -> Optional[dict[str, Any]
     if not url:
         return None
     headers: dict[str, str] = {}
+    secret_specs: list[dict[str, Any]] = []
     for h in rem.get("headers") or []:
         if not isinstance(h, dict) or not h.get("name"):
             continue
-        headers[str(h["name"])] = _remote_header_value(h)
+        name = str(h["name"])
+        value = _remote_header_value(h)
+        headers[name] = value
+        providers = _PLACEHOLDER_RE.findall(str(h.get("value") or ""))
+        if providers:
+            secret_specs.extend({"name": p, "required": bool(h.get("isRequired"))}
+                                for p in providers)
+        elif h.get("isSecret"):
+            secret_specs.append({"name": name, "required": bool(h.get("isRequired"))})
+    p = dict(prov)
+    if secret_specs:
+        p["secret_specs"] = secret_specs
     return {
         "transport": "http", "command": "", "args": [], "url": url,
-        "env": {}, "headers": headers, "provenance": dict(prov), "command_unresolved": False,
+        "env": {}, "headers": headers, "provenance": p, "command_unresolved": False,
     }
 
 

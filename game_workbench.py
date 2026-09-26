@@ -2579,6 +2579,17 @@ def approval_ledger_path(root):
     return _project_state.path(root, 'approvals.jsonl', legacy='.docmind_approvals.jsonl')
 
 
+def list_approval_records(root):
+    """读取项目审批台账，供开发舱展示已处理与待处理请求。"""
+    path = approval_ledger_path(root)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return [row for line in handle if line.strip()
+                    if isinstance((row := json.loads(line)), dict)]
+    except (OSError, ValueError):
+        return []
+
+
 def approval(root, action, user, approved=False, target=""):
     """记录一条审批（追加到 .docmind_approvals.jsonl）。target 用于把审批绑定到具体对象。"""
     path = approval_ledger_path(root)
@@ -2643,6 +2654,12 @@ def require_approval(root, action, target):
     """
     if is_approved(root, action, target):
         return None
+    try:
+        from agent_runtime.cockpit_policy import record_gate_request
+        record_gate_request(root, action, target)
+    except Exception:
+        # 审核队列只是可视化；记录失败也绝不能让审批门放行。
+        pass
     return {
         "blocked": True,
         "approval_required": True,

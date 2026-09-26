@@ -32,6 +32,7 @@ const FlowCanvas = defineAsyncComponent(() => import('./components/FlowCanvas.vu
 const RegionMapDialog = defineAsyncComponent(() => import('./components/RegionMapDialog.vue'))
 const SettingsView = defineAsyncComponent(() => import('./components/SettingsView.vue'))
 const AssetCenterView = defineAsyncComponent(() => import('./components/AssetCenterView.vue'))
+const AutonomousCockpit = defineAsyncComponent(() => import('./components/AutonomousCockpit.vue'))
 
 // 演示侧栏的文件 → 业务标签（key 取文件名，与静态示例树对齐）
 const demoBadgeOf = (name: string) => {
@@ -57,6 +58,15 @@ const {
 const dirtyCount = computed(() => tabs.value.filter((t) => t.dirty).length)
 /** 统一设置页（用量费用 / 网络搜索 / MCP / 智能体）显隐 */
 const settingsVisible = ref(false)
+const settingsSection = ref<'usage' | 'search' | 'mcp' | 'agent'>('usage')
+function openSettings(tab: 'usage' | 'search' | 'mcp' | 'agent' = 'usage') {
+  settingsSection.value = tab
+  settingsVisible.value = true
+}
+function onOpenSettings(ev: Event) {
+  const tab = (ev as CustomEvent<{ tab?: string }>).detail?.tab
+  openSettings(tab === 'mcp' ? 'mcp' : 'usage')
+}
 /**
  * 重型弹层首次打开才挂载（异步 chunk 届时才下载）；挂载后常驻、关闭不销毁，
  * 保留已加载数据与缩放状态——与原先"始终挂载 + 根 v-if 隐藏"的体验一致。
@@ -273,6 +283,7 @@ function onWorkspaceHotkey(e: KeyboardEvent) {
   if (e.key === '1') { e.preventDefault(); setWorkspace('overview') }
   else if (e.key === '2' && tabs.value.length) { e.preventDefault(); setWorkspace('code') }
   else if (e.key === '3') { e.preventDefault(); setWorkspace('assets') }
+  else if (e.key === '4' && !demoMode.value) { e.preventDefault(); setWorkspace('cockpit') }
 }
 
 onMounted(() => {
@@ -289,11 +300,13 @@ onMounted(() => {
   })
   window.addEventListener('beforeunload', beforeUnload)
   window.addEventListener('keydown', onWorkspaceHotkey)
+  window.addEventListener('docmind:open-settings', onOpenSettings)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', beforeUnload)
   window.removeEventListener('keydown', onWorkspaceHotkey)
+  window.removeEventListener('docmind:open-settings', onOpenSettings)
   if (noticeTimer !== null) { window.clearTimeout(noticeTimer); noticeTimer = null }
 })
 </script>
@@ -377,7 +390,7 @@ onBeforeUnmount(() => {
         <button
           class="wb-save-btn wb-settings-btn"
           title="设置：Token 用量与费用、网络搜索、MCP 连接器、智能体预设"
-          @click="settingsVisible = true"
+          @click="openSettings('usage')"
         >
           <svg width="13" height="13" viewBox="0 0 13 13">
             <circle cx="6.5" cy="6.5" r="2.1" fill="none" stroke="currentColor" stroke-width="1.1" />
@@ -554,7 +567,8 @@ onBeforeUnmount(() => {
           <template v-else-if="tree">
             <EditorTabs v-if="workspace === 'code'" />
             <div class="wb-editor-row">
-              <CodeView :tab="workspace === 'code' ? activeTab : null" />
+              <AutonomousCockpit v-if="workspace === 'cockpit'" />
+              <CodeView v-else :tab="workspace === 'code' ? activeTab : null" />
               <SelectionAiPanel v-if="aiPanelOpen && workspace === 'code'" />
               <SymbolOutline v-if="workspace === 'code'" />
             </div>
@@ -605,6 +619,6 @@ onBeforeUnmount(() => {
     <UnityGraph v-if="everMounted.unity" />
     <FlowCanvas v-if="everMounted.flow" />
     <SelectionToolbar />
-    <SettingsView v-if="everMounted.settings" :visible="settingsVisible" @close="settingsVisible = false" />
+    <SettingsView v-if="everMounted.settings" :visible="settingsVisible" :initial-tab="settingsSection" @close="settingsVisible = false" />
   </div>
 </template>

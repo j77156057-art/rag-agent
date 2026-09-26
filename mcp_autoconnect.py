@@ -32,39 +32,25 @@ import project_state
 from textutil import as_text as _as_text
 from mcp_server_index import match_curated_server, curated_entry_to_config
 import mcp_registry
+from mcp_registry_bridge import registry_fn_for, humanize_registry_error, _registry_layer
+from mcp_validation import (
+    ALLOWED_LAUNCHERS, TRUSTED_SOURCE_DOMAINS, ALLOWED_KEYS, SECRET_INLINE_RE,
+    SHELL_META_RE, ALLOWED_URL_RE, HTTP_ENDPOINT_RE,
+    _split_tokens, _LAUNCHER_PATTERNS, parse_install_command, _domain_of,
+    is_trusted_domain, _safe_dir, _looks_like_secret,
+    validate_extracted_config as _validate_extracted_config,
+)
+from mcp_candidates import (
+    DEFAULT_DIAG_STAGES, render_diagnostic_svg, build_candidate,
+    _is_official_namespace, _trust_tier, _candidate_view, _dedupe,
+)
+from mcp_providers import (
+    DEFAULT_USER_PROMPT, PROVIDER_ADAPTERS, CHALLENGE_KEYWORDS, CHALLENGE_URL_MARKERS,
+    select_provider_adapter, _adapter_by_url, _provider_url_trusted,
+)
 
 _log = logging.getLogger("docmind.mcp_autoconnect")
 
-
-# ---------------------------------------------------------------- 常量（白名单，与 R3 并存）
-
-ALLOWED_LAUNCHERS: frozenset[str] = frozenset({
-    "uvx", "npx", "bunx", "bun", "node", "python", "python3",
-    "pipx", "docker", "deno", "go", "poetry",
-})
-
-TRUSTED_SOURCE_DOMAINS: frozenset[str] = frozenset({
-    "github.com", "raw.githubusercontent.com", "pypi.org", "npmjs.com",
-    "www.npmjs.com", "modelcontextprotocol.io", "smithery.ai", "glama.ai",
-})
-
-# 候选只允许这些字段；任何额外键（如 run_script / post_install）来自不可信文本 → 丢弃
-ALLOWED_KEYS: frozenset[str] = frozenset({
-    "transport", "command", "args", "url", "env", "headers",
-    "label", "key", "provenance", "command_unresolved",
-})
-
-# 值内嵌 @secret:<provider>（含整值形态，向后兼容）：provider 名为 token 字符集。
-SECRET_INLINE_RE = re.compile(r"@secret:([A-Za-z0-9_.-]+)")
-SHELL_META_RE = re.compile(r"[;|&$><\n\r(){}\[\]*?~`#!]")
-ALLOWED_URL_RE = re.compile(r"^https://[a-z0-9.-]+(?::\d{1,5})?(/[^\s]*)?$", re.I)
-HTTP_ENDPOINT_RE = re.compile(r"https://[^\s)'\"`]+/mcp[^\s)'\"`]*", re.I)
-
-# 诊断图默认 6 节点（Phase 2 C5 集合，非 Phase 1 §6.1 旧集合）
-DEFAULT_DIAG_STAGES = [
-    ("search", "搜索"), ("fetch", "抓取"), ("extract", "抽取"),
-    ("validate", "校验"), ("probe", "试连"), ("confirm", "确认"),
-]
 
 # 浏览器级 UA：GitHub 等站点对朴素 UA 直接 403 / 反爬；贴近 Chrome 才能稳定取正文。
 _BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -77,299 +63,11 @@ class AutoConnectError(Exception):
 
 # ---------------------------------------------------------------- 纯函数（无网络、无 subprocess、可离线单测）
 
-def _split_tokens(rest: str) -> list[str]:
-    return [t for t in rest.split() if t]
-
-
-# 每条：正则 + 把匹配组拼成 argv（argv[0] 为裸启动器 token）
-_LAUNCHER_PATTERNS: list[tuple[re.Pattern[str], Callable[[re.Match[str]], list[str]]]] = [
-    (re.compile(r"\buvx\s+([^\s]+)(.*)", re.S),
-     lambda m: ["uvx", m.group(1)] + _split_tokens(m.group(2))),
-    (re.compile(r"\bnpx\s+(-y\s+)?([^\s]+)(.*)", re.S),
-     lambda m: ["npx"] + (["-y"] if m.group(1) else []) + [m.group(2)] + _split_tokens(m.group(3))),
-    (re.compile(r"\bbunx\s+([^\s]+)(.*)", re.S),
-     lambda m: ["bunx", m.group(1)] + _split_tokens(m.group(2))),
-    (re.compile(r"\bpython3?\s+-m\s+([^\s]+)(.*)", re.S),
-     lambda m: ["python", "-m", m.group(1)] + _split_tokens(m.group(2))),
-    (re.compile(r"\bnode\s+([^\s]+)(.*)", re.S),
-     lambda m: ["node", m.group(1)] + _split_tokens(m.group(2))),
-    (re.compile(r"\bpipx\s+run\s+([^\s]+)(.*)", re.S),
-     lambda m: ["pipx", "run", m.group(1)] + _split_tokens(m.group(2))),
-    (re.compile(r"\bdocker\s+run\b(.*)", re.S),
-     lambda m: ["docker", "run"] + _split_tokens(m.group(1))),
-    (re.compile(r"\bdeno\s+run\s+(.*)", re.S),
-     lambda m: ["deno", "run"] + _split_tokens(m.group(1))),
-    (re.compile(r"\bgo\s+run\s+(.*)", re.S),
-     lambda m: ["go", "run"] + _split_tokens(m.group(1))),
-    (re.compile(r"\bpoetry\s+run\s+(.*)", re.S),
-     lambda m: ["poetry", "run"] + _split_tokens(m.group(1))),
-]
-
-
-def parse_install_command(text: str) -> Optional[list[str]]:
-    """确定性解析官方安装范式，返回 argv 列表（argv[0] 为裸启动器 token）或 None。
-
-    识别：uvx / npx -y / bunx / python -m / node / pipx run / docker run /
-    deno run / go run / poetry run。不触 PATH、不 subprocess。
-    返回 None 表示确定性解析未命中。
-    """
-    if not text:
-        return None
-    samples = [text] + [ln.strip() for ln in text.splitlines() if ln.strip()]
-    for sample in samples:
-        for pat, build in _LAUNCHER_PATTERNS:
-            m = pat.search(sample)
-            if m:
-                return build(m)
-    return None
-
-
-def _domain_of(url: str) -> str:
-    m = re.match(r"https?://([^/]+)/?", url or "")
-    return m.group(1).lower() if m else ""
-
-
-def is_trusted_domain(host: str) -> bool:
-    """host 在 TRUSTED_SOURCE_DOMAINS 或与其同注册域（含子域）。"""
-    host = (host or "").lower()
-    if not host:
-        return False
-    if host in TRUSTED_SOURCE_DOMAINS:
-        return True
-    return any(host == d or host.endswith("." + d) for d in TRUSTED_SOURCE_DOMAINS)
-
-
-def _safe_dir(cmd: str) -> bool:
-    """绝对路径命令所在目录是否落在安全目录集（PATH ∪ ~/.local/bin ∪ ProgramFiles）。"""
-    if not os.path.isabs(cmd):
-        return False
-    parent = os.path.dirname(cmd)
-    safe = set(os.environ.get("PATH", "").split(os.pathsep))
-    safe.add(os.path.join(os.path.expanduser("~"), ".local", "bin"))
-    prog = os.environ.get("ProgramFiles")
-    if prog:
-        safe.add(prog)
-    progx = os.environ.get("ProgramFiles(x86)")
-    if progx:
-        safe.add(progx)
-    return parent in safe
-
-
-def _looks_like_secret(value: str) -> bool:
-    v = (value or "").strip()
-    if not v:
-        return False
-    if re.search(r"(sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|Bearer\s+[A-Za-z0-9._-]{20,})", v):
-        return True
-    if len(v) >= 40 and re.fullmatch(r"[A-Za-z0-9+/=_.-]{40,}", v):
-        return True
-    return False
-
-
 def validate_extracted_config(cand: dict[str, Any]) -> tuple[bool, list[str]]:
-    """信任闸门 R1-R9。返回 (ok, errors)。
-
-    模型辅助输出也强制过此（权威裁决）。R3 已收紧为「抽取阶段解析绝对路径，
-    候选不保留裸启动器」——若 command_unresolved 为 True 直接 error。
-    """
-    errors: list[str] = []
-    if not isinstance(cand, dict):
-        return False, ["候选必须是对象"]
-
-    # R1 结构白名单
-    for k in cand:
-        if k not in ALLOWED_KEYS:
-            errors.append(f"拒绝未知字段 {k}（可能来自不可信文本）")
-
-    # R2 transport
-    transport = cand.get("transport")
-    if transport not in ("stdio", "http"):
-        errors.append("transport 仅支持 stdio 或 http")
-
-    # R3 启动器 / 路径
-    if transport == "stdio":
-        if cand.get("command_unresolved"):
-            errors.append("启动器未在环境中解析到绝对路径，需手动确认/安装")
-        else:
-            cmd = cand.get("command") or ""
-            if not cmd:
-                errors.append("stdio 缺少 command")
-            elif os.path.isabs(cmd):
-                base = os.path.basename(cmd)
-                base_name = base[:-4] if base.lower().endswith(".exe") else base
-                if not _safe_dir(cmd) or base_name not in ALLOWED_LAUNCHERS:
-                    errors.append("command 绝对路径不在安全目录或启动器不在白名单")
-            else:
-                base = os.path.basename(cmd)
-                base_name = base[:-4] if base.lower().endswith(".exe") else base
-                if base_name not in ALLOWED_LAUNCHERS:
-                    errors.append("command 启动器不在白名单")
-
-    # R4 shell 元字符拒绝
-    scan = [str(cand.get("command") or "")]
-    scan += [str(a) for a in (cand.get("args") or [])]
-    for sec in ("env", "headers"):
-        for val in (cand.get(sec) or {}).values():
-            scan.append(str(val))
-    for piece in scan:
-        if SHELL_META_RE.search(piece):
-            errors.append("拒绝 shell 元字符（命令/参数/环境变量中检测到 ; | & $ 等）")
-            break
-
-    # R5 args 形状
-    args = cand.get("args")
-    if args is not None:
-        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
-            errors.append("args 必须是字符串列表")
-        else:
-            for a in args:
-                if len(a) > 256:
-                    errors.append("args 单元素超过 256 字符上限")
-                    break
-
-    # R6 url 方案/主机（http）
-    if transport == "http":
-        url = cand.get("url") or ""
-        if not url:
-            errors.append("http 缺少 url")
-        else:
-            # 只拒绝 authority 段的 userinfo（http://u:p@host）；path 里的 "@"（如
-            # smithery 规范形态 /@scope/pkg/mcp）是合法的，不得误杀。
-            parts = urllib.parse.urlsplit(url)
-            if parts.username or parts.password:
-                errors.append("url 拒绝用户信息（http://u:p@host）")
-            elif (parts.scheme or "").lower() != "https" or not ALLOWED_URL_RE.match(url):
-                errors.append("url 必须是 https")
-            else:
-                host = parts.hostname or _domain_of(url)
-                if not is_trusted_domain(host):
-                    errors.append(f"url 主机 {host} 不在可信来源域")
-
-    # R7 密钥不来自网页
-    for sec in ("env", "headers"):
-        for val in (cand.get(sec) or {}).values():
-            if _looks_like_secret(str(val)):
-                errors.append("疑似密钥，请走注册代管写入 secrets_store，勿从网页直接填入")
-                break
-
-    # R8 来源可信度（决策#1：拒非官方域名命令）
-    prov = cand.get("provenance") or {}
-    domain = prov.get("domain") or ""
-    if transport == "stdio" and cand.get("command") and domain and not is_trusted_domain(domain):
-        errors.append(f"来源 {domain} 不可信，拒绝自动抽取命令（请手动确认）")
-
-    return (len(errors) == 0, errors)
-
-
-def render_diagnostic_svg(stages: Optional[list[dict[str, Any]]] = None,
-                          failed_at: Optional[str] = None) -> str:
-    """确定性生成连接诊断 SVG（无 emoji、stroke=currentColor，引用 Token 变量）。
-
-    stages 为 [{'key','label','state'}]；state ∈ done/active/fail/warn/idle。
-    failed_at 为卡住的 stage key（高亮 fail/warn）。无 stages 时用默认 6 节点。
-    """
-    stages = stages or [{"key": k, "label": lbl, "state": "idle"} for k, lbl in DEFAULT_DIAG_STAGES]
-    parts = ['<svg viewBox="0 0 680 96" class="mcp-diag" role="img" aria-label="连接诊断" '
-             'xmlns="http://www.w3.org/2000/svg">']
-    parts.append('<style>'
-                 '.mcp-seg-done{stroke:var(--diag-seg-done,#1c9e66);}'
-                 '.mcp-seg-idle{stroke:var(--diag-seg-idle,#dde3ee);}'
-                 '.mcp-ring{fill:var(--bg-raised,#fff);stroke-width:2;}'
-                 '.n-done{stroke:var(--diag-done,#1c9e66);}'
-                 '.n-fail{stroke:var(--diag-fail,#e0484f);}'
-                 '.n-warn{stroke:var(--diag-warn,#c8811c);}'
-                 '.n-active{stroke:var(--diag-active,#2f6fed);}'
-                 '.n-idle{stroke:var(--diag-idle,#98a3b4);}'
-                 '.mcp-lbl{font:510 12px var(--font-ui,system-ui);fill:var(--text,#222b38);}'
-                 '</style>')
-    n = len(stages)
-    step = 600 / max(n, 1)
-    prev_x = 40
-    for i, st in enumerate(stages):
-        x = 40 + i * step
-        state = st.get("state", "idle")
-        if failed_at and st.get("key") == failed_at:
-            state = "fail" if state in ("fail", "idle") else state
-        cls = {"done": "n-done", "fail": "n-fail", "warn": "n-warn",
-               "active": "n-active", "idle": "n-idle"}.get(state, "n-idle")
-        if i > 0:
-            seg = "mcp-seg-done" if state in ("done", "fail", "warn", "active") else "mcp-seg-idle"
-            parts.append(f'<line class="{seg}" x1="{prev_x}" y1="40" x2="{x}" y2="40"/>')
-        parts.append(f'<g class="mcp-node" data-state="{state}" data-step="{i+1}" '
-                     f'transform="translate({x},40)">')
-        parts.append(f'<circle class="mcp-ring {cls}" r="16"/>')
-        parts.append(f'<text class="mcp-lbl" y="36" text-anchor="middle">{st.get("label","")}</text>')
-        parts.append('</g>')
-        prev_x = x
-    parts.append('</svg>')
-    return "".join(parts)
-
+    """保留主模块调用入口和安全目录判定注入点。"""
+    return _validate_extracted_config(cand, safe_dir=_safe_dir)
 
 # ---------------------------------------------------------------- 编排（不执行、不写盘；仅 search/fetch/解析/校验）
-
-def build_candidate(parsed: list[str], *, provenance: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """把 parse_install_command 的 argv 经 resolve_command（mcp_client.py:72）解析为绝对路径
-    写入 cand['command']；解析失败置 cand['command_unresolved']=True。组装候选。
-    """
-    launcher = parsed[0]
-    resolved = mcp_client.resolve_command(launcher)
-    abs_ok = (resolved != launcher) and os.path.isabs(resolved)
-    return {
-        "transport": "stdio",
-        "command": resolved if abs_ok else launcher,
-        "args": list(parsed[1:]),
-        "url": "",
-        "env": {},
-        "headers": {},
-        "provenance": dict(provenance or {}),
-        "command_unresolved": not abs_ok,
-    }
-
-
-def _is_official_namespace(ns: str) -> bool:
-    """registry 官方命名空间判定（与 mcp_registry._is_official_namespace 口径一致）。
-
-    `io.modelcontextprotocol.*` / `io.github.*` 视为官方发布；第三方如 `222wcnm` 不算。
-    """
-    return bool(ns) and (ns.startswith("io.modelcontextprotocol") or ns.startswith("io.github."))
-
-
-def _trust_tier(prov: dict[str, Any], trust: str) -> str:
-    """显示用信任分档（不改动 R8 自动填参闸门语义，R8 仍看 `trust`）。
-
-    - unknown：不可信来源域（source_untrusted）
-    - official：registry 官方命名空间，或精选索引收录的官方 server
-    - community：受信来源域（如 github.com）但非官方命名空间的第三方 server
-    """
-    if trust == "source_untrusted":
-        return "unknown"
-    ns = str(prov.get("namespace") or "")
-    if prov.get("curated"):
-        return "official"
-    if _is_official_namespace(ns):
-        return "official"
-    return "community"
-
-
-def _candidate_view(cand: dict[str, Any], trust: str, errors: list[str]) -> dict[str, Any]:
-    prov = cand.get("provenance") or {}
-    return {"config": cand, "trust": trust,
-            "trust_tier": _trust_tier(prov, trust),
-            "validation_errors": errors}
-
-
-def _dedupe(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen = set()
-    out = []
-    for c in cands:
-        cfg = c["config"]
-        key = (cfg.get("transport"), cfg.get("command") or cfg.get("url"))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(c)
-    return out
-
 
 def _github_readme_markdown(url: str) -> str:
     """把 github.com 仓库/子路径链接改写为 api.github.com readme/contents，解码 base64 → markdown。
@@ -416,76 +114,6 @@ def _github_readme_markdown(url: str) -> str:
         return base64.b64decode(content).decode("utf-8", "replace")
     except Exception:
         return ""
-
-
-def registry_fn_for(root: str) -> Callable[[str], dict[str, Any]]:
-    """返回绑定 `root` 缓存 + 真 HTTP 的 Registry 检索可调用（供 api/tools 注入）。
-
-    缓存落 `project_state.path(root, "mcp_registry_cache.json")`（TTL 24h）；
-    缓存路径解析失败退化为无缓存直连，绝不上抛（外层 search_registry 亦全兜底）。
-    """
-    def _fn(need: str) -> dict[str, Any]:
-        try:
-            cache: Optional[Any] = mcp_registry.RegistryCache(
-                project_state.path(root, "mcp_registry_cache.json"))
-        except Exception:
-            cache = None
-        return mcp_registry.search_registry(need, cache=cache)
-    return _fn
-
-
-_NET_ERROR_MARKERS = ("timeouterror", "timed out", "timeout", "urlerror", "connectionerror",
-                      "connectionreseterror", "remotedisconnected", "incompleteread",
-                      "sslerror", "socket", "oserror", "network")
-
-
-def humanize_registry_error(err: str) -> str:
-    """Registry/联网软降级错误 → 可行动中文；非网络类错误原样保留（截断 300）。
-
-    用于把「裸 TimeoutError: The read operation timed out」之类的底层异常，转成
-    前端可直读的中文提示（含重试仍失败说明 + 已回退离线索引的安抚），避免真机那样
-    直接把 Python 异常名透给用户。非网络类错误（如 Registry 结构异常）则原样截断返回。
-    """
-    text = (err or "").strip()
-    if not text:
-        return ""
-    low = text.lower()
-    if any(m in low for m in _NET_ERROR_MARKERS):
-        host = mcp_registry.REGISTRY_BASE.replace("https://", "")
-        return (f"联网检索超时：无法访问 MCP 官方 Registry（{host}），已重试仍失败。"
-                "请检查网络或配置代理后重试；本次已回退离线精选索引与联网抓取。")
-    return text[:300]
-
-
-def _registry_layer(registry_fn: Optional[Callable[[str], dict[str, Any]]],
-                    need: str) -> tuple[list[dict[str, Any]], str, str]:
-    """调用 registry_fn 并把结果**强制过 R1-R9**，返回 (候选视图, 错误说明, 来源)。
-
-    来源 src ∈ registry/cache/cache-stale（沿用 search_registry 词表，供上层透传）。
-    Registry 是 preview 服务、数据形态可能漂移；此处任何异常/异常结构一律软降级，
-    交由调用方回落精选索引 —— 绝不打崩请求。
-    """
-    if not callable(registry_fn):
-        return [], "", ""
-    try:
-        res = registry_fn(need)
-    except Exception as exc:  # noqa: BLE001
-        return [], humanize_registry_error(f"{type(exc).__name__}: {exc}"), ""
-    if not isinstance(res, dict):
-        return [], "", ""
-    if not res.get("ok"):
-        return [], humanize_registry_error(str(res.get("error") or "")), ""
-    src = str(res.get("source") or "registry")
-    views: list[dict[str, Any]] = []
-    for cfg in res.get("candidates") or []:
-        if not isinstance(cfg, dict):
-            continue
-        ok, errs = validate_extracted_config(cfg)
-        if not ok:                                        # registry 数据也绝不绕过信任闸门
-            continue
-        # 能过闸门的 registry 候选即视为可信（R6/R8 已对受信域/来源做了裁决）
-        views.append(_candidate_view(cfg, "trusted", errs))
-    return views, "", src
 
 
 def auto_connect_pipeline(root: str, query: str, *,
@@ -689,21 +317,29 @@ def resolve_secret_refs(cfg: dict[str, Any], root: str) -> dict[str, Any]:
     → `Bearer <明文>`）；整值 `@secret:NAME` 仍等价（向后兼容）。env 与 headers 同走此规则。
     引用了未存入的 provider 时抛 AutoConnectError（可读，不静默）。
     """
+    specs = ((cfg.get("provenance") or {}).get("secret_specs")
+             if isinstance(cfg.get("provenance"), dict) else None)
+    optional = {str(s.get("name")) for s in (specs or [])
+                if isinstance(s, dict) and s.get("name") and not s.get("required")}
     out = dict(cfg)
     for sec in ("env", "headers"):
         src = cfg.get(sec) or {}
         if not src:
             continue
-        out[sec] = {k: _substitute_secret_refs(v, root) for k, v in src.items()}
+        out[sec] = {k: _substitute_secret_refs(v, root, optional) for k, v in src.items()}
     return out
 
 
-def _substitute_secret_refs(value: Any, root: str) -> str:
-    """把值里所有 `@secret:<provider>` 就地替换为明文；缺失 provider 抛可读 AutoConnectError。"""
+def _substitute_secret_refs(value: Any, root: str,
+                            optional: Optional[set[str]] = None) -> str:
+    """把值里所有 `@secret:<provider>` 就地替换为明文；可选且未存储的引用为空串。"""
+    optional = optional or set()
     def _repl(m: re.Match[str]) -> str:
         provider = m.group(1)
         plain = secrets_store.load(root, provider)
         if not plain:
+            if provider in optional:
+                return ""
             raise AutoConnectError(f"凭证提供方 {provider} 未存入 secrets_store，无法解析 @secret 引用")
         return plain
     return SECRET_INLINE_RE.sub(_repl, str(value))
@@ -727,7 +363,18 @@ def http_headers_for(cfg: dict[str, Any], root: str) -> dict[str, str]:
             or not is_trusted_domain(host)):
         _log.warning("忽略 http 请求头：主机非受信域或非 https（host=%s）", host or "?")
         return {}
-    return dict(resolve_secret_refs({"headers": raw}, root).get("headers") or {})
+    provenance = cfg.get("provenance")
+    specs = (provenance.get("secret_specs") or []) if isinstance(provenance, dict) else []
+    optional = {str(spec.get("name")) for spec in specs
+                if isinstance(spec, dict) and spec.get("name") and not spec.get("required")}
+    raw = {name: value for name, value in raw.items()
+           if not any(match.group(1) in optional
+                      and not secrets_store.load(root, match.group(1))
+                      for match in SECRET_INLINE_RE.finditer(str(value)))}
+    resolved = dict(resolve_secret_refs(
+        {"headers": raw, "provenance": cfg.get("provenance")}, root
+    ).get("headers") or {})
+    return {k: v for k, v in resolved.items() if str(v).strip()}
 
 
 def probe_candidate(root: str, cand: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
@@ -750,10 +397,27 @@ def probe_candidate(root: str, cand: dict[str, Any], timeout: int = 60) -> dict[
         return {"ok": True, "probe_ok": True, "tools": names, "error": ""}
     sess = mcp_client._StdioSession(cfg, cwd=os.path.abspath(root))
     try:
-        sess.initialize()
+        sess.initialize(timeout=timeout)
         tools = sess.request("tools/list", {}, timeout=min(timeout, 30)) or {}
         names = [t.get("name") for t in tools.get("tools", [])]
-        return {"ok": True, "probe_ok": True, "tools": names, "error": ""}
+        result = {"ok": True, "probe_ok": True, "tools": names, "error": ""}
+        # EasyEDA 桥接进程本身可以连通，但编辑器扩展可能未安装。已知只读状态工具
+        # 可区分这两层，避免向用户误报「已能设计电路」。其他 MCP 不猜测健康状态。
+        if "easyeda_live_status" in names:
+            try:
+                health = sess.request("tools/call", {
+                    "name": "easyeda_live_status", "arguments": {},
+                }, timeout=min(timeout, 10)) or {}
+                status = (health.get("structuredContent") or {}).get("status") or {}
+                if isinstance(status.get("connected"), bool):
+                    result["ready"] = status["connected"]
+                    if not status["connected"]:
+                        result["readiness_message"] = (
+                            "MCP 服务已连接，但 EasyEDA Pro 扩展未连接。"
+                            "请打开 EasyEDA Pro、安装对应扩展并允许外部交互。")
+            except (mcp_client.MCPError, ValueError, TypeError):
+                pass
+        return result
     finally:
         sess.close()
 
@@ -783,138 +447,6 @@ def vision_extract_params(image_b64: str, root: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------- 注册代管（L0/L1/L2 降级链）
-
-# provider 适配器注册表（数据驱动）：新增 provider = 加一条数据，**不改状态机**。
-# 字段含义：
-#   tier              该 provider 的自动化档（L0 全自动 / L1 自动填表但停在提交或挑战前，
-#                     由用户点后 resume / L2 仅给指引不自动）
-#   aliases           匹配 provider 名 / 来源域 / 产品名的别名（配合域名兜底）
-#   domains           导航可信域（注册页主机必须落在其中，防跨域填凭证）
-#   register_url      注册 / 取凭证页
-#   deep_link         官方预填深链（可选；覆盖 register_url）
-#   fields            确定性填表动作序列 [{selector, action, value}]
-#   submit            提交按钮选择器（空串 = 不需要提交）
-#   auto_submit       是否允许自动点击 submit；默认 False。§5 denylist：创建长期令牌/PAT
-#                     等动作绝不自动 → 保持 False，填到提交前停下走 L1；仅「揭示/复制已存在
-#                     凭证」（如 Stripe 测试键）可设 True
-#   token_selectors   凭证白名单 DOM 选择器集（只读，绝不 eval 页面脚本）
-#   token_pattern     凭证正则（命中才捕获，避免把噪声当凭证）
-#   secret_provider   secrets_store 落库用的 provider key
-#   user_prompt       L1 停等待时给用户看的提示
-DEFAULT_USER_PROMPT = "如页面出现登录 / 验证 / 授权，请在浏览器中完成后点“继续”。"
-
-PROVIDER_ADAPTERS: dict[str, dict[str, Any]] = {
-    "github": {
-        "tier": "L1",  # §7：创建长期令牌不可自动 → 自动填表停在提交前，用户点后 resume
-        "aliases": ("github", "github.com", "github pat", "personal access token"),
-        "domains": ("github.com",),
-        "register_url": "https://github.com/settings/tokens/new",
-        "deep_link": ("https://github.com/settings/tokens/new"
-                      "?description=DocMind&scopes=repo%2Cread%3Auser"),
-        "fields": [{"selector": "#oauth_access_description", "action": "fill", "value": "DocMind"}],
-        "submit": "button:has-text('Generate token')",
-        "auto_submit": False,  # 创建长期令牌属 §5 denylist：绝不自动提交，留给用户点
-        "token_selectors": ["#new-oauth-token", "code.js-token-value",
-                            "input[readonly][type='text']", "code"],
-        "token_pattern": r"ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}",
-        "secret_provider": "github",
-        "user_prompt": "GitHub 需登录与两步验证，请在浏览器中完成后点“继续”。",
-    },
-    "figma": {
-        "tier": "L1",  # §7：创建长期令牌不可自动 → 自动填表停在提交前，用户点后 resume
-        "aliases": ("figma", "figma.com"),
-        "domains": ("figma.com", "www.figma.com"),
-        "register_url": "https://www.figma.com/settings/",
-        "deep_link": "https://www.figma.com/settings/",
-        "fields": [
-            {"selector": "a[href*='personal-access-tokens']", "action": "click"},
-            {"selector": "button:has-text('Generate new token')", "action": "click"},
-        ],
-        "submit": "button:has-text('Generate token')",
-        "auto_submit": False,  # 创建长期令牌属 §5 denylist：绝不自动提交，留给用户点
-        "token_selectors": ["input[readonly][type='text']", "code"],
-        "token_pattern": r"figd_[A-Za-z0-9_-]{20,}",
-        "secret_provider": "figma",
-        "user_prompt": "Figma 需登录，请在浏览器中完成后点“继续”。",
-    },
-    "stripe": {
-        "tier": "L0",
-        "aliases": ("stripe", "stripe.com", "stripe test", "stripe test key"),
-        "domains": ("dashboard.stripe.com", "stripe.com"),
-        "register_url": "https://dashboard.stripe.com/test/apikeys",
-        "deep_link": "https://dashboard.stripe.com/test/apikeys",
-        "fields": [],
-        "submit": "",
-        "auto_submit": True,  # 仅揭示/复制已存在测试键（无创建动作），可自动
-        "token_selectors": ["input[readonly][type='text']", "code"],
-        "token_pattern": r"sk_test_[A-Za-z0-9]{16,}|rk_test_[A-Za-z0-9]{16,}",
-        "secret_provider": "stripe",
-        "user_prompt": "Stripe 测试密钥页需登录，请在浏览器中完成后点“继续”。",
-    },
-    "notion": {
-        "tier": "L1",
-        "aliases": ("notion", "notion.so"),
-        "domains": ("notion.so", "www.notion.so"),
-        "register_url": "https://www.notion.so/my-integrations",
-        "deep_link": "https://www.notion.so/my-integrations",
-        "fields": [],
-        "submit": "",
-        "token_selectors": ["input[readonly]", "code"],
-        "token_pattern": r"secret_[A-Za-z0-9]{20,}|ntn_[A-Za-z0-9]{20,}",
-        "secret_provider": "notion",
-        "user_prompt": "Notion 需登录并在页面内确认集成，请在浏览器中完成后点“继续”。",
-    },
-    "slack": {
-        "tier": "L1",
-        "aliases": ("slack", "slack.com", "slack api"),
-        "domains": ("api.slack.com", "slack.com", "app.slack.com"),
-        "register_url": "https://api.slack.com/apps",
-        "deep_link": "https://api.slack.com/apps",
-        "fields": [],
-        "submit": "",
-        "token_selectors": ["input[readonly]", "code"],
-        "token_pattern": r"xoxb-[A-Za-z0-9-]{20,}|xapp-[A-Za-z0-9-]{20,}",
-        "secret_provider": "slack",
-        "user_prompt": "Slack 需登录并创建工作区应用，请在浏览器中完成后点“继续”。",
-    },
-    "brave": {
-        "tier": "L2",
-        "aliases": ("brave", "brave search", "brave-search"),
-        "domains": ("api.search.brave.com", "brave.com"),
-        "register_url": "https://api.search.brave.com/app/keys",
-        "note": "Brave Search API 需绑定信用卡，首版不做自动注册，请手动创建后回填。",
-    },
-    "google_drive": {
-        "tier": "L2",
-        "aliases": ("google drive", "googledrive", "google_drive", "gdrive"),
-        "domains": ("console.cloud.google.com", "console.developers.google.com"),
-        "register_url": "https://console.cloud.google.com/apis/credentials",
-        "note": "Google Drive 需 Cloud Console 多步配置 + OAuth，首版不做自动注册，请手动创建后回填。",
-    },
-    "smithery": {
-        "tier": "L2",  # Smithery 用统一 API Key 代理各 server 的第三方凭证，首版手动回填
-        "aliases": ("smithery", "smithery.ai", "smithery api"),
-        "domains": ("smithery.ai", "www.smithery.ai", "server.smithery.ai"),
-        "register_url": "https://smithery.ai/account/api-keys",
-        "note": "Smithery 用统一 API Key 代理各 server 的第三方凭证。请先登录 smithery.ai"
-                "（未登录点击会回到首页），再在「Account → API Keys」创建 Key 后回填。",
-    },
-}
-
-# 挑战关键字（本地确定性匹配，只用于「停-继续」判定；页面正文绝不回传模型）。
-CHALLENGE_KEYWORDS: tuple[str, ...] = (
-    "captcha", "recaptcha", "hcaptcha", "cloudflare", "verify you are human",
-    "two-factor", "2fa", "authentication code", "one-time code", "one time code",
-    "verify your email", "confirm your email", "check your email",
-    "enter the code", "enter your password", "confirm your password",
-    "sign in to continue", "sign in to your account", "log in to continue",
-    "add a payment method", "payment method required",
-)
-
-# URL 路径标记（登录/授权跳转即视为需人工的挑战）。
-CHALLENGE_URL_MARKERS: tuple[str, ...] = (
-    "/login", "/signin", "/sign_in", "/session", "/auth/", "/oauth",
-)
 
 # 进程内 live 会话注册表（仿 mcp_client._SESSIONS）：磁盘 context_dir 作崩溃恢复兜底。
 _BROWSER_SESSIONS: dict[str, dict[str, Any]] = {}
@@ -960,52 +492,6 @@ def _playwright_available() -> bool:
 def _new_task_id() -> str:
     import uuid
     return f"ac_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
-
-
-def select_provider_adapter(provider: str, cand: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
-    """按 provider 名 / MCP server 自有 URL 解析适配器；未收录返回 None（→ L2）。
-
-    注意：cand["provenance"] 是**来源代码仓库**（如 github.com/...），并非凭证签发方，
-    因此**不参与** adapter 匹配——否则任何以 GitHub 为仓库的候选（mcp_server_index
-    多数 curated 条目 provenance.domain == "github.com"）都会被误路由到 github adapter
-    （其 aliases 含 "github.com" 且排在 PROVIDER_ADAPTERS 首位），导致「去官网创建凭证」
-    错误地打开 GitHub PAT 页。匹配只基于：
-      (1) 凭证 provider 名（如 "smithery_api_key" / "postgres" / "github"）
-      (2) MCP server 自身的 url 域（host 兜底）
-    纯数据查找，无副作用。新增 provider 只需往 PROVIDER_ADAPTERS 加一条数据。
-    """
-    parts = [str(provider or "")]
-    if isinstance(cand, dict):
-        parts += [str(cand.get("url", ""))]
-    hay = " ".join(parts).lower()
-    for name, adapter in PROVIDER_ADAPTERS.items():
-        for alias in adapter.get("aliases", ()):
-            if alias and alias.lower() in hay:
-                return {"name": name, **adapter}
-    for token in parts:  # 域名兜底
-        found = _adapter_by_url(token)
-        if found:
-            return found
-    return None
-
-
-def _adapter_by_url(url: str) -> Optional[dict[str, Any]]:
-    host = _domain_of(url)
-    if not host:
-        return None
-    for name, adapter in PROVIDER_ADAPTERS.items():
-        for dom in adapter.get("domains", ()):
-            if host == dom or host.endswith("." + dom):
-                return {"name": name, **adapter}
-    return None
-
-
-def _provider_url_trusted(url: str, adapter: dict[str, Any]) -> bool:
-    """导航限定：注册页主机必须落在适配器可信域（防跨域重定向填凭证）。"""
-    host = _domain_of(url)
-    if not host:
-        return False
-    return any(host == dom or host.endswith("." + dom) for dom in adapter.get("domains", ()))
 
 
 def _launch_edge(context_dir: str) -> tuple[Any, Any]:

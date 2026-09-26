@@ -443,8 +443,10 @@ class _StdioSession:
         self._next_id = 0
         self._dead_reason = ""
         self._stop = threading.Event()
-        threading.Thread(target=self._pump_stdout, daemon=True).start()
-        threading.Thread(target=self._pump_stderr, daemon=True).start()
+        self._stdout_thread = threading.Thread(target=self._pump_stdout, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._pump_stderr, daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
 
     def _pump_stdout(self):
         try:
@@ -517,18 +519,25 @@ class _StdioSession:
         except MCPError:
             pass
 
-    def initialize(self):
+    def initialize(self, timeout=INIT_TIMEOUT):
         result = self.request("initialize", {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": CLIENT_INFO,
-        }, timeout=INIT_TIMEOUT)
+        }, timeout=timeout)
         self.notify("notifications/initialized")
         return result or {}
 
     def close(self):
         self._stop.set()
         try:
+            # Windows 上 npx.CMD 会再启动 node。仅终止 cmd 会留下持有 stdout 管道的
+            # 子进程，随后 close 管道会一直等 reader 线程退出。
+            if os.name == "nt" and self.proc.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=5, check=False,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             self.proc.terminate()
             self.proc.wait(timeout=3)
         except Exception:
@@ -536,12 +545,20 @@ class _StdioSession:
                 self.proc.kill()
             except Exception:
                 pass
-        for pipe in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+        for pipe in (self.proc.stdin,):
             try:
                 if pipe:
                     pipe.close()
             except Exception:
                 pass
+        for thread, pipe in ((self._stdout_thread, self.proc.stdout),
+                             (self._stderr_thread, self.proc.stderr)):
+            thread.join(timeout=1)
+            if not thread.is_alive() and pipe:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
 
 
 _SESSIONS = {}

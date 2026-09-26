@@ -302,8 +302,65 @@ class ChatSseWorkflowEventTests(unittest.TestCase):
                 if line.startswith("data: "):
                     types.append(json.loads(line[6:]).get("type"))
             self.assertIn("workflow", types)
+            self.assertIn("notice", types)
             # 取走即清：整个 SSE 流只补发一次
             self.assertEqual(types.count("workflow"), 1)
+        finally:
+            config.set_runtime("llm_provider", old_provider or "")
+
+    def test_chat_stream_emits_heartbeat_while_agent_waits(self):
+        import config
+        import time
+        from starlette.testclient import TestClient
+        import api
+
+        old_provider = config.get_runtime("llm_provider")
+        old_heartbeat = api.CHAT_STREAM_HEARTBEAT_S
+        config.set_runtime("llm_provider", "ollama")
+        api.CHAT_STREAM_HEARTBEAT_S = 0.01
+        try:
+            def fake_run(self, *args, **kwargs):
+                time.sleep(0.05)
+                yield {"type": "final", "text": "等待后完成"}
+
+            with __import__("unittest.mock", fromlist=["patch"]).patch.object(
+                    api, "check_ollama",
+                    return_value={"reachable": True, "guidance": ""}), \
+                 __import__("unittest.mock", fromlist=["patch"]).patch.object(
+                    api.Agent, "run", fake_run):
+                with TestClient(api.app) as client:
+                    resp = client.post("/api/chat", data={"question": "等待模型"})
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("模型仍在处理", resp.text)
+            self.assertIn("等待后完成", resp.text)
+        finally:
+            api.CHAT_STREAM_HEARTBEAT_S = old_heartbeat
+            config.set_runtime("llm_provider", old_provider or "")
+
+    def test_chat_stream_passes_cancellation_event_to_agent(self):
+        import config
+        from starlette.testclient import TestClient
+        import api
+
+        old_provider = config.get_runtime("llm_provider")
+        seen = {}
+        config.set_runtime("llm_provider", "ollama")
+        try:
+            def fake_run(self, *args, **kwargs):
+                seen["cancel_event"] = kwargs.get("cancel_event")
+                yield {"type": "final", "text": "已完成"}
+
+            with __import__("unittest.mock", fromlist=["patch"]).patch.object(
+                    api, "check_ollama",
+                    return_value={"reachable": True, "guidance": ""}), \
+                 __import__("unittest.mock", fromlist=["patch"]).patch.object(
+                    api.Agent, "run", fake_run):
+                with TestClient(api.app) as client:
+                    resp = client.post("/api/chat", data={"question": "验证取消链路"})
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("已完成", resp.text)
+            self.assertIsNotNone(seen.get("cancel_event"))
+            self.assertTrue(hasattr(seen["cancel_event"], "is_set"))
         finally:
             config.set_runtime("llm_provider", old_provider or "")
 

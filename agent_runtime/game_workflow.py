@@ -9,6 +9,7 @@ an equivalent StateGraph; otherwise callers use the deterministic methods on
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import re
@@ -25,6 +26,11 @@ from pathlib import Path
 from typing import Annotated, Any, Callable, Iterable, Mapping, TypedDict
 
 from config import STATE_ROOT
+from .acceptance_contract import AcceptanceError, approve as approve_acceptance
+from .acceptance_contract import (from_tasks as acceptance_from_tasks,
+                                  on_plan_changed as acceptance_on_plan_changed,
+                                  revise as revise_acceptance)
+from .preview_adapters import build_preview_bundle
 from .context_router import (CONTEXT_LAYERS, ContextPlan, ContextRouter,
                              allocate_layer_budgets, compress_context,
                              compress_context_async, compress_layers,
@@ -267,6 +273,9 @@ class WorkflowState:
     subagents: list[dict[str, Any]] = field(default_factory=list)
     results: dict[str, Any] = field(default_factory=dict)
     review: dict[str, Any] = field(default_factory=dict)
+    acceptance_contract: dict[str, Any] = field(default_factory=dict)
+    preview: dict[str, Any] = field(default_factory=dict)
+    visual_feedback: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     interrupt_reason: str = ""
     error: str = ""
@@ -708,8 +717,11 @@ class GameWorkflowManager:
     def _path(self, workflow_id: str) -> Path:
         return self.state_root / (re.sub(r"[^A-Za-z0-9_-]", "", workflow_id) + ".json")
 
-    def _save(self, state: WorkflowState) -> WorkflowState:
+    def _save(self, state: WorkflowState, *, register: bool = True,
+              strict: bool = False) -> WorkflowState:
         state.updated_at = _now()
+        if state.results or state.review:
+            state.preview = build_preview_bundle(state.public())
         # Persist bounded content snapshots, not only layer counters. This is
         # the cross-window handoff consumed after a process/checkpoint restart.
         raw_layers = dict(state.context_layers or {})
@@ -736,9 +748,11 @@ class GameWorkflowManager:
         try:
             self._path(state.workflow_id).write_text(
                 json.dumps(state.public(), ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError:
-            pass
-        self._states[state.workflow_id] = state
+        except OSError as exc:
+            if strict:
+                raise WorkflowError("工作流记录保存失败") from exc
+        if register or state.workflow_id in self._states or state.status in self._TERMINAL_STATUSES:
+            self._states[state.workflow_id] = state
         if state.status in {"completed", "failed"}:
             try:
                 from .langsmith import export_workflow, finish_workflow
@@ -1548,6 +1562,7 @@ class GameWorkflowManager:
             # approval/execute without a second planning request.
             if graph_view.get("tasks") and graph_view.get("status") in {"planned", "awaiting_approval"}:
                 state.tasks = [dict(item) for item in graph_view.get("tasks") or []]
+                state.acceptance_contract = acceptance_from_tasks(state.tasks)
                 state.status = "planned"
                 state.phase = "execute"
                 state.interrupt_reason = ""
@@ -1734,7 +1749,14 @@ class GameWorkflowManager:
         if tasks is None:
             task_source = "deterministic"
             tasks = get_profile(state.kind).fallback_tasks()
+        previous_plan = [(item.get("id"), item.get("task")) for item in state.tasks]
         state.tasks = [dict(t) for t in list(tasks)[:policy.max_subagents]]
+        next_plan = [(item.get("id"), item.get("task")) for item in state.tasks]
+        if previous_plan != next_plan or not state.acceptance_contract.get("items"):
+            state.acceptance_contract = acceptance_on_plan_changed(
+                state.acceptance_contract, state.tasks)
+            if state.acceptance_contract["revision"] > 1:
+                state.policy["approval_mode"] = "safe"
         # 步数预算随任务规模放大（几个 Agent 并行调工具，总调用次数成倍增加）：
         # 调用方显式给过 max_steps（含低于自动下限的低值）时尊重显式值；
         # 否则按 n*子代理默认+4 自动推算并夹在配置区间内。
@@ -2398,6 +2420,7 @@ class GameWorkflowManager:
             except Exception as exc:
                 report["merged"] = "（结果合成失败：%s）" % type(exc).__name__
         state.results = report
+        state.preview = build_preview_bundle(state.public())
         # A dispatcher can expand the task graph during execution. Keep the
         # durable workflow/task roster aligned with the effective graph so the
         # workbench shows the actual members rather than the initial seed only.
@@ -2500,6 +2523,13 @@ class GameWorkflowManager:
                 self._resume_gate(state, "approval", {"approved": False})
             self._event(state, "approval_denied")
         else:
+            # The plan and its acceptance conditions are approved together.
+            # Model-generated criteria cannot approve themselves.
+            if state.acceptance_contract.get("items"):
+                try:
+                    state.acceptance_contract = approve_acceptance(state.acceptance_contract)
+                except AcceptanceError as exc:
+                    raise WorkflowError(str(exc)) from exc
             state.status, state.phase = "planned", "execute"
             state.policy["approval_mode"] = "high"
             state.interrupt_reason = ""
@@ -2530,6 +2560,149 @@ class GameWorkflowManager:
         self._workflow_hook(state, "after_approval", approved=bool(approved),
                             task_count=len(state.tasks))
         return self._save(state).public()
+
+    def set_acceptance_contract(self, workflow_id: str,
+                                items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+        """User edits criteria at the plan gate; active execution is immutable."""
+        with self._lock:
+            state = self._load(workflow_id)
+            if state.status not in {"planned", "awaiting_approval", "planning", "interrupted"}:
+                raise WorkflowError("当前阶段不能修改验收条件")
+            try:
+                state.acceptance_contract = revise_acceptance(
+                    state.acceptance_contract, items)
+            except AcceptanceError as exc:
+                raise WorkflowError(str(exc)) from exc
+            if state.policy.get("approval_mode") == "high" and state.status == "planned":
+                state.policy["approval_mode"] = "safe"
+            self._event(state, "acceptance_revised",
+                        revision=state.acceptance_contract["revision"],
+                        item_count=len(state.acceptance_contract["items"]))
+            return self._save(state).public()
+
+    def decide_acceptance(self, workflow_id: str, approved: bool,
+                          note: str = "") -> dict[str, Any]:
+        """Record the user's final decision; a Harness review is only evidence."""
+        with self._lock:
+            state = self._load(workflow_id)
+            if state.status != "completed":
+                raise WorkflowError("工作流尚未完成，不能最终验收")
+            contract = dict(state.acceptance_contract or {})
+            if not contract.get("items"):
+                raise WorkflowError("工作流没有验收条件")
+            if contract.get("final_decision") == "accepted":
+                raise WorkflowError("工作流已经验收")
+            contract["final_decision"] = "accepted" if approved else "rejected"
+            contract["final_note"] = _clean_text(note, 2000)
+            state.acceptance_contract = contract
+            self._event(state, "acceptance_decided", approved=bool(approved))
+            return self._save(state).public()
+
+    def record_visual_feedback(self, workflow_id: str,
+                               feedback: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist a bounded user feedback record with the workflow evidence."""
+        with self._lock:
+            state = self._load(workflow_id, register=False)
+            note = _clean_text(feedback.get("note") or feedback.get("message"), 4000)
+            if not note:
+                raise WorkflowError("视觉反馈不能为空")
+            region = feedback.get("region") if isinstance(feedback.get("region"), Mapping) else None
+            safe_region = None
+            if region:
+                try:
+                    values = {key: float(region.get(key) or 0) for key in ("x", "y", "width", "height")}
+                    if not all(math.isfinite(value) for value in values.values()):
+                        raise ValueError("nonfinite region")
+                    safe_region = {key: max(0.0, min(100.0, value)) for key, value in values.items()}
+                    safe_region["width"] = min(safe_region["width"], 100 - safe_region["x"])
+                    safe_region["height"] = min(safe_region["height"], 100 - safe_region["y"])
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise WorkflowError("标注区域坐标无效") from exc
+            feedback_id = str(feedback.get("id") or uuid.uuid4().hex)
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", feedback_id):
+                raise WorkflowError("反馈标识无效")
+            existing = next((row for row in state.visual_feedback if row.get("id") == feedback_id), None)
+            if existing is not None:
+                return {"feedback": dict(existing), "items": state.visual_feedback}
+            item = {
+                "id": feedback_id,
+                "artifact_id": _clean_text(feedback.get("artifact_id"), 100),
+                "label": _clean_text(feedback.get("label") or "实时画面", 240),
+                "note": note,
+                "region": safe_region,
+                "screenshot": False,
+                "sent_at": _clean_text(feedback.get("sent_at") or _now(), 64),
+                "status": "pending",
+                "snapshots": {},
+            }
+            state.visual_feedback = [item] + [
+                dict(row) for row in state.visual_feedback
+                if isinstance(row, Mapping) and str(row.get("id") or "") != item["id"]
+            ]
+            state.visual_feedback = state.visual_feedback[:20]
+            self._event(state, "visual_feedback_recorded", feedback_id=item["id"],
+                        screenshot=item["screenshot"])
+            saved = self._save(state, register=False, strict=True).public()
+            return {"feedback": item, "items": saved.get("visual_feedback") or []}
+
+    def update_visual_feedback(self, workflow_id: str, feedback_id: str,
+                               status: str, detail: str = "") -> dict[str, Any]:
+        from .visual_feedback import FEEDBACK_STATUSES
+        if status not in FEEDBACK_STATUSES:
+            raise WorkflowError("反馈状态无效")
+        with self._lock:
+            state = self._load(workflow_id, register=False)
+            item = next((row for row in state.visual_feedback if row.get("id") == feedback_id), None)
+            if item is None:
+                raise WorkflowError("视觉反馈不存在")
+            item.update(status=status, detail=_clean_text(detail, 1000), updated_at=_now())
+            self._event(state, "visual_feedback_updated", feedback_id=feedback_id, feedback_status=status)
+            self._save(state, register=False, strict=True)
+            return {"feedback": dict(item)}
+
+    def save_visual_snapshot(self, workflow_id: str, feedback_id: str,
+                             phase: str, image_base64: str) -> dict[str, Any]:
+        from .visual_feedback import decode_snapshot, evidence_path
+        try:
+            image, metadata = decode_snapshot(image_base64)
+            path = evidence_path(self.state_root, workflow_id, feedback_id, phase)
+        except ValueError as exc:
+            raise WorkflowError(str(exc)) from exc
+        with self._lock:
+            state = self._load(workflow_id, register=False)
+            item = next((row for row in state.visual_feedback if row.get("id") == feedback_id), None)
+            if item is None:
+                raise WorkflowError("视觉反馈不存在")
+            if phase == "before" and (item.get("snapshots") or {}).get("before"):
+                raise WorkflowError("修改前截图已保存，不能覆盖")
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_suffix(".tmp")
+                temporary.write_bytes(image)
+                temporary.replace(path)
+            except OSError as exc:
+                raise WorkflowError("截图保存失败") from exc
+            snapshots = dict(item.get("snapshots") or {})
+            snapshots[phase] = dict(metadata, captured_at=_now())
+            item.update(snapshots=snapshots, screenshot=bool(snapshots.get("before")))
+            self._event(state, "visual_snapshot_saved", feedback_id=feedback_id, snapshot_phase=phase)
+            self._save(state, register=False, strict=True)
+            return {"feedback": dict(item)}
+
+    def visual_snapshot_path(self, workflow_id: str, feedback_id: str, phase: str) -> Path:
+        from .visual_feedback import evidence_path
+        with self._lock:
+            state = self._load(workflow_id, register=False)
+            item = next((row for row in state.visual_feedback if row.get("id") == feedback_id), None)
+            if item is None or not (item.get("snapshots") or {}).get(phase):
+                raise WorkflowError("截图不存在")
+            try:
+                path = evidence_path(self.state_root, workflow_id, feedback_id, phase)
+            except ValueError as exc:
+                raise WorkflowError(str(exc)) from exc
+            if not path.is_file():
+                raise WorkflowError("截图文件不存在")
+            return path
 
     def interrupt(self, workflow_id: str, reason: str = "用户请求中断") -> dict[str, Any]:
         state = self._load(workflow_id)
@@ -2579,6 +2752,9 @@ class GameWorkflowManager:
             self._event(state, "dag_revision_denied")
         else:
             state.tasks = [dict(item) for item in state.pending_tasks]
+            state.acceptance_contract = acceptance_on_plan_changed(
+                state.acceptance_contract, state.tasks)
+            state.policy["approval_mode"] = "safe"
             state.pending_tasks = []
             state.results = {}
             state.review = {}

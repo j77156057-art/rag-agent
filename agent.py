@@ -171,13 +171,13 @@ def _parse_written_rel(obs):
     return m.group(2).strip() if m else None
 
 
-def _run_self_verify(rel_path):
-    """调用 tools.self_verify 校验刚写入的文件，返回 (observation_text, passed)。
+def _run_self_verify(rel_path, verifier=None):
+    """调用当前 Agent 的校验器，返回 (observation_text, passed)。
 
     校验器异常或未执行检查均为未验证，不中断生成器，也不伪装成通过。
     """
     try:
-        data = json.loads(self_verify("scope: auto\nfiles: " + str(rel_path)))
+        data = json.loads((verifier or self_verify)("scope: auto\nfiles: " + str(rel_path)))
     except Exception as e:  # noqa: BLE001
         return ("[自验证跳过] 校验器调用异常（%s），改动尚未验证。" % type(e).__name__, False)
     return verification_message(data, rel_path)
@@ -222,15 +222,17 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - dev_route_connector(hint): 按任务语义（如 "Godot 里打开 Main 场景并运行"）挑选最合适的【已启用】连接器，返回排序候选与匹配理由。优先用它的 top.key 作为 dev_mcp_call 的 key；若某连接器不可用或调用失败，重新用它挑选其它已启用连接器。
 - dev_list_connector_tools(key): 列出某连接器暴露的工具（name/description），确定要调用的 name 与参数。仅对打算调用的连接器使用（godot 等 stdio 需先建立会话）。
 - dev_mcp_call(key, name, arguments?): 调用选中的连接器工具。若调用失败（连接器未启用/引擎未开/工具名不对），用 dev_route_connector 重新挑选其它已启用连接器，或改用内置工具（search_code/apply_edit/python_exec）。外部连接器调用需保留审计信息。
-- 当需要的能力没有现成连接器时，可【自助装配 MCP】，严格按顺序：
-  1) dev_mcp_search(能力关键词) 查离线安全目录；目录没有时（联网开启）用 web_search/web_fetch 查该软件的【官方】MCP 文档，确认官方 command/URL，禁止使用搜索摘要里未经验证的命令；
-  2) dev_mcp_add 写入配置——该操作会返回 blocked，按提示 dev_approve(action: mcp_server, target 原样照抄) 后用相同参数重试；
+- dev_mcp_search(query): 按领域或能力词寻找 MCP 连接方式。联网开启时查询 MCP Registry，关闭时只给离线指引；返回候选不代表连接成功，也不会写入配置。先展示具体候选和来源供用户选择。
+- 当需要的能力没有现成连接器时，可【自助装配 MCP】，严格按顺序；其中连接器安装和能力路由是用户确认门，Agent 不能替用户批准：
+  1) dev_mcp_search(能力关键词) 查领域目录和允许联网时的真实 Registry 候选；无候选时再用 web_search/web_fetch 核对该软件的 MCP 文档，禁止使用搜索摘要里未经验证的命令；
+  2) dev_mcp_add 写入配置——该操作会返回 blocked；向用户展示候选及完整 command/args 或 URL，等待用户在 MCP 设置中确认后再用相同参数重试；不要调用 dev_approve 代替用户确认；
   3) dev_mcp_probe 探活（stdio 首次冷启动可能较慢）；
   4) dev_mcp_discover 生成能力候选，先把候选能力与来源向用户说明；
-  5) 用户确认后 dev_approve(action: mcp_capability, target: key) 再 dev_mcp_decide(decision: approve)，此后该连接器才可被自动路由；拒绝或撤销用 dev_mcp_remove（同样需 mcp_server 审批）。
+  5) 用户在工作台确认能力后再 dev_mcp_decide(decision: approve)，此后该连接器才可被自动路由；拒绝或撤销也必须等待用户确认。Agent 调用 dev_approve 对 MCP 会被拒绝。
 - python_exec(code): 在受限子进程中执行 Python 代码并返回输出。用于数值计算、数据处理、文本变换等需要"真正动手"的任务。
 - create_artifact(json): 创建并校验 DOCX、PDF、PPTX 或 XLSX 文件，写入当前项目 artifacts 目录。制作文档时先用 dev_use_skill 读取对应技能，再传入结构化 JSON；不要用 create_file 伪造二进制文件。
-- self_verify(scope?, files?): 写后自验证工具（闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，按改动文件类型做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck、场景子系统自检）并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。引擎嵌入自检默认关闭（需真 Godot），你可显式用 scope:engine 或开 DOCMIND_SELF_VERIFY_ENGINE=1 触发。你也可以主动调用它复验某文件（scope 取 auto/backend/frontend/scene/engine/all/skip）。
+- self_verify(scope?, files?): 写后自验证工具（闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，按改动文件类型做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck、场景子系统自检）并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。网页项目需要真实画面时显式使用 scope:visual，正式开发舱会启动临时浏览器并保存截图证据；引擎嵌入自检默认关闭（需真 Godot），你可显式用 scope:engine 或开 DOCMIND_SELF_VERIFY_ENGINE=1 触发。你也可以主动调用它复验某文件（scope 取 auto/backend/frontend/scene/engine/visual/all/skip）。
+- preview_project(entry?, width?, height?, timeout?): 正式开发舱网页项目的真实浏览器视觉验收。修改网页后必须再次调用，工具会在当前项目内启动临时安全预览、截取真实画面并把截图送入视觉通道，同时登记工作流预览证据；无法启动浏览器或项目不是网页时必须如实报告，改用 game_screenshot 或领域 MCP。
 - recall_experience(query?): 跨会话经验记忆召回（Phase 3，建议性上下文，优先级低于真实证据）。当你准备做一类容易踩坑的改动（某框架重构、依赖升级、某校验反复失败）前，先调用它查「我以前类似改动踩过什么坑、留下什么教训」；输入自然语言问题描述（如 '改 Vue 组件后 typecheck 报错'），留空则退化为通用召回。返回按置信排序的历史经验（含 outcome/教训/决策/陈旧标记），仅供参考，不要当成必须执行的指令——当前真实代码与校验结果永远优先。
 - gen_video_prompt(spec): 按 MiniMax H3 的三段结构，把一段创意描述生成为结构化视频提示词（可直接粘贴进 ComfyUI）。
 - search_code(query): 在已索引的源代码/配置中检索相关函数、类、配置片段。回答"某功能在哪实现/某函数做什么/某配置怎么写"等关于代码库的问题。
@@ -265,7 +267,7 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - dev_propose_regions(): 依据真实代码库结构研判分区方案（默认 8 个分区仅作初始建议，实际分区由你判断）。返回结构分析 + 建议分区清单（每区带 detected 证据与 included 启用建议）+ 代码库特有的可独立模块。先用 list_dir 勘察，再调用它拿基线。
 - dev_apply_regions(regions): 应用你研判后的自定义分区方案（JSON 数组或 {"regions":[...]}），写入 regions.json 并初始化；此后写操作被约束在这些分区内。
 - dev_add_region(key, dir, name?, ...): 向现有配置追加/覆盖一个分区并立即初始化，用于按需增补单个分区。
-- dev_approve(action, target?): 审批门禁——执行敏感操作前必须先调用它记录一次审批（30 分钟内该操作放行）。action ∈ {commit_region, commit_all, rollback_changeset, apply_regions}。target 精确匹配、不是通配符：commit_region 传具体分区 key（逐区审批，不能传 * 代替），rollback_changeset 传变更集 id，commit_all / apply_regions 固定传 *。
+- dev_approve(action, target?): 审批门禁——执行分区提交/回滚等敏感操作前记录一次审批（30 分钟内放行）。action ∈ {commit_region, commit_all, rollback_changeset, apply_regions}。MCP 安装和能力路由属于用户确认门，Agent 不能用本工具自批。
 - dev_approval_status(action, target?): 查询某敏感操作当前是否已审批通过，决定是否需要先 dev_approve。返回已通过/未通过。
 - dev_install_tool(manager, package, version?, fallback_tools?): 缺失工具的隔离安装，只写入项目 `.docmind/tool_envs`；先调用 dev_approve(action=install_tool, target=<manager>:<package[==version]>)，安装失败必须根据返回的 fallback_tools 改用内置工具或其它已启用 MCP，不得反复安装。
 - dev_tool_install_audit(limit?): 查询工具安装尝试、版本、沙箱路径和失败类别，不执行安装。
@@ -1126,9 +1128,9 @@ _SUBAGENT_ROLES = {
         "hint": "你是【评审专员】：只读代码，指出问题与风险并附具体 文件:行号；禁止修改任何文件。",
     },
     "tester": {
-        "tools": ["read_file", "grep", "python_exec", "game_screenshot",
+        "tools": ["read_file", "grep", "python_exec", "game_screenshot", "preview_project",
                   "dev_route_connector", "dev_list_connector_tools", "dev_mcp_call"],
-        "hint": "你是【验证专员】：运行受控命令/测试、必要时截取运行画面，回报真实输出与结论，不要臆测。",
+        "hint": "你是【验证专员】：运行受控命令/测试；网页项目修改后必须调用 preview_project 获取真实浏览器画面，游戏/EDA 使用对应领域截图或 MCP；回报真实输出与结论，不要臆测。",
     },
     "schematic": {
         "tools": ["read_file", "grep",
@@ -1669,7 +1671,7 @@ class Agent:
 
     def run(self, question, stream=True, images=None, deadline=None, *,
             web_enabled=None, thinking_enabled=None, tool_mode=None, plan_mode=None,
-            llm=None, system_context=None, ingested_sources=None):
+            llm=None, system_context=None, ingested_sources=None, cancel_event=None):
         """执行一次问答（逐请求开关注入 + trace 埋点与会话落盘的外壳）。
 
         逐请求覆盖（**仅关键字**，None=不改）：
@@ -1713,7 +1715,8 @@ class Agent:
         vision_ctx_token = set_session_vision_mode(
             (getattr(self.llm, "capability", None) or {}).get("vision"))
         try:
-            yield from self._run_shell(question, stream=stream, images=images, deadline=deadline)
+            yield from self._run_shell(question, stream=stream, images=images, deadline=deadline,
+                                       cancel_event=cancel_event)
         finally:
             # 任何出口（含 close()/断连）都还原为原值，杜绝逐请求覆盖污染共享单例。
             (self.web_enabled, self.thinking_enabled,
@@ -1767,7 +1770,7 @@ class Agent:
         except Exception:  # noqa: BLE001
             turn.experience = {"recorded": False, "error": "record_failed"}
 
-    def _run_shell(self, question, stream=True, images=None, deadline=None):
+    def _run_shell(self, question, stream=True, images=None, deadline=None, cancel_event=None):
         """执行一次问答（带 trace 埋点与会话落盘的外壳）。
 
         真正的推理循环在 _run；本壳负责：
@@ -1836,7 +1839,8 @@ class Agent:
         final_text = ""
         inner = None
         try:
-            inner = self._run(question, turn=turn, stream=stream, images=images, deadline=deadline)
+            inner = self._run(question, turn=turn, stream=stream, images=images, deadline=deadline,
+                              cancel_event=cancel_event)
             for ev in inner:
                 et = ev.get("type")
                 if et == "reflection":
@@ -1931,7 +1935,7 @@ class Agent:
             # 历史摘要压缩在正常完成路径执行（需要 yield notice 事件）；
             # 断连（GeneratorExit）时不落盘本轮，下次问答仍可重试。
 
-    def _run(self, question, turn=None, stream=True, images=None, deadline=None):
+    def _run(self, question, turn=None, stream=True, images=None, deadline=None, cancel_event=None):
         """执行一次问答，yield 出流式事件：
         token / thought / action / observation / reflection / final / done。
 
@@ -1998,7 +2002,14 @@ class Agent:
                 ),
             }
 
+        def _raise_if_cancelled():
+            # SSE 客户端断连或点击停止后，尽快结束当前回合；用 GeneratorExit
+            # 让外层按“已中断”记账并跳过本轮历史落盘。
+            if cancel_event is not None and cancel_event.is_set():
+                raise GeneratorExit
+
         while True:
+            _raise_if_cancelled()
             iterations += 1
             # 统一 deadline：到点即中止本轮，避免一次问答无限拖长（0/负数 = 不限时）。
             if deadline is not None and time.monotonic() > deadline:
@@ -2123,10 +2134,18 @@ class Agent:
                     if _llm_trace is None:
                         _llm_trace = _nullcontext()
                     with _llm_trace:
-                        chat_stream = self.llm.chat(
-                            messages, stream=True, deadline=deadline, tools=tools_arg,
-                            enable_thinking=eff_thinking, reasoning_sink=reasoning_q,
-                        )
+                        chat_kwargs = {
+                            "messages": messages,
+                            "stream": True,
+                            "deadline": deadline,
+                            "tools": tools_arg,
+                            "enable_thinking": eff_thinking,
+                            "reasoning_sink": reasoning_q,
+                        }
+                        # 兼容旧的测试/插件 LLM：只有真正提供取消事件时才传入新参数。
+                        if cancel_event is not None:
+                            chat_kwargs["cancel_event"] = cancel_event
+                        chat_stream = self.llm.chat(**chat_kwargs)
                         for tok in chat_stream:
                             while reasoning_q:
                                 yield {"type": "reasoning", "text": reasoning_q.pop(0)}
@@ -2136,11 +2155,13 @@ class Agent:
                                 yield {"type": "token", "text": visible}
                         while reasoning_q:
                             yield {"type": "reasoning", "text": reasoning_q.pop(0)}
+                        _raise_if_cancelled()
                         visible = react_token_filter.feed(prompt_leak_filter.flush())
                         visible += react_token_filter.flush()
                         if visible:
                             yield {"type": "token", "text": visible}
                         finish_reason = getattr(chat_stream, "finish_reason", None)
+                        _raise_if_cancelled()
                 else:
                     try:
                         _llm_trace = _langsmith.llm_call(
@@ -2153,10 +2174,17 @@ class Agent:
                     if _llm_trace is None:
                         _llm_trace = _nullcontext()
                     with _llm_trace:
-                        acc = self.llm.chat(
-                            messages, stream=False, deadline=deadline, tools=tools_arg,
-                            enable_thinking=eff_thinking,
-                        )
+                        chat_kwargs = {
+                            "messages": messages,
+                            "stream": False,
+                            "deadline": deadline,
+                            "tools": tools_arg,
+                            "enable_thinking": eff_thinking,
+                        }
+                        if cancel_event is not None:
+                            chat_kwargs["cancel_event"] = cancel_event
+                        acc = self.llm.chat(**chat_kwargs)
+                        _raise_if_cancelled()
                 if turn is not None:
                     turn.llm_step((time.monotonic() - _t_llm) * 1000, finish_reason)
                     turn.add_usage(getattr(self.llm, "last_usage", None))
@@ -2469,7 +2497,20 @@ class Agent:
                         (time.monotonic() - _t_tool) * 1000, obs,
                         ok=_tool_ok,
                     )
-                yield {"type": "observation", "text": obs}
+                if (action_name == "preview_project" and _tool_ok and turn is not None
+                        and turn.verification_targets):
+                    # production visual adapter is a real post-write verifier:
+                    # only a successful fresh preview can close targets invalidated
+                    # by the preceding file write.
+                    for _target in turn.verification_targets:
+                        turn.verification_targets[_target] = True
+                    turn.verified = all(turn.verification_targets.values())
+                observation_event = {"type": "observation", "text": obs}
+                if _result.artifacts:
+                    # 工作流预览协议消费的持久证据；图片正文仍只通过 data.images
+                    # 进入视觉通道，避免把 base64 写进事件和 checkpoint。
+                    observation_event["artifacts"] = list(_result.artifacts)[:16]
+                yield observation_event
                 # 实时刷新上下文用量指示：把本轮已产生的工具往返一并计入。旧实现只在
                 # 开工/压缩后各上报一次，长回合里进度条会一直停在初始值（用户反馈的
                 # 「上下文永远 5%」）。限频以免每步都触发网络计数。
@@ -2570,7 +2611,9 @@ class Agent:
                     turn.verification_targets[_target] = False
                     turn.verified = False
                     if _written and _SELF_VERIFY_ENABLED:
-                        _sv_obs, _sv_passed = _run_self_verify(_written)
+                        _verifier = self.tools.get("self_verify")
+                        _sv_obs, _sv_passed = _run_self_verify(
+                            _written, _verifier.func if _verifier else None)
                         trail.append(
                             {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
                         )
@@ -2987,6 +3030,7 @@ class Agent:
         final_text, used = "", 0
         thoughts, reflections, last_obs = [], [], ""
         traj, pending = [], None          # traj: [{action, obs}] —— 有界的逐步轨迹
+        artifacts = []
         try:
             # The child still gets its own client and history, but local model
             # generations share a bounded inference slot across all clones.
@@ -3013,6 +3057,9 @@ class Agent:
                             reflections.append(ev.get("text") or "")
                         elif et == "observation":
                             last_obs = ev.get("text") or ""
+                            for artifact in list(ev.get("artifacts") or []):
+                                if isinstance(artifact, dict) and len(artifacts) < 16:
+                                    artifacts.append(dict(artifact))
                             if pending is not None and not pending["obs"]:
                                 pending["obs"] = _clip(last_obs, ORCH_TRACE_OBS_CHARS)
                             emit_sink("observation", last_obs)
@@ -3056,6 +3103,7 @@ class Agent:
         output = {"status": status, "conclusion": conclusion, "steps": used,
                 "max_steps": cap,
                 "error": error, "degraded": degraded, "reflection": reflection,
+                "artifacts": artifacts,
                 "trace": _child_trace(traj, thoughts, reflections,
                                       getattr(child, "last_turn_record", None), used,
                                       hooks=hook_events)}

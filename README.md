@@ -59,7 +59,7 @@ IT 查询助手已经拆分为独立项目 `docmind-it-assistant`；本仓库只
 
 配套：**引擎嵌入**（Godot / Unity / Unreal 启停 + Win32 HWND 嵌进工作台）、**Web 试玩**（导出 WASM 在画布里边玩边改）、**MCP 桥接**、**GPU 租约队列**、**桌面打包**（PyInstaller onedir，双击即用）。
 
-> **MCP 引擎桥接** 与 **Web 试玩导出** 的产品级使用文档与边界说明（配置模型 / API 表 / 调用前置 / 能力边界）见 [`docs/integrations.md`](docs/integrations.md)。设置页的 MCP 面板现在带能力搜索栏：输入 `EDA` / `PCB` / `KiCad` 可查看连接方式、安全配置步骤和联网来源；连接成功后从真实 `tools/list` 生成能力与表单候选，必须人工批准才加入 Agent 路由，不会根据搜索摘要自动安装或执行未知命令。
+> **MCP 引擎桥接** 与 **Web 试玩导出** 的产品级使用文档与边界说明见 [`docs/integrations.md`](docs/integrations.md)。设置页搜索 `EDA` / `PCB` / `KiCad` 时可联网发现真实 MCP Registry 候选；用户选择并测试连接后，系统从真实 `tools/list` 生成能力与表单候选，必须人工批准才加入 Agent 路由。搜索摘要不会变成可执行命令；测试本地候选时可能首次下载对应 MCP 包。
 
 ## 🧱 技术栈
 

@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """LLM 弹性层：重试/退避/deadline/可重试判定（离线，不触网）。"""
 import time
+import threading
 import unittest
+from types import SimpleNamespace
 
-from llm import retry_call, is_retryable
+from llm import retry_call, is_retryable, _OllamaStream, StreamChat, LLMClient
 
 
 class _Err(Exception):
@@ -83,6 +85,144 @@ class RetryCallTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             retry_call(fn, deadline=time.monotonic() - 1, attempts=3, base=0.0)
         self.assertEqual(calls["n"], 0, "已过期的 deadline 不应发起任何调用")
+
+
+class OllamaStreamCancellationTests(unittest.TestCase):
+    class _Response:
+        def __init__(self, rows=()):
+            self.rows = list(rows)
+            self.closed = threading.Event()
+
+        def __iter__(self):
+            return iter(self.rows)
+
+        def close(self):
+            self.closed.set()
+
+    def test_cancel_event_closes_blocked_response(self):
+        cancel = threading.Event()
+        response = self._Response()
+        stream = _OllamaStream(response, cancel_event=cancel)
+        cancel.set()
+        self.assertTrue(response.closed.wait(1.0), "取消后应关闭底层 Ollama 响应")
+
+    def test_normal_stream_closes_response_after_consumption(self):
+        response = self._Response([
+            b'{"message":{"content":"done"},"done":true}',
+        ])
+        stream = _OllamaStream(response)
+        self.assertEqual(list(stream), ["done"])
+        self.assertTrue(response.closed.is_set())
+
+    def test_openai_compatible_stream_closes_on_cancel(self):
+        cancel = threading.Event()
+
+        class _Stream:
+            def __init__(self):
+                self.closed = threading.Event()
+
+            def __iter__(self):
+                return iter(())
+
+            def close(self):
+                self.closed.set()
+
+        response = _Stream()
+        wrapped = StreamChat(response, cancel_event=cancel)
+        cancel.set()
+        self.assertTrue(response.closed.wait(1.0), "云端流取消后应关闭底层响应")
+        list(wrapped)
+
+
+class NonStreamCancellationTests(unittest.TestCase):
+    """非流式调用在有取消事件时也必须能打断底层生成。"""
+
+    @staticmethod
+    def _client_with_stream(stream):
+        client = object.__new__(LLMClient)
+        client.provider = "custom"
+        client.model = "test-model"
+        client.capability = {"thinking": "none", "cloud": True, "context_window": 32768}
+        client.output_budget = 256
+        client.max_retries = 1
+        client.retry_base = 0.0
+        client.timeout = 2.0
+        client.last_usage = {}
+        client.last_tool_calls = []
+
+        class _Completions:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                return stream
+
+        client.client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+        client._to_openai_messages = lambda messages: messages
+        return client
+
+    def test_cloud_non_stream_cancel_closes_response_and_raises(self):
+        cancel = threading.Event()
+
+        class _BlockingStream:
+            def __init__(self):
+                self.closed = threading.Event()
+
+            def __iter__(self):
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        finish_reason=None,
+                        delta=SimpleNamespace(content="partial", reasoning_content=None,
+                                               tool_calls=None),
+                    )],
+                    usage=None,
+                )
+                self.closed.wait(2.0)
+
+            def close(self):
+                self.closed.set()
+
+        raw = _BlockingStream()
+        client = self._client_with_stream(raw)
+        outcome = []
+
+        def run():
+            try:
+                client.chat([{"role": "user", "content": "hi"}],
+                            stream=False, cancel_event=cancel)
+            except BaseException as exc:  # GeneratorExit is intentional here
+                outcome.append(exc)
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        time.sleep(0.05)
+        cancel.set()
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive(), "取消后非流式请求不应继续阻塞")
+        self.assertTrue(raw.closed.is_set())
+        self.assertTrue(any(isinstance(exc, GeneratorExit) for exc in outcome))
+
+    def test_cloud_non_stream_cancelable_path_still_returns_text(self):
+        cancel = threading.Event()
+
+        class _FiniteStream:
+            def __iter__(self):
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        finish_reason="stop",
+                        delta=SimpleNamespace(content="hello", reasoning_content=None,
+                                               tool_calls=None),
+                    )],
+                    usage=None,
+                )
+
+            def close(self):
+                pass
+
+        client = self._client_with_stream(_FiniteStream())
+        self.assertEqual(
+            client.chat([{"role": "user", "content": "hi"}],
+                        stream=False, cancel_event=cancel),
+            "hello",
+        )
 
 
 class ThinkingResolutionTests(unittest.TestCase):

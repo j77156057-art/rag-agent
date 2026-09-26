@@ -2,7 +2,7 @@
 // 工作流人工断点模态：方案选择 / 检索补充 / 计划审批与修改。
 // 遮罩 pointer-events:none —— 弹窗背后的对话流仍可滚动查看，只有弹层本身拦截点击。
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import type { WorkflowState } from '../api'
+import type { AcceptanceItem, WorkflowState } from '../api'
 
 const props = defineProps<{
   state: WorkflowState
@@ -16,6 +16,7 @@ const emit = defineEmits<{
   (e: 'reject'): void
   (e: 'revise', taskId: string, task: string, deps: string[]): void
   (e: 'revise-approve', approved: boolean): void
+  (e: 'acceptance-save', items: AcceptanceItem[]): void
   (e: 'dismiss'): void
 }>()
 
@@ -26,6 +27,23 @@ const reviseOpen = ref(false)
 const reviseTaskId = ref('')
 const reviseTaskText = ref('')
 const reviseTaskDeps = ref('')
+const criteria = ref<AcceptanceItem[]>([])
+const criteriaEditing = ref(false)
+watch(() => props.state.acceptance_contract?.revision, () => {
+  criteria.value = (props.state.acceptance_contract?.items || []).map(item => ({
+    ...item, evidence: [...(item.evidence || [])],
+  }))
+  criteriaEditing.value = false
+}, { immediate: true })
+function addCriterion() {
+  criteria.value.push({ id: `accept-user-${Date.now()}`, statement: '', method: '人工检查',
+    evidence: [], required: true, user_approved: false })
+}
+function saveCriteria() {
+  if (!criteria.value.length || criteria.value.some(item => !item.statement.trim())) return
+  emit('acceptance-save', criteria.value.map(item => ({ ...item,
+    evidence: item.evidence.filter(Boolean), user_approved: false })))
+}
 
 watch(() => props.state.status, () => {
   customOpen.value = false
@@ -89,7 +107,9 @@ const title = computed(() => {
 })
 const editableTasks = computed(() =>
   (props.state.tasks || []).filter((t) => {
-    const r = props.state.results?.[String(t.id)]
+    const report = props.state.results || {}
+    const results = (report.results as Record<string, Record<string, unknown>> | undefined) || report
+    const r = results[String(t.id)]
     return !r || ['pending', 'blocked', 'failed'].includes(String(r.status || 'pending'))
   }))
 
@@ -193,6 +213,29 @@ function submitRevise() {
               </div>
             </div>
           </div>
+          <section class="wg-acceptance">
+            <div class="wg-acceptance-head">
+              <b>验收条件</b>
+              <button class="wg-btn" :disabled="busy" @click="criteriaEditing = !criteriaEditing">
+                {{ criteriaEditing ? '收起编辑' : '编辑条件' }}
+              </button>
+            </div>
+            <p>模型根据任务提出条件。请检查完成效果和证据，再决定是否通过最终验收。</p>
+            <div v-for="(item, index) in criteria" :key="item.id" class="wg-criterion">
+              <template v-if="criteriaEditing">
+                <label>条件 {{ index + 1 }}<textarea v-model="item.statement" rows="2" maxlength="1000" /></label>
+                <label>检查方法<input v-model="item.method" maxlength="200" /></label>
+                <label>预期证据<input :value="item.evidence.join('，')" @input="item.evidence = ($event.target as HTMLInputElement).value.split(/[,，]/).map(s => s.trim()).filter(Boolean)" /></label>
+                <label class="wg-check"><input v-model="item.required" type="checkbox" />必须满足</label>
+                <button class="wg-btn wg-danger" :disabled="criteria.length <= 1" @click="criteria.splice(index, 1)">删除</button>
+              </template>
+              <template v-else><b>{{ item.required ? '必须' : '可选' }}</b><span>{{ item.statement }}</span><small>{{ item.method }} · {{ item.evidence.join('、') || '待补证据' }}</small></template>
+            </div>
+            <div v-if="criteriaEditing" class="wg-row">
+              <button class="wg-btn" @click="addCriterion">增加条件</button>
+              <button class="wg-btn wg-primary" :disabled="busy || !criteria.length || criteria.some(i => !i.statement.trim()) || !criteria.some(i => i.required)" @click="saveCriteria">保存验收条件</button>
+            </div>
+          </section>
           <div v-if="reviseOpen" class="wg-revise">
             <select v-model="reviseTaskId">
               <option disabled value="">选择未执行任务</option>
@@ -212,7 +255,7 @@ function submitRevise() {
             <button class="wg-btn wg-ghost" :disabled="busy || !state.tasks?.length" @click="reviseOpen = !reviseOpen">修改任务</button>
             <span class="wg-spacer" />
             <button class="wg-btn" :disabled="busy" @click="emit('reject')">暂不执行</button>
-            <button class="wg-btn wg-primary" :disabled="busy" @click="emit('approve')">
+            <button class="wg-btn wg-primary" :disabled="busy || criteriaEditing" @click="emit('approve')">
               {{ state.status === 'planned' ? '确认执行' : '批准并开始执行' }}
             </button>
           </div>
@@ -328,4 +371,13 @@ textarea:focus, input:focus, select:focus { outline: none; border-color: var(--a
 .wg-danger { border-color: var(--danger); color: var(--danger); }
 .wg-danger:hover:not(:disabled) { background: var(--danger); color: #fff; }
 .wg-ghost { border-style: dashed; }
+.wg-acceptance { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--border); border-radius: 9px; }
+.wg-acceptance-head { display: flex; align-items: center; justify-content: space-between; }
+.wg-acceptance-head b { font-size: 12px; }
+.wg-acceptance p { margin: 0; color: var(--text-muted); font-size: 11px; }
+.wg-criterion { display: grid; gap: 4px; padding: 7px 0; border-top: 1px solid var(--border); font-size: 12px; }
+.wg-criterion small { color: var(--text-faint); }
+.wg-criterion label { display: grid; gap: 4px; }
+.wg-criterion .wg-check { display: flex; align-items: center; }
+.wg-check input { width: auto; }
 </style>

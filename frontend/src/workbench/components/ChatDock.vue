@@ -15,6 +15,7 @@ import ModelSettingsDialog from './ModelSettingsDialog.vue'
 import WorkflowCard from './WorkflowCard.vue'
 import WorkflowMembersDock from './WorkflowMembersDock.vue'
 import type { WorkflowState, WorkflowSummary } from '../api'
+import type { PreviewFeedbackRequest } from '../previewFeedback'
 
 const {
   nodeExists, revealPath, jumpToLine,
@@ -31,6 +32,7 @@ interface ChatMsg {
   notices: string[]        // 系统通知（如上下文自动压缩）
   plan: string[]           // 计划模式步骤
   startedAt?: number
+  lastActivityAt?: number
   finishedAt?: number
   error?: string
   recoverable?: boolean
@@ -269,7 +271,7 @@ async function startWorkflowTurn(prompt: string) {
   const turn: ChatMsg = {
     id: msgSeq++, role: 'assistant', text: '', status: 'streaming', trace: [], reasoning: '', notices: [], plan: [],
     workflow: { workflowId: '', seed: { status: 'generating_options', kind: 'generic', request: prompt } },
-    startedAt: Date.now(),
+    startedAt: Date.now(), lastActivityAt: Date.now(),
   }
   messages.value.push(turn)
   sending.value = true
@@ -288,6 +290,7 @@ async function startWorkflowTurn(prompt: string) {
     if (r.ok && r.workflow) {
       turn.workflow = { workflowId: r.workflow.workflow_id, seed: r.workflow }
       turn.status = 'done'
+      window.dispatchEvent(new CustomEvent('docmind:workflow-started', { detail: { workflowId: r.workflow.workflow_id } }))
     } else {
       turn.workflow = undefined
       turn.status = 'error'
@@ -443,17 +446,17 @@ function onModelSaved(info: ModelConfigInfo) {
 }
 
 // ---------------------------------------------------------------- 发送 / 停止
-async function send(text?: string) {
+async function send(text?: string, attached?: File[], onAccepted?: () => void): Promise<boolean> {
   const q = (text ?? input.value).trim()
-  const imgs = pendingImages.value.slice()
-  if ((!q && !imgs.length) || sending.value) return
+  const imgs = attached ? attached.slice() : pendingImages.value.slice()
+  if ((!q && !imgs.length) || sending.value) return false
   // 审批门打开期间禁止发起新问答（CSS 已挡鼠标，这里挡 Ctrl+Enter 键盘发送）
   if (gateBlocking.value) {
     void askAlert({
       title: '工作流等待你的处理',
       message: '请先在居中的审批窗口中选择方案、批准或调整任务（也可中断该工作流），再继续提问。',
     })
-    return
+    return false
   }
   const recovery = readInterruptedRecovery()
   const isResume = !!recovery && isContinuationRequest(q)
@@ -465,9 +468,11 @@ async function send(text?: string) {
     const previous = messages.value[messages.value.length - 1]
     if (previous?.recoverable) previous.recoverable = false
   }
-  input.value = ''
-  pendingImages.value = []
-  attachmentError.value = ''
+  if (attached === undefined) {
+    input.value = ''
+    pendingImages.value = []
+    attachmentError.value = ''
+  }
   stickToBottom.value = true  // 用户主动发送，恢复贴底自动滚动
   messages.value.push({ id: msgSeq++, role: 'user', text: q || '请分析附件图片', status: 'done', trace: [], reasoning: '', notices: [], plan: [], imageCount: imgs.length })
   const turn: ChatMsg = {
@@ -476,17 +481,19 @@ async function send(text?: string) {
   }
   messages.value.push(turn)
   sending.value = true
+  onAccepted?.()
   if (demoMode.value) {
     await nextTick(scrollToBottom)
     await demoAnswer(turn.id, q)
     sending.value = false
     await nextTick(scrollToBottom)
-    return
+    return true
   }
   const ac = new AbortController()
   abortCtl = ac
   await nextTick(scrollToBottom)
-  if (epoch !== chatEpoch) return
+  if (epoch !== chatEpoch) return false
+  let finished = false
 
   const live = () => epoch === chatEpoch ? messages.value.find((m) => m.id === turn.id) : undefined
   const onEvent = (ev: SseEvent) => {
@@ -498,6 +505,7 @@ async function send(text?: string) {
     }
     const t = live()
     if (!t) return
+    t.lastActivityAt = Date.now()
     if (ev.type === 'token' && typeof ev.text === 'string') {
       // 进帧缓冲：同一帧内到达的多个 token 合并成一次响应式提交
       let buf = streamBuffers.get(t.id)
@@ -555,11 +563,12 @@ async function send(text?: string) {
       t.status = t.text ? 'done' : 'stopped'
       t.finishedAt = Date.now()
       finishLiveMd(t.id, () => answerHtml(t))
+      finished = !!t.text
     }
   } catch (e) {
     drainStreamNow()
     const t = live()
-    if (!t) return
+    if (!t) return false
     finishLiveMd(t.id, () => answerHtml(t))
     if ((e as Error).name === 'AbortError') {
       t.status = 'stopped'
@@ -580,11 +589,15 @@ async function send(text?: string) {
     void refreshSessionList()
     await nextTick(scrollToBottom)
   }
+  return finished
 }
 
 function stop() {
+  // 主动停止也保存现场，便于用户之后点击“继续上次任务”。
+  preserveInterrupted()
   drainStreamNow()
   const turn = messages.value[messages.value.length - 1]
+  if (turn?.status === 'streaming' && !turn.workflow) turn.recoverable = true
   if (turn) finishLiveMd(turn.id, () => answerHtml(turn))
   if (turn?.status === 'streaming') {
     turn.status = 'stopped'
@@ -1051,6 +1064,12 @@ function demoReply(q: string): string {
 
 // 概览页「去问问 / 试试问 AI」：展开对话台、（可选）预填问题、定位输入框
 // 运行台「继续这段对话」：detail.reload=true 时按当前存储的会话 id 重新回灌历史
+function onStartWorkflow(ev: Event) {
+  const prompt = (ev as CustomEvent<{ prompt?: string }>).detail?.prompt?.trim()
+  if (!prompt) return
+  collapsed.value = false
+  void startWorkflowTurn(prompt)
+}
 function onFocusChat(ev?: Event) {
   const detail = (ev as CustomEvent<{ q?: string; reload?: boolean }> | undefined)?.detail
   const q = detail?.q
@@ -1065,8 +1084,35 @@ function onFocusChat(ev?: Event) {
     inputEl.value?.focus()
   })
 }
+async function onSendChat(ev: Event) {
+  const detail = (ev as CustomEvent<PreviewFeedbackRequest>).detail
+  const prompt = detail?.prompt?.trim()
+  if (!prompt) { detail?.onStatus?.('failed', '反馈不能为空'); return }
+  if (detail.projectId !== getProjectId()) { detail.onStatus?.('pending', '项目已切换，请回到原项目重试'); return }
+  if (sending.value || gateBlocking.value) {
+    detail.onStatus?.('pending', sending.value ? 'AI 正忙，反馈已保存，请稍后重试' : '请先完成当前审核，再重试反馈')
+    return
+  }
+  collapsed.value = false
+  const images = (detail?.images || []).filter((image): image is Blob => image instanceof Blob)
+  const files = images.map((image, index) => new File(
+    [image], `live-preview-${Date.now()}-${index}.png`, { type: image.type || 'image/png' }))
+  await nextTick()
+  if (detail.projectId !== getProjectId() || sending.value || gateBlocking.value) {
+    detail.onStatus?.('pending', '当前对话暂不可接收，请稍后在原项目重试')
+    return
+  }
+  try {
+    const finished = await send(prompt, files, () => detail.onStatus?.('processing'))
+    detail.onStatus?.(finished ? 'awaiting_review' : 'failed', finished ? 'AI 回复已结束，请检查预览效果' : '本次对话未完成，已执行操作不会自动撤销，请检查后重试')
+  } catch {
+    detail.onStatus?.('failed', '本次对话未完成，请检查项目当前状态后重试')
+  }
+}
 onMounted(() => {
   window.addEventListener('docmind:focus-chat', onFocusChat as EventListener)
+  window.addEventListener('docmind:send-chat', onSendChat as EventListener)
+  window.addEventListener('docmind:start-workflow', onStartWorkflow as EventListener)
   window.addEventListener('docmind:project-context-changed', resetChatContext)
   window.addEventListener('pagehide', onPageHide)
   window.addEventListener('beforeunload', onBeforeLeave)
@@ -1083,6 +1129,8 @@ onBeforeUnmount(() => {
   liveMdTimers.clear()
   onPageHide()
   window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener)
+  window.removeEventListener('docmind:send-chat', onSendChat as EventListener)
+  window.removeEventListener('docmind:start-workflow', onStartWorkflow as EventListener)
   window.removeEventListener('docmind:project-context-changed', resetChatContext)
   window.removeEventListener('pagehide', onPageHide)
   window.removeEventListener('beforeunload', onBeforeLeave)
@@ -1320,6 +1368,12 @@ function elapsedLabel(msg: ChatMsg) {
   const end = msg.finishedAt || nowTick.value
   const seconds = Math.max(0, (end - msg.startedAt) / 1000)
   return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`
+}
+function slowResponseLabel(msg: ChatMsg) {
+  if (msg.status !== 'streaming' || !msg.lastActivityAt) return ''
+  const quiet = Math.max(0, nowTick.value - msg.lastActivityAt)
+  if (quiet < 15000) return ''
+  return `已经 ${Math.round(quiet / 1000)} 秒没有收到新进展；模型可能仍在推理或执行工具。现场会保留，必要时可停止后继续。`
 }
 
 // 深度思考面板折叠态（reasoning_content 独立窗口）
@@ -1833,6 +1887,9 @@ function connectorGuide(s: McpServer) {
             <div v-if="m.status === 'streaming'" class="cd-thinking">
               {{ m.reasoning ? '正在整理最终回答' : 'AI 正在翻代码、组织回答' }}<span class="cd-dots">…</span>
             </div>
+            <div v-if="slowResponseLabel(m)" class="cd-slow-notice" role="status">
+              {{ slowResponseLabel(m) }}
+            </div>
             <!-- 流式中按 ~8fps 节流重渲染 markdown（格式边出边成型，又不逐 token 重建
                  DOM）；结束瞬间由 answerHtml 缓存接管成稿，视觉无跳变 -->
             <div v-if="m.text" class="ai-md cd-answer" :class="{ 'cd-answer-live': m.status === 'streaming' }">
@@ -2294,6 +2351,7 @@ function connectorGuide(s: McpServer) {
 @keyframes cd-caret { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .cd-caret { animation: none; } }
 .cd-thinking, .cd-error { font-size: 12px; color: var(--text-muted); padding: 4px 0; }
+.cd-slow-notice { margin: 6px 0; padding: 7px 9px; border: 1px solid color-mix(in srgb, var(--amber) 45%, var(--border)); border-radius: 6px; color: var(--text-muted); background: color-mix(in srgb, var(--amber) 10%, transparent); font-size: 11px; line-height: 1.45; }
 .cd-error { color: var(--danger); }
 
 .cd-run-head {

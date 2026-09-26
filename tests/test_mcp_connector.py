@@ -8,9 +8,11 @@ import asyncio
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import mcp_client
 import api
+from tools import _mcp_server_approval_target
 
 
 class _FakeSession:
@@ -75,9 +77,21 @@ class TestMcpConnectorEndpoints(unittest.TestCase):
         self.assertTrue(out["ok"])
         keys = [s["key"] for s in out["servers"]]
         self.assertIn("demo_custom", keys)
+        self.assertTrue(api.approval_status(
+            self._tmp.name, "mcp_server",
+            _mcp_server_approval_target(
+                "demo_custom", {"transport": "http", "url": "http://127.0.0.1:9999/mcp"}))['approved'])
         out2 = asyncio.run(api.mcp_server_remove_ep(api.McpServerKeyReq(key="demo_custom")))
         self.assertTrue(out2["ok"])
         self.assertNotIn("demo_custom", [s["key"] for s in out2["servers"]])
+
+    def test_capability_user_decision_records_approval(self):
+        with patch.object(api.mcp_capabilities, "approve", return_value={"ok": True, "approved": True}):
+            out = asyncio.run(api.mcp_capability_decision_ep(
+                api.McpCapabilityDecisionReq(key="demo_custom", approved=True)))
+        self.assertTrue(out["ok"])
+        self.assertTrue(api.approval_status(
+            self._tmp.name, "mcp_capability", "demo_custom")["approved"])
 
 
 if __name__ == "__main__":

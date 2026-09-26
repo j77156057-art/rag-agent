@@ -183,7 +183,9 @@ class AgentSequentialVisionTests(unittest.TestCase):
     def _registry(self):
         def shot(_arg):
             return ToolResult(ok=True, text="截图完成：.docmind/screenshots/shot-1.jpg",
-                              data={"images": [_IMG], "image_sources": ["local"]})
+                              data={"images": [_IMG], "image_sources": ["local"]},
+                              artifacts=[{"id": "shot-1", "kind": "image",
+                                          "path": ".docmind/screenshots/shot-1.jpg"}])
         return {"shot_tool": {"description": "test screenshot", "func": shot}}
 
     def test_native_observation_message_carries_data_url(self):
@@ -201,6 +203,15 @@ class AgentSequentialVisionTests(unittest.TestCase):
         self.assertEqual(len(obs_msgs), 1)
         self.assertEqual(obs_msgs[0].get("images"), [_IMG])
         self.assertIn("含 1 张图片", obs_msgs[0]["content"])
+
+    def test_visual_artifact_is_exposed_on_observation_event(self):
+        llm = _ScriptedLLM(
+            [_act("shot_tool", "target: foreground"), _FINAL],
+            capability={"context_window": 32768, "vision": "native"})
+        events = list(agent_mod.Agent(llm=llm, tool_registry=self._registry()).run(
+            "记录预览证据", stream=True))
+        observation = next(event for event in events if event.get("type") == "observation")
+        self.assertEqual(observation["artifacts"][0]["id"], "shot-1")
 
     def test_non_vision_model_never_receives_image_content(self):
         with patch.dict(os.environ, {}, clear=False):

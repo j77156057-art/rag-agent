@@ -356,9 +356,9 @@ export function setActiveTask(task: ActiveTask, project = getProjectId()) {
  * - `getProjectId()` 为空时**不注入**，原样返回（生命线：后端回落当前项目）；
  * - 用 `new Headers(...)` 统一处理 headers 为 `undefined` / 普通对象 / `Headers` 实例三种形态。
  */
-export function withProject(init?: RequestInit): RequestInit {
+export function withProject(init?: RequestInit, projectId = getProjectId()): RequestInit {
   const base: RequestInit = init ? { ...init } : {}
-  const pid = getProjectId()
+  const pid = projectId
   if (!pid) return base
   const merged = new Headers(base.headers as HeadersInit | undefined)
   merged.set('X-DocMind-Project', pid)
@@ -405,12 +405,12 @@ async function postJson<T>(url: string, payload: unknown): Promise<T> {
  * stale / rolled_back / warnings 才能正确分支，所以这里单独给一条原始通道；
  * 只有网络不可达或响应不是 JSON 才抛错。
  */
-async function rawJson<T>(url: string, payload?: unknown, signal?: AbortSignal): Promise<T> {
+async function rawJson<T>(url: string, payload?: unknown, signal?: AbortSignal, projectId = getProjectId()): Promise<T> {
   let res: Response
   try {
     res = await fetch(url, withProject(payload === undefined
       ? { method: 'GET', signal }
-      : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal }))
+      : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal }, projectId))
   } catch {
     throw new FsApiError(0, '无法连接本地服务（127.0.0.1:8000），请确认 DocMind 已启动。')
   }
@@ -1999,11 +1999,21 @@ export interface McpDirectoryResult {
   label: string
   summary: string
   capabilities: string[]
-  connection_options: Array<{ transport: 'stdio' | 'http'; when: string; value: string }>
+  connection_options: Array<{
+    id?: string
+    label?: string
+    transport: 'stdio' | 'http'
+    when: string
+    value: string
+    config?: Partial<McpAutoConnectConfig>
+    trust_tier?: McpAutoConnectCandidate['trust_tier']
+    secrets?: McpAutoConnectCandidate['secrets']
+    register_provider?: string
+  }>
   setup_steps: string[]
   template: { key: string; label: string; transport: 'stdio' | 'http'; command: string; args: string[]; url: string }
   sources: string[]
-  source_status: 'web_sources' | 'offline_guide'
+  source_status: 'web_sources' | 'offline_guide' | 'registry'
 }
 
 // P1：MCP 自动连接向导（设置 → MCP 链路重做）
@@ -2033,6 +2043,8 @@ export interface McpAutoConnectConfig {
 export interface McpAutoConnectCandidate {
   config: McpAutoConnectConfig
   trust: 'trusted' | 'source_untrusted'
+  /** 候选引用的凭证；required=false 仅作可选预填，不阻塞提交。 */
+  secrets?: { name: string; required: boolean }[]
   /** 显示用信任分档：official（官方发布）/ community（受信域第三方）/ unknown（来源不可信）。R8 自动填参闸门仍看 trust。 */
   trust_tier?: 'official' | 'community' | 'unknown'
   validation_errors: string[]
@@ -2048,6 +2060,8 @@ export interface McpProbeRes {
   probe_ok: boolean
   tools?: string[]
   error?: string
+  ready?: boolean
+  readiness_message?: string
 }
 /** L0/L1/L2 档位：L0=全自动填表取凭证；L1=遇验证码/2FA 暂停、用户点继续；L2=仅人工回填。 */
 export type McpRegisterTier = 'L0' | 'L1' | 'L2'
@@ -2401,8 +2415,11 @@ export const harnessApi = {
 export interface AgentRoutingResp { ok?: boolean; auto_cloud_enabled?: boolean }
 export interface AgentConnectorInfo { key: string; label: string; enabled: boolean }
 export interface AgentConnectorsResp { ok?: boolean; connectors?: AgentConnectorInfo[] }
-export interface AgentApproval { id: string; status: string; summary?: string; diff?: string }
+export interface AgentApproval { id: string; status: string; summary?: string; diff?: string; paths?: string[] }
 export interface AgentApprovalsResp { ok?: boolean; approvals?: AgentApproval[] }
+export interface CockpitApprovalRequest {
+  id: string; action: string; target: string; risk: 'L2' | 'L3'; created_at: string
+}
 export interface AgentPermissionResp { ok?: boolean; recorded?: boolean; reason?: string }
 export interface AgentApprovalCreateResp { ok?: boolean; approval?: AgentApproval; error?: string }
 
@@ -2481,6 +2498,33 @@ export interface WorkflowEvaluation {
   replans?: number
   metrics?: Record<string, number | boolean>
 }
+export interface AcceptanceItem {
+  id: string; statement: string; method: string; evidence: string[]
+  required: boolean; user_approved: boolean
+}
+export interface AcceptanceContract {
+  revision: number; approved_revision: number; items: AcceptanceItem[]
+  final_decision: 'pending' | 'accepted' | 'rejected'; final_note: string
+}
+export interface WorkflowPreviewArtifact {
+  id: string; kind: string; label: string; renderer?: string; adapter?: string; path?: string; uri?: string; mime?: string
+  status?: string; summary?: string; before?: string; after?: string
+  evidence?: string[]; metadata?: Record<string, string>
+  change_summary?: { before_lines?: number; after_lines?: number; added_lines?: number; removed_lines?: number }
+}
+export interface WorkflowPreview {
+  schema?: string; workflow_id?: string; generated_at?: string; status?: string
+  summary?: string; artifacts?: WorkflowPreviewArtifact[]
+  checks?: Array<{ name?: string; ok?: boolean; detail?: string }>
+  counts?: { artifacts?: number; by_kind?: Record<string, number> }
+  changes?: { total?: number; files?: Array<{ path?: string; kind?: string; artifact_id?: string; summary?: Record<string, number> }>; counts?: Record<string, number> }
+}
+export interface VisualFeedbackRecord {
+  id: string; artifact_id?: string; label: string; note: string
+  region?: { x: number; y: number; width: number; height: number } | null
+  screenshot: boolean; sent_at: string; status?: string; detail?: string
+  snapshots?: Partial<Record<'before' | 'after', { width: number; height: number; bytes: number; captured_at: string }>>
+}
 export interface WorkflowState {
   workflow_id: string; status: string; phase: string; request?: string
   kind?: 'generic' | 'game' | 'eda' | string
@@ -2499,6 +2543,9 @@ export interface WorkflowState {
   results?: Record<string, Record<string, unknown>>; events?: WorkflowEvent[]
   dispatches?: Array<{ planner?: string; added?: string[]; kind?: string }>
   review?: Record<string, unknown>; interrupt_reason?: string
+  acceptance_contract?: AcceptanceContract
+  visual_feedback?: VisualFeedbackRecord[]
+  preview?: WorkflowPreview
   steps?: number; replans?: number; subagent_retries?: Record<string, number>; context_layers?: Record<string, unknown>
   langsmith_trace?: Record<string, unknown>
   observability?: {
@@ -2571,6 +2618,12 @@ export const agentApi = {
   approvals(): Promise<AgentApprovalsResp> {
     return rawJson<AgentApprovalsResp>('/api/agent/approvals')
   },
+  approvalRequests(): Promise<{ ok?: boolean; items?: CockpitApprovalRequest[]; error?: string }> {
+    return rawJson('/api/agent/approval-requests')
+  },
+  decideApprovalRequest(id: string, approved: boolean): Promise<{ ok?: boolean; error?: string }> {
+    return rawJson('/api/agent/approval-requests/decide', { id, approved })
+  },
   /** 为「项目外文件」发起改动审批请求。 */
   requestApproval(paths: string[], summary: string): Promise<AgentApprovalCreateResp> {
     return rawJson<AgentApprovalCreateResp>('/api/agent/approvals', { paths, summary })
@@ -2636,8 +2689,29 @@ export const agentApi = {
   workflowPlan(id: string, tasks?: Array<Record<string, unknown>>): Promise<WorkflowResp> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/plan`, { tasks })
   },
-  workflowApprove(id: string, approved: boolean): Promise<WorkflowResp> {
-    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/approve`, { approved })
+  workflowApprove(id: string, approved: boolean, auto_execute = false): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/approve`, { approved, auto_execute })
+  },
+  workflowPreview(id: string): Promise<{ ok?: boolean; preview?: WorkflowPreview; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/preview`)
+  },
+  workflowAcceptance(id: string, items: AcceptanceItem[]): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/acceptance`, { items })
+  },
+  workflowAcceptanceDecide(id: string, approved: boolean, note = ''): Promise<WorkflowResp> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/acceptance/decide`, { approved, note })
+  },
+  workflowVisualFeedback(id: string, feedback: Record<string, unknown>, projectId = getProjectId()): Promise<{ ok?: boolean; feedback?: VisualFeedbackRecord; items?: VisualFeedbackRecord[]; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/visual-feedback`, feedback, undefined, projectId)
+  },
+  workflowFeedbackStatus(id: string, feedbackId: string, status: string, detail = '', projectId = getProjectId()): Promise<{ ok?: boolean; feedback?: VisualFeedbackRecord; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/visual-feedback/${encodeURIComponent(feedbackId)}/status`, { status, detail }, undefined, projectId)
+  },
+  workflowFeedbackSnapshot(id: string, feedbackId: string, phase: 'before' | 'after', image_base64: string, projectId = getProjectId()): Promise<{ ok?: boolean; feedback?: VisualFeedbackRecord; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/visual-feedback/${encodeURIComponent(feedbackId)}/snapshot/${phase}`, { image_base64 }, undefined, projectId)
+  },
+  workflowFeedbackSnapshotUrl(id: string, feedbackId: string, phase: 'before' | 'after', projectId = getProjectId()): string {
+    return `/api/agent/workflow/${encodeURIComponent(id)}/visual-feedback/${encodeURIComponent(feedbackId)}/snapshot/${phase}?project_id=${encodeURIComponent(projectId)}`
   },
   workflowCheckpoint(id: string, approved?: boolean): Promise<{ ok?: boolean; checkpoint?: Record<string, unknown>; error?: string }> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/checkpoint`, { approved })

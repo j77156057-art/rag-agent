@@ -12,6 +12,7 @@ import time
 from typing import Any, Callable
 
 import project_state
+import mcp_registry
 
 CAPABILITIES_FILENAME = ".docmind_mcp_capabilities.json"
 SCHEMA_VERSION = 1
@@ -36,7 +37,7 @@ _DIRECTORY = [
     {
         "id": "eda",
         "label": "EDA / PCB / 原理图",
-        "keywords": ["eda", "pcb", "kicad", "altium", "easyeda", "原理图", "电路板", "仿真"],
+        "keywords": ["eda", "kicad", "easyeda", "pcb", "altium", "原理图", "电路板", "仿真"],
         "summary": "连接 KiCad、Altium、EasyEDA 或仿真工具所提供的标准 MCP Server。",
         "capabilities": ["schematic", "pcb", "erc", "drc", "bom", "netlist", "gerber", "simulation"],
         "connection_options": [
@@ -109,11 +110,22 @@ def _ui_requirements(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _sources_from_search(raw: str) -> list[str]:
-    return list(dict.fromkeys(re.findall(r"https?://[^\s)]+", raw or "")))[:8]
+    urls = []
+    seen_hosts: set[str] = set()
+    for raw_url in re.findall(r"https?://[^\s)]+", raw or ""):
+        url = raw_url.rstrip(".,;:!?]}")
+        host = re.sub(r"^https?://", "", url, flags=re.I).split("/", 1)[0].lower()
+        if host and host in seen_hosts:
+            continue
+        if host:
+            seen_hosts.add(host)
+        urls.append(url)
+    return urls[:5]
 
 
 def search_directory(query: str, *, web_enabled: bool = False,
-                     search_fn: Callable[[str], str] | None = None) -> dict[str, Any]:
+                     search_fn: Callable[[str], str] | None = None,
+                     registry_fn: Callable[[str], dict[str, Any]] | None = None) -> dict[str, Any]:
     """搜索连接指引。联网只补充来源，绝不从摘要自动生成可执行命令。"""
     q = (query or "").strip().lower()
     if len(q) < 2:
@@ -139,6 +151,66 @@ def search_directory(query: str, *, web_enabled: bool = False,
     for item in results:
         item["sources"] = sources
         item["source_status"] = "web_sources" if sources else "offline_guide"
+    # 领域词只命中目录时，也把官方 Registry 的具体 Server 转成可选择的连接方式。
+    # Registry 数据后续仍由自动连接管线执行 R1-R9 校验，目录本身不写盘、不执行。
+    if web_enabled and registry_fn and results:
+        try:
+            registry_candidates: list[dict[str, Any]] = []
+            queries = [query]
+            for item in results:
+                for keyword in item.get("keywords") or []:
+                    if keyword not in queries and len(queries) < 5:
+                        queries.append(keyword)
+            seen_names: set[str] = set()
+            for lookup in queries:
+                registry = registry_fn(lookup)
+                batch = registry.get("candidates") if isinstance(registry, dict) else []
+                for cfg in batch or []:
+                    if not isinstance(cfg, dict):
+                        continue
+                    if results[0]["id"] == "eda" and not mcp_registry.is_eda_candidate(cfg):
+                        continue
+                    # 领域目录与自动连接主链路共享同一组 R1-R9 安全校验，
+                    # 防止从目录选择时绕过启动器、URL 或来源闸门。
+                    from mcp_autoconnect import validate_extracted_config
+                    valid, _errors = validate_extracted_config(cfg)
+                    if not valid:
+                        continue
+                    prov = cfg.get("provenance") if isinstance(cfg, dict) else {}
+                    name = str((prov or {}).get("server_name") or (prov or {}).get("url") or "")
+                    if name and name in seen_names:
+                        continue
+                    if name:
+                        seen_names.add(name)
+                    registry_candidates.append(cfg)
+            options = []
+            for cfg in registry_candidates or []:
+                if not isinstance(cfg, dict):
+                    continue
+                prov = cfg.get("provenance") or {}
+                name = str(prov.get("server_name") or prov.get("namespace") or "MCP Server")
+                transport = str(cfg.get("transport") or "stdio")
+                command = str(cfg.get("command") or "")
+                args = [str(a) for a in (cfg.get("args") or [])]
+                value = (" ".join([command, *args]).strip()
+                         if transport == "stdio" else str(cfg.get("url") or ""))
+                from mcp_candidates import _candidate_view
+                view = _candidate_view(cfg, "trusted", [])
+                options.append({
+                    "id": name,
+                    "label": name,
+                    "transport": transport,
+                    "when": "MCP Registry 收录候选（尚未试连）",
+                    "value": value or "请查看官方来源",
+                    "config": cfg,
+                    "trust_tier": view["trust_tier"],
+                    "secrets": view["secrets"],
+                })
+            if options:
+                results[0]["connection_options"] = options + list(results[0].get("connection_options") or [])
+                results[0]["source_status"] = "registry"
+        except Exception:
+            pass
     if not results:
         results.append({
             "id": "generic", "label": f"{query} MCP 连接指引",

@@ -43,6 +43,15 @@ def _npm_pkg(identifier="@modelcontextprotocol/server-github", hint="npx",
 
 
 class PureFunctionTests(unittest.TestCase):
+    def test_eda_relevance_filters_registry_substring_matches(self):
+        jeda = {"provenance": {"server_name": "ai.jeda/jeda-ai",
+                               "description": "Visual AI for mindmaps", "url": ""}}
+        easyeda = {"provenance": {"server_name": "io.github.biosshot/easyeda-copilot",
+                                  "description": "Schematic and PCB design", "url": "https://github.com/biosshot/easyeda-copilot"}}
+        self.assertTrue(mcp_registry.is_eda_query("EDA"))
+        self.assertFalse(mcp_registry.is_eda_candidate(jeda))
+        self.assertTrue(mcp_registry.is_eda_candidate(easyeda))
+
     def test_registry_search_url(self):
         url = mcp_registry.registry_search_url("git hub", 3)
         self.assertTrue(url.startswith(mcp_registry.REGISTRY_BASE + "/v0.1/servers?"))
@@ -86,6 +95,27 @@ class PureFunctionTests(unittest.TestCase):
                          "@secret:GITHUB_PERSONAL_ACCESS_TOKEN")
         self.assertEqual(cfg["env"]["LOG_LEVEL"], "")
         self.assertIn("GITHUB_PERSONAL_ACCESS_TOKEN", cfg["provenance"]["required_env"])
+        self.assertEqual(cfg["provenance"]["secret_specs"], [
+            {"name": "GITHUB_PERSONAL_ACCESS_TOKEN", "required": True},
+        ])
+
+    def test_npx_first_install_can_start_without_interactive_prompt(self):
+        cfg = mcp_registry.server_to_candidates(_entry(packages=[_npm_pkg(
+            identifier="easyeda-copilot-mcp", runtime_args=[]
+        )])["server"])[0]
+        self.assertEqual(cfg["args"], ["-y", "easyeda-copilot-mcp"])
+
+    def test_optional_secret_is_metadata_only(self):
+        srv = _entry(packages=[_npm_pkg(env=[
+            {"name": "OPTIONAL_TOKEN", "isSecret": True, "isRequired": False},
+        ])])["server"]
+        cfg = mcp_registry.server_to_candidates(srv)[0]
+        self.assertEqual(cfg["env"]["OPTIONAL_TOKEN"], "@secret:OPTIONAL_TOKEN")
+        self.assertEqual(cfg["provenance"]["secret_specs"], [
+            {"name": "OPTIONAL_TOKEN", "required": False},
+        ])
+        view = mcp_autoconnect._candidate_view(cfg, "trusted", [])
+        self.assertEqual(view["secrets"], [{"name": "OPTIONAL_TOKEN", "required": False}])
 
     def test_launcher_from_registry_type_without_hint(self):
         pkg = {"registryType": "pypi", "identifier": "mcp-server-git"}
@@ -124,6 +154,9 @@ class PureFunctionTests(unittest.TestCase):
         self.assertIn("smithery_api_key", cfg["headers"]["Authorization"])   # provider = 占位名
         self.assertNotIn("{", cfg["headers"]["Authorization"])               # 占位符已转引用
         self.assertNotIn("{smithery_api_key}", json.dumps(cfg))
+        self.assertEqual(cfg["provenance"]["secret_specs"], [
+            {"name": "smithery_api_key", "required": True},
+        ])
 
     def test_remotes_secret_header_without_placeholder_uses_header_name(self):
         # ③无占位但 isSecret → 回退 @secret:<header_name>（与 env 口径一致）

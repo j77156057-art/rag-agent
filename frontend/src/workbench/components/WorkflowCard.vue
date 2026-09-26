@@ -5,7 +5,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   agentApi, workflowEvents,
 } from '../api'
-import type { WorkflowChildTrace, WorkflowEvent, WorkflowState, WorkflowStepItem } from '../api'
+import type { AcceptanceItem, WorkflowChildTrace, WorkflowEvent, WorkflowState, WorkflowStepItem } from '../api'
 import WorkflowGateDialog from './WorkflowGateDialog.vue'
 
 const props = defineProps<{
@@ -57,6 +57,7 @@ const EVENT_LABELS: Record<string, string> = {
   dag_revision_requested: '请求修改 DAG', dag_revision_approved: 'DAG 修改已批准', dag_revision_denied: 'DAG 修改被拒绝',
   complete: '工作流完成', fail: '工作流失败', interrupt: '工作流中断', resume: '工作流恢复',
   approval_granted: '审批通过', approval_denied: '审批驳回', auto_execute_start: '自动开始执行',
+  acceptance_revised: '验收条件已更新', acceptance_decided: '用户已完成验收决定',
 }
 
 function roleMeta(role?: string) {
@@ -69,6 +70,7 @@ const loadError = ref('')
 const busy = ref(false)
 const cardOpen = ref(true)
 const gateDismissed = ref(false)
+const finalNote = ref('')
 const rootEl = ref<HTMLElement | null>(null)
 
 /** SSE 实时轨迹（task_id -> steps），仅内存；终态后由 state.results[].trace 补全。 */
@@ -150,6 +152,11 @@ interface MemberRow {
   status: string; elapsedMs?: number; error?: string; conclusion?: string
   steps: WorkflowStepItem[]; trace?: WorkflowChildTrace
 }
+function taskResults(wf: WorkflowState | null | undefined): Record<string, Record<string, unknown>> {
+  const report = wf?.results || {}
+  return (report.results as Record<string, Record<string, unknown>> | undefined)
+    || report as Record<string, Record<string, unknown>>
+}
 const members = computed<MemberRow[]>(() => {
   const wf = state.value
   const order: string[] = []
@@ -176,7 +183,7 @@ const members = computed<MemberRow[]>(() => {
       trace: sub.trace,
     })
   }
-  for (const [id, result] of Object.entries(wf?.results || {})) {
+  for (const [id, result] of Object.entries(taskResults(wf))) {
     if (!order.includes(id)) order.push(id)
     const prev = base.get(id) || {}
     base.set(id, {
@@ -361,7 +368,9 @@ function patchStatus(next: string, phase?: string) {
 // ---------------------------------------------------------------- 交互
 async function withBusy(fn: () => Promise<void>) {
   busy.value = true
-  try { await fn() } finally { busy.value = false }
+  try { await fn() }
+  catch (e) { loadError.value = (e as Error).message || '工作流操作失败' }
+  finally { busy.value = false }
 }
 async function onChoose(choiceId: string, customText?: string) {
   await withBusy(async () => {
@@ -387,10 +396,14 @@ async function onApprove() {
     const id = props.workflowId
     // planned=首次执行（后端会先落审批门）；awaiting_approval=批准后真正开跑
     const r = status.value === 'awaiting_approval'
-      ? await agentApi.workflowApprove(id, true)
+      ? await agentApi.workflowApprove(id, true, true)
       : await agentApi.workflowExecute(id)
     if (r.workflow) setState(r.workflow)
-    if (r.workflow && r.workflow.status === 'awaiting_approval') setState((await agentApi.workflowApprove(id, true)).workflow)
+    if (r.workflow && r.workflow.status === 'awaiting_approval') {
+      const continued = await agentApi.workflowApprove(id, true, true)
+      if (continued.workflow) setState(continued.workflow)
+      else loadError.value = continued.error || '批准后启动失败'
+    }
   })
 }
 async function onReject() {
@@ -411,6 +424,20 @@ async function onReviseApprove(approved: boolean) {
   await withBusy(async () => {
     const r = await agentApi.workflowReviseApprove(props.workflowId, approved)
     if (r.workflow) setState(r.workflow)
+  })
+}
+async function onAcceptanceSave(items: AcceptanceItem[]) {
+  await withBusy(async () => {
+    const r = await agentApi.workflowAcceptance(props.workflowId, items)
+    if (r.workflow) setState(r.workflow)
+    else loadError.value = r.error || '保存验收条件失败'
+  })
+}
+async function onFinalAcceptance(approved: boolean) {
+  await withBusy(async () => {
+    const r = await agentApi.workflowAcceptanceDecide(props.workflowId, approved, finalNote.value)
+    if (r.workflow) setState(r.workflow)
+    else loadError.value = r.error || '记录验收结果失败'
   })
 }
 async function interrupt() {
@@ -457,9 +484,16 @@ function fmtMs(ms?: number): string {
   return `${(ms / 1000).toFixed(1)}s`
 }
 function taskStatusOf(id: string): string {
-  const r = state.value?.results?.[id]
+  const r = taskResults(state.value)[id]
   if (r) return String(r.status || 'ok')
   return members.value.find(m => m.id === id)?.status || 'pending'
+}
+function criterionTaskResult(evidence: string[]): { status: string; conclusion: string } | null {
+  const ref = evidence.find(value => value.startsWith('task:'))
+  if (!ref) return null
+  const result = taskResults(state.value)[ref.slice(5)]
+  return result ? { status: String(result.status || 'unknown'),
+    conclusion: String(result.conclusion || result.summary || result.error || '') } : null
 }
 function eventDetail(ev: WorkflowEvent): string {
   const fields = ['task_id', 'role', 'option', 'task_count', 'attempt', 'reason', 'error', 'status', 'task_thread']
@@ -606,6 +640,26 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- 复核结果 -->
+      <section v-if="state?.acceptance_contract?.items?.length" class="wf-acceptance">
+        <b>验收条件</b>
+        <span v-if="state.acceptance_contract.approved_revision" class="wf-acceptance-meta">已随计划确认 · 第 {{ state.acceptance_contract.approved_revision }} 版</span>
+        <span v-else class="wf-acceptance-meta">等待计划审核</span>
+        <div v-for="item in state.acceptance_contract.items" :key="item.id" class="wf-acceptance-item">
+          <span>{{ item.required ? '必需' : '可选' }}</span>
+          <div><b>{{ item.statement }}</b><small>{{ item.method }} · 预期证据：{{ item.evidence.join('、') || '待补充' }}</small></div>
+          <small v-if="criterionTaskResult(item.evidence)" class="wf-acceptance-result">任务结果：{{ criterionTaskResult(item.evidence)?.status }} · {{ criterionTaskResult(item.evidence)?.conclusion }}</small>
+        </div>
+        <template v-if="status === 'completed'">
+          <p v-if="state.acceptance_contract.final_decision === 'accepted'" class="wf-ok">用户已验收通过</p>
+          <p v-else-if="state.acceptance_contract.final_decision === 'rejected'" class="wf-bad">用户未通过验收：{{ state.acceptance_contract.final_note || '请继续说明不满足的效果' }}</p>
+          <div v-else class="wf-acceptance-final">
+            <p>工作流执行已结束。请按条件检查实际效果和证据，再做最终验收。</p>
+            <textarea v-model="finalNote" rows="2" placeholder="未通过时请写明哪些效果需要继续修改；通过时可选填备注" />
+            <div><button class="wf-mini-btn" :disabled="busy || !finalNote.trim()" @click="onFinalAcceptance(false)">未通过</button>
+              <button class="wf-mini-btn wf-mini-primary" :disabled="busy" @click="onFinalAcceptance(true)">验收通过</button></div>
+          </div>
+        </template>
+      </section>
       <div v-if="state?.review" class="wf-review">
         <b :class="state.review.ok ? 'wf-ok' : 'wf-bad'">{{ state.review.ok ? '✓ 复核通过' : '! 复核未通过' }}</b>
         <div v-for="(f, i) in reviewFailures" :key="i" class="wf-review-fail">
@@ -634,6 +688,7 @@ onBeforeUnmount(() => {
       @reject="onReject"
       @revise="onRevise"
       @revise-approve="onReviseApprove"
+      @acceptance-save="onAcceptanceSave"
       @dismiss="gateDismissed = true"
     />
   </div>
@@ -695,6 +750,15 @@ onBeforeUnmount(() => {
   border-left: 3px solid var(--accent); background: var(--bg-hover); border-radius: 0 8px 8px 0;
   color: var(--text);
 }
+.wf-acceptance { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--border); border-radius: 9px; font-size: 12px; }
+.wf-acceptance-meta, .wf-acceptance-item small { color: var(--text-faint); font-size: 11px; }
+.wf-acceptance-item { display: flex; gap: 8px; border-top: 1px solid var(--border); padding-top: 7px; }
+.wf-acceptance-item > span { flex: 0 0 auto; color: var(--accent); font-size: 11px; }
+.wf-acceptance-item > div { display: grid; gap: 3px; }
+.wf-acceptance-final { display: grid; gap: 7px; }
+.wf-acceptance-final p { margin: 0; color: var(--text-muted); }
+.wf-acceptance-final textarea { width: 100%; box-sizing: border-box; padding: 7px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-raised); color: var(--text); resize: vertical; }
+.wf-acceptance-final > div { display: flex; gap: 7px; }
 .wf-meta { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
 .wf-error { margin: 0; color: var(--danger); font-size: 11.5px; }
 .wf-alert {

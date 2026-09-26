@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><title>自主开发舱反馈交互验证</title>
+<style>
+:root{--bg:#111824;--bg-raised:#192234;--bg-hover:#232e43;--text:#e8eef9;--text-muted:#adbcd3;--text-faint:#8293ae;--border:#34445e;--border-strong:#637492;--accent:#70aaff;--danger:#ff8199;--green:#57d59a;--amber:#edc173}
+body{margin:0;font:14px sans-serif;background:var(--bg);color:var(--text)}#app{height:100vh;display:flex;flex-direction:column}
+</style><div id="app"></div>
+<script type="module">
+import { createApp, h, nextTick } from 'vue'
+import Cockpit from '/src/workbench/components/AutonomousCockpit.vue'
+import ChatDock from '/src/workbench/components/ChatDock.vue'
+import { agentApi, aiApi, modelApi, contextApi, mcpApi, getProjectId, setProjectId } from '/src/workbench/api.ts'
+import { capturePreviewFrame, refreshPreviewFrame } from '/src/workbench/previewCapture.ts'
+
+const checks = [], errors = []
+window.DocMindSession = {get:()=> 'smoke-session', ready:Promise.resolve(), ensure:async()=>true, set:async()=>true, create:async()=> 'smoke-session'}
+window.addEventListener('error', ev => errors.push(ev.message))
+window.addEventListener('unhandledrejection', ev => errors.push(String(ev.reason)))
+const clone = value => JSON.parse(JSON.stringify(value))
+const state = {workflow_id:'smoke-wf', request:'检查通用项目交互画面', status:'completed', tasks:[], events:[], visual_feedback:[], preview:{artifacts:[{id:'preview-1',label:'通用项目画面',kind:'interactive',uri:'/.docmind/cockpit-feedback-preview.html'}]}}
+const statuses = [], projects = [], chatRequests = []
+const noopList = async () => ({ok:true,items:[],approvals:[],pending:{},servers:[]})
+agentApi.workflowList = async () => ({items:[state]})
+agentApi.workflow = async () => ({ok:true,workflow:clone(state)})
+agentApi.workflowActive = async () => ({ok:true,items:[]})
+agentApi.approvalRequests = agentApi.approvals = noopList
+mcpApi.capabilities = mcpApi.servers = noopList
+modelApi.get = async () => ({llm_provider:'mock',llm_model:'mock',providers:[],provider_meta:{},capability:{thinking:'none',vision:'native',video:'none',context_window:8192}})
+contextApi.get = async () => ({ok:true})
+// Every remaining API request is handled locally; no real project or model is used.
+const originalFetch = window.fetch.bind(window)
+window.fetch = async (url, options) => {
+  if (String(url).startsWith('/api/')) return new Response(JSON.stringify({ok:true,items:[],sessions:[],messages:[],servers:[],workflow:null}), {headers:{'Content-Type':'application/json'}})
+  return originalFetch(url,options)
+}
+window.EventSource = class { addEventListener(){} close(){} }
+agentApi.workflowVisualFeedback = async (wid, record, pid) => {
+  projects.push(pid)
+  let saved = state.visual_feedback.find(row => row.id === record.id)
+  if (!saved) { saved = {...record,status:'pending',screenshot:false,snapshots:{}};state.visual_feedback.unshift(saved) }
+  return {ok:true,feedback:clone(saved)}
+}
+const images = new Map()
+const snapshotCalls = []
+let failSnapshot = false
+agentApi.workflowFeedbackSnapshot = async (wid,id,phase,image,pid) => {
+  projects.push(pid)
+  snapshotCalls.push({id,phase,pid})
+  if (phase === 'after' && failSnapshot) { failSnapshot=false;return {ok:false,error:'测试：截图存储不可用'} }
+  const record = state.visual_feedback.find(row => row.id === id)
+  images.set(`${id}:${phase}`,image)
+  record.snapshots[phase] = {width:300,height:360,bytes:300,captured_at:new Date().toISOString()}
+  record.screenshot = !!record.snapshots.before
+  return {ok:true,feedback:clone(record)}
+}
+agentApi.workflowFeedbackSnapshotUrl = (wid,id,phase) => `/.docmind/cockpit-feedback-pixel.png?id=${id}&phase=${phase}`
+agentApi.workflowFeedbackStatus = async (wid,id,status,detail,pid=getProjectId()) => {
+  projects.push(pid)
+  // Deliberately slower first status to expose out-of-order acknowledgement bugs.
+  if(status === 'processing') await new Promise(resolve => setTimeout(resolve,70))
+  statuses.push(status)
+  const record = state.visual_feedback.find(row => row.id === id)
+  Object.assign(record,{status,detail})
+  return {ok:true,feedback:clone(record)}
+}
+let completeChat
+aiApi.askGrounded = (prompt,handlers,options) => new Promise(resolve => {
+  chatRequests.push({prompt,options})
+  completeChat = () => { handlers.onEvent({type:'final',text:'请检查项目效果。'}); resolve() }
+})
+setProjectId('smoke-project')
+const root = {render:()=>[h(Cockpit),h(ChatDock)]}
+let app = createApp(root)
+app.mount('#app')
+const waitFor = async (predicate,label) => {
+  for(let i=0;i<150;i++){if(predicate())return;await new Promise(resolve=>setTimeout(resolve,30))}
+  throw new Error(`等待超时：${label}\n${document.body.innerText.slice(-1200)}\n${errors.join('\n')}`)
+}
+const assert = (condition,label) => {if(!condition)throw new Error(label);checks.push(label)}
+const pixel = async (encoded,x,y) => {
+  const image=await createImageBitmap(await (await originalFetch(encoded)).blob())
+  const canvas=document.createElement('canvas');canvas.width=image.width;canvas.height=image.height
+  const ctx=canvas.getContext('2d');ctx.drawImage(image,0,0);image.close()
+  return [...ctx.getImageData(x,y,1,1).data].slice(0,3).join(',')
+}
+const click = text => {
+  const button = [...document.querySelectorAll('button')].find(button=>button.textContent.trim()===text)
+  if(!button)throw new Error(`按钮不存在：${text}`)
+  button.click()
+}
+const writeFeedback = async text => {
+  click('反馈给 AI');await nextTick()
+  const textarea = document.querySelector('.acp-feedback-pop textarea')
+  textarea.value = text;textarea.dispatchEvent(new Event('input',{bubbles:true}));await nextTick()
+  click('发送并修改')
+}
+window.runSmoke = async () => {
+  await waitFor(()=>document.querySelector('.acp-preview'),'加载工作流')
+  document.querySelector('.acp-preview').open = true
+  await waitFor(()=>document.querySelector('iframe')?.contentDocument?.querySelector('canvas'),'加载同源画布')
+  const handle=document.querySelector('.acp-resize-handle'), viewport=document.querySelector('.acp-live-viewport')
+  handle.setPointerCapture=()=>{}
+  handle.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,pointerId:2,clientX:100,clientY:300}))
+  window.dispatchEvent(new PointerEvent('pointermove',{pointerId:2,clientX:50,clientY:340}))
+  window.dispatchEvent(new PointerEvent('pointerup',{pointerId:2,clientX:50,clientY:340}))
+  await nextTick()
+  assert(viewport.style.width!=='100%' && viewport.style.height==='400px','拖动可以调整预览宽度与高度')
+  const draft=document.querySelector('.cd-input')
+  draft.value='保留尚未发送的聊天草稿';draft.dispatchEvent(new Event('input',{bubbles:true}));await nextTick()
+  click('标注区域');await nextTick()
+  const layer = document.querySelector('.acp-annotation-layer'), box = layer.getBoundingClientRect()
+  layer.setPointerCapture = () => {} // Synthetic pointers do not own browser capture.
+  for(const [type,x,y] of [['pointerdown',.2,.3],['pointermove',.6,.7],['pointerup',.6,.7]]) layer.dispatchEvent(new PointerEvent(type,{bubbles:true,pointerId:1,clientX:box.left+box.width*x,clientY:box.top+box.height*y}))
+  await nextTick()
+  assert(!!document.querySelector('.acp-feedback-pop'),'框选后自动打开反馈窗')
+  assert(!!document.querySelector('.acp-annotation-box'),'框选范围保留')
+  click('反馈给 AI');await nextTick() // close the form opened by selection
+  await writeFeedback('把按钮移动到框选区域')
+  await waitFor(()=>chatRequests.length===1,'首条反馈进入真实对话组件')
+  assert(chatRequests[0].options.images.length===1,'真实对话组件收到 PNG 附图')
+  assert(draft.value==='保留尚未发送的聊天草稿','画面反馈不会清空原有聊天草稿')
+  assert(chatRequests[0].prompt.includes('左 20%'),'发送内容包含框选坐标')
+  assert(state.visual_feedback[0].snapshots.before,'修改前截图保存')
+  const firstId=state.visual_feedback[0].id,original=images.get(`${firstId}:before`)
+  assert(await pixel(original,10,70)==='232,76,76','截图包含普通网页按钮而不只包含画布')
+  assert(await pixel(original,10,140)==='112,170,255','同一截图包含画布内容与网页内容')
+  await writeFeedback('另外调整背景颜色')
+  await waitFor(()=>state.visual_feedback.length===2 && state.visual_feedback[0].detail?.includes('正忙'),'忙碌反馈保留')
+  assert(chatRequests.length===1,'AI 忙碌时不会悄悄丢弃或重复发送')
+  const loadsBefore=window.previewLoads
+  localStorage.setItem('smoke-preview-color','#198754')
+  completeChat()
+  await waitFor(()=>state.visual_feedback[1].status==='awaiting_review','首条回复等待用户复验')
+  assert(window.previewLoads>loadsBefore,'AI 回复后自动重新加载项目画面')
+  assert(state.visual_feedback[1].snapshots.after,'AI 回复后自动保存复验截图')
+  assert(await pixel(images.get(`${firstId}:after`),10,70)==='25,135,84','复验截图来自刷新后的新画面')
+  assert(images.get(`${firstId}:before`)===original,'自动复验不会覆盖原始截图')
+  assert(state.visual_feedback[1].status!=='accepted','自动截图不替用户确认效果满意')
+  click('重新发送')
+  await waitFor(()=>chatRequests.length===2,'保留反馈可重试')
+  assert(chatRequests[1].options.images.length===1,'重试重新附上原始截图')
+  completeChat()
+  await waitFor(()=>state.visual_feedback[0].status==='awaiting_review','重试完成')
+  assert(statuses.filter(status=>status==='awaiting_review').length===2,'两次处理和自动记录都完成后等待用户审核')
+  assert(statuses.at(-1)==='awaiting_review','慢响应不会覆盖最终反馈状态')
+  click('记录当前效果')
+  await waitFor(()=>state.visual_feedback[0].snapshots.after,'保存复验截图')
+  await waitFor(()=>[...document.querySelectorAll('.acp-snapshot-pair figure img')].every(image=>image.naturalWidth>0),'截图图片成功加载')
+  assert(document.querySelectorAll('.acp-snapshot-pair figure img').length>=2,'修改前与复验画面并排显示')
+  await writeFeedback('模拟截图保存失败')
+  await waitFor(()=>chatRequests.length===3,'第三条反馈收到')
+  failSnapshot=true;completeChat()
+  await waitFor(()=>state.visual_feedback[0].status==='awaiting_review','截图失败仍保留待审核反馈')
+  assert(state.visual_feedback[0].detail.includes('自动记录未完成')&&!state.visual_feedback[0].snapshots.after,'自动截图保存失败明确展示且不冒充已有证据')
+  click('记录当前效果')
+  await waitFor(()=>state.visual_feedback[0].snapshots.after,'截图失败后可以手动补录')
+  click('效果满意')
+  await waitFor(()=>state.visual_feedback[0].status==='accepted','用户确认效果')
+  assert(projects.every(pid=>pid==='smoke-project'),'保存始终绑定发起反馈的项目')
+  const frame=document.querySelector('iframe')
+  frame.contentDocument.body.innerHTML='<div style="height:60px;background:#e84c4c">DOM only</div>'
+  const domOnly=await capturePreviewFrame(frame)
+  assert(await pixel(await new Promise(resolve=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.readAsDataURL(domOnly)}),180,40)==='232,76,76','没有任何 canvas 的普通网页也可以截图')
+  await refreshPreviewFrame(frame)
+  frame.contentWindow.scrollTo(0,0)
+  frame.contentDocument.body.style.height='1200px'
+  const block=frame.contentDocument.createElement('div');block.style.cssText='position:absolute;top:600px;left:0;width:200px;height:60px;background:#e84c4c';frame.contentDocument.body.appendChild(block)
+  frame.contentWindow.scrollTo(0,600)
+  const scrolled=await capturePreviewFrame(frame)
+  assert(await pixel(await new Promise(resolve=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.readAsDataURL(scrolled)}),10,10)==='232,76,76','截图与用户当前滚动视口一致')
+  await refreshPreviewFrame(frame)
+  frame.contentDocument.body.insertAdjacentHTML('beforeend','<video style="width:100px;height:100px"></video>')
+  let unsupported='';try{await capturePreviewFrame(frame)}catch(e){unsupported=e.message}
+  assert(unsupported.includes('视频'),'不能完整截取的视频画面明确拒绝，避免虚假截图')
+  await refreshPreviewFrame(frame)
+  const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));frame.src='data:text/html,<h1>cross origin</h1>';await loaded
+  await writeFeedback('跨域画面反馈')
+  await waitFor(()=>chatRequests.length===4,'跨域画面仍能发送文字反馈')
+  assert(chatRequests[3].options.images.length===0&&chatRequests[3].prompt.includes('跨域'),'跨域画面明确退回文字反馈，模型不会收到假图')
+  // Preserve the cross-origin frame during refresh to exercise the automatic failure path.
+  completeChat()
+  await waitFor(()=>state.visual_feedback[0].status==='awaiting_review','跨域自动截图结束')
+  assert(state.visual_feedback[0].detail.includes('跨域')&&!state.visual_feedback[0].snapshots.after,'跨域自动复验明确报告未完成')
+  click('刷新')
+  await waitFor(()=>document.querySelector('iframe')?.contentDocument?.querySelector('canvas'),'恢复同源项目画面')
+  app.unmount();app=createApp(root);app.mount('#app')
+  await waitFor(()=>document.body.innerText.includes('效果已确认'),'刷新组件恢复反馈')
+  localStorage.removeItem('smoke-preview-color')
+  assert(document.querySelectorAll('.acp-snapshot-pair img').length>=2,'重新打开仍能查看截图对比')
+  assert(!errors.length,`页面无运行错误：${errors.join('; ')}`)
+  document.querySelector('.acp-preview').open=true
+  document.querySelector('.cd-head-toggle').click();await nextTick()
+  document.querySelector('.acp-feedback-history').scrollIntoView({block:'center'})
+  return {checks,statuses,chatRequests:chatRequests.length}
+}
+</script></html>

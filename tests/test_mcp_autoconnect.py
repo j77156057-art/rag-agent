@@ -258,6 +258,22 @@ class ResolveSecretRefsTests(_TmpProject):
         with self.assertRaises(mcp_autoconnect.AutoConnectError):
             mcp_autoconnect.resolve_secret_refs(cfg, self.project)
 
+    def test_missing_optional_provider_is_empty(self):
+        cfg = {"transport": "stdio", "command": "x", "args": [],
+               "env": {"OPTIONAL": "@secret:optional"}, "headers": {},
+               "provenance": {"secret_specs": [{"name": "optional", "required": False}]}}
+        out = mcp_autoconnect.resolve_secret_refs(cfg, self.project)
+        self.assertEqual(out["env"]["OPTIONAL"], "")
+
+    def test_missing_optional_http_token_omits_authorization_header(self):
+        cfg = {"transport": "http", "url": "https://api.smithery.ai/mcp",
+               "headers": {"Authorization": "Bearer @secret:optional", "X-Mode": "public"},
+               "provenance": {"secret_specs": [{"name": "optional", "required": False}]}}
+        self.assertEqual(mcp_autoconnect.http_headers_for(cfg, self.project), {"X-Mode": "public"})
+        secrets_store.save(self.project, "optional", "token-value")
+        self.assertEqual(mcp_autoconnect.http_headers_for(cfg, self.project),
+                         {"Authorization": "Bearer token-value", "X-Mode": "public"})
+
     def test_resolves_inline_secret_keeps_prefix(self):
         # 值内嵌 @secret:（remotes header 形态）：前缀 "Bearer " 必须保留
         secrets_store.save(self.project, "smithery_api_key", "PLAIN-TOKEN-999")
@@ -281,6 +297,31 @@ class ResolveSecretRefsTests(_TmpProject):
 
 
 class ProbeCandidateTests(_TmpProject):
+    def test_easyeda_probe_reports_editor_disconnected(self):
+        class FakeSession:
+            def __init__(self, _cfg, cwd=None):
+                self.cwd = cwd
+
+            def initialize(self, timeout=60):
+                return {}
+
+            def request(self, method, params, timeout=30):
+                if method == "tools/list":
+                    return {"tools": [{"name": "easyeda_live_status"}]}
+                return {"structuredContent": {"status": {"connected": False}}}
+
+            def close(self):
+                pass
+
+        with patch("mcp_client._StdioSession", FakeSession):
+            res = mcp_autoconnect.probe_candidate(self.project, {
+                "transport": "stdio", "command": "npx", "args": [],
+                "env": {}, "headers": {},
+            }, timeout=7)
+        self.assertTrue(res["probe_ok"])
+        self.assertFalse(res["ready"])
+        self.assertIn("扩展未连接", res["readiness_message"])
+
     def test_unresolvable_command_raises_mcp_error(self):
         cand = {"transport": "stdio", "command": "definitely-not-a-real-launcher-xyz",
                 "args": [], "url": "", "env": {}, "headers": {}, "command_unresolved": True}
@@ -599,6 +640,16 @@ class TrustTierTests(_TmpProject):
                               "namespace": "io.modelcontextprotocol"}}
         view = mcp_autoconnect._candidate_view(cfg, "trusted", [])
         self.assertEqual(view["trust_tier"], "official")
+
+    def test_github_namespace_does_not_prove_vendor_official(self):
+        cfg = {"transport": "stdio", "command": "npx", "args": ["easyeda-copilot-mcp"],
+               "url": "", "env": {}, "headers": {},
+               "provenance": {"url": "https://github.com/biosshot/easyeda-copilot",
+                              "domain": "github.com", "registry": True,
+                              "server_name": "io.github.biosshot/easyeda-copilot",
+                              "namespace": "io.github.biosshot"}}
+        view = mcp_autoconnect._candidate_view(cfg, "trusted", [])
+        self.assertEqual(view["trust_tier"], "community")
 
     def test_curated_is_official(self):
         cfg = {"transport": "stdio", "command": "uvx", "args": ["mcp-server-github"],

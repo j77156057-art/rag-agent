@@ -381,16 +381,14 @@ def _mcp_gate_blocked(root, action, target):
 
 
 def dev_mcp_search(arg):
-    """搜索 MCP 连接方式的【离线安全目录】：按能力关键词（如 kicad / pcb / 数据库 / github）
-    返回匹配条目的能力清单、连接选项、安装步骤、可直接回填的连接模板。
+    """搜索 MCP 连接方式：离线领域指引 + 用户允许联网时的真实 Registry 候选。
 
-    输入：能力关键词（至少 2 个字符）。本工具不联网；需要最新第三方 MCP 时，在联网开启下
-    另行使用 web_search（如 '<软件名> MCP server uvx github'）与 web_fetch 读官方文档，
-    确认官方 command/URL 后再调用 dev_mcp_add——严禁把搜索摘要里未经验证的命令直接装配。
+    输入：能力关键词（至少 2 个字符）。联网开关继承当前 Agent 会话；关时绝不查 Registry。
+    Registry 候选先过 R1-R9，模型仍须展示候选、经审批后装配；搜索摘要不能直接执行。
 
     返回 JSON：ok / results[]（id,label,summary,capabilities,connection_options,
     setup_steps,template{key,label,transport,command,args,url},source_status）。
-    注意 template.command 可能为空（离线指引类条目），此时必须以官方文档补全命令后再 add。
+    注意 template.command 可能为空（离线指引类条目）；带 config 的 Registry 选项可直接预览。
     """
     root = _mcp_project_root()
     if not root:
@@ -399,7 +397,13 @@ def dev_mcp_search(arg):
     if query.lower().startswith("query:"):
         query = query[6:].strip()
     try:
-        result = mcp_capabilities.search_directory(query, web_enabled=False)
+        web_enabled = _session_web_enabled.get()
+        if web_enabled:
+            from mcp_registry_bridge import registry_fn_for
+            result = mcp_capabilities.search_directory(
+                query, web_enabled=True, registry_fn=registry_fn_for(root))
+        else:
+            result = mcp_capabilities.search_directory(query, web_enabled=False)
     except Exception as e:  # noqa: BLE001
         return f'MCP 搜索失败：{type(e).__name__}: {e}'
     if not result.get("ok"):
@@ -416,8 +420,7 @@ def dev_mcp_search(arg):
             "template": item.get("template") or {},
             "source_status": item.get("source_status"),
         })
-    return json.dumps({"ok": True, "query": query, "results": items},
-                      ensure_ascii=False)[:6000]
+    return json.dumps({"ok": True, "query": query, "results": items}, ensure_ascii=False)
 
 
 def dev_mcp_add(arg):
@@ -435,9 +438,9 @@ def dev_mcp_add(arg):
       url: <http(s)://.../mcp>
       enabled: <true|false，默认 true>
 
-    首次调用未审批时返回 blocked/approval_required，其中含 action 与 target；
-    先调用 dev_approve(action: mcp_server, target: <阻断结构里给出的完整 target>)，
-    再用【完全相同的参数】重试本工具。target 已绑定命令/URL，改参数需重新审批。
+    首次调用未获用户确认时返回 blocked/approval_required，其中含 action 与 target；
+    向用户展示阻断结构里的完整 command/args 或 URL，用户在 MCP 设置中确认后，
+    再用【完全相同的参数】重试本工具。target 已绑定命令/URL，改参数需重新确认。
     成功返回 {ok, server:{key,transport,enabled,...}}，随后应调用 dev_mcp_probe 探活。
     """
     root = _mcp_project_root()
@@ -489,8 +492,8 @@ def dev_mcp_add(arg):
     target = _mcp_server_approval_target(key, cfg)
     gate = _mcp_gate_blocked(root, "mcp_server", target)
     if gate:
-        gate["hint"] = ("先调用 dev_approve，输入 action: mcp_server 换行 target: "
-                        + target + "，审批通过后用完全相同的参数重试 dev_mcp_add。")
+        gate["hint"] = ("请用户在 MCP 设置中确认该连接器（target: " + target
+                        + "）；确认后用完全相同的参数重试 dev_mcp_add。")
         return json.dumps(gate, ensure_ascii=False)
     try:
         mcp_client.save_server(root, key, cfg)
@@ -534,12 +537,12 @@ def dev_mcp_probe(arg):
 
 
 def dev_mcp_discover(arg):
-    """读取连接器工具并生成【待审批】能力候选（不会自动启用路由）。
+    """读取连接器工具并生成【待用户确认】能力候选（不会自动启用路由）。
 
     输入：连接器 key。前置：dev_mcp_add 已添加且 dev_mcp_probe 成功（引擎类 stdio 还需
     对应软件已打开）。返回候选摘要：domain/capabilities/tool_count/confidence/tool_mappings。
-    之后必须向用户说明该连接器能做什么，用户确认后：dev_approve(action: mcp_capability,
-    target: <key>) → dev_mcp_decide(decision: approve) 才允许 Agent 自动路由调用。
+    之后必须向用户说明该连接器能做什么，用户确认后再 dev_mcp_decide(decision: approve)
+    才允许 Agent 自动路由调用。
     """
     root = _mcp_project_root()
     if not root:
@@ -563,13 +566,13 @@ def dev_mcp_discover(arg):
         "capabilities": cand["capabilities"], "tool_count": cand["tool_count"],
         "confidence": cand["confidence"], "best_for": cand["best_for"],
         "tool_mappings": cand["tool_mappings"][:40],
-    }, "next": ("向用户说明能力清单并取得确认；随后 dev_approve(action: mcp_capability, "
-                f"target: {key}) 再 dev_mcp_decide(decision: approve, key: {key})")},
+    }, "next": ("向用户说明能力清单并取得确认；用户确认后再 "
+                f"dev_mcp_decide(decision: approve, key: {key})")},
         ensure_ascii=False)[:6000]
 
 
 def dev_mcp_decide(arg):
-    """批准/拒绝连接器的能力候选。批准是敏感操作，需先通过 mcp_capability 审批。
+    """批准/拒绝连接器的能力候选。批准是敏感操作，需先通过用户确认。
 
     输入（多行 key: value）：
       decision: approve   # 或 reject
@@ -591,8 +594,8 @@ def dev_mcp_decide(arg):
     if approved:
         gate = _mcp_gate_blocked(root, "mcp_capability", key)
         if gate:
-            gate["hint"] = (f"先调用 dev_approve，输入 action: mcp_capability 换行 target: {key}，"
-                            "审批通过后重试 dev_mcp_decide。")
+            gate["hint"] = (f"请用户在 MCP 设置中确认连接器 {key} 的能力，"
+                            "确认后重试 dev_mcp_decide。")
             return json.dumps(gate, ensure_ascii=False)
     try:
         result = mcp_capabilities.approve(root, key, approved)
@@ -606,10 +609,10 @@ def dev_mcp_decide(arg):
 
 
 def dev_mcp_remove(arg):
-    """移除（自定义）或禁用（内置预设）一个 MCP 连接器。敏感操作：需先通过 mcp_server 审批。
+    """移除（自定义）或禁用（内置预设）一个 MCP 连接器。敏感操作：需先通过用户确认。
 
     输入：连接器 key（可带 'key: ' 前缀）。会先关闭活动会话。审批 target 即 key 本身：
-    dev_approve(action: mcp_server, target: <key>) 后重试。
+    用户在 MCP 设置中确认后重试。
     """
     root = _mcp_project_root()
     if not root:
@@ -621,8 +624,7 @@ def dev_mcp_remove(arg):
         return json.dumps({"ok": False, "error": "缺少连接器 key。"}, ensure_ascii=False)
     gate = _mcp_gate_blocked(root, "mcp_server", key)
     if gate:
-        gate["hint"] = (f"先调用 dev_approve，输入 action: mcp_server 换行 target: {key}，"
-                        "审批通过后重试 dev_mcp_remove。")
+        gate["hint"] = (f"请用户在 MCP 设置中确认移除 {key}，确认后重试 dev_mcp_remove。")
         return json.dumps(gate, ensure_ascii=False)
     try:
         mcp_client.close_server(root, key)
@@ -3922,30 +3924,28 @@ def dev_add_region(arg):
 
 
 def dev_approve(arg):
-    """审批敏感操作（提交/回滚/应用分区方案/装配 MCP）前必须调用：记录一次审批，30 分钟内该操作放行。
-    输入：action: <commit_region|commit_all|rollback_changeset|apply_regions|mcp_server|mcp_capability> 换行 target: <对象>
+    """审批敏感操作（提交/回滚/应用分区方案）前必须调用：记录一次审批，30 分钟内该操作放行。
+    输入：action: <commit_region|commit_all|rollback_changeset|apply_regions|install_tool> 换行 target: <对象>
     target 精确匹配、不是通配符：commit_region 传分区 key（逐区审批，不能用 *）、
     rollback_changeset 传变更集 id、commit_all / apply_regions 固定传 *；
-    mcp_server 传 dev_mcp_add/dev_mcp_remove 阻断结构里给出的完整 target（add 的 target 已绑定命令/URL，必须原样照抄）；
-    mcp_capability 传连接器 key。
+    MCP 的 mcp_server / mcp_capability 审批只能由用户在工作台确认，不能由 Agent 自己写入；
+    Agent 遇到这两类阻断时应把候选、命令/URL 和能力清单展示给用户，等待用户操作。
     在调用 dev_commit / dev_commit_all / dev_rollback_changeset / dev_apply_regions / dev_add_region /
-    dev_mcp_add / dev_mcp_remove / dev_mcp_decide 之前先调用本工具完成审批。
-    若这些工具返回 blocked / approval_required，先调用本工具再重试，不要绕过。"""
+    分区类 dev_* 工具之前先调用本工具完成审批。
+    MCP 工具返回 blocked / approval_required 时必须等待用户在工作台确认；
+    不要调用本工具代替用户审批，也不要绕过阻断。"""
     f = _parse_keyed(arg or "", ["action", "target"])
     action = (f.get("action") or "").strip()
     target = (f.get("target") or "*").strip() or "*"
     if not action:
-        return "参数缺失：请提供 action: <操作名>（如 commit_all / mcp_server / mcp_capability）。"
-    # MCP 审批只依赖代码库根，不要求初始化分区；分区类操作维持原前置。
+        return "参数缺失：请提供 action: <操作名>（如 commit_all / rollback_changeset / install_tool）。"
     if action in ("mcp_server", "mcp_capability"):
-        root = _get_code_root()
-        if not root:
-            return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
-    else:
-        res, err = _require_regions()
-        if res is None:
-            return err
-        root, _ = res
+        return ("MCP 连接和能力路由必须由用户在工作台明确确认，Agent 不能自行审批。"
+                "请展示 blocked 详情后等待用户在 MCP 设置中点击确认。")
+    res, err = _require_regions()
+    if res is None:
+        return err
+    root, _ = res
     from game_workbench import approval
     approval(root, action, "agent", approved=True, target=target)
     return f"已审批 {action}(target={target})，30 分钟内该操作放行。现在可执行对应的 dev_* 工具。"
@@ -4348,6 +4348,41 @@ def game_screenshot(arg=""):
         data={"images": [encoded], "image_sources": [path]})
 
 
+def preview_project(arg=""):
+    """在正式开发舱中捕获当前项目的真实网页画面。
+
+    这是视觉验收适配器的通用入口：截图会同时作为模型视觉观察和工作流
+    preview artifact 保存。非网页项目应改用领域工具（如 game_screenshot 或
+    已启用的 EDA MCP），不能把缺少画面误报成通过。
+    """
+    root = _get_code_root()
+    if not root:
+        return ToolResult(False, "真实预览失败：尚未配置当前项目。", error_kind="configuration")
+    fields = _parse_keyed(arg or "", ["entry", "width", "height", "timeout"])
+    try:
+        from agent_runtime.visual_acceptance import capture_project_preview
+        report = capture_project_preview(
+            root,
+            entry=fields.get("entry") or "",
+            width=int(fields.get("width") or 960),
+            height=int(fields.get("height") or 540),
+            timeout=float(fields.get("timeout") or 25),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return ToolResult(False, f"真实预览失败：{type(exc).__name__}：{str(exc)[:300]}",
+                          error_kind="visual_capture")
+    screenshot = report.get("screenshot") or ""
+    text = json.dumps({key: value for key, value in report.items() if key != "image"},
+                      ensure_ascii=False)
+    return ToolResult(
+        bool(report.get("passed")),
+        "真实浏览器预览已完成：" + text,
+        data={"images": [report["image"]], "image_sources": [screenshot]},
+        artifacts=list(report.get("artifacts") or []),
+        error_kind="" if report.get("passed") else "visual_acceptance_failed",
+    )
+
+
 # ---------------------------------------------------------------------------
 # start_workflow：对话内发起【跨窗口持久开发工作流】
 #
@@ -4636,11 +4671,34 @@ def _sv_verify_script(script_name, kind, root, result):
         result["ran"].append(kind + ":skip（%s）" % type(e).__name__)
 
 
+def _sv_verify_visual(root, result):
+    """Use the formal browser adapter as an explicit visual verification gate."""
+    try:
+        from agent_runtime.visual_acceptance import capture_project_preview
+        report = capture_project_preview(root)
+        result["ran"].append("visual:browser_preview")
+        result["visual"] = {
+            "checks": dict(report.get("checks") or {}),
+            "screenshot": report.get("screenshot", ""),
+        }
+        if not report.get("passed"):
+            result["failures"].append({
+                "scope": "visual", "file": root,
+                "error": "真实浏览器画面验收未通过：" + json.dumps(
+                    report.get("checks") or {}, ensure_ascii=False),
+            })
+    except Exception as exc:  # noqa: BLE001
+        result["failures"].append({
+            "scope": "visual", "file": root,
+            "error": "真实浏览器画面验收失败：%s：%s" % (type(exc).__name__, str(exc)[:240]),
+        })
+
+
 def self_verify(arg=""):
     """对代码库最近改动做轻量自验证，返回结构化 JSON 字符串（与文本协议 Action Input 同形）。
 
     入参（单行/多行 key: value）：
-      scope: auto(默认, 按改动文件自动选) / backend / frontend / scene / engine / all / skip
+      scope: auto(默认, 按改动文件自动选) / backend / frontend / scene / engine / visual / all / skip
       files: 显式指定待校验文件（相对/绝对路径，可多行或逗号分隔）；缺省时用 git diff 自动发现
     返回 JSON：{"scope","ran":[...],"passed":bool,"failures":[...],"note":""}
       status 区分 passed/failed/skipped/partial；无检查或跳过不视为通过。
@@ -4666,7 +4724,7 @@ def self_verify(arg=""):
             targets.append(os.path.abspath(f))
     else:
         targets = _sv_changed_via_git(root) if root else []
-    if not targets:
+    if not targets and scope != "visual":
         result["note"] = "未发现可校验的改动（无 git 改动或显式文件）。"
         return json.dumps(finalize_verification(result), ensure_ascii=False)
 
@@ -4723,6 +4781,8 @@ def self_verify(arg=""):
                 _sv_verify_script("verify_scene_canvas.py", "scene", root, result)
             elif sc == "engine":
                 _sv_verify_script("verify_engine_embed.py", "engine", root, result)
+            elif sc == "visual":
+                _sv_verify_visual(root, result)
             else:
                 result["ran"].append("skip:未知 scope=" + str(sc))
         except Exception as e:  # noqa: BLE001 —— 单个 scope 校验器故障绝不阻断整体
@@ -4775,12 +4835,12 @@ TOOLS = {
     "dev_list_connectors": {"description": "列出已配置 MCP 连接器（key/label/engine/transport/启用状态/能力标签/适用说明），供 Agent 自主挑选最合适的引擎连接器。输入留空。", "func": dev_list_connectors},
     "dev_route_connector": {"description": "按任务语义挑选最合适的【已启用】连接器：输入 hint（任务描述，如 'Godot 里打开 Main 场景并运行'），返回排序候选与匹配理由（top.key 即 dev_mcp_call 的 key）。某连接器不可用或调用失败时，用它重新挑选其它已启用连接器。", "func": dev_route_connector},
     "dev_list_connector_tools": {"description": "列出某连接器暴露的工具（name/description/input_schema），确定 dev_mcp_call 的 name 与参数。输入 key: <连接器key>；仅对打算调用的连接器使用（godot 等 stdio 需先建立会话）。", "func": dev_list_connector_tools},
-    "dev_mcp_search": {"description": "自助装配 MCP 第 1 步：按能力关键词（如 kicad/pcb/数据库/github）搜索离线安全连接目录，返回能力清单、安装步骤与可回填的连接模板。本工具不联网；查最新第三方 MCP 时先 web_search/web_fetch 核对官方 command/URL。输入能力关键词。", "func": dev_mcp_search},
-    "dev_mcp_add": {"description": "自助装配 MCP 第 2 步（敏感，需先 dev_approve(action: mcp_server)）：新增/更新连接器配置。多行输入 key/label/transport(stdio|http)，stdio 给 command+args（或 args_json），http 给 url。未审批时返回含 action/target 的 blocked，按 hint 审批后用相同参数重试。成功后调用 dev_mcp_probe。", "func": dev_mcp_add},
+    "dev_mcp_search": {"description": "自助装配 MCP 第 1 步：按领域或能力词搜索连接方式。会话允许联网时查询官方 MCP Registry，返回经安全校验的真实候选配置；关闭联网时只返回离线指引。模型须展示候选，装配仍需审批，不能把搜索摘要当作安装命令。输入能力关键词。", "func": dev_mcp_search},
+    "dev_mcp_add": {"description": "自助装配 MCP 第 2 步（用户确认门）：新增/更新连接器配置。多行输入 key/label/transport(stdio|http)，stdio 给 command+args（或 args_json），http 给 url。未确认时返回含 action/target 的 blocked；向用户展示完整参数，用户在 MCP 设置中确认后用相同参数重试。成功后调用 dev_mcp_probe。", "func": dev_mcp_add},
     "dev_mcp_probe": {"description": "自助装配 MCP 第 3 步：探活已装配连接器（MCP initialize + tools/list），返回工具数量与名称。输入连接器 key；stdio 首次冷启动可能较慢。失败时按 error 修正参数后重新 dev_mcp_add。", "func": dev_mcp_probe},
-    "dev_mcp_discover": {"description": "自助装配 MCP 第 4 步：读取连接器工具并生成【待审批】能力候选（不会自动启用路由）。输入连接器 key。向用户说明候选能力并获确认后，dev_approve(action: mcp_capability, target: key) 再 dev_mcp_decide(decision: approve)。", "func": dev_mcp_discover},
-    "dev_mcp_decide": {"description": "自助装配 MCP 第 5 步：批准/拒绝能力候选（approve 需先 dev_approve(action: mcp_capability, target: key)）。多行输入 decision: approve|reject 与 key: <连接器key>。批准后 Agent 才能经 dev_route_connector/dev_mcp_call 自动调用该连接器。", "func": dev_mcp_decide},
-    "dev_mcp_remove": {"description": "移除自定义 MCP 连接器（内置预设则禁用），敏感操作需先 dev_approve(action: mcp_server, target: key)。输入连接器 key；会先关闭活动会话。", "func": dev_mcp_remove},
+    "dev_mcp_discover": {"description": "自助装配 MCP 第 4 步：读取连接器工具并生成【待用户确认】能力候选（不会自动启用路由）。输入连接器 key。向用户说明候选能力后，等待用户在 MCP 设置中确认，再调用 dev_mcp_decide(decision: approve)。", "func": dev_mcp_discover},
+    "dev_mcp_decide": {"description": "自助装配 MCP 第 5 步：批准/拒绝能力候选。多行输入 decision: approve|reject 与 key: <连接器key>；approve 只有用户在 MCP 设置中确认后才会放行。批准后 Agent 才能经 dev_route_connector/dev_mcp_call 自动调用该连接器。", "func": dev_mcp_decide},
+    "dev_mcp_remove": {"description": "移除自定义 MCP 连接器（内置预设则禁用），用户确认后才会放行。输入连接器 key；会先关闭活动会话。", "func": dev_mcp_remove},
     "dev_mcp_discover_from_need": {"description": "从自然语言需求发现可装配的 MCP 连接器候选（不写盘、不自动启用）。输入需求描述（如『我需要查高铁票的 MCP』），可选多行 web_enabled: true 开启联网。流程：离线精选索引 →（联网时）GitHub 域限定搜索取仓库 README 解析官方命令，候选过 R1-R9 信任闸门。返回后须向用户展示候选，逐条 dev_mcp_add（审批）落盘，再 dev_mcp_probe 探活、dev_mcp_discover 生成能力候选。", "func": dev_mcp_discover_from_need},
     "dev_skill_create": {"description": "起草用户技能（待审批，不会自动启用）。skill 是*可执行行为*，必须经用户确认才激活。多行输入 name/description/body；写入 SKILLS_DIR/.pending/<name>/SKILL.md（草稿不生效）。返回完整正文，代理须向用户完整展示并取得明确同意后，再 dev_skill_approve 激活。", "func": dev_skill_create},
     "dev_skill_approve": {"description": "激活待审批技能：把 .pending/<name>/SKILL.md 移到 SKILLS_DIR 并 reload 生效。仅当用户已明确确认该技能正文安全时调用。输入 name: <技能名>。", "func": dev_skill_approve},
@@ -4854,7 +4914,7 @@ TOOLS = {
         "func": create_file,
     },
     "self_verify": {
-        "description": "写后自验证工具（Phase 1 闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，对改动做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck），并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。你也可以主动调用它来复验指定文件。Action Input 格式：第一行 scope: <auto/backend/frontend/scene/engine/all/skip>，之后可跟多行 files: <文件路径>（缺省时自动用 git diff 发现改动）。",
+        "description": "写后自验证工具（Phase 1 闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，对改动做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck），并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。网页项目需要真实画面时可显式调用 scope: visual（正式开发舱会启动临时浏览器并保存截图证据）；你也可以主动调用它来复验指定文件。Action Input 格式：第一行 scope: <auto/backend/frontend/scene/engine/visual/all/skip>，之后可跟多行 files: <文件路径>（缺省时自动用 git diff 发现改动）。",
         "func": self_verify,
     },
     "recall_experience": {
@@ -4892,6 +4952,7 @@ TOOLS = {
     "game_impact": {"description": "按符号或关键词分析代码影响文件，输入 query。", "func": game_impact},
     "game_playtest": {"description": "在项目根目录运行 Playtest 命令，输入 command/timeout。", "func": game_playtest},
     "game_screenshot": {"description": "截取当前引擎运行画面作为视觉观察：可选输入 target: embedded|foreground（默认 embedded，嵌入窗口不可用时自动改抓前台窗口）。优先使用已启用引擎连接器的截图能力，其次抓取工作台内嵌窗口；JPEG 保存到项目 .docmind/screenshots/ 并回传图片。截图只是某一瞬间的观察，不是代码事实；无窗口/无头环境会明确失败，那时改用运行日志或受控 playtest 证据，不要臆测画面。", "func": game_screenshot},
+    "preview_project": {"description": "正式开发舱真实视觉验收：在当前项目内启动安全的本地网页预览，用真实 Edge/Chromium 截取当前画面并把截图送给视觉模型，同时登记工作流预览证据。输入可选 entry/index.html、width、height、timeout。修改网页后必须再次调用，截图失败或项目不是网页时如实报告并改用领域专用工具。", "func": preview_project},
     "start_workflow": {"description": (
         "当目标是【长链路开发流程】时升级为跨窗口持久开发工作流：满足多阶段/多角色协作、"
         "含写码或命令等副作用阶段、需要人工方案门与审批门、或可能跨窗口中断恢复之一即应使用"
@@ -4969,7 +5030,7 @@ TOOLS = {
         "func": dev_add_region,
     },
     "dev_approve": {
-        "description": "审批敏感操作前必须调用：记录一次审批，30 分钟内该操作放行。输入：action: <commit_region|commit_all|rollback_changeset|apply_regions> 换行 target: <对象>。target 精确匹配、不是通配符：commit_region 传分区 key（不能用 *）、rollback_changeset 传变更集 id、commit_all/apply_regions 固定传 *。在调用 dev_commit/dev_commit_all/dev_rollback_changeset/dev_apply_regions/dev_add_region 之前先调用本工具；若它们返回 blocked/approval_required，先调用本工具再重试，不要绕过。",
+        "description": "审批分区提交/回滚或隔离工具安装等敏感操作前必须调用。MCP 安装和能力路由不能由 Agent 自批，必须由用户在工作台确认。",
         "func": dev_approve,
     },
     "dev_approval_status": {

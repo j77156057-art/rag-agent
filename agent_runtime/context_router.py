@@ -41,6 +41,11 @@ _WEB = re.compile(
     r"\b(?:latest|current|news|release|github|bilibili)\b",
     re.I,
 )
+_MCP_DISCOVERY = re.compile(
+    r"(?:mcp|连接器).*(?:搜|找|连接|接入|添加|安装|配置|使用|调用)|"
+    r"(?:搜|找|连接|接入|添加|安装|配置|使用|调用).*(?:mcp|连接器)|"
+    r"(?:eda|kicad|altium|easyeda|pcb).*(?:mcp|连接器)", re.I,
+)
 _EXPERIENCE = re.compile(r"再次|之前|历史|经验|类似问题|复现|回归|修复|失败", re.I)
 _TERM_SPLIT = re.compile(r"[\s,，、/|;；:：()（）\[\]【】]+")
 
@@ -696,6 +701,7 @@ class ContextRouter:
         has_knowledge = bool(tuple(ingested_sources)) or "知识库中已上传" in (question or "")
         wants_knowledge = bool(has_knowledge and _KNOWLEDGE.search(query))
         wants_web = bool(web_enabled and _WEB.search(query))
+        wants_mcp = bool(_MCP_DISCOVERY.search(query))
         wants_experience = bool(experience_enabled and _EXPERIENCE.search(query))
 
         # Ambiguous questions may use both local stores.  A configured code
@@ -709,6 +715,8 @@ class ContextRouter:
         if wants_web:
             sources.append("web")
             groups.add("web")
+        if wants_mcp:
+            groups.add("developer")
         if wants_experience:
             sources.append("experience")
         if not sources:
@@ -761,6 +769,11 @@ class ContextRouter:
             route_lines.append("需要时效信息时使用 web_search/web_research，并在回答中附来源 URL。")
         elif _WEB.search(query) and not web_enabled:
             route_lines.append("问题可能需要最新外部信息，但联网未开启；应明确说明限制，不得编造实时结果。")
+        if wants_mcp:
+            route_lines.append(
+                "需要新 MCP 连接器时先调用 dev_mcp_search 查真实候选并展示给用户；"
+                "联网开关关闭时该工具只给离线指引。搜索结果不代表已连接，"
+                "添加连接器和启用能力仍需用户确认。")
         add("\n".join(route_lines))
 
         if selected:

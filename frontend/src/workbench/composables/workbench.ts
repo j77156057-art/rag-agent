@@ -219,7 +219,7 @@ function seedDemoRegionCards(cards: RegionCard[]) {
 
 // ================================================================ 工作区视图
 // Godot 式工作区切换：概览驾驶舱 / 代码编辑 / 素材中心。画布、运行为后续阶段预留标签。
-export type WorkspaceView = 'overview' | 'code' | 'assets'
+export type WorkspaceView = 'overview' | 'code' | 'assets' | 'cockpit'
 const workspace = ref<WorkspaceView>('overview')
 
 function setWorkspace(v: WorkspaceView) {
@@ -322,7 +322,7 @@ async function restoreWorkspace() {
     tabSeq = Math.max(0, ...tabs.value.map(t => t.id)) + 1
     activeId.value = data.activeId
     selectedPath.value = data.selectedPath
-    if (['overview', 'code', 'assets'].includes(data.workspace)) workspace.value = data.workspace
+    if (['overview', 'code', 'assets', 'cockpit'].includes(data.workspace)) workspace.value = data.workspace
     for (const tab of tabs.value) {
       if (tab.dirty) continue // Preserve the original base for conflict detection.
       try {
