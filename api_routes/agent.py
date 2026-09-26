@@ -18,6 +18,7 @@ from agent_runtime.retrieval_eval import compare_reports, evaluate_modes
 from agent_runtime.workflow_eval import DEFAULT_DATASET_NAME, dataset_cases
 from agent_runtime.tool_install import ToolInstallError, ToolInstallManager
 from agent_runtime.project_profile import load_profile
+from agent_runtime.adapter_catalog import catalog as adapter_catalog
 from agent_runtime.local_runtime import effective_subagent_limit, resource_profile
 from config import COLLECTION_NAME, LLM_MODEL, LLM_PROVIDER, PROVIDERS, get_runtime
 from game_workbench import approval as record_user_approval
@@ -109,6 +110,7 @@ class WorkflowCheckpointReq(BaseModel):
 
 class WorkflowProjectRollbackReq(BaseModel):
     approved: bool = False
+    paths: list[str] = []
 
 
 class WorkflowInterruptReq(BaseModel):
@@ -811,7 +813,37 @@ def build_router(ctx) -> APIRouter:
     async def workflow_project_rollback(workflow_id: str, req: WorkflowProjectRollbackReq):
         try:
             return {"ok": True, "rollback": WORKFLOWS.rollback_project_checkpoint(
-                workflow_id, approved=req.approved)}
+                workflow_id, approved=req.approved, paths=req.paths)}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @router.get("/preview-adapters")
+    async def preview_adapters():
+        """List safe adapter capabilities without exposing MCP credentials."""
+        try:
+            root = ctx._project_root_or_error()
+            connector_api = getattr(ctx, "mcp_client", None)
+            connectors = connector_api.connector_directory(root) if connector_api else []
+            return {"ok": True, **adapter_catalog(root, connectors=connectors)}
+        except Exception as exc:
+            return {"ok": False, "error": type(exc).__name__}
+
+    @router.get("/workflow/{workflow_id}/acceptance-report")
+    async def workflow_acceptance_report(workflow_id: str):
+        try:
+            state = WORKFLOWS.get(workflow_id)
+            evaluation = WORKFLOWS.evaluate(workflow_id)
+            return {"ok": True, "report": {
+                "workflow_id": workflow_id,
+                "status": state.get("status"), "kind": state.get("kind"),
+                "request": state.get("request"),
+                "acceptance": state.get("acceptance_contract") or {},
+                "evaluation": evaluation,
+                "preview": state.get("preview") or {},
+                "self_review": state.get("self_review") or {},
+                "recovery": state.get("recovery") or {},
+                "generated_at": state.get("updated_at") or state.get("created_at"),
+            }}
         except WorkflowError as exc:
             return {"ok": False, "error": str(exc)}
 

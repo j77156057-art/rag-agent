@@ -131,7 +131,7 @@ def create_checkpoint(project_root: str, storage_root: str, workflow_id: str,
 
 
 def restore_checkpoint(project_root: str, storage_root: str, workflow_id: str,
-                       checkpoint: dict[str, Any]) -> dict[str, Any]:
+                       checkpoint: dict[str, Any], selected_paths: Iterable[str] = ()) -> dict[str, Any]:
     root = _root(project_root)
     if str(checkpoint.get("workflow_id") or "") != str(workflow_id):
         raise ValueError("快照不属于当前工作流")
@@ -145,10 +145,19 @@ def restore_checkpoint(project_root: str, storage_root: str, workflow_id: str,
     files_dir = base / "files"
     restored: list[str] = []
     failed: list[dict[str, str]] = []
+    requested = {
+        str(item or "").replace("\\", "/").lstrip("/")
+        for item in selected_paths
+        if str(item or "").strip()
+    }
+    if requested and any(".." in item.split("/") for item in requested):
+        raise ValueError("回滚路径无效")
     for item in checkpoint.get("files") or []:
         if not isinstance(item, dict):
             continue
         rel = str(item.get("path") or "").replace("\\", "/").lstrip("/")
+        if requested and rel not in requested:
+            continue
         if not rel or ".." in rel.split("/"):
             failed.append({"path": rel, "reason": "invalid_path"})
             continue
@@ -163,6 +172,8 @@ def restore_checkpoint(project_root: str, storage_root: str, workflow_id: str,
             restored.append(rel)
         except OSError as exc:
             failed.append({"path": rel, "reason": type(exc).__name__})
+    missing = sorted(requested - set(restored) - {str(item.get("path") or "") for item in failed})
+    failed.extend({"path": path, "reason": "not_in_checkpoint"} for path in missing)
     return {"ok": not failed, "checkpoint_id": checkpoint_id,
             "restored": restored, "failed": failed,
             "created_at": _now(), "deletes": []}

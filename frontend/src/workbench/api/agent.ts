@@ -24,6 +24,18 @@ export interface ProjectProfile {
   preview_adapters?: string[]; sources?: string[]; updated_at?: string
 }
 export interface ProjectProfileResp { ok?: boolean; profile?: ProjectProfile; error?: string }
+export interface PreviewAdapterInfo {
+  id: string; label?: string; kind?: string; evidence?: string
+  capture_adapter?: string; available?: boolean; requires_connector?: boolean
+  connector_key?: string; transport?: string; project_scoped?: boolean
+}
+export interface PreviewAdapterCatalogResp { ok?: boolean; adapters?: PreviewAdapterInfo[]; count?: number; error?: string }
+export interface WorkflowAcceptanceReport {
+  workflow_id?: string; status?: string; kind?: string; request?: string
+  acceptance?: AcceptanceContract; evaluation?: WorkflowEvaluation
+  preview?: WorkflowPreview; self_review?: WorkflowSelfReview; recovery?: WorkflowState['recovery']
+  generated_at?: string
+}
 
 export interface WorkflowOption {
   id: string; title: string; summary: string; recommended?: boolean
@@ -315,6 +327,12 @@ export const agentApi = {
   workflowPreview(id: string): Promise<{ ok?: boolean; preview?: WorkflowPreview; error?: string }> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/preview`)
   },
+  previewAdapters(): Promise<PreviewAdapterCatalogResp> {
+    return rawJson('/api/agent/preview-adapters')
+  },
+  workflowAcceptanceReport(id: string): Promise<{ ok?: boolean; report?: WorkflowAcceptanceReport; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/acceptance-report`)
+  },
   workflowAcceptance(id: string, items: AcceptanceItem[]): Promise<WorkflowResp> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/acceptance`, { items })
   },
@@ -339,8 +357,8 @@ export const agentApi = {
   workflowProjectCheckpoint(id: string): Promise<{ ok?: boolean; checkpoint?: Record<string, unknown>; error?: string }> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/project-checkpoint`, {})
   },
-  workflowProjectRollback(id: string, approved = false): Promise<{ ok?: boolean; rollback?: Record<string, unknown>; error?: string }> {
-    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/project-rollback`, { approved })
+  workflowProjectRollback(id: string, approved = false, paths: string[] = []): Promise<{ ok?: boolean; rollback?: Record<string, unknown>; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/project-rollback`, { approved, paths })
   },
   workflowInterrupt(id: string, reason = '用户请求中断'): Promise<WorkflowResp> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/interrupt`, { reason })

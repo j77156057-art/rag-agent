@@ -3202,8 +3202,10 @@ class GameWorkflowManager:
         self._save(state)
         return dict(manifest)
 
-    def rollback_project_checkpoint(self, workflow_id: str, *, approved: bool = False) -> dict[str, Any]:
-        """Restore the workflow baseline after an explicit user approval."""
+    def rollback_project_checkpoint(self, workflow_id: str, *, approved: bool = False,
+                                    paths: Iterable[str] = ()) -> dict[str, Any]:
+        """Restore the baseline, optionally limited to selected project files."""
+        paths = tuple(str(item) for item in paths if str(item or "").strip())
         state = self._load(workflow_id)
         if not state.project_checkpoint:
             raise WorkflowError("当前工作流没有可恢复的项目快照")
@@ -3214,14 +3216,15 @@ class GameWorkflowManager:
         try:
             result = restore_checkpoint(
                 state.project_root, str(self.state_root.parent), workflow_id,
-                state.project_checkpoint,
+                state.project_checkpoint, selected_paths=paths,
             )
         except (OSError, ValueError) as exc:
             raise WorkflowError("项目快照恢复失败：%s" % type(exc).__name__) from exc
         self._event(state, "project_checkpoint_restored",
                     checkpoint_id=state.project_checkpoint.get("id"),
                     restored=len(result.get("restored") or []),
-                    failed=len(result.get("failed") or []))
+                    failed=len(result.get("failed") or []),
+                    selected=len(list(paths or [])))
         self._save(state)
         result["workflow_id"] = workflow_id
         return result
