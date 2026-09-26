@@ -667,6 +667,40 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+      <!-- 项目能力画像：只展示可复用能力摘要，不展示命令参数、环境变量或凭据 -->
+      <section v-if="state?.project_profile" class="wf-project-profile">
+        <div class="wf-project-profile-head">
+          <b>项目能力画像</b>
+          <span>{{ state.project_profile.kind || 'generic' }}</span>
+        </div>
+        <div class="wf-project-profile-counts">
+          <span>工具 <b>{{ state.project_profile.tools?.length || 0 }}</b></span>
+          <span>MCP <b>{{ state.project_profile.mcp?.length || 0 }}</b></span>
+          <span>运行命令 <b>{{ state.project_profile.run_commands?.length || 0 }}</b></span>
+          <span>预览适配器 <b>{{ state.project_profile.preview_adapters?.length || 0 }}</b></span>
+        </div>
+        <div v-if="state.project_profile.mcp?.length" class="wf-project-profile-list">
+          <small class="wf-project-profile-label">项目 MCP</small>
+          <div v-for="item in state.project_profile.mcp" :key="item.key" class="wf-project-profile-mcp">
+            <b :class="{ 'wf-profile-disabled': item.enabled === false }">{{ item.name || item.key }}</b>
+            <small v-if="item.enabled === false">已停用</small>
+            <small v-else-if="item.capabilities?.length">{{ item.capabilities.join('、') }}</small>
+          </div>
+        </div>
+        <div v-if="state.project_profile.preview_adapters?.length" class="wf-project-profile-list">
+          <small class="wf-project-profile-label">预览能力</small>
+          <div class="wf-project-profile-tags">
+            <span v-for="item in state.project_profile.preview_adapters" :key="item">{{ item }}</span>
+          </div>
+        </div>
+        <div v-if="state.project_profile.acceptance_methods?.length" class="wf-project-profile-list">
+          <small class="wf-project-profile-label">验收方式</small>
+          <div class="wf-project-profile-tags">
+            <span v-for="item in state.project_profile.acceptance_methods" :key="item">{{ item }}</span>
+          </div>
+        </div>
+      </section>
+
       <!-- 事件日志（透明：整个流程发生了什么） -->
       <details v-if="state?.events?.length" class="wf-events">
         <summary>流程事件（{{ state.events.length }}）</summary>
@@ -863,6 +897,20 @@ onBeforeUnmount(() => {
 .wf-bad { color: var(--danger); }
 .wf-review-fail { display: grid; gap: 1px; width: 100%; font-size: 11px; color: var(--text-muted); }
 .wf-review-fail small { color: var(--text-faint); }
+.wf-project-profile { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-hover); font-size: 11px; }
+.wf-project-profile-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.wf-project-profile-head span { color: var(--accent); font-size: 10px; border: 1px solid var(--border); border-radius: 99px; padding: 1px 7px; }
+.wf-project-profile-counts { display: flex; flex-wrap: wrap; gap: 6px 12px; color: var(--text-faint); }
+.wf-project-profile-counts span { white-space: nowrap; }
+.wf-project-profile-counts b { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.wf-project-profile-list { display: grid; gap: 4px; border-top: 1px solid var(--border); padding-top: 6px; }
+.wf-project-profile-label { color: var(--text-faint); }
+.wf-project-profile-mcp { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; min-width: 0; }
+.wf-project-profile-mcp b { color: var(--text-muted); font-size: 11px; font-weight: 600; }
+.wf-project-profile-mcp small { color: var(--text-faint); overflow-wrap: anywhere; }
+.wf-project-profile-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.wf-project-profile-tags span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid var(--border); border-radius: 99px; padding: 2px 7px; color: var(--text-muted); background: var(--bg-raised); }
+.wf-project-profile-tags .wf-profile-disabled { opacity: .55; text-decoration: line-through; }
 .wf-events { font-size: 11px; }
 .wf-events summary { cursor: pointer; color: var(--text-faint); }
 .wf-event { display: flex; gap: 8px; padding: 2px 0; }
