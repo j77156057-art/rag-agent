@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { agentApi, getProjectId, workflowEvents } from '../api'
-import type { VisualFeedbackRecord, WorkflowEvent, WorkflowState, WorkflowSummary } from '../api'
+import type { VisualFeedbackRecord, WorkflowEvent, WorkflowEvaluation, WorkflowState, WorkflowSummary } from '../api'
 import { blobDataUrl } from '../previewFeedback'
 import { capturePreviewFrame, refreshPreviewFrame } from '../previewCapture'
 import type { PreviewFeedbackRequest } from '../previewFeedback'
@@ -9,6 +9,7 @@ import CockpitApprovalQueue from './CockpitApprovalQueue.vue'
 
 const goal = ref('')
 const workflow = ref<WorkflowState | null>(null)
+const evaluation = ref<WorkflowEvaluation | null>(null)
 const selectedId = ref('')
 const history = ref<WorkflowSummary[]>([])
 const error = ref('')
@@ -359,6 +360,13 @@ async function hydrate(id: string, ticket = generation) {
     if (ticket !== generation) return
     if (r.ok && r.workflow) {
       workflow.value = r.workflow
+      const terminal = ['completed', 'failed', 'interrupted'].includes(r.workflow.status)
+      if (terminal) {
+        try {
+          const evaluated = await agentApi.workflowEvaluation(id)
+          if (ticket === generation && evaluated.ok && evaluated.evaluation) evaluation.value = evaluated.evaluation
+        } catch { /* 评估是增强信息，接口暂时不可用时不影响工作流状态展示 */ }
+      } else if (ticket === generation) evaluation.value = null
       if (r.workflow.visual_feedback?.length) {
         const server = r.workflow.visual_feedback.map(item => feedbackUpdates.has(item.id)
           ? feedbackHistory.value.find(row => row.id === item.id) || mapFeedback(item)
@@ -385,6 +393,7 @@ function select(id: string) {
   unsubscribe?.()
   selectedId.value = id
   workflow.value = null
+  evaluation.value = null
   loadFeedbackHistory(id)
   error.value = ''
   const ticket = generation
@@ -505,6 +514,7 @@ function onProjectChanged() {
   generation++
   unsubscribe?.()
   workflow.value = null
+  evaluation.value = null
   selectedId.value = ''
   history.value = []
   feedbackHistory.value = []
@@ -620,6 +630,14 @@ onBeforeUnmount(() => {
             <button :disabled="busy" @click="applyRecovery(option)">{{ option.action === 'retry_failed' ? '重试这些任务' : option.action === 'rollback' ? '恢复项目快照' : '查看并重新规划' }}</button>
           </div>
         </div>
+        <div v-if="evaluation" class="acp-evaluation">
+          <div class="acp-evaluation-head"><b>工作流质量评估</b><span :class="evaluation.passed ? 'acp-ok' : 'acp-error'">{{ evaluation.passed ? '通过' : '未通过' }}</span></div>
+          <div class="acp-evaluation-score"><strong>{{ Math.round((evaluation.score ?? 0) * 100) }}%</strong><small>{{ evaluation.task_count || 0 }} 个任务 · {{ evaluation.steps || 0 }} 步 · 重规划 {{ evaluation.replans || 0 }} 次</small></div>
+          <div class="acp-evaluation-metrics">
+            <span>失败 {{ evaluation.metrics?.failed_tasks || 0 }}</span><span>阻塞 {{ evaluation.metrics?.blocked_tasks || 0 }}</span><span>不确定副作用 {{ evaluation.metrics?.idempotency_in_doubt || 0 }}</span>
+          </div>
+          <details class="acp-evaluation-checks"><summary>查看检查项</summary><div v-for="check in (evaluation.checks || [])" :key="check.name" :class="check.ok ? 'acp-ok' : 'acp-error'"><span>{{ check.ok ? '✓' : '!' }}</span>{{ check.name }}<small>{{ check.detail }}</small></div></details>
+        </div>
         <div v-if="workflow.project_checkpoint?.id" class="acp-checkpoint">
           <b>执行前快照</b>
           <small>{{ workflow.project_checkpoint.file_count || 0 }} 个文件 · {{ Math.round((workflow.project_checkpoint.bytes || 0) / 1024) }} KB</small>
@@ -681,4 +699,15 @@ button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent);
 .acp-recovery-option b { display: block; }
 .acp-recovery-option small { display: block; margin-top: 3px; color: var(--text-faint); line-height: 1.45; }
 .acp-recovery-option button { justify-self: start; padding: 5px 8px; font-size: 11px; }
+.acp-evaluation { display: grid; gap: 7px; padding: 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-hover); font-size: 11px; }
+.acp-evaluation-head { display: flex; justify-content: space-between; gap: 8px; }
+.acp-evaluation-score { display: flex; align-items: baseline; gap: 8px; }
+.acp-evaluation-score strong { font-size: 21px; color: var(--accent); }
+.acp-evaluation-score small { color: var(--text-faint); }
+.acp-evaluation-metrics { display: flex; flex-wrap: wrap; gap: 6px; color: var(--text-muted); }
+.acp-evaluation-metrics span { padding: 3px 5px; border-radius: 4px; background: var(--bg-raised); }
+.acp-evaluation-checks { border-top: 1px solid var(--border); padding-top: 6px; }
+.acp-evaluation-checks summary { cursor: pointer; color: var(--text-muted); }
+.acp-evaluation-checks div { display: grid; grid-template-columns: 14px 1fr; gap: 3px; margin-top: 5px; }
+.acp-evaluation-checks small { grid-column: 2; color: var(--text-faint); line-height: 1.35; }
 </style>
