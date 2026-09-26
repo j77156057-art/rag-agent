@@ -98,6 +98,32 @@ class GameWorkflowTests(unittest.TestCase):
         self.assertEqual(preview["artifacts"][0]["id"], "screen")
         self.assertTrue(os.path.isfile(preview["artifacts"][0]["path"]))
 
+    def test_project_checkpoint_restores_baseline_without_deleting_new_files(self):
+        state_root = tempfile.mkdtemp()
+        project_root = tempfile.mkdtemp()
+        source = os.path.join(project_root, "src", "main.py")
+        os.makedirs(os.path.dirname(source), exist_ok=True)
+        with open(source, "w", encoding="utf-8") as fh:
+            fh.write("before\n")
+        with open(os.path.join(project_root, ".env"), "w", encoding="utf-8") as fh:
+            fh.write("API_KEY=should-not-be-snapshotted\n")
+        with open(os.path.join(project_root, "private.pem"), "w", encoding="utf-8") as fh:
+            fh.write("PRIVATE KEY\n")
+        manager = GameWorkflowManager(state_root)
+        wid = manager.start("修改项目", project_root=project_root)["workflow_id"]
+        checkpoint = manager.create_project_checkpoint(wid)
+        self.assertEqual(checkpoint["file_count"], 1)
+        with open(source, "w", encoding="utf-8") as fh:
+            fh.write("after\n")
+        created = os.path.join(project_root, "generated.txt")
+        with open(created, "w", encoding="utf-8") as fh:
+            fh.write("keep\n")
+        restored = manager.rollback_project_checkpoint(wid, approved=True)
+        self.assertTrue(restored["ok"])
+        with open(source, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "before\n")
+        self.assertTrue(os.path.isfile(created), "回滚不应删除快照后新建的文件")
+
     def test_acceptance_contract_rejects_empty_and_duplicate_criteria(self):
         wid = self.manager.start("检查验收条件")["workflow_id"]
         self.manager.choose(wid, "recommended")

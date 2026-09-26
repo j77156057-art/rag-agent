@@ -2544,6 +2544,10 @@ export interface WorkflowState {
   dispatches?: Array<{ planner?: string; added?: string[]; kind?: string }>
   review?: Record<string, unknown>; interrupt_reason?: string
   acceptance_contract?: AcceptanceContract
+  project_checkpoint?: {
+    id?: string; created_at?: string; file_count?: number; bytes?: number
+    skipped?: Array<{ path?: string; reason?: string }>
+  }
   visual_feedback?: VisualFeedbackRecord[]
   preview?: WorkflowPreview
   steps?: number; replans?: number; subagent_retries?: Record<string, number>; context_layers?: Record<string, unknown>
@@ -2715,6 +2719,12 @@ export const agentApi = {
   },
   workflowCheckpoint(id: string, approved?: boolean): Promise<{ ok?: boolean; checkpoint?: Record<string, unknown>; error?: string }> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/checkpoint`, { approved })
+  },
+  workflowProjectCheckpoint(id: string): Promise<{ ok?: boolean; checkpoint?: Record<string, unknown>; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/project-checkpoint`, {})
+  },
+  workflowProjectRollback(id: string, approved = false): Promise<{ ok?: boolean; rollback?: Record<string, unknown>; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/project-rollback`, { approved })
   },
   workflowInterrupt(id: string, reason = '用户请求中断'): Promise<WorkflowResp> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/interrupt`, { reason })

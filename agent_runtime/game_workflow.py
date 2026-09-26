@@ -31,6 +31,7 @@ from .acceptance_contract import (from_tasks as acceptance_from_tasks,
                                   on_plan_changed as acceptance_on_plan_changed,
                                   revise as revise_acceptance)
 from .preview_adapters import build_preview_bundle
+from .project_checkpoint import create_checkpoint, restore_checkpoint
 from .context_router import (CONTEXT_LAYERS, ContextPlan, ContextRouter,
                              allocate_layer_budgets, compress_context,
                              compress_context_async, compress_layers,
@@ -275,6 +276,9 @@ class WorkflowState:
     review: dict[str, Any] = field(default_factory=dict)
     acceptance_contract: dict[str, Any] = field(default_factory=dict)
     preview: dict[str, Any] = field(default_factory=dict)
+    # Project files captured before the first side-effecting execution wave.
+    # The orchestration checkpoint above is insufficient to restore files.
+    project_checkpoint: dict[str, Any] = field(default_factory=dict)
     visual_feedback: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     interrupt_reason: str = ""
@@ -2243,6 +2247,12 @@ class GameWorkflowManager:
         if state.status != "planned":
             raise WorkflowError("当前工作流不能执行：%s" % state.status)
         policy = WorkflowPolicy.from_state(state.policy)
+        # Capture the project before entering the approval gate.  Planning is
+        # side-effect free, so this baseline remains valid while the user
+        # reviews the plan and survives a later process restart.
+        if state.project_root and not state.project_checkpoint:
+            self.create_project_checkpoint(workflow_id)
+            state = self._load(workflow_id)
         # Keep callbacks process-local.  They may close over an Agent and are
         # deliberately never persisted; after a restart the configured
         # resolver rebuilds them from the durable session identifier.
@@ -2836,6 +2846,57 @@ class GameWorkflowManager:
         state.graph_state = snapshot
         self._save(state)
         return {"backend": "langgraph", "state": snapshot}
+
+    def create_project_checkpoint(self, workflow_id: str) -> dict[str, Any]:
+        """Capture a bounded project baseline for this workflow once."""
+        state = self._load(workflow_id)
+        if state.project_checkpoint:
+            return dict(state.project_checkpoint)
+        if not state.project_root:
+            raise WorkflowError("当前工作流没有绑定项目目录")
+        requested: list[str] = []
+        for task in state.tasks or []:
+            if isinstance(task, Mapping):
+                requested.extend(str(item) for item in task.get("files") or [])
+        try:
+            manifest = create_checkpoint(
+                state.project_root, str(self.state_root.parent), workflow_id,
+                requested,
+            )
+        except (OSError, ValueError) as exc:
+            raise WorkflowError("项目快照创建失败：%s" % type(exc).__name__) from exc
+        state.project_checkpoint = manifest
+        self._event(state, "project_checkpoint_created",
+                    checkpoint_id=manifest.get("id"),
+                    file_count=manifest.get("file_count", 0),
+                    bytes=manifest.get("bytes", 0),
+                    skipped=len(manifest.get("skipped") or []))
+        self._save(state)
+        return dict(manifest)
+
+    def rollback_project_checkpoint(self, workflow_id: str, *, approved: bool = False) -> dict[str, Any]:
+        """Restore the workflow baseline after an explicit user approval."""
+        state = self._load(workflow_id)
+        if not state.project_checkpoint:
+            raise WorkflowError("当前工作流没有可恢复的项目快照")
+        if not approved:
+            raise WorkflowError("项目回滚需要用户明确批准")
+        if not state.project_root:
+            raise WorkflowError("当前工作流没有绑定项目目录")
+        try:
+            result = restore_checkpoint(
+                state.project_root, str(self.state_root.parent), workflow_id,
+                state.project_checkpoint,
+            )
+        except (OSError, ValueError) as exc:
+            raise WorkflowError("项目快照恢复失败：%s" % type(exc).__name__) from exc
+        self._event(state, "project_checkpoint_restored",
+                    checkpoint_id=state.project_checkpoint.get("id"),
+                    restored=len(result.get("restored") or []),
+                    failed=len(result.get("failed") or []))
+        self._save(state)
+        result["workflow_id"] = workflow_id
+        return result
 
     def build_langgraph(self, *, checkpointer=None, workflow_id: str | None = None,
                         execute_wave: Callable[[list[dict[str, Any]], dict[str, Any], int], Mapping[str, Any]] | None = None,

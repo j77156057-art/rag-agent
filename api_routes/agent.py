@@ -106,6 +106,10 @@ class WorkflowCheckpointReq(BaseModel):
     approved: bool | None = None
 
 
+class WorkflowProjectRollbackReq(BaseModel):
+    approved: bool = False
+
+
 class WorkflowInterruptReq(BaseModel):
     reason: str = "用户请求中断"
 
@@ -765,6 +769,21 @@ def build_router(ctx) -> APIRouter:
     async def workflow_checkpoint(workflow_id: str, req: WorkflowCheckpointReq):
         try:
             return {"ok": True, "checkpoint": WORKFLOWS.checkpoint(
+                workflow_id, approved=req.approved)}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @router.post("/workflow/{workflow_id}/project-checkpoint")
+    async def workflow_project_checkpoint(workflow_id: str):
+        try:
+            return {"ok": True, "checkpoint": WORKFLOWS.create_project_checkpoint(workflow_id)}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @router.post("/workflow/{workflow_id}/project-rollback")
+    async def workflow_project_rollback(workflow_id: str, req: WorkflowProjectRollbackReq):
+        try:
+            return {"ok": True, "rollback": WORKFLOWS.rollback_project_checkpoint(
                 workflow_id, approved=req.approved)}
         except WorkflowError as exc:
             return {"ok": False, "error": str(exc)}

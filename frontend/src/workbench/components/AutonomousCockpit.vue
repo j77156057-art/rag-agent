@@ -419,6 +419,19 @@ async function control(action: 'interrupt' | 'resume') {
   } catch (e) { error.value = (e as Error).message || '操作失败'
   } finally { busy.value = false }
 }
+
+async function rollbackProject() {
+  if (!workflow.value || busy.value || !workflow.value.project_checkpoint?.id) return
+  if (!window.confirm('将恢复模型执行前的项目文件快照，是否继续？')) return
+  busy.value = true
+  error.value = ''
+  try {
+    const r = await agentApi.workflowProjectRollback(workflow.value.workflow_id, true)
+    if (r.rollback?.ok) await hydrate(workflow.value.workflow_id)
+    else error.value = r.error || '项目快照恢复失败'
+  } catch (e) { error.value = (e as Error).message || '项目快照恢复失败' }
+  finally { busy.value = false }
+}
 async function approvePlan() {
   if (!workflow.value || busy.value) return
   busy.value = true
@@ -562,6 +575,11 @@ onBeforeUnmount(() => {
         <p v-else-if="workflow.status === 'completed'">执行已结束。请对照验收条件、任务结果和实际项目效果做最终验收。</p>
         <p v-else>模型正在使用当前项目内已授权的工具和能力推进任务。</p>
         <button @click="openChat">打开对话与审核卡片</button>
+        <div v-if="workflow.project_checkpoint?.id" class="acp-checkpoint">
+          <b>执行前快照</b>
+          <small>{{ workflow.project_checkpoint.file_count || 0 }} 个文件 · {{ Math.round((workflow.project_checkpoint.bytes || 0) / 1024) }} KB</small>
+          <button :disabled="busy" @click="rollbackProject">恢复执行前版本</button>
+        </div>
         <button v-if="workflow.status === 'executing'" :disabled="busy" @click="control('interrupt')">暂停工作流</button>
         <button v-if="workflow.status === 'interrupted'" :disabled="busy" @click="control('resume')">恢复工作流</button>
         <h3>本项目历史</h3><button v-for="item in history" :key="item.workflow_id" class="acp-history" @click="select(item.workflow_id)">{{ item.request || item.workflow_id }}<small>{{ statusLabel[item.status] || item.status }}</small></button>
@@ -598,4 +616,7 @@ button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent);
 .acp-snapshot-pair figcaption { margin-bottom: 5px; font-size: 11px; color: var(--text-muted); }
 .acp-snapshot-pair img { width: 100%; display: block; }
 .acp-snapshot-pair small { display: block; }
+.acp-checkpoint { display: grid; gap: 4px; padding: 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-hover); font-size: 11px; }
+.acp-checkpoint small { color: var(--text-faint); }
+.acp-checkpoint button { justify-self: start; color: var(--danger); }
 </style>
