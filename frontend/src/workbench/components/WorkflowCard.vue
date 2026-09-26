@@ -5,7 +5,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   agentApi, workflowEvents,
 } from '../api'
-import type { AcceptanceItem, WorkflowChildTrace, WorkflowEvent, WorkflowState, WorkflowStepItem } from '../api'
+import type { AcceptanceItem, WorkflowChildTrace, WorkflowEvaluation, WorkflowEvent, WorkflowState, WorkflowStepItem } from '../api'
 import WorkflowGateDialog from './WorkflowGateDialog.vue'
 
 const props = defineProps<{
@@ -26,6 +26,13 @@ const STATUS_LABEL: Record<string, string> = {
   awaiting_choice: '等待选择', generating_options: '正在生成方案', awaiting_research: '等待检索',
   planned: '待执行', awaiting_approval: '等待审核', executing: '执行中',
   planning: '规划中', interrupted: '已暂停', completed: '已完成', failed: '执行失败',
+}
+const EVALUATION_CHECK_LABELS: Record<string, string> = {
+  completed: '工作流完成', review_ok: '结果复核通过',
+  no_failed_tasks: '没有失败或阻塞任务',
+  steps_within_limit: '执行步数在上限内',
+  replans_within_limit: '重规划次数在上限内',
+  no_in_doubt_tool: '没有不确定的工具副作用',
 }
 const ROLE_META: Record<string, { label: string; avatar: string }> = {
   dispatcher: { label: '文件派发员', avatar: '派' },
@@ -79,6 +86,7 @@ const gateDismissed = ref(false)
 const finalNote = ref('')
 const recoveryRiskAcknowledged = ref(false)
 const showAllTimeline = ref(false)
+const evaluation = ref<WorkflowEvaluation | null>(null)
 const rootEl = ref<HTMLElement | null>(null)
 
 /** SSE 实时轨迹（task_id -> steps），仅内存；终态后由 state.results[].trace 补全。 */
@@ -261,6 +269,25 @@ watch(() => state.value?.recovery?.generated_at, () => { recoveryRiskAcknowledge
 
 const timelineEvents = computed(() => state.value?.timeline?.length ? state.value.timeline : (state.value?.events || []))
 const visibleTimeline = computed(() => timelineEvents.value.slice(showAllTimeline.value ? 0 : -30).reverse())
+
+const evaluationKey = computed(() => {
+  const wf = state.value
+  if (!wf || wf.workflow_id !== props.workflowId || !TERMINAL.has(wf.status)) return ''
+  const lastEvent = wf.events?.[wf.events.length - 1]
+  return [wf.workflow_id, wf.status, lastEvent?.seq ?? '', wf.steps ?? 0, wf.replans ?? 0].join(':')
+})
+let evaluationRequest = 0
+watch(evaluationKey, async key => {
+  const ticket = ++evaluationRequest
+  evaluation.value = null
+  if (!key) return
+  try {
+    const result = await agentApi.workflowEvaluation(props.workflowId)
+    if (!destroyed && ticket === evaluationRequest && result.ok && result.evaluation) {
+      evaluation.value = result.evaluation
+    }
+  } catch { /* 评估是增强信息，读取失败不影响工作流操作 */ }
+})
 
 // ---------------------------------------------------------------- SSE + hydrate
 function setState(wf: WorkflowState | null | undefined) {
@@ -762,6 +789,28 @@ onBeforeUnmount(() => {
           >{{ option.action === 'retry_failed' ? '确认后重试' : option.action === 'rollback' ? '恢复执行前快照' : '查看任务轨迹' }}</button>
         </div>
       </section>
+      <section v-if="evaluation" class="wf-evaluation">
+        <div class="wf-evaluation-head">
+          <b>工作流质量评估</b>
+          <span :class="evaluation.passed ? 'wf-ok' : 'wf-bad'">{{ evaluation.passed ? '检查通过' : '有检查未通过' }}</span>
+        </div>
+        <div class="wf-evaluation-score">
+          <strong>{{ Math.round((evaluation.score ?? 0) * 100) }}%</strong>
+          <span>{{ evaluation.task_count || 0 }} 个任务 · {{ evaluation.steps || 0 }} 步 · 重规划 {{ evaluation.replans || 0 }} 次</span>
+        </div>
+        <div class="wf-evaluation-metrics">
+          <span>失败 {{ evaluation.metrics?.failed_tasks || 0 }}</span>
+          <span>阻塞 {{ evaluation.metrics?.blocked_tasks || 0 }}</span>
+          <span>不确定副作用 {{ evaluation.metrics?.idempotency_in_doubt || 0 }}</span>
+        </div>
+        <details v-if="evaluation.checks?.length">
+          <summary>查看检查项（{{ evaluation.checks.length }}）</summary>
+          <div v-for="(check, i) in evaluation.checks" :key="i" class="wf-evaluation-check" :class="check.ok ? 'wf-ok' : 'wf-bad'">
+            <span>{{ check.ok ? '✓' : '!' }}</span>
+            <span>{{ EVALUATION_CHECK_LABELS[check.name || ''] || check.name || '检查项' }}</span>
+          </div>
+        </details>
+      </section>
       <!-- 项目能力画像：只展示可复用能力摘要，不展示命令参数、环境变量或凭据 -->
       <section v-if="state?.project_profile" class="wf-project-profile">
         <div class="wf-project-profile-head">
@@ -1017,6 +1066,15 @@ onBeforeUnmount(() => {
 .wf-recovery-option b { color: var(--text); }
 .wf-recovery-option small { color: var(--text-faint); line-height: 1.45; }
 .wf-recovery-option button { flex: 0 0 auto; }
+.wf-evaluation { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-hover); font-size: 11px; }
+.wf-evaluation-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.wf-evaluation-score { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px; }
+.wf-evaluation-score strong { font-size: 20px; color: var(--text); font-variant-numeric: tabular-nums; }
+.wf-evaluation-score span, .wf-evaluation-metrics { color: var(--text-faint); }
+.wf-evaluation-metrics { display: flex; flex-wrap: wrap; gap: 6px 12px; }
+.wf-evaluation details { border-top: 1px solid var(--border); padding-top: 6px; }
+.wf-evaluation summary { cursor: pointer; color: var(--text-muted); }
+.wf-evaluation-check { display: flex; gap: 7px; margin-top: 5px; }
 .wf-project-profile { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-hover); font-size: 11px; }
 .wf-project-profile-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .wf-project-profile-head span { color: var(--accent); font-size: 10px; border: 1px solid var(--border); border-radius: 99px; padding: 1px 7px; }
