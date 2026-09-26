@@ -88,7 +88,9 @@ def _safe_uri(value: Any) -> str:
 
 
 def _adapter_inputs(raw: Mapping[str, Any], workflow: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
-    name = str(raw.get("adapter") or raw.get("domain") or "").strip().lower()
+    # Workflow kind is the safe fallback for legacy tool results that only
+    # contain a file path or screenshot and predate the adapter field.
+    name = str(raw.get("adapter") or raw.get("domain") or workflow.get("kind") or "").strip().lower()
     handler = _ADAPTERS.get(name) if name else None
     if handler is None:
         yield raw

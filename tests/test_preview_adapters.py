@@ -2,7 +2,7 @@ import unittest
 
 from agent_runtime.preview_adapters import (build_preview_bundle, infer_artifact_kind,
                                             normalize_artifact, register_preview_adapter,
-                                            unregister_preview_adapter)
+                                            preview_adapters, unregister_preview_adapter)
 
 
 class PreviewAdapterTests(unittest.TestCase):
@@ -60,6 +60,27 @@ class PreviewAdapterTests(unittest.TestCase):
         self.assertEqual(item["kind"], "interactive")
         self.assertEqual(item["renderer"], "interactive")
         self.assertEqual(item["uri"], "/play/session/index.html")
+
+    def test_builtin_game_adapter_marks_refresh_tool(self):
+        bundle = build_preview_bundle({"workflow_id": "wf-game", "kind": "game", "results": {"results": {
+            "tester": {"artifacts": [{"path": ".docmind/screenshots/run.jpg", "kind": "image"}]}
+        }}})
+        item = bundle["artifacts"][0]
+        self.assertEqual(item["adapter"], "game")
+        self.assertEqual(item["metadata"]["capture_adapter"], "game_screenshot_or_engine_mcp")
+        self.assertIn("game_screenshot", item["metadata"]["refresh_hint"])
+
+    def test_builtin_eda_adapter_normalizes_board_files(self):
+        bundle = build_preview_bundle({"workflow_id": "wf-eda", "kind": "eda", "results": {"results": {
+            "layout": {"file_changes": ["board.kicad_pcb"]}
+        }}})
+        item = bundle["artifacts"][0]
+        self.assertEqual(item["adapter"], "eda")
+        self.assertEqual(item["kind"], "structured")
+        self.assertEqual(item["metadata"]["capture_adapter"], "eda_mcp_or_editor_adapter")
+
+    def test_builtin_adapter_registry_is_available(self):
+        self.assertTrue({"game", "eda", "native"}.issubset(set(preview_adapters())))
 
 
 if __name__ == "__main__":

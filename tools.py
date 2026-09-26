@@ -4311,6 +4311,18 @@ def game_screenshot(arg=""):
         target = "embedded"
     root = _get_code_root()
 
+    def preview_artifact(path, source):
+        return [{
+            "id": "game-screenshot",
+            "kind": "image",
+            "adapter": "game",
+            "path": path,
+            "label": "游戏运行画面",
+            "summary": "由游戏截图工具捕获的当前运行画面",
+            "evidence": ["game_screenshot", "source:" + str(source)],
+            "metadata": {"capture_source": str(source)},
+        }]
+
     if root:
         out_dir = os.path.join(root, ".docmind", "screenshots")
     else:
@@ -4332,7 +4344,8 @@ def game_screenshot(arg=""):
                 ok=True,
                 text=(f"截图完成（来源：连接器 {source}），已保存：{saved_path}\n"
                       "截图是观察素材，不是代码事实；请结合代码与日志复核。"),
-                data={"images": [encoded], "image_sources": [saved_path]})
+                data={"images": [encoded], "image_sources": [saved_path]},
+                artifacts=preview_artifact(saved_path, source))
 
     try:
         import screen_capture
@@ -4368,7 +4381,8 @@ def game_screenshot(arg=""):
         text=(f"截图完成（来源：{source_kind} 窗口，原始 {width}x{height}，"
               f"输出 {size[0]}x{size[1]}）：{path}\n"
               "截图是观察素材，不是代码事实；请结合代码与运行日志复核。"),
-        data={"images": [encoded], "image_sources": [path]})
+        data={"images": [encoded], "image_sources": [path]},
+        artifacts=preview_artifact(path, source_kind))
 
 
 def preview_project(arg=""):

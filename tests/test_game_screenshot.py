@@ -161,6 +161,8 @@ class GameScreenshotToolTests(unittest.TestCase):
         self.assertIn("mcp:k/capture_screen", result.text)
         self.assertIn(saved_path, result.text)
         self.assertEqual(called["embedded"], 0)
+        self.assertEqual(result.artifacts[0]["adapter"], "game")
+        self.assertEqual(result.artifacts[0]["path"], saved_path)
 
     def test_embedded_frame_saved_without_touching_foreground(self):
         frame = (_bgra(320, 240), 320, 240, 4321)
@@ -177,6 +179,7 @@ class GameScreenshotToolTests(unittest.TestCase):
         self.assertIn(".docmind", path)
         self.assertIn("screenshots", path)
         self.assertIn("320x240", result.text)
+        self.assertEqual(result.artifacts[0]["metadata"]["capture_source"], "embedded")
 
     def test_falls_back_to_foreground(self):
         frame = (_bgra(64, 64), 64, 64, 111)
