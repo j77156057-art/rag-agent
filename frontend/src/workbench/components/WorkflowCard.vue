@@ -71,6 +71,7 @@ const busy = ref(false)
 const cardOpen = ref(true)
 const gateDismissed = ref(false)
 const finalNote = ref('')
+const recoveryRiskAcknowledged = ref(false)
 const rootEl = ref<HTMLElement | null>(null)
 
 /** SSE 实时轨迹（task_id -> steps），仅内存；终态后由 state.results[].trace 补全。 */
@@ -247,6 +248,9 @@ const reviewFailures = computed(() => {
   const failures = state.value?.review?.failures
   return Array.isArray(failures) ? failures as Array<{ kind?: string; message?: string; recovery?: string }> : []
 })
+
+const uncertainTaskIds = computed(() => state.value?.recovery?.evidence?.uncertain_task_ids || [])
+watch(() => state.value?.recovery?.generated_at, () => { recoveryRiskAcknowledged.value = false })
 
 // ---------------------------------------------------------------- SSE + hydrate
 function setState(wf: WorkflowState | null | undefined) {
@@ -452,11 +456,56 @@ async function resume() {
     if (r.workflow) setState(r.workflow)
   })
 }
-async function retryMember(id: string) {
+async function retryTasks(taskIds: string[]) {
+  if (busy.value) return
+  const ids = [...new Set(taskIds.filter(Boolean))]
+  if (!ids.length) return
+  const uncertain = ids.filter(id => uncertainTaskIds.value.includes(id))
+  if (uncertain.length && !recoveryRiskAcknowledged.value) {
+    loadError.value = '请先核对不确定副作用的外部状态，并勾选确认后再重试。'
+    return
+  }
+  if (!window.confirm(uncertain.length
+    ? '已核对 ' + uncertain.length + ' 个任务的外部状态。确定按顺序重试这 ' + ids.length + ' 个任务吗？'
+    : '确定按顺序重试 ' + ids.length + ' 个失败或阻塞任务吗？')) return
+  loadError.value = ''
   await withBusy(async () => {
-    const r = await agentApi.workflowSubagentRetry(props.workflowId, id)
-    if (r.workflow) setState(r.workflow)
+    for (const id of ids) {
+      const r = await agentApi.workflowSubagentRetry(props.workflowId, id)
+      if (!r.workflow || r.ok === false) throw new Error(r.error || '任务 ' + id + ' 重试失败')
+      setState(r.workflow)
+    }
+    await hydrate()
   })
+}
+function retryMember(id: string) {
+  void retryTasks([id])
+}
+type RecoveryOption = NonNullable<NonNullable<WorkflowState['recovery']>['options']>[number]
+function inspectRecovery(option: RecoveryOption) {
+  const id = option.task_ids?.[0] || uncertainTaskIds.value[0]
+  if (id) focusTask(id)
+  else (rootEl.value?.querySelector('.wf-review, .wf-members, .wf-acceptance') || rootEl.value)
+    ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+async function rollbackProject() {
+  if (busy.value || !state.value?.project_checkpoint?.id) return
+  if (!window.confirm('将恢复执行前快照中已有的项目文件；快照之后新建的文件会保留。确定继续吗？')) return
+  loadError.value = ''
+  await withBusy(async () => {
+    const r = await agentApi.workflowProjectRollback(props.workflowId, true)
+    if (!r.rollback || r.ok === false) throw new Error(r.error || '项目快照恢复失败')
+    await hydrate()
+    if (r.rollback.ok === false) {
+      const count = Array.isArray(r.rollback.failed) ? r.rollback.failed.length : 0
+      throw new Error('项目快照部分恢复失败（' + count + ' 个文件），请检查项目状态。')
+    }
+  })
+}
+function applyRecovery(option: RecoveryOption) {
+  if (option.action === 'retry_failed') { void retryTasks(option.task_ids || []); return }
+  if (option.action === 'rollback') { void rollbackProject(); return }
+  inspectRecovery(option)
 }
 
 function toggleMember(id: string) {
@@ -502,7 +551,11 @@ function eventDetail(ev: WorkflowEvent): string {
 function focusTask(id: string) {
   cardOpen.value = true
   openMembers.value = new Set([...openMembers.value, id])
-  rootEl.value?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  requestAnimationFrame(() => {
+    const target = [...(rootEl.value?.querySelectorAll<HTMLElement>('.wf-member') || [])]
+      .find(element => element.dataset.taskId === id)
+    ;(target || rootEl.value)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  })
 }
 function onFocusEvent(ev: Event) {
   const detail = (ev as CustomEvent<{ workflowId?: string; taskId?: string }>).detail
@@ -592,7 +645,7 @@ onBeforeUnmount(() => {
           <b>团队成员（{{ members.length }}）</b>
           <small>每个成员的思考、工具调用与观察都实时显示在这里</small>
         </div>
-        <div v-for="m in members" :key="m.id" class="wf-member" :class="`wf-member-${m.status}`">
+        <div v-for="m in members" :key="m.id" class="wf-member" :class="`wf-member-${m.status}`" :data-task-id="m.id">
           <button class="wf-member-row" @click="toggleMember(m.id)">
             <span class="wf-member-avatar">{{ m.avatar }}</span>
             <span class="wf-member-main">
@@ -667,6 +720,22 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+      <section v-if="state?.recovery?.status === 'required' && (status === 'failed' || status === 'interrupted')" class="wf-recovery">
+        <div class="wf-recovery-head"><b>失败后的下一步</b><span>需要用户审核</span></div>
+        <p>{{ state.recovery.summary || '执行未通过复核，请选择下一步。' }}</p>
+        <div v-if="uncertainTaskIds.length" class="wf-recovery-risk">
+          <p>有 {{ uncertainTaskIds.length }} 个任务的副作用尚未确认。重试前请先核对外部状态，避免重复执行。</p>
+          <label><input v-model="recoveryRiskAcknowledged" type="checkbox" />我已核对这些任务的外部状态</label>
+        </div>
+        <div v-for="option in (state.recovery.options || [])" :key="option.id || option.title" class="wf-recovery-option">
+          <div><b>{{ option.title }}</b><small>{{ option.detail }}</small></div>
+          <button
+            class="wf-mini-btn"
+            :disabled="busy || (option.action === 'retry_failed' && (option.task_ids || []).some(id => uncertainTaskIds.includes(id)) && !recoveryRiskAcknowledged)"
+            @click="applyRecovery(option)"
+          >{{ option.action === 'retry_failed' ? '确认后重试' : option.action === 'rollback' ? '恢复执行前快照' : '查看任务轨迹' }}</button>
+        </div>
+      </section>
       <!-- 项目能力画像：只展示可复用能力摘要，不展示命令参数、环境变量或凭据 -->
       <section v-if="state?.project_profile" class="wf-project-profile">
         <div class="wf-project-profile-head">
@@ -897,6 +966,19 @@ onBeforeUnmount(() => {
 .wf-bad { color: var(--danger); }
 .wf-review-fail { display: grid; gap: 1px; width: 100%; font-size: 11px; color: var(--text-muted); }
 .wf-review-fail small { color: var(--text-faint); }
+.wf-recovery { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--danger); border-radius: 9px; background: var(--bg-hover); font-size: 11px; }
+.wf-recovery-head { display: flex; justify-content: space-between; gap: 8px; }
+.wf-recovery-head span { color: var(--danger); font-size: 10px; }
+.wf-recovery p { margin: 0; line-height: 1.5; color: var(--text-muted); }
+.wf-recovery-risk { display: grid; gap: 6px; padding: 7px 8px; border-radius: 7px; background: rgba(214,158,46,.08); }
+.wf-recovery-risk p { color: var(--amber); }
+.wf-recovery-risk label { display: flex; align-items: center; gap: 5px; color: var(--text); cursor: pointer; }
+.wf-recovery-risk input { margin: 0; }
+.wf-recovery-option { display: flex; justify-content: space-between; align-items: center; gap: 8px; border-top: 1px solid var(--border); padding-top: 7px; }
+.wf-recovery-option > div { display: grid; gap: 3px; min-width: 0; }
+.wf-recovery-option b { color: var(--text); }
+.wf-recovery-option small { color: var(--text-faint); line-height: 1.45; }
+.wf-recovery-option button { flex: 0 0 auto; }
 .wf-project-profile { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-hover); font-size: 11px; }
 .wf-project-profile-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .wf-project-profile-head span { color: var(--accent); font-size: 10px; border: 1px solid var(--border); border-radius: 99px; padding: 1px 7px; }
