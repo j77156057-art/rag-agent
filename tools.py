@@ -796,7 +796,7 @@ def dev_preview_adapter_approve(arg):
         return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
 
-_PREVIEW_BUILTIN_REFRESH_TOOLS = frozenset({"preview_project", "game_screenshot", "self_verify"})
+_PREVIEW_BUILTIN_REFRESH_TOOLS = frozenset({"preview_project", "game_screenshot", "dev_desktop_capture", "self_verify"})
 
 
 def _preview_refresh_reference(value):
@@ -4514,6 +4514,36 @@ def game_screenshot(arg=""):
         artifacts=preview_artifact(path, source_kind))
 
 
+def dev_desktop_capture(arg=""):
+    """Capture the current project's embedded or foreground desktop window.
+
+    This is the runtime bridge for the desktop visual skill. It exposes
+    observation only; state changes still require an app MCP or plugin.
+    """
+    fields = _parse_keyed(arg or "", ["target"])
+    target = (fields.get("target") or "foreground").strip().lower()
+    if target not in {"embedded", "foreground"}:
+        return "桌面截图失败：target 只能是 embedded 或 foreground。"
+    result = game_screenshot("target: " + target)
+    if not isinstance(result, ToolResult):
+        return result
+    artifacts = []
+    for artifact in list(result.artifacts or []):
+        row = dict(artifact)
+        row["adapter"] = "native"
+        metadata = dict(row.get("metadata") or {})
+        metadata["capture_adapter"] = "desktop_computer_use"
+        metadata["target"] = target
+        row["metadata"] = metadata
+        row.setdefault("summary", "桌面自动化视觉技能捕获的当前窗口画面")
+        artifacts.append(row)
+    return ToolResult(
+        ok=result.ok,
+        text=result.text + ("\n画面仅用于观察；修改软件状态请调用已批准的应用 MCP 或插件。" if result.ok else ""),
+        data=result.data, error_kind=result.error_kind, artifacts=artifacts,
+        idempotency_key=result.idempotency_key, replayed=result.replayed)
+
+
 def preview_project(arg=""):
     """在正式开发舱中捕获当前项目的真实网页画面。
 
@@ -5018,7 +5048,7 @@ TOOLS = {
     "dev_skill_create": {"description": "起草用户技能（待审批，不会自动启用）。skill 是*可执行行为*，必须经用户确认才激活。多行输入 name/description/body；写入 SKILLS_DIR/.pending/<name>/SKILL.md（草稿不生效）。返回完整正文，代理须向用户完整展示并取得明确同意后，再 dev_skill_approve 激活。", "func": dev_skill_create},
     "dev_preview_adapter_create": {"description": "让 Agent 为当前项目自主生成领域预览适配器草稿（不会自动启用）。多行输入 id/label/domain/artifact_kinds/capture_adapter/refresh_tool/connector_hint/validation/evidence；写入项目 .docmind/preview-adapters/*.json。先展示方案与验证条件，用户明确确认后才可调用 dev_preview_adapter_approve。", "func": dev_preview_adapter_create},
     "dev_preview_adapter_approve": {"description": "激活或拒绝 Agent 生成的项目预览适配器。只有用户明确确认适配器方案、刷新工具和验证条件后才传 decision: approve；否则只用 reject。输入 id 与 decision。", "func": dev_preview_adapter_approve},
-    "dev_preview_adapter_refresh": {"description": "执行已激活项目预览适配器的受控刷新。适配器 manifest 的 refresh_tool 只能是 builtin:preview_project|game_screenshot|self_verify，或 mcp:<connector>/<tool>；禁止 Python、shell、URL 和任意 callable。输入 id 与可选 arguments(JSON)，MCP 仍遵守连接器启用和用户审批。", "func": dev_preview_adapter_refresh},
+    "dev_preview_adapter_refresh": {"description": "执行已激活项目预览适配器的受控刷新。适配器 manifest 的 refresh_tool 只能是 builtin:preview_project|game_screenshot|dev_desktop_capture|self_verify，或 mcp:<connector>/<tool>；禁止 Python、shell、URL 和任意 callable。输入 id 与可选 arguments(JSON)，MCP 仍遵守连接器启用和用户审批。", "func": dev_preview_adapter_refresh},
     "dev_skill_approve": {"description": "激活待审批技能：把 .pending/<name>/SKILL.md 移到 SKILLS_DIR 并 reload 生效。仅当用户已明确确认该技能正文安全时调用。输入 name: <技能名>。", "func": dev_skill_approve},
     "dev_skill_reject": {"description": "丢弃待审批技能草稿（不激活、不保留）。输入 name: <技能名>。", "func": dev_skill_reject},
     "search_knowledge": {
@@ -5128,6 +5158,7 @@ TOOLS = {
     "game_impact": {"description": "按符号或关键词分析代码影响文件，输入 query。", "func": game_impact},
     "game_playtest": {"description": "在项目根目录运行 Playtest 命令，输入 command/timeout。", "func": game_playtest},
     "game_screenshot": {"description": "截取当前引擎运行画面作为视觉观察：可选输入 target: embedded|foreground（默认 embedded，嵌入窗口不可用时自动改抓前台窗口）。优先使用已启用引擎连接器的截图能力，其次抓取工作台内嵌窗口；JPEG 保存到项目 .docmind/screenshots/ 并回传图片。截图只是某一瞬间的观察，不是代码事实；无窗口/无头环境会明确失败，那时改用运行日志或受控 playtest 证据，不要臆测画面。", "func": game_screenshot},
+    "dev_desktop_capture": {"description": "桌面自动化视觉技能的安全观察入口：截取当前项目嵌入窗口或前台窗口，输入 target: embedded|foreground。只返回真实画面和 native 预览 artifact，不直接点击、输入或修改软件状态；状态修改必须调用已批准的应用 MCP、插件或其他明确工具。", "func": dev_desktop_capture},
     "preview_project": {"description": "正式开发舱真实视觉验收：在当前项目内启动安全的本地网页预览，用真实 Edge/Chromium 截取当前画面并把截图送给视觉模型，同时登记工作流预览证据。输入可选 entry/index.html、width、height、timeout。修改网页后必须再次调用，截图失败或项目不是网页时如实报告并改用领域专用工具。", "func": preview_project},
     "start_workflow": {"description": (
         "当目标是【长链路开发流程】时升级为跨窗口持久开发工作流：满足多阶段/多角色协作、"

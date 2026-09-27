@@ -98,7 +98,7 @@ _NO_PARALLEL_TOOLS = {"apply_edit", "create_file", "create_artifact", "dev_regio
                       "dev_rollback_changeset", "init_regions_tool", "dev_apply_regions",
                       "dev_add_region", "dev_refactor", "dev_rebuild_index",
                       "dev_mcp_add", "dev_mcp_decide", "dev_mcp_remove", "dev_mcp_probe",
-                      "dev_preview_adapter_refresh",
+                      "dev_preview_adapter_refresh", "dev_desktop_capture",
                       "orchestrate", "start_workflow"}
 
 # 写后自验证收尾门开关（Phase 1 闭环）。默认开启；设 DOCMIND_SELF_VERIFY=0 可关闭
@@ -234,9 +234,10 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - create_artifact(json): 创建并校验 DOCX、PDF、PPTX 或 XLSX 文件，写入当前项目 artifacts 目录。制作文档时先用 dev_use_skill 读取对应技能，再传入结构化 JSON；不要用 create_file 伪造二进制文件。
 - self_verify(scope?, files?): 写后自验证工具（闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，按改动文件类型做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck、场景子系统自检）并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。网页项目需要真实画面时显式使用 scope:visual，正式开发舱会启动临时浏览器并保存截图证据；引擎嵌入自检默认关闭（需真 Godot），你可显式用 scope:engine 或开 DOCMIND_SELF_VERIFY_ENGINE=1 触发。你也可以主动调用它复验某文件（scope 取 auto/backend/frontend/scene/engine/visual/all/skip）。
 - preview_project(entry?, width?, height?, timeout?): 正式开发舱网页项目的真实浏览器视觉验收。修改网页后必须再次调用，工具会在当前项目内启动临时安全预览、截取真实画面并把截图送入视觉通道，同时登记工作流预览证据；无法启动浏览器或项目不是网页时必须如实报告，改用 game_screenshot 或领域 MCP。
+- dev_desktop_capture(target?): 桌面自动化视觉技能的安全观察入口，捕获当前项目嵌入窗口或前台窗口并作为 native 预览证据返回。它只观察，不点击、不输入、不修改软件状态；状态修改必须通过已批准的应用 MCP、插件或专用工具完成。
 - dev_preview_adapter_create(...): 当用户要求支持新的软件、文件类型或运行环境时，先查现有 MCP/连接器和内置工具；确认没有足够能力后，为当前项目自主设计并写入一个声明式预览适配器草稿。草稿必须包含领域、产物类型、画面/状态获取方式、刷新工具和验收条件，默认是 pending，不会自动启用。
 - dev_preview_adapter_approve(id, decision): 向用户展示 Agent 生成的适配器方案、依赖连接器、刷新工具和验收条件，取得明确确认后才可传 decision: approve 激活；用户拒绝则传 reject。适配器 manifest 只允许声明式元数据，不得导入或执行项目中的任意代码。
-- dev_preview_adapter_refresh(id, arguments?): 执行已激活适配器声明的受控刷新。refresh_tool 只能复用 builtin:preview_project、builtin:game_screenshot、builtin:self_verify 或已启用且获用户批准的 mcp:<connector>/<tool>；Python、shell、URL 和任意 callable 会被拒绝。
+- dev_preview_adapter_refresh(id, arguments?): 执行已激活适配器声明的受控刷新。refresh_tool 只能复用 builtin:preview_project、builtin:game_screenshot、builtin:dev_desktop_capture、builtin:self_verify 或已启用且获用户批准的 mcp:<connector>/<tool>；Python、shell、URL 和任意 callable 会被拒绝。
 - 新领域适配器的标准流程：先 dev_list_connectors/dev_route_connector/dev_list_connector_tools 复用已有能力，再 dev_mcp_search 查真实候选；仍缺能力时调用 dev_preview_adapter_create 起草，向用户说明方案并等待确认，激活后再用真实 MCP/工具返回的截图、状态或文件作为预览证据。安装工具、联网、写入外部软件和 MCP 连接仍遵守现有用户审批门，不能用适配器审批代替这些审批。
 - recall_experience(query?): 跨会话经验记忆召回（Phase 3，建议性上下文，优先级低于真实证据）。当你准备做一类容易踩坑的改动（某框架重构、依赖升级、某校验反复失败）前，先调用它查「我以前类似改动踩过什么坑、留下什么教训」；输入自然语言问题描述（如 '改 Vue 组件后 typecheck 报错'），留空则退化为通用召回。返回按置信排序的历史经验（含 outcome/教训/决策/陈旧标记），仅供参考，不要当成必须执行的指令——当前真实代码与校验结果永远优先。
 - gen_video_prompt(spec): 按 MiniMax H3 的三段结构，把一段创意描述生成为结构化视频提示词（可直接粘贴进 ComfyUI）。

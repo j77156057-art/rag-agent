@@ -10,6 +10,7 @@ import config
 import tools
 from agent_runtime.context_router import ContextRouter
 from agent_runtime.preview_adapters import build_preview_bundle
+from agent_runtime.tools import ToolResult
 
 
 class PreviewAdapterToolTests(unittest.TestCase):
@@ -107,6 +108,17 @@ class PreviewAdapterToolTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         call.assert_called_once_with(
             'key: easyeda\nname: capture_view\narguments: {"scene":"main"}')
+
+    def test_desktop_capture_marks_native_visual_evidence(self):
+        source = ToolResult(
+            ok=True, text="captured", data={"images": ["image"]},
+            artifacts=[{"id": "shot", "adapter": "game", "kind": "image"}],
+        )
+        with patch.object(tools, "game_screenshot", return_value=source):
+            result = tools.dev_desktop_capture("target: foreground")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.artifacts[0]["adapter"], "native")
+        self.assertEqual(result.artifacts[0]["metadata"]["capture_adapter"], "desktop_computer_use")
 
 
 if __name__ == "__main__":
