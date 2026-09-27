@@ -710,9 +710,26 @@ class LLMClient:
         return "".join(chunks)
 
     @staticmethod
+    def _raw_b64(image):
+        """把 data URL / 纯 base64 统一成**纯 base64**。
+
+        内部来源格式不一致：tools/web_fetch、screen_capture 等产出
+        ``data:image/jpeg;base64,...``（data URL），而 ollama 原生 /api/chat 的
+        ``images`` 只接受纯 base64——传 data URL 会被拒（实测 400
+        ``illegal base64 data at input byte 4``）；OpenAI 兼容端点则需自行拼 data URL。
+        故统一在入口剥掉前缀，两条链路都不再受来源格式影响。
+        """
+        text = str(image or "")
+        if text.startswith("data:"):
+            _, _, payload = text.partition(",")
+            return payload
+        return text
+
+    @staticmethod
     def _sniff_image_mime(b64):
         """按 base64 解码头部魔数判断图片 MIME（供 OpenAI data URL 使用）。"""
         import base64
+        b64 = LLMClient._raw_b64(b64)
         try:
             head = base64.b64decode(b64[:32] + "==")
         except Exception:
@@ -738,7 +755,8 @@ class LLMClient:
                 out.append(m)
                 continue
             parts = [{"type": "text", "text": m.get("content") or ""}]
-            for b64 in imgs:
+            for raw in imgs:
+                b64 = self._raw_b64(raw)
                 mime = self._sniff_image_mime(b64)
                 parts.append(
                     {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
@@ -785,6 +803,15 @@ class LLMClient:
             # 注意用 budget 而非 num_ctx：num_ctx 已被窗口封顶，win - num_ctx 恒≈512，
             # 会错误地把输出掐到地板；按真实 prompt 占用给输出留量才是正确裁剪。
             num_predict = min(out_budget, max(512, win - budget - 512))
+        # Ollama 原生 /api/chat 的 images 只接受**纯 base64**；内部来源（tools/web_fetch、
+        # screen_capture 等）会产出 data URL。不剥前缀会被 Ollama 直接拒绝（实测 400
+        # "illegal base64 data at input byte 4"），整轮问答因此失败、历史也一并丢失。
+        if isinstance(messages, (list, tuple)):
+            messages = [
+                ({**m, "images": [self._raw_b64(x) for x in m["images"]]}
+                 if isinstance(m, dict) and m.get("images") else m)
+                for m in messages
+            ]
         payload = {
             "model": self.model,
             "messages": messages,

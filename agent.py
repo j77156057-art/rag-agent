@@ -1892,6 +1892,7 @@ class Agent:
         error = None
         final_text = ""
         inner = None
+        history_start = len(self.history)
         try:
             inner = self._run(question, turn=turn, stream=stream, images=images, deadline=deadline,
                               cancel_event=cancel_event)
@@ -1944,6 +1945,19 @@ class Agent:
             raise
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
+            # 失败也要把「用户问了什么」写进历史。此前的历史只在成功路径 append+save，
+            # 于是任意一次 400 / 连接错误都会让整轮问答凭空消失，下一轮完全不记得
+            # 用户问过（实测：一轮 web_fetch 图片触发 400 后，"广西北海" 就查无此问）。
+            try:
+                if len(self.history) == history_start:
+                    self.history.append({
+                        "user": question,
+                        "assistant": f"（本轮未完成：{type(e).__name__}，请重试。）",
+                    })
+                if self.session_id:
+                    _sessions.save(self.session_id, self.history, self.summary, self.project_id)
+            except Exception:  # noqa: BLE001 —— 历史兜底绝不能再抛
+                pass
             raise
         finally:
             # 断连时关闭内层循环，确保不再执行后续工具调用（已耗尽时 close 是空操作）。

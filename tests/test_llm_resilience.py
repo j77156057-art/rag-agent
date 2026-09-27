@@ -264,7 +264,7 @@ class ThinkingResolutionTests(unittest.TestCase):
 class OllamaPayloadTests(unittest.TestCase):
     """ollama 原生 /api/chat：think 字段恒携带、num_ctx 按画像封顶、输出预算给满。"""
 
-    def _capture(self, model, thinking_on):
+    def _capture(self, model, thinking_on, messages=None):
         import json as _json
         from unittest.mock import patch
         from llm import LLMClient
@@ -287,9 +287,23 @@ class OllamaPayloadTests(unittest.TestCase):
                 patch("llm._gpu_release"), patch("llm._gpu_note_activity"), \
                 patch("llm.urllib.request.build_opener", return_value=_Opener()):
             out = client._ollama_chat(
-                [{"role": "user", "content": "hi"}],
+                messages if messages is not None else [{"role": "user", "content": "hi"}],
                 stream=False, thinking_on=thinking_on)
         return captured["payload"], out
+
+    def test_image_data_urls_normalized_without_mutating_messages(self):
+        png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+        messages = [{"role": "user", "content": "look",
+                     "images": ["data:image/png;base64," + png, png]}]
+        payload, out = self._capture("qwen3:8b", False, messages)
+        self.assertEqual(out, "ok")
+        self.assertEqual(payload["messages"][0]["images"], [png, png])
+        self.assertTrue(messages[0]["images"][0].startswith("data:"))
+        client = object.__new__(LLMClient)
+        cloud = client._to_openai_messages(messages)
+        self.assertNotIn("images", cloud[0])
+        for part in cloud[0]["content"][1:]:
+            self.assertEqual(part["image_url"]["url"], "data:image/png;base64," + png)
 
     def test_payload_always_carries_think_flag(self):
         from config import (prompt_token_budget, output_token_budget,

@@ -127,6 +127,20 @@ class TraceRecordTests(_IsoBase):
 
 
 class AgentTraceIntegrationTests(_IsoBase):
+    def test_failed_repeated_question_is_saved_as_a_new_turn(self):
+        from unittest.mock import patch
+        a = agent_mod.Agent(llm=_FakeLLM(["Final Answer: ok"]), session_id="s-failure")
+        a.history = [{"user": "广西北海", "assistant": "previous answer"}]
+        with patch.object(a, "_run", side_effect=RuntimeError("sensitive backend details")):
+            with self.assertRaises(RuntimeError):
+                list(a.run("广西北海", stream=False))
+        self.assertEqual(len(a.history), 2)
+        self.assertEqual(a.history[-1]["user"], "广西北海")
+        self.assertIn("未完成", a.history[-1]["assistant"])
+        self.assertNotIn("sensitive", a.history[-1]["assistant"])
+        restored = agent_mod.Agent(llm=_FakeLLM(["Final Answer: ok"]), session_id="s-failure")
+        self.assertEqual(restored.history, a.history)
+
     def test_agent_run_records_one_trace(self):
         a = agent_mod.Agent(llm=_FakeLLM(["Final Answer: 你好"]), session_id="s-trace")
         events = list(a.run("hi", stream=True))
