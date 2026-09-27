@@ -916,6 +916,32 @@ def dev_preview_adapter_rollback(arg):
         return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
 
+def dev_preview_adapter_test(arg):
+    """用固定 JSON 输入测试已激活适配器，不调用真实软件或 MCP。"""
+    fields = _parse_keyed(str(arg or ""), ["id", "payload", "timeout"])
+    adapter_id = (fields.get("id") or "").strip().lower()
+    root = _get_code_root()
+    if not root or not adapter_id:
+        return json.dumps({"ok": False, "error": "需要当前项目和适配器 id"}, ensure_ascii=False)
+    raw_payload = (fields.get("payload") or "{}").strip()
+    try:
+        payload = json.loads(raw_payload)
+        timeout = max(1, min(30, int(fields.get("timeout") or 12)))
+        from agent_runtime.adapter_catalog import generated
+        manifest = next((item for item in generated(root)
+                         if item.get("id") == adapter_id and item.get("status") == "active"), None)
+        if not manifest or not manifest.get("runtime"):
+            return json.dumps({"ok": False, "error": "没有找到已激活的代码适配器"}, ensure_ascii=False)
+        from agent_runtime.generated_adapter_runtime import execute
+        result = execute(root, manifest, payload, timeout=timeout)
+        return json.dumps({"ok": True, "adapter": adapter_id, "fixture": True,
+                           "result": result["value"], "module": result["module"]}, ensure_ascii=False)
+    except json.JSONDecodeError:
+        return json.dumps({"ok": False, "error": "payload 必须是 JSON 对象或数组"}, ensure_ascii=False)
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        return json.dumps({"ok": False, "error": str(exc)[:300]}, ensure_ascii=False)
+
+
 def dev_skill_approve(arg):
     """激活一个待审批技能：从 .pending 移到 SKILLS_DIR 并 reload（变为可用）。仅当用户已确认。"""
     name = str(arg or "").strip()
@@ -5144,6 +5170,7 @@ TOOLS = {
     "dev_preview_adapter_approve": {"description": "激活或拒绝 Agent 生成的项目预览适配器。只有用户明确确认适配器方案、刷新工具和验证条件后才传 decision: approve；否则只用 reject。输入 id 与 decision。", "func": dev_preview_adapter_approve},
     "dev_preview_adapter_refresh": {"description": "执行已激活项目预览适配器的受控刷新。适配器可使用已批准的 builtin/MCP 获取原始结果，再交给隔离 Python/Node 的 adapt(payload) 转换为预览产物；禁止适配器自行联网、启动命令或读写项目。", "func": dev_preview_adapter_refresh},
     "dev_preview_adapter_rollback": {"description": "回滚当前项目生成的 Python/Node 领域适配器到上一个已激活版本。首次调用需要用户批准 preview_adapter_rollback，批准后使用相同 id 重试。", "func": dev_preview_adapter_rollback},
+    "dev_preview_adapter_test": {"description": "用固定 JSON fixture 测试已激活的 Python/Node 领域适配器，不调用真实软件、MCP 或网络。输入 id、payload(JSON)、可选 timeout；适合先验证 EasyEDA/Godot/CAD 返回数据的转换逻辑。", "func": dev_preview_adapter_test},
     "dev_skill_approve": {"description": "激活待审批技能：把 .pending/<name>/SKILL.md 移到 SKILLS_DIR 并 reload 生效。仅当用户已明确确认该技能正文安全时调用。输入 name: <技能名>。", "func": dev_skill_approve},
     "dev_skill_reject": {"description": "丢弃待审批技能草稿（不激活、不保留）。输入 name: <技能名>。", "func": dev_skill_reject},
     "search_knowledge": {

@@ -82,6 +82,19 @@ class GeneratedAdapterRuntimeTests(unittest.TestCase):
         self.assertTrue(result["generated"])
         self.assertEqual(result["result"]["artifact"], "ok")
 
+    def test_fixture_tool_replays_active_adapter_without_mcp(self):
+        source = "def adapt(payload):\n    return {'artifact': payload.get('name', '').upper()}\n"
+        create_generated(self.root, {"id": "fixture", "runtime": "python", "source": source})
+        approve_generated(self.root, "fixture", True)
+        result = json.loads(tools.dev_preview_adapter_test(
+            'id: fixture\npayload: {"name":"easyeda"}'))
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["fixture"])
+        self.assertEqual(result["result"]["artifact"], "EASYEDA")
+
+        invalid = json.loads(tools.dev_preview_adapter_test("id: fixture\npayload: nope"))
+        self.assertFalse(invalid["ok"])
+
     def test_rollback_requires_approval_and_restores_previous_module(self):
         source_one = "def adapt(payload):\n    return {'version': 1}\n"
         source_two = "def adapt(payload):\n    return {'version': 2}\n"

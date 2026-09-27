@@ -121,13 +121,13 @@ _NETWORK_TOOLS = {
     "dev_mcp_probe", "dev_mcp_discover",
     "dev_mcp_search",
 }
-_EXEC_TOOLS = {"python_exec", "run_command", "game_playtest", "self_verify"}
+_EXEC_TOOLS = {"python_exec", "run_command", "game_playtest", "self_verify", "dev_preview_adapter_test"}
 _ADMIN_TOOLS = {
     "dev_approve", "dev_commit", "dev_commit_all", "dev_rollback_changeset",
     "dev_apply_regions", "dev_add_region", "init_regions", "dev_install_tool",
     "dev_mcp_add", "dev_mcp_decide", "dev_mcp_remove",
     "dev_preview_adapter_approve",
-    "dev_desktop_action",
+                      "dev_desktop_action", "dev_preview_adapter_test",
     "dev_preview_adapter_rollback",
     "start_workflow",
 }

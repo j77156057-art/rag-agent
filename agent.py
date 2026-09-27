@@ -241,6 +241,7 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - dev_preview_adapter_approve(id, decision): 向用户展示 Agent 生成的适配器方案、依赖连接器、刷新工具和验收条件，取得明确确认后才可传 decision: approve 激活；用户拒绝则传 reject。适配器 manifest 只允许声明式元数据，不得导入或执行项目中的任意代码。
 - dev_preview_adapter_refresh(id, arguments?): 执行已激活适配器声明的受控刷新。refresh_tool 只能复用 builtin:preview_project、builtin:game_screenshot、builtin:dev_desktop_capture、builtin:self_verify 或已启用且获用户批准的 mcp:<connector>/<tool>；Python、shell、URL 和任意 callable 会被拒绝。
 - 领域适配器代码：dev_preview_adapter_create(..., runtime: python|node, entrypoint: adapt, source: ...): 在当前项目生成待审批的完整适配器模块。模块只能接收已批准工具返回的 JSON 并输出 JSON artifact，系统会做语法、输出 Schema 和静态限制检查；用户批准适配器后才会激活代码。dev_preview_adapter_refresh 会在 Windows Job Object 隔离子进程中运行它；隔离边界建立失败就停止，不会伪造预览结果。dev_preview_adapter_rollback(id) 可在用户批准后恢复上一个版本。
+- dev_preview_adapter_test(id, payload): 用固定 JSON fixture 测试已激活适配器，不调用真实软件、MCP 或网络；先用它验证 EasyEDA/Godot/CAD 数据转换，再进行真实联验。
 - 新领域适配器的标准流程：先 dev_list_connectors/dev_route_connector/dev_list_connector_tools 复用已有能力，再 dev_mcp_search 查真实候选；仍缺能力时调用 dev_preview_adapter_create 起草，向用户说明方案并等待确认，激活后再用真实 MCP/工具返回的截图、状态或文件作为预览证据。安装工具、联网、写入外部软件和 MCP 连接仍遵守现有用户审批门，不能用适配器审批代替这些审批。
 - recall_experience(query?): 跨会话经验记忆召回（Phase 3，建议性上下文，优先级低于真实证据）。当你准备做一类容易踩坑的改动（某框架重构、依赖升级、某校验反复失败）前，先调用它查「我以前类似改动踩过什么坑、留下什么教训」；输入自然语言问题描述（如 '改 Vue 组件后 typecheck 报错'），留空则退化为通用召回。返回按置信排序的历史经验（含 outcome/教训/决策/陈旧标记），仅供参考，不要当成必须执行的指令——当前真实代码与校验结果永远优先。
 - gen_video_prompt(spec): 按 MiniMax H3 的三段结构，把一段创意描述生成为结构化视频提示词（可直接粘贴进 ComfyUI）。
