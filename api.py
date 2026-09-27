@@ -2014,6 +2014,19 @@ async def sessions_ep(limit: int = 50):
     return {"ok": True, "items": session_store.list_sessions(limit, project_id=_request_project_id() or None)}
 
 
+@app.get("/api/agent/memory")
+async def agent_memory_ep(query: str = "", limit: int = 20):
+    import agent_memory
+    scope = agent_memory.scope_key(_request_project_id() or None)
+    return {"ok": True, "items": agent_memory.recall(scope, query, limit), "advisory": True}
+
+
+@app.delete("/api/agent/memory/{memory_id}")
+async def agent_memory_delete_ep(memory_id: str):
+    import agent_memory
+    return {"ok": agent_memory.forget(agent_memory.scope_key(_request_project_id() or None), memory_id)}
+
+
 @app.get("/api/context")
 async def context_usage_ep(session_id: str = ""):
     """当前会话的上下文窗口占用（供刷新页面后恢复「上下文已用 N%」指示）。
@@ -2047,6 +2060,15 @@ async def session_detail_ep(session_id: str):
     与同路径的 DELETE 是不同 HTTP 方法，FastAPI 允许二者共存。
     """
     data = session_store.load(session_id, project_id=_request_project_id() or None)
+    import agent_memory
+    try:
+        saved = agent_memory.latest_checkpoint(agent_memory.scope_key(_request_project_id() or None), session_id)
+        if saved and saved["status"] != "completed" and not any(
+                item.get("checkpoint_id") == saved["id"] for item in data.get("turns", [])):
+            data.setdefault("turns", []).append(agent_memory.recovery_turn(saved))
+            session_store.save(session_id, data["turns"], data.get("summary", ""), _request_project_id() or None)
+    except Exception:
+        pass  # A broken memory database must not hide existing chat history.
     return {
         "ok": True,
         "session_id": data.get("session_id") or str(session_id or ""),
@@ -2058,6 +2080,8 @@ async def session_detail_ep(session_id: str):
 
 @app.delete("/api/sessions/{session_id}")
 async def session_delete_ep(session_id: str):
+    import agent_memory
+    agent_memory.delete_checkpoints(agent_memory.scope_key(_request_project_id() or None), session_id)
     # 同时丢弃常驻 Agent，避免删除后旧历史仍在内存里续用（键与 _agent_for 一致）
     _SESSION_AGENTS.pop(_agent_key(session_id), None)
     return {"ok": session_store.delete(session_id, project_id=_request_project_id() or None)}

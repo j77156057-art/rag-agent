@@ -158,7 +158,8 @@ def _write(session_id, data, project_id=None) -> bool:
 def history(session_id, project_id=None):
     """返回给 Agent 回放的 turns 列表（list[{user, assistant}]）。"""
     return [{"user": t.get("user", ""), "assistant": t.get("assistant", ""),
-             **({"resume_context": str(t["resume_context"])[-6000:]} if "resume_context" in t else {})}
+             **({"resume_context": str(t["resume_context"])[-6000:]} if "resume_context" in t else {}),
+             **{key: str(t[key])[:1200] for key in ("checkpoint_id", "failure_reason") if t.get(key)}}
             for t in load(session_id, project_id).get("turns", []) if isinstance(t, dict)]
 
 
@@ -176,7 +177,8 @@ def save(session_id, turns, summary=None, project_id=None) -> bool:
         data["turns"] = [
             {"user": t.get("user", ""), "assistant": t.get("assistant", ""),
              "ts": t.get("ts") or datetime.now().isoformat(timespec="seconds"),
-             **({"resume_context": str(t["resume_context"])[-6000:]} if "resume_context" in t else {})}
+             **({"resume_context": str(t["resume_context"])[-6000:]} if "resume_context" in t else {}),
+             **{key: str(t[key])[:1200] for key in ("checkpoint_id", "failure_reason") if t.get(key)}}
             for t in (turns or []) if isinstance(t, dict)
         ]
         return _write(session_id, data, project_id)

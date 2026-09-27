@@ -8,6 +8,7 @@ import unittest
 import agent as agent_mod
 import agent_trace
 import sessions
+import agent_memory
 
 
 class _FakeLLM:
@@ -42,6 +43,8 @@ class _IsoBase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="dm_iso_")
         self._old_trace = agent_trace.TRACE_FILE
         self._old_dir = sessions.SESSIONS_DIR
+        self._old_memory_db = agent_memory.DB_PATH
+        agent_memory.DB_PATH = os.path.join(self.tmp, "memory.sqlite3")
         self._old_enabled = agent_trace.TRACE_ENABLED
         agent_trace.TRACE_FILE = os.path.join(self.tmp, "traces.jsonl")
         sessions.SESSIONS_DIR = os.path.join(self.tmp, "sessions")
@@ -50,6 +53,7 @@ class _IsoBase(unittest.TestCase):
     def tearDown(self):
         agent_trace.TRACE_FILE = self._old_trace
         sessions.SESSIONS_DIR = self._old_dir
+        agent_memory.DB_PATH = self._old_memory_db
         agent_trace.TRACE_ENABLED = self._old_enabled
 
 

@@ -12,6 +12,7 @@ __pycache__/
 .docmind_traces.jsonl
 .docmind_traces.jsonl.1
 .docmind_sessions/
+.docmind_memory.sqlite3*
 .docmind_pricing.json
 .docmind_budget.json
 

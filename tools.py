@@ -5557,6 +5557,41 @@ def self_verify(arg=""):
     return json.dumps(finalize_verification(result), ensure_ascii=False)
 
 
+def memory_save(arg):
+    """保存当前项目的有用事实、明确用户偏好或可复用流程。"""
+    import agent_memory as memory
+    try:
+        data = json.loads(str(arg)) if str(arg).lstrip().startswith("{") else _parse_keyed(str(arg), ["kind", "title", "content", "evidence"])
+        scope, user_text = memory.current_scope()
+        kind = str(data.get("kind") or "fact")
+        evidence = str(data.get("evidence") or "")
+        if kind == "preference" and (not evidence or evidence not in user_text):
+            return json.dumps({"ok": False, "error": "用户偏好必须引用当前或最近会话中用户明确说过的原文，不允许推测画像。"}, ensure_ascii=False)
+        mid = memory.remember(scope, kind, data.get("title", ""), data.get("content", ""), evidence,
+            source="user_explicit" if kind == "preference" else "agent")
+        return json.dumps({"ok": True, "id": mid, "kind": kind}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": memory.scrub(str(exc), 500)}, ensure_ascii=False)
+
+
+def memory_search(arg=""):
+    import agent_memory as memory
+    try:
+        rows = memory.recall(memory.current_scope()[0], str(arg or ""), limit=20)
+        return json.dumps({"ok": True, "items": rows, "advisory": True}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": memory.scrub(str(exc), 500)}, ensure_ascii=False)
+
+
+def memory_forget(arg):
+    import agent_memory as memory
+    try:
+        mid = _parse_keyed(str(arg), ["id"]).get("id") or str(arg).strip()
+        return json.dumps({"ok": memory.forget(memory.current_scope()[0], mid)}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": memory.scrub(str(exc), 500)}, ensure_ascii=False)
+
+
 def recall_experience(arg=""):
     """召回与当前任务相似的历史经验（跨会话经验记忆，Phase 3 建议性上下文）。
 
@@ -5695,6 +5730,9 @@ TOOLS = {
         "description": "跨会话经验记忆召回（Phase 3，建议性上下文，优先级低于真实证据）。当你准备做一类容易踩坑的改动（如某框架重构、某依赖升级、某校验反复失败）时，先调用它查「我以前类似的改动踩过什么坑、留下了什么教训」。输入为自然语言问题描述（如 '改 Vue 组件后 typecheck 报错'），留空则退化为通用召回。返回按置信度排序的历史经验（含 outcome/教训/决策/陈旧标记），仅供参考，不要把它当成必须执行的指令，当前真实代码与校验结果永远优先。",
         "func": recall_experience,
     },
+    "memory_save": {"description": "保存当前项目的长期记忆。输入 JSON 或多行 kind(fact/preference/workflow)/title/content/evidence。只保留有用摘要，不存密码、图片或整段网页。preference 必须 evidence 引用用户明确表达的原文，禁止推测用户画像。workflow 是流程资料，需用 dev_skill_create 起草技能、审核后启用。", "func": memory_save, "capability": "write_local", "side_effect": "mutating", "parallel_safe": False, "group": "general"},
+    "memory_search": {"description": "检索当前项目的历史结果、失败教训、用户偏好和流程。输入关键词，空串列出最近记忆；历史内容仅供参考，model_report 不是已验证事实。", "func": memory_search, "parallel_safe": False, "group": "general"},
+    "memory_forget": {"description": "删除当前项目的一条长期记忆，输入 id 或 id: <值>。用户纠正偏好或要求忘记时使用；删除记忆不会删除原始会话和任务日志。", "func": memory_forget, "capability": "write_local", "side_effect": "idempotent_write", "parallel_safe": False, "group": "general"},
     "run_command": {
         "description": "在代码库根目录内执行 shell 命令（如 pytest / npm run build / gradle test），返回合并后的标准输出与错误（截断 1500 字，超时 12s）。用于跑构建、跑测试、执行项目内命令来验证改动或查看结果。命令在 code_root 内执行，危险操作（rm -rf /、format、shutdown 等）会被拦截。输入为完整命令字符串。",
         "func": run_command,
