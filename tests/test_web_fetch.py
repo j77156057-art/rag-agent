@@ -47,14 +47,14 @@ class WebSearchFailoverTests(unittest.TestCase):
         self.assertEqual(out, bing_result)
         mb.assert_called_once_with("今天新闻")
 
-    def test_ddg_success_skips_bing(self):
+    def test_ddg_success_can_merge_parallel_backends(self):
         ddg_result = "· DDG 标题\n  摘要\n  https://ddg.test/x"
         with patch.dict(tools.os.environ, self._env_no_recency(), clear=True), \
                 patch("tools.get_web_search_provider", return_value="builtin_auto"), \
                 patch("tools._ddg_search", return_value=ddg_result), \
                 patch("tools._bing_search") as mb:
             self.assertEqual(tools.web_search("q"), ddg_result)
-        mb.assert_not_called()
+        mb.assert_called_once_with("q")
 
     def test_ddg_exception_falls_back_to_bing(self):
         with patch.dict(tools.os.environ, self._env_no_recency(), clear=True), \

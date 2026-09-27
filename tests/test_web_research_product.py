@@ -103,6 +103,32 @@ class WebResearchProductTests(unittest.TestCase):
         self.assertIn("example.com/doc", out)
         self.assertIn("正文：窗口上下文说明", out)
 
+    def test_auto_search_adds_relevant_platform_sources(self):
+        base = "· 通用结果\n  摘要\n  https://example.com/general"
+        platform_rows = {
+            "知乎": "· 知乎评价\n  用户口碑\n  https://www.zhihu.com/question/1",
+            "小红书": "· 小红书探店\n  实拍体验\n  https://www.xiaohongshu.com/explore/1",
+        }
+        with patch.object(tools, "_infer_search_sources", return_value=["zhihu.com", "xiaohongshu.com"]), \
+                patch.object(tools, "_search_one_source", side_effect=lambda domain, _q: (
+                    tools._SEARCH_SOURCE_LABELS[domain], platform_rows[tools._SEARCH_SOURCE_LABELS[domain]])):
+            out = tools._search_auxiliary_sources("什么菜好吃 推荐", base)
+        self.assertIn("知乎评价", out)
+        self.assertIn("小红书探店", out)
+        self.assertIn("通用结果", out)
+
+    def test_batch_search_runs_queries_in_parallel_and_excludes_seen(self):
+        rows = {
+            "候选菜 评价": "· 菜 A 评价\n  很好吃\n  https://example.com/a",
+            "候选菜 做法": "· 菜 A 做法\n  步骤\n  https://example.com/a\n"
+                         "· 菜 B 做法\n  步骤\n  https://example.com/b",
+        }
+        with patch.object(tools, "web_search", side_effect=lambda q, _allow_aux=True: rows[q]):
+            out = tools.web_search_batch(json.dumps({"queries": list(rows), "exclude": ["example.com/a"]}, ensure_ascii=False))
+        self.assertIn("2 个查询并行", out)
+        self.assertNotIn("example.com/a", out)
+        self.assertIn("example.com/b", out)
+
 
 if __name__ == "__main__":
     unittest.main()

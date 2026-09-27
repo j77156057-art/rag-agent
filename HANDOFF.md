@@ -242,3 +242,9 @@ git status --short
 | `frontend/src/workbench/components/SettingsView.vue` | 候选卡 UI：`acCardTitle`(标题取 server_name)、`acTrustTag`(徽章分档)、`acSecretProviders`(:373)、`regFields`(:644) |
 
 > 更细的真机复现证据、匹配逻辑、commit diff 见 `.workbuddy/memory/2026-09-25.md`「接手 handoff」节。
+# 2026-09-28 自适应多来源搜索与批量检索
+
+- `tools.py` 的自动联网搜索会按查询语义并行补充 GitHub、B 站、知乎、百度贴吧、小红书、微博、CSDN、Stack Overflow 等相关站点，并跨来源去重排序；保留 DuckDuckGo、百度、Bing 的通用搜索结果作为广度来源。
+- 新增 `web_search_batch`：多个查询并行执行，按 URL/标题去重，并可通过 `exclude` 排除上一轮已看过的结果，支持候选、评价、教程、做法等多轮搜索。
+- `web_search` 与 `web_research` 的工具描述明确引导 Agent 根据观察动态改写查询、并行查证、排除重复结果后继续下一轮。
+- 定向联网回归：**39 passed**；Agent/并行工具回归：**88 passed**；`py_compile` 通过。

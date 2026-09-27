@@ -197,7 +197,8 @@ def _source_score(url, title="", snippet=""):
     score, reasons = 0.45, []
     if url.lower().startswith("https://"):
         score += .08; reasons.append("HTTPS")
-    if host.endswith("github.com") or host.endswith("bilibili.com"):
+    if host.endswith(("github.com", "bilibili.com", "zhihu.com", "tieba.baidu.com",
+                      "xiaohongshu.com", "weibo.com", "csdn.net", "stackoverflow.com")):
         score += .18; reasons.append("平台原站")
     if any(x in host for x in ("docs.", "developer.", "dev.", "learn.")):
         score += .12; reasons.append("文档域名")
@@ -1222,6 +1223,8 @@ _SEARCH_PLATFORMS = {
     "贴吧": "tieba.baidu.com", "tieba": "tieba.baidu.com",
     "百度": "baidu.com", "baidu": "baidu.com",
     "知乎": "zhihu.com", "zhihu": "zhihu.com",
+    "小红书": "xiaohongshu.com",
+    "xiaohongshu": "xiaohongshu.com", "xhs": "xiaohongshu.com",
     "csdn": "csdn.net",
     "stackoverflow": "stackoverflow.com", "so": "stackoverflow.com",
 }
@@ -1261,6 +1264,102 @@ def _parse_web_search_arg(arg):
             q_parts.append(ln)
     q = re.sub(r"\s+", " ", " ".join(q_parts)).strip()
     return q, site[0]
+
+
+# 自动发现的补充来源。通用搜索引擎负责广度，下面的站点负责不同类型的
+# 一手资料、教程、社区口碑和中文经验；它们是候选来源，不代表内容天然可信。
+_SEARCH_SOURCE_LABELS = {
+    "github.com": "GitHub",
+    "bilibili.com": "B 站",
+    "zhihu.com": "知乎",
+    "tieba.baidu.com": "百度贴吧",
+    "xiaohongshu.com": "小红书",
+    "weibo.com": "微博",
+    "csdn.net": "CSDN",
+    "stackoverflow.com": "Stack Overflow",
+}
+
+_SEARCH_SOURCE_RULES = (
+    ("github.com", ("github", "代码", "源码", "仓库", "开源", "库", "api", "sdk", "mcp", "插件", "报错", "bug", "issue", "godot", "unity", "unreal", "easyeda", "cad")),
+    ("bilibili.com", ("视频", "教程", "演示", "怎么做", "教学", "评测", "测评", "游戏", "剪辑", "编程")),
+    ("zhihu.com", ("为什么", "经验", "推荐", "评价", "口碑", "哪个好", "怎么选", "避坑", "值得", "原理", "方案")),
+    ("tieba.baidu.com", ("吧", "贴吧", "玩家", "经验", "求助", "推荐", "评价", "游戏")),
+    ("xiaohongshu.com", ("小红书", "种草", "探店", "好吃", "美食", "旅行", "穿搭", "护肤", "购物", "推荐", "避坑", "评价", "口碑")),
+    ("weibo.com", ("热搜", "舆论", "事件", "明星", "品牌", "评价")),
+    ("csdn.net", ("代码", "报错", "教程", "编程", "python", "java", "前端", "后端", "部署")),
+    ("stackoverflow.com", ("error", "exception", "stack trace", "programming", "python", "javascript", "typescript", "sql", "api")),
+)
+
+
+def _infer_search_sources(query):
+    """按查询语义挑选补充站点，限制数量避免把一次搜索放大成爬站。"""
+    text = str(query or "").strip().lower()
+    if not text:
+        return []
+    picked = []
+    for domain, terms in _SEARCH_SOURCE_RULES:
+        if any(term.lower() in text for term in terms):
+            picked.append(domain)
+    # 中文推荐/比较问题通常需要社区口碑；没有明确技术语义时优先这些来源。
+    if any(term in text for term in ("推荐", "评价", "口碑", "好吃", "哪个好", "怎么选", "值得买", "避坑")):
+        for domain in ("zhihu.com", "xiaohongshu.com", "tieba.baidu.com", "bilibili.com"):
+            if domain not in picked:
+                picked.append(domain)
+    try:
+        limit = max(0, min(6, int(os.getenv("WEB_SEARCH_SOURCE_FANOUT", "4"))))
+    except (TypeError, ValueError):
+        limit = 4
+    return picked[:limit]
+
+
+def _source_query_backend(domain):
+    """选择更适合该站点的 HTML 搜索入口，失败仍由通用来源兜底。"""
+    if domain in {"github.com", "stackoverflow.com"}:
+        return "ddg"
+    if domain in {"bilibili.com", "zhihu.com", "tieba.baidu.com", "xiaohongshu.com", "weibo.com", "csdn.net"}:
+        return "baidu"
+    return "ddg"
+
+
+def _search_one_source(domain, query):
+    """读取一个补充站点；专用 API 失败时退回 site: 搜索。"""
+    if domain == "github.com":
+        result = _github_search(query)
+        if not result.startswith("GitHub API 暂不可用"):
+            return "GitHub", result
+    elif domain == "bilibili.com":
+        result = _bilibili_search(query)
+        if not result.startswith("B 站专用搜索暂不可用") and not result.startswith("B 站搜索未返回结果"):
+            return "B 站", result
+    provider = _source_query_backend(domain)
+    backend = {"ddg": _ddg_search, "baidu": _baidu_search}.get(provider, _ddg_search)
+    try:
+        result = backend(f"{query} site:{domain}")
+    except Exception as exc:  # noqa: BLE001
+        result = f"搜索失败: {provider}: {type(exc).__name__}: {exc}"
+    return _SEARCH_SOURCE_LABELS.get(domain, domain), result
+
+
+def _search_auxiliary_sources(query, base_result):
+    """并行搜索语义相关的社区/代码站点并与通用结果合并。"""
+    domains = _infer_search_sources(query)
+    if not domains:
+        return base_result
+    named = [("general", base_result)]
+    with ThreadPoolExecutor(max_workers=len(domains), thread_name_prefix="docmind-source") as pool:
+        futures = {pool.submit(_search_one_source, domain, query): domain for domain in domains}
+        for future in as_completed(futures):
+            domain = futures[future]
+            try:
+                label, result = future.result()
+            except Exception as exc:  # noqa: BLE001
+                label, result = _SEARCH_SOURCE_LABELS.get(domain, domain), f"搜索失败: {type(exc).__name__}: {exc}"
+            named.append((label, result))
+    merged = _merge_builtin_results(query, named)
+    if not merged or any(merged.startswith(marker) for marker in _SEARCH_EMPTY_MARKERS):
+        return base_result
+    return merged.replace("聚合搜索结果（已跨 DuckDuckGo、百度、Bing 去重排序）：",
+                          "聚合搜索结果（通用引擎 + 相关站点并行去重排序）：", 1)
 
 
 def _json_request(url, *, headers=None, timeout=15):
@@ -1369,7 +1468,7 @@ def web_subtitles(arg):
         return f"字幕提取失败：{type(exc).__name__}: {exc}"
 
 
-def web_search(query):
+def web_search(query, _allow_aux=True):
     """联网搜索（按设置选择服务商，无需 Key 的内置后端默认可用）。
 
     入参为单字符串，可带站点限定：
@@ -1412,11 +1511,99 @@ def web_search(query):
         result = _builtin_search(provider, q)
     else:
         result = _api_web_search(provider, q)
+    # 自动模式在通用引擎结果之外，按查询语义并行补充相关社区/代码站点。
+    # 显式 site/platform 查询保持单站点语义；批量搜索会关闭此层，避免查询爆炸。
+    if provider == "builtin_auto" and not site and _allow_aux and not any(
+            result.startswith(marker) for marker in _SEARCH_EMPTY_MARKERS):
+        result = _search_auxiliary_sources(q, result)
     if specialized_error and not any(result.startswith(m) for m in _SEARCH_EMPTY_MARKERS):
         result = specialized_error + "\n\n通用搜索回退结果：\n" + result
     if _search_cache_enabled() and not any(result.startswith(m) for m in _SEARCH_EMPTY_MARKERS):
         _web_cache_write(cache_key, result)
     return result
+
+
+def _parse_search_batch(arg):
+    """解析 web_search_batch 的 JSON 或逐行查询输入。"""
+    text = str(arg or "").strip()
+    if not text:
+        return [], []
+    payload = None
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict):
+        raw_queries = payload.get("queries") or payload.get("query") or []
+        excludes = payload.get("exclude") or payload.get("exclude_urls") or []
+        if isinstance(raw_queries, str):
+            raw_queries = [raw_queries]
+        if isinstance(excludes, str):
+            excludes = [excludes]
+    elif isinstance(payload, list):
+        raw_queries, excludes = payload, []
+    else:
+        raw_queries = []
+        excludes = []
+        for line in text.splitlines():
+            line = re.sub(r"^\s*(?:query|q|queries?)\s*[:：]\s*", "", line, flags=re.I).strip()
+            if line:
+                raw_queries.append(line)
+    queries = list(dict.fromkeys(str(q).strip() for q in raw_queries if str(q).strip()))[:8]
+    excludes = list(dict.fromkeys(str(v).strip().lower() for v in excludes if str(v).strip()))[:100]
+    return queries, excludes
+
+
+def web_search_batch(arg):
+    """并行执行一组搜索，跨查询按 URL/标题去重并支持排除已看过的结果。
+
+    输入 JSON：{"queries":["候选菜 评价","候选菜 做法"],"exclude":["已看过的 URL"]}；
+    也支持每行一个查询。适合发现候选后并行查评价、教程、做法，再把结果交回
+    Agent 决定是否继续下一轮。
+    """
+    queries, excludes = _parse_search_batch(arg)
+    if not queries:
+        return "未提供批量搜索关键词。"
+    outputs = [None] * len(queries)
+    with ThreadPoolExecutor(max_workers=min(8, len(queries)), thread_name_prefix="docmind-query") as pool:
+        futures = {pool.submit(web_search, query, False): index for index, query in enumerate(queries)}
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                outputs[index] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                outputs[index] = f"搜索失败：{type(exc).__name__}: {exc}"
+    unique, diagnostics = {}, []
+    for query, raw in zip(queries, outputs):
+        if not raw:
+            continue
+        rows = _formatted_search_rows(raw)
+        if not rows:
+            diagnostics.append(f"{query}：{raw}")
+            continue
+        for row in rows:
+            haystack = (row.get("url", "") + " " + row.get("title", "") + " " + row.get("snippet", "")).lower()
+            if any(item in haystack for item in excludes):
+                continue
+            key = (row.get("url") or row.get("title") or "").strip().lower()
+            if not key:
+                continue
+            score, reason = _source_score(row.get("url", ""), row.get("title", ""), row.get("snippet", ""))
+            candidate = {**row, "query": query, "rank": score, "reason": reason}
+            old = unique.get(key)
+            if old is None or candidate["rank"] > old["rank"]:
+                unique[key] = candidate
+    if not unique:
+        return "\n".join(diagnostics) if diagnostics else "搜索未返回结果。"
+    lines = [f"批量搜索结果（{len(queries)} 个查询并行，已跨查询去重）："]
+    for row in sorted(unique.values(), key=lambda item: item["rank"], reverse=True)[:24]:
+        snippet = row.get("snippet", "")[:320]
+        query_hint = row.get("query", "")
+        if query_hint:
+            snippet = f"{snippet}（查询：{query_hint}）".strip()
+        lines.append(_format_search_result(row.get("title", ""), snippet,
+                                           row.get("url", ""), source="batch"))
+    return "\n".join(lines)
 
 
 def _builtin_search(provider, q):
@@ -1442,6 +1629,12 @@ def _builtin_search(provider, q):
                     results[name] = future.result()
                 except Exception as exc:  # noqa: BLE001
                     results[name] = f"搜索失败: {name}: {type(exc).__name__}: {exc}"
+        # 只有一个后端真正返回候选时保留原始格式，兼容旧调用方；多个后端
+        # 都有结果时才输出聚合头、去重和统一可信度字段。
+        meaningful = [raw for raw in (results.get(name, "") for name in selected)
+                      if _formatted_search_rows(raw)]
+        if len(meaningful) == 1:
+            return meaningful[0]
         merged = _merge_builtin_results(q, [(name, results.get(name, "")) for name in selected])
         if merged and not any(merged.startswith(marker) for marker in _SEARCH_EMPTY_MARKERS):
             return merged
@@ -5289,7 +5482,7 @@ def recall_experience(arg=""):
 
 
 TOOLS = {
-    "web_research": {"description": "联网研究：先搜索，再读取多个公开网页正文（默认最多 5 个，可配置），返回来源和证据。适合教程、GitHub、引擎文档和需要最新资料的问题；样本不足时可用不同主题再次调用。输入研究主题。", "func": web_research},
+    "web_research": {"description": "联网研究：先搜索，再读取多个公开网页正文（默认最多 5 个，可配置），返回来源和证据。适合教程、GitHub、引擎文档和需要最新资料的问题。推荐采用多轮策略：第一轮发现候选；看到候选后用 web_search_batch 并行查评价、口碑、教程或做法；若评价一般或证据不足，排除已见 URL/标题后提交下一批候选，最后再对关键来源调用 web_fetch。输入研究主题。", "func": web_research},
     "web_fetch": {"description": "读取公开网页正文并返回来源、标题和清理后的文本。输入完整 http/https URL。联网研究时先 web_search，再对关键来源调用。", "func": web_fetch},
     "web_subtitles": {"description": "读取公开 B 站视频字幕。输入包含 BV 号或 av 号的完整视频 URL；没有公开字幕、需要登录或被风控时返回明确原因。", "func": web_subtitles},
     "dev_mcp_call": {"description": "调用已启用的 MCP 游戏引擎连接器。输入 key: 服务器key、name: 工具名、arguments: JSON；可选 fallback_keys 或 hint 触发有界故障转移。先用 dev_list_connectors 看清可用连接器、用 dev_route_connector 按任务语义挑 top 作为 key、用 dev_list_connector_tools 确认 name 与参数；外部连接器需已启用并遵守审批。涉及写入时传 side_effect: true，默认不会跨连接器重试；只有明确传 allow_side_effect_fallback: true 才允许。", "func": dev_mcp_call},
@@ -5324,8 +5517,12 @@ TOOLS = {
         "func": calculate,
     },
     "web_search": {
-        "description": "当知识库不足或需要时效性/外部信息时，联网搜索（DuckDuckGo/百度/Bing 自动故障转移，无需 Key）。GitHub 与 B 站站点限定会优先走专用 API，API 不可用时回退通用搜索；结果附可解释的可信度排序参考，不代表事实已证实。",
+        "description": "当知识库不足或需要时效性/外部信息时，联网搜索。自动模式会并行查询 DuckDuckGo/百度/Bing，并按问题语义补充 GitHub、B 站、知乎、贴吧、小红书、CSDN 等相关来源；结果附可解释的可信度排序参考，不代表事实已证实。看到候选后可用 web_search_batch 并行查评价、做法或最新状态。",
         "func": web_search,
+    },
+    "web_search_batch": {
+        "description": "并行执行多个联网查询并跨查询去重。输入 JSON：{\"queries\":[\"候选1 评价\",\"候选1 做法\"],\"exclude\":[\"已看过的 URL 或标题片段\"]}，也支持每行一个查询。适合先发现候选，再并行查评价/教程/做法；结果不足时排除旧结果后继续提交下一批。",
+        "func": web_search_batch,
     },
     "dev_http_request": {
         "description": "调用你自己的外部业务 API（REST/JSON）。受 EXTERNAL_API_ALLOWLIST 域名白名单约束（防止 SSRF），未配置白名单则拒绝。输入（多行 key: value）：url: <完整URL> 换行 method: <GET/POST/...默认GET> 换行 可选 timeout: <秒> 换行 可选 headers: <单行JSON对象> 换行 可选 body: <请求体，可多行>。返回 HTTP 状态码 + 响应头 + 截断响应体。",
