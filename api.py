@@ -77,6 +77,9 @@ from config import (
     get_context_window_override,
     get_model_capability_override,
     set_model_capability_override,
+    load_model_presets,
+    upsert_model_preset,
+    remove_model_preset,
     ensure_dirs,
     _apply_persisted_state,
     set_context_code_root,
@@ -230,7 +233,23 @@ async def _app_lifespan(app):
     if os.getenv("DOCMIND_WORKFLOW_AUTO_RECOVER", "1").strip().lower() in {"1", "true", "yes"}:
         # The resolver is installed while composing the agent router below;
         # it rebuilds session-bound runners without persisting clients.
-        WORKFLOWS.recover_pending()
+        #
+        # 恢复必须在后台线程执行、不能阻塞 lifespan：recover_pending() 会对每个
+        # 合格工作流同步重跑 execute()，一次恢复可能耗时数分钟（LLM/工具链）。
+        # 阻塞启动会让桌面启动器的 20s 健康探针超时并误报「8000 端口被占用」；
+        # 更糟的是用户随后关掉启动器 → 恢复线程半途被杀，工作流永远停在
+        # planned/executing → 下次启动再卡，形成启动死循环。
+        def _recover_pending_workflows() -> None:
+            try:
+                WORKFLOWS.recover_pending()
+            except Exception as exc:  # noqa: BLE001 恢复失败只记录，不影响服务
+                set_runtime("workflow_recovery_error", f"{type(exc).__name__}: {exc}")
+
+        threading.Thread(
+            target=_recover_pending_workflows,
+            name="docmind-workflow-recover",
+            daemon=True,
+        ).start()
     try:
         yield
     finally:
@@ -475,6 +494,21 @@ def _project_root_or_error():
         root = ""
     root = root or get_runtime("code_root") or CODE_ROOT
     return root if root and os.path.isdir(root) else None
+
+
+def _preset_secret_slot(preset_id: str) -> str:
+    return f"preset:{preset_id}"
+
+
+def _presets_payload():
+    """预设列表 + 当前项目下每个预设是否已存 Key（Key 本身不回显）。"""
+    root = _project_root_or_error()
+    out = []
+    for p in load_model_presets():
+        item = dict(p)
+        item["has_key"] = bool(root and secrets_store.load(root, _preset_secret_slot(p["id"])))
+        out.append(item)
+    return out
 
 
 async def _restore_persisted_llm():
@@ -1775,22 +1809,46 @@ async def chat(
                           if plan_mode.strip() else None)
     is_cloud = False
     cloud_llm = None
-    if routing.get('route') == 'cloud' and routing.get('auto_cloud_enabled'):
-        cloud_provider = get_runtime('cloud_llm_provider') or os.getenv('AGENT_CLOUD_PROVIDER', 'deepseek')
-        if cloud_provider in PROVIDERS and PROVIDERS[cloud_provider].get('api_key_env'):
-            key = get_runtime('llm_api_key') or os.getenv(PROVIDERS[cloud_provider]['api_key_env'], '')
-            if key:
+    # 自动模式：UI 持久化开关 llm_mode=auto（用户在模型设置选的云端预设）
+    # 与旧环境变量 AGENT_AUTO_CLOUD 两条路并存，任一开启即允许按复杂度升级云端。
+    mode_auto = (get_runtime("llm_mode") or "fixed") == "auto"
+    cloud_allowed = mode_auto or routing.get('auto_cloud_enabled')
+    if routing.get('route') == 'cloud' and cloud_allowed:
+        cloud_provider = ""
+        cloud_model = ""
+        cloud_base_url = ""
+        key = ""
+        # 优先使用用户在自动模式中选定的云端模型预设
+        preset_id = (get_runtime("auto_cloud_preset_id") or "").strip()
+        preset = next((p for p in load_model_presets() if p["id"] == preset_id), None) if preset_id else None
+        if mode_auto and preset:
+            cloud_provider = preset["provider"]
+            cloud_model = preset.get("model") or ""
+            cloud_base_url = preset.get("base_url") or ""
+            _root = _project_root_or_error()
+            key = secrets_store.load(_root, _preset_secret_slot(preset["id"])) if _root else ""
+        if not cloud_provider:
+            # 旧路径：运行时/环境变量指定的云端厂商（默认 deepseek），仅在需要 key 时使用
+            cloud_provider = get_runtime('cloud_llm_provider') or os.getenv('AGENT_CLOUD_PROVIDER', 'deepseek')
+        if cloud_provider in PROVIDERS:
+            if not key and PROVIDERS[cloud_provider].get('api_key_env'):
+                key = get_runtime('llm_api_key') or os.getenv(PROVIDERS[cloud_provider]['api_key_env'], '')
+            # 本地（ollama/llamacpp/mock）不承担「云端升级」；需要 key 的厂商没 key 也不能升级
+            if PROVIDERS[cloud_provider].get('cloud') and (
+                    not PROVIDERS[cloud_provider].get('api_key_env') or key):
                 # 云端路由只为本轮造一个云端 client，随 run(llm=cloud_llm) 临时覆盖，
                 # 请求结束即还原——不再新建 Agent、不再改 _SESSION_AGENTS。旧做法
                 # `_SESSION_AGENTS[sid] = cloud_agent` 会把模块级 agent（会话单例）
                 # 变成孤儿：set_config/ingest 等仍打旧对象、且本会话被永久黏到云端。
                 # LLMClient 构造可能同步探活（≤3s）：放到线程池，避免阻塞事件循环。
                 cloud_llm = await run_in_threadpool(
-                    lambda: LLMClient(provider=cloud_provider, api_key=key)
+                    lambda: LLMClient(
+                        provider=cloud_provider, model=cloud_model or None,
+                        api_key=key or None, base_url=cloud_base_url or None)
                 )
                 is_cloud = True
             else:
-                routing = {**routing, 'route': 'local', 'reason': '云端未配置 API Key，已回退本地'}
+                routing = {**routing, 'route': 'local', 'reason': '云端模型未配置 API Key 或不可用，已回退本地'}
     hints.append(f"模型路由建议：{routing['route']}（复杂度 {routing['complexity']}，{routing['reason']}）。若需云端模型，必须使用已配置且可审计的 provider。")
     # 逐请求开关：联网（默认关，空串也按关处理，避免漏传时误外联）；
     # 深度思考空串=沿用模型画像/全局默认，显式 1/0 才覆盖（None=不改）。
@@ -2438,6 +2496,10 @@ class ConfigReq(BaseModel):
     video_capability: Optional[str] = None
     # AI 越界访问模式：'safe'=仅项目内；'high'=允许受控越界读写。None=不变
     external_access_mode: Optional[str] = None
+    # 模型选择模式：'fixed'=固定用当前模型；'auto'=每轮按任务复杂度在本地/云端间自动路由
+    llm_mode: Optional[str] = None
+    # 自动模式下复杂任务使用的云端模型预设 id
+    auto_cloud_preset_id: Optional[str] = None
     # 网络搜索 / URL 获取服务商配置：None=不变
     web_search_provider: Optional[str] = None
     web_search_api_key: Optional[str] = None
@@ -2546,6 +2608,10 @@ async def get_config():
         "web_fetch_provider": get_web_fetch_provider(),
         "web_fetch_api_url": get_web_fetch_api_url(),
         "web_fetch_has_key": bool(get_web_fetch_api_key()),
+        # 模型选择模式 + 自动模式所用云端预设 + 已保存预设（含每预设 has_key）
+        "llm_mode": get_runtime("llm_mode") or "fixed",
+        "auto_cloud_preset_id": get_runtime("auto_cloud_preset_id") or "",
+        "model_presets": _presets_payload(),
         # 同步 urllib 探活放线程池，Ollama 不可达时不阻塞事件循环/拖慢面板打开
         "ollama_status": await run_in_threadpool(check_ollama),
     }
@@ -3119,9 +3185,11 @@ async def model_power_ep(req: ModelPowerReq):
         return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
 
 
-@app.post("/api/config")
-async def set_config(req: ConfigReq):
-    """页面内切换模型：更新运行时覆盖、重建 Agent 的 LLM 客户端，即时生效。"""
+async def _apply_config(req: ConfigReq):
+    """切换模型的完整实现：更新运行时覆盖、重建 Agent 的 LLM 客户端，即时生效。
+
+    /api/config 与「预设一键激活」共用本函数，保证两条路径行为完全一致。
+    """
     if req.provider not in PROVIDERS:
         return JSONResponse({"ok": False, "error": f"未知 provider: {req.provider}"}, status_code=400)
 
@@ -3213,10 +3281,27 @@ async def set_config(req: ConfigReq):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     # P3：即时生效于「本请求上下文所属项目」的默认会话 Agent（无上下文等价改动前）
     _cur_agent = _agent_for("default")
-    _cur_agent.llm = new_llm
     _cur_agent.history = []
-    # 窗口随模型变化，旧的上下文用量快照作废（前端下一轮问答会收到新事件）
-    _cur_agent.last_context = None
+    # 切模型后必须给「所有会话」的 Agent 换 LLM 客户端：真实问答走的是
+    # _agent_for(session_id) 的各会话 Agent（pid::ask-xxx / pid::web-xxx），
+    # 旧实现只换 default，于是问答页/对话台的上下文窗口仍按旧模型的十几 k 画像算，
+    # /api/context 与 SSE context 事件全是旧值。历史保留（落盘文件还在），只作废快照。
+    for _ag in list(_SESSION_AGENTS.values()):
+        _ag.llm = new_llm
+        _ag.last_context = None
+
+    # 模型选择模式（固定 / 自动）与自动模式云端预设：校验后即时生效并跨重启持久化
+    if req.llm_mode is not None:
+        if req.llm_mode not in ("fixed", "auto"):
+            return JSONResponse({"ok": False, "error": "模型模式仅支持 fixed / auto。"}, status_code=400)
+        set_runtime("llm_mode", req.llm_mode)
+        save_state("llm_mode", req.llm_mode)
+    if req.auto_cloud_preset_id is not None:
+        acp = req.auto_cloud_preset_id.strip()
+        if acp and not any(p["id"] == acp for p in load_model_presets()):
+            return JSONResponse({"ok": False, "error": "指定的云端模型预设不存在。"}, status_code=400)
+        set_runtime("auto_cloud_preset_id", acp)
+        save_state("auto_cloud_preset_id", acp)
 
     # 切换 embedding provider：清空向量缓存 + 重建集合（维度可能变化）
     if req.embedding_provider:
@@ -3297,7 +3382,95 @@ async def set_config(req: ConfigReq):
         "web_fetch_provider": get_web_fetch_provider(),
         "web_fetch_api_url": get_web_fetch_api_url(),
         "web_fetch_has_key": bool(get_web_fetch_api_key()),
+        "llm_mode": get_runtime("llm_mode") or "fixed",
+        "auto_cloud_preset_id": get_runtime("auto_cloud_preset_id") or "",
+        "model_presets": _presets_payload(),
     }
+
+
+@app.post("/api/config")
+async def set_config(req: ConfigReq):
+    """页面内切换模型（含预设保存/自动模式开关的统一入口）。"""
+    return await _apply_config(req)
+
+
+class PresetReq(BaseModel):
+    id: Optional[str] = None
+    label: str
+    provider: str
+    model: str = ""
+    base_url: str = ""
+    context_window: Optional[int] = None
+    # 可选：随预设一起保存到「当前项目」密钥库的 API Key（不回显）
+    api_key: Optional[str] = None
+
+
+@app.get("/api/model_presets")
+async def list_model_presets():
+    return {"ok": True, "presets": _presets_payload()}
+
+
+@app.post("/api/model_presets")
+async def save_model_preset_ep(req: PresetReq):
+    """新增/更新命名模型预设；api_key（如有）存当前项目的 preset:<id> 槽位。"""
+    preset, err = upsert_model_preset({
+        "id": (req.id or "").strip(),
+        "label": req.label,
+        "provider": req.provider,
+        "model": req.model,
+        "base_url": req.base_url,
+        "context_window": req.context_window or 0,
+    })
+    if err:
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+    if req.api_key:
+        root = _project_root_or_error()
+        if not root:
+            return JSONResponse({"ok": False, "error": "当前没有可用项目，无法保存 API Key。"}, status_code=400)
+        secrets_store.save(root, _preset_secret_slot(preset["id"]), req.api_key)
+    return {"ok": True, "presets": _presets_payload()}
+
+
+@app.delete("/api/model_presets/{preset_id}")
+async def delete_model_preset_ep(preset_id: str):
+    removed = remove_model_preset(preset_id)
+    # 自动模式正指向被删预设时退回固定默认，避免路由到不存在的配置
+    if removed and (get_runtime("auto_cloud_preset_id") or "") == preset_id:
+        set_runtime("auto_cloud_preset_id", "")
+        save_state("auto_cloud_preset_id", "")
+    if not removed:
+        return JSONResponse({"ok": False, "error": "预设不存在。"}, status_code=404)
+    return {"ok": True, "presets": _presets_payload()}
+
+
+@app.post("/api/model_presets/{preset_id}/activate")
+async def activate_model_preset_ep(preset_id: str):
+    """一键激活预设：复用 /api/config 全套逻辑（探活/落盘/换客户端/清空会话）。"""
+    match = next((p for p in load_model_presets() if p["id"] == preset_id), None)
+    if not match:
+        return JSONResponse({"ok": False, "error": "预设不存在。"}, status_code=404)
+    root = _project_root_or_error()
+    slot = _preset_secret_slot(match["id"])
+    stored = secrets_store.load(root, slot) if root else ""
+    needs_key = bool(PROVIDERS.get(match["provider"], {}).get("api_key_env"))
+    if needs_key and not stored and not (
+            get_runtime("llm_api_key") if (get_runtime("llm_provider") == match["provider"]) else ""):
+        # 切过去也没有可用 key（环境变量除外，LLMClient 会兜底）：给出明确提示而非静默切空
+        if not os.getenv(PROVIDERS[match["provider"]].get("api_key_env", ""), ""):
+            return JSONResponse(
+                {"ok": False, "error": f"该预设在当前项目还没有保存 API Key，请在模型设置中填好 Key 后重新激活。"},
+                status_code=400)
+    req = ConfigReq(
+        provider=match["provider"],
+        model=match["model"] or "",
+        base_url=match.get("base_url") or "",
+        api_key=stored or "",
+        context_window=match.get("context_window") or 0,
+    )
+    result = await _apply_config(req)
+    if isinstance(result, JSONResponse):
+        return result
+    return result
 
 
 @app.post("/api/reset_code")

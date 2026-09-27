@@ -13,6 +13,7 @@ import {
   demoBudget, demoSessions, demoTraceItems, demoTraceSummary, demoSkills, demoHooks,
 } from '../composables/demo'
 import { useWorkbench } from '../composables/workbench'
+import { appEvents } from '../eventBus'
 
 const { openFlow } = useWorkbench()
 
@@ -204,7 +205,7 @@ async function removeSession(id: string) {
   if (id === currentId.value) {
     currentId.value = await startNewSession()
     open.value = false
-    window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
+    appEvents.emit('docmind:focus-chat', { reload: true })
   }
 }
 /** 继续某段历史对话：把该 session_id 切为当前会话并让 AI 助手回灌其历史。 */
@@ -213,14 +214,14 @@ async function continueSession(id: string) {
   if (!await setSessionId(id)) { actionMsg.value = '该会话正在另一个页面使用，请先关闭那个页面。'; return }
   currentId.value = id
   open.value = false
-  window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
+  appEvents.emit('docmind:focus-chat', { reload: true })
 }
 /** 开一段全新对话：切到全新 session id（新 id 无历史），让 AI 助手显示空态。 */
 async function newSession() {
   if (demoMode.value) { actionMsg.value = '演示模式不能新建会话'; return }
   currentId.value = await startNewSession()
   open.value = false
-  window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
+  appEvents.emit('docmind:focus-chat', { reload: true })
 }
 async function clearTraces() {
   if (demoMode.value) { traces.value = []; actionMsg.value = '演示记录已清空（刷新后恢复）'; return }

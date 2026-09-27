@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import os
 import contextvars
+import threading
+import time
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import BoundedSemaphore, Lock
@@ -40,7 +43,16 @@ class LocalResourceProfile:
 
 
 _LOCAL_PROVIDERS = {"ollama", "llamacpp"}
+# 等待本地推理槽的上限（秒）。>0 为有界等待；0 = 无限等待（旧行为，失衡时会永久阻塞）。
+# 背景：本地 provider 全局只有一个 BoundedSemaphore(1) 槽位，任何一次 acquire/release
+# 失衡或上一个生成长期不返回，都会让后续每一个请求在"首次 LLM 调用之前"无限阻塞，
+# 表现为「0 次 LLM 调用、静默挂死到客户端断开」（实测有过 844s 的一轮）。
+_SLOT_WAIT_SECONDS = float(os.getenv("DOCMIND_LOCAL_SLOT_TIMEOUT", "180") or 0)
 _SEMAPHORES: dict[tuple[str, str, int], BoundedSemaphore] = {}
+# 诊断用：key -> {"tag": 用途@线程名, "since": 开始持有时刻}。仅用于"卡住时点名持有者"。
+_HOLDERS: dict[tuple[str, str, int], dict] = {}
+# 诊断计数：等槽超时被放行的次数（>0 即说明确实发生过"槽位被长期占用"）。
+_STATS = {"wait_exceeded": 0}
 _SEMAPHORE_LOCK = Lock()
 _HELD_SLOTS: contextvars.ContextVar[set[tuple[str, str, int]]] = contextvars.ContextVar(
     "docmind_held_local_slots", default=set())
@@ -124,8 +136,11 @@ def effective_subagent_limit(provider: str, model: str, requested: int | None) -
 
 
 @contextmanager
-def local_llm_slot(provider: str, model: str):
-    """Serialize local generations even when callers use independent clients."""
+def local_llm_slot(provider: str, model: str, purpose: str = ""):
+    """Serialize local generations even when callers use independent clients.
+
+    ``purpose`` 只用于诊断：卡住时可点名"谁"占着槽（用途@线程名）。
+    """
     profile = resource_profile(provider, model)
     if not profile.local:
         yield
@@ -138,15 +153,77 @@ def local_llm_slot(provider: str, model: str):
         # re-entrant so the two protection layers cannot deadlock at capacity 1.
         yield
         return
+    tag = f"{purpose or 'llm'}@{threading.current_thread().name}"
     with _SEMAPHORE_LOCK:
         semaphore = _SEMAPHORES.setdefault(key, BoundedSemaphore(profile.max_parallel))
-    semaphore.acquire()
+    if _SLOT_WAIT_SECONDS > 0:
+        acquired = semaphore.acquire(timeout=_SLOT_WAIT_SECONDS)
+    else:
+        semaphore.acquire()          # 旧行为：无限等待
+        acquired = True
+    if not acquired:
+        # 槽位被上一个本地生成长期占用（失衡/卡死）。超时后**放行本次**而不是继续
+        # 无限等待：本地推理服务端自身会排队，宁可轻微过订阅，也绝不能让整轮请求
+        # 在第一次 LLM 调用前静默挂死到客户端断开。
+        _STATS["wait_exceeded"] = int(_STATS.get("wait_exceeded", 0)) + 1
+        with _SEMAPHORE_LOCK:
+            holder = dict(_HOLDERS.get(key) or {})
+        who = holder.get("tag") or "未知持有者"
+        wait_note = (f"（已持有 {time.time() - holder['since']:.0f}s）"
+                     if holder.get("since") else "")
+        warnings.warn(
+            f"[local_llm_slot] 等待 {profile.provider}/{profile.model} 本地推理槽超过 "
+            f"{_SLOT_WAIT_SECONDS:.0f}s，已放行本次以免请求永久阻塞。"
+            f"当前持有者：{who}{wait_note}。"
+        )
+        # 仍要登记 _HELD_SLOTS（但不 acquire、因此也不 release），否则嵌套的
+        # local_llm_slot（子代理/非流式）会在同一 key 上再等待一次、把超时叠加。
+        token = _HELD_SLOTS.set(set(held) | {key})
+        try:
+            yield
+        finally:
+            _HELD_SLOTS.reset(token)
+        return
+    with _SEMAPHORE_LOCK:
+        _HOLDERS[key] = {"tag": tag, "since": time.time()}
     token = _HELD_SLOTS.set(set(held) | {key})
     try:
         yield
     finally:
         _HELD_SLOTS.reset(token)
+        with _SEMAPHORE_LOCK:
+            if (_HOLDERS.get(key) or {}).get("tag") == tag:
+                _HOLDERS.pop(key, None)
         semaphore.release()
+
+
+def slot_holders() -> dict:
+    """诊断：当前每个本地推理槽的持有者（tag / 已持有秒数）。供 workbench 排障。"""
+    now = time.time()
+    with _SEMAPHORE_LOCK:
+        return {f"{key[0]}/{key[1]}": {
+            "tag": value.get("tag"),
+            "held_seconds": round(now - value.get("since", now), 1),
+        } for key, value in _HOLDERS.items()}
+
+
+def set_slot_wait_seconds(seconds) -> float:
+    """运行时调整"等本地推理槽"的上限（秒）；<=0 表示无限等待（旧行为）。"""
+    global _SLOT_WAIT_SECONDS
+    _SLOT_WAIT_SECONDS = max(0.0, float(seconds or 0))
+    return _SLOT_WAIT_SECONDS
+
+
+def slot_status() -> dict:
+    """本地推理槽诊断快照：等待上限、超时放行次数、当前持有者。
+
+    供 workbench 的 GPU 面板展示：卡住时能直接看到"谁占着槽、占了多久"。
+    """
+    return {
+        "wait_timeout_seconds": _SLOT_WAIT_SECONDS,
+        "wait_exceeded": int(_STATS.get("wait_exceeded", 0)),
+        "holders": slot_holders(),
+    }
 
 
 __all__ = [
@@ -155,4 +232,7 @@ __all__ = [
     "effective_parallelism",
     "effective_subagent_limit",
     "local_llm_slot",
+    "slot_holders",
+    "slot_status",
+    "set_slot_wait_seconds",
 ]

@@ -3,7 +3,9 @@
 // 离开对话前可选地确认并自动中断未终结工作流，避免卡片卸载后后端停在门里成为孤儿。
 import { computed, ref } from 'vue'
 import { agentApi } from '../api'
-import { askConfirm } from './workbench'
+// 直接依赖对话框域，勿走 workbench 聚合桶——那会把编辑器（CodeMirror 650KB）
+// 整条依赖链拖进问答首页首屏。
+import { askConfirm } from './dialogs'
 
 export function useWorkflowGate(getActiveIds?: () => string[]) {
   // 正打开人工审批门的工作流集合：此时锁定对话台操作区（发送/工具/头部按钮），

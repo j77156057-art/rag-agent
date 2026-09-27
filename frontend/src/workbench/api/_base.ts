@@ -1,5 +1,6 @@
 // API 基础设施：统一错误类型、项目上下文注入与请求出口。
 // 各业务域文件只负责端点定义，通用能力统一从这里引入。
+import { appEvents } from '../eventBus'
 
 /** 业务/HTTP 错误；status=0 表示网络层失败（服务未启动） */
 export class FsApiError extends Error {
@@ -38,7 +39,7 @@ export function setProjectId(pid: string): void {
   } catch {
     /* 写入失败（隐私模式等）不影响主流程 */
   }
-  if (previous !== pid) window.dispatchEvent(new CustomEvent('docmind:project-context-changed'))
+  if (previous !== pid) appEvents.emit('docmind:project-context-changed')
 }
 
 export interface ActiveTask { id: string; region: string; allowedPaths: string[] }

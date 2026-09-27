@@ -3107,7 +3107,8 @@ class Agent:
             # generations share a bounded inference slot across all clones.
             with _hooks.workflow_event_scope(record_hook):
                 with local_llm_slot(getattr(child_llm, "provider", ""),
-                                    getattr(child_llm, "model", "")):
+                                    getattr(child_llm, "model", ""),
+                                    purpose=f"subagent:{role}"):
                     for ev in child.run(question, stream=False):
                         et = ev.get("type")
                         if et == "final":

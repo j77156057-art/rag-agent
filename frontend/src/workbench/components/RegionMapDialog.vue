@@ -4,6 +4,7 @@
 // 顶部横幅展示契约校验结果（依赖无环、导出文件存在）。
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useWorkbench, askConfirm } from '../composables/workbench'
+import { appEvents } from '../eventBus'
 import { withProject } from '../api'
 import { regionColor } from '../theme'
 import type { RegionInfo } from '../api'
@@ -42,7 +43,7 @@ async function addRegion() {
 }
 function askAiForRegions() {
   closeRegionMap()
-  window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { q: '请读取当前项目结构和现有分区，提出适合此项目的分区调整方案。先展示依据、建议目录和影响范围，等待我审核再修改。' } }))
+  appEvents.emit('docmind:focus-chat', { q: '请读取当前项目结构和现有分区，提出适合此项目的分区调整方案。先展示依据、建议目录和影响范围，等待我审核再修改。' })
 }
 
 const byKey = computed(() => new Map(regionMap.value.regions.map((r) => [r.key, r])))

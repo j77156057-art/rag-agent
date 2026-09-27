@@ -5,9 +5,15 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
+from agent_runtime import local_runtime
+
 
 class GpuOwnerReq(BaseModel):
     owner: str = ""
+
+
+class SlotTimeoutReq(BaseModel):
+    seconds: float = 180
 
 
 class GpuConfigureReq(BaseModel):
@@ -61,6 +67,19 @@ def build_router(ctx) -> APIRouter:
         if previous is None:
             return {"ok": False, "error": "没有可回收的租约"}
         return {"ok": True, "released": previous}
+
+    @router.get("/local-slots")
+    async def local_slots():
+        """本地推理槽（串行闸）诊断：等待上限 / 超时放行次数 / 当前持有者。
+
+        卡住时用它能直接看到"是哪个用途@线程占着槽、占了多久"。
+        """
+        return {"ok": True, **local_runtime.slot_status()}
+
+    @router.post("/local-slots/wait-timeout")
+    async def set_local_slots_timeout(req: SlotTimeoutReq):
+        value = local_runtime.set_slot_wait_seconds(req.seconds)
+        return {"ok": True, "wait_timeout_seconds": value, **local_runtime.slot_status()}
 
     @router.post("/configure")
     async def configure(req: GpuConfigureReq):

@@ -49,8 +49,28 @@ export interface GpuStatus {
   recovery_events?: Record<string, unknown>[]
 }
 
+/** 本地推理槽（本地模型串行闸）诊断：GET /api/gpu/local-slots */
+export interface LocalSlotHolder {
+  /** 用途@线程名，例如 "subagent:coder@docmind-chat-agent" */
+  tag: string | null
+  held_seconds: number
+}
+export interface LocalSlots {
+  ok?: boolean
+  /** 等槽上限（秒）；0 = 无限等待 */
+  wait_timeout_seconds: number
+  /** 超时被放行的累计次数（>0 说明确实发生过"槽位被长期占用"） */
+  wait_exceeded: number
+  /** "provider/model" → 当前持有者 */
+  holders: Record<string, LocalSlotHolder>
+}
+
 export const gpuApi = {
   status() { return request<GpuStatus>('/api/gpu/status') },
+  localSlots() { return request<LocalSlots>('/api/gpu/local-slots') },
+  setSlotTimeout(seconds: number) {
+    return postJson<LocalSlots & { ok: boolean }>('/api/gpu/local-slots/wait-timeout', { seconds })
+  },
   cancel(owner: string) { return postJson<{ ok: boolean; canceled?: number; error?: string }>('/api/gpu/cancel', { owner }) },
   forceRelease(owner?: string) { return postJson<{ ok: boolean; released?: string; error?: string }>('/api/gpu/force-release', { owner: owner ?? '' }) },
   configure(idleUnloadSeconds?: number, pollInterval?: number) {

@@ -94,7 +94,14 @@ def _wait_for_server(timeout: float = 20.0) -> bool:
 def _run_server():
     import uvicorn
 
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    try:
+        uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    except Exception as e:  # noqa: BLE001 线程异常默认只丢 stderr，必须落日志否则启动失败无线索
+        import traceback
+
+        _log("服务线程异常退出：%s: %s" % (type(e).__name__, e))
+        _log(traceback.format_exc())
+        raise
 
 
 def _open_browser() -> bool:
@@ -336,7 +343,7 @@ def main():
 
     if not _wait_for_server():
         _log("服务启动失败")
-        print("[DocMind] 服务启动失败：请检查 8000 端口是否被占用。")
+        print("[DocMind] 服务在 20 秒内未就绪：可能是 8000 端口被占用，或启动过程被卡住。")
         print(f"          详情见日志：{LOG}")
         input("按 Enter 退出。\n")
         return

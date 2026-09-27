@@ -629,9 +629,11 @@ button { font-family: inherit; }
 }
 .wb-menu-caret { opacity: .65; }
 .wb-menu-backdrop { position: fixed; inset: 0; z-index: 60; }
+/* fixed 而非 absolute：.wb-topbar 有 overflow-y:hidden，绝对定位的菜单向下
+   伸出顶栏会被裁掉（不可见且不命中点击，只剩透明遮罩吃点击 = 菜单"没反应"）。
+   坐标由 App.vue 打开时按触发按钮量取后内联给出（top/left）。 */
 .wb-menu {
-  position: absolute;
-  top: calc(100% + 6px);
+  position: fixed;
   z-index: 61;
   min-width: 244px;
   padding: 6px;
@@ -640,7 +642,6 @@ button { font-family: inherit; }
   border-radius: 10px;
   box-shadow: var(--shadow-pop);
 }
-.wb-menu-right { right: 0; }
 .wb-menu-item {
   display: flex;
   flex-direction: column;

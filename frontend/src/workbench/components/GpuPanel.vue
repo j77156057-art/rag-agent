@@ -3,14 +3,16 @@
 // 持有者强制回收、FIFO 排队取消、Ollama 空闲卸载秒数设置。
 // 组件自管轮询（打开时 5s 一次），不进工作台全局状态。
 import { computed, ref, watch } from 'vue'
-import { gpuApi, type GpuStatus } from '../api'
+import { gpuApi, type GpuStatus, type LocalSlots } from '../api'
 import { usePolling } from '../composables/polling'
 
 const open = ref(false)
 const st = ref<GpuStatus | null>(null)
+const slots = ref<LocalSlots | null>(null)
 const error = ref('')
 const busy = ref(false)
 const idleInput = ref('')
+const slotTimeoutInput = ref('')
 
 const CHART_W = 380
 const CHART_H = 56
@@ -74,6 +76,13 @@ async function refresh() {
   try {
     const data = await gpuApi.status()
     st.value = data
+    try {
+      const s = await gpuApi.localSlots()
+      slots.value = s
+      slotTimeoutInput.value = String(s.wait_timeout_seconds)
+    } catch {
+      slots.value = null
+    }
     error.value = ''
   } catch (e) {
     error.value = (e as Error).message || 'GPU 状态获取失败'
@@ -116,6 +125,17 @@ async function saveIdle() {
   }
   await withBusy(async () => {
     await gpuApi.configure(v)
+  })
+}
+
+async function saveSlotTimeout() {
+  const v = Number(slotTimeoutInput.value)
+  if (!Number.isFinite(v) || v < 0) {
+    error.value = '槽位等待秒数需为不小于 0 的数字（0=无限等待）'
+    return
+  }
+  await withBusy(async () => {
+    await gpuApi.setSlotTimeout(v)
   })
 }
 
@@ -225,6 +245,35 @@ defineExpose({ show })
           <div v-if="st" class="gp-faint gp-idle-meta">
             最近活动：{{ st.ollama_idle.last_activity_ago === null ? '无' : fmtDur(st.ollama_idle.last_activity_ago) + '前' }}
             · 最近卸载：{{ st.ollama_idle.last_unload_ago === null ? '无' : fmtDur(st.ollama_idle.last_unload_ago) + '前' }}
+          </div>
+        </div>
+
+        <!-- 本地推理槽（本地模型串行闸）：谁占着槽、占了多久 -->
+        <div class="gp-idle">
+          <div class="gp-idle-title">本地推理槽（本地模型串行闸）
+            <span class="gp-faint" v-if="slots">
+              （{{ slots.wait_timeout_seconds ? '等待上限 ' + fmtDur(slots.wait_timeout_seconds) + ' 后放行' : '无限等待' }}）
+            </span>
+          </div>
+          <template v-if="slots">
+            <div v-if="Object.keys(slots.holders).length" class="gp-slot-list">
+              <div v-for="(h, key) in slots.holders" :key="key" class="gp-holder">
+                <span class="gp-tag gp-tag-on">占用</span>
+                <span class="gp-owner">{{ key }}</span>
+                <span class="gp-faint" v-if="h.tag">· {{ h.tag }}</span>
+                <span class="gp-faint">· {{ fmtDur(h.held_seconds) }}</span>
+              </div>
+            </div>
+            <div v-else class="gp-faint">当前无持有者（空闲）。</div>
+            <div class="gp-faint gp-idle-meta">
+              超时放行次数：{{ slots.wait_exceeded }}（&gt;0 说明曾出现槽位被长期占用）
+            </div>
+          </template>
+          <div v-else class="gp-faint">未获取到槽位信息（接口不可用？）。</div>
+          <div class="gp-idle-row">
+            <input v-model="slotTimeoutInput" type="number" min="0" step="30" class="gp-input" />
+            <span class="gp-faint">秒（0=无限等待）</span>
+            <button class="gp-mini" :disabled="busy" @click="saveSlotTimeout">保存</button>
           </div>
         </div>
 

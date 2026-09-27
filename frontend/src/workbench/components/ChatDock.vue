@@ -3,50 +3,36 @@
 // - 答案中的文件引用渲染为可点击卡片：跳转代码行 + 文件树展开闪烁 + 分区高亮；
 // - 引擎连接 / 会话历史 / 工作流历史均为独立弹层组件（components/*Popover.vue）；
 // - 模型配置、审批门、孤儿工作流恢复、SSE 流式管线在 composables/ 与问答页共用。
-import { nextTick, reactive, ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
-import { useWorkbench, askConfirm, askAlert } from '../composables/workbench'
+import { nextTick, ref, watch, onMounted, onBeforeUnmount, computed, defineAsyncComponent } from 'vue'
+// 直接依赖对话框域，避免经 workbench 聚合桶拖入编辑器链
+import { askConfirm, askAlert } from '../composables/dialogs'
 import { aiApi, agentApi, visionApi, contextApi, harnessApi, getSessionId, getProjectId, setSessionId, startNewSession, startTabProbe } from '../api'
 import type { ContextUsage, SessionInfo } from '../api'
 import type { SseEvent } from '../api'
-import { mdToHtml, extractFileRefs, extractWebRefs } from '../markdown'
-import type { FileRef } from '../markdown'
+import { appEvents } from '../eventBus'
+import type { FocusChatDetail } from '../eventBus'
 import { demoMode } from '../composables/demo'
 import { useModelConfig } from '../composables/useModelConfig'
 import { useWorkflowGate } from '../composables/useWorkflowGate'
 import { useOrphanWorkflow } from '../composables/useOrphanWorkflow'
 import { useChatStream } from '../composables/useChatStream'
-import ModelSettingsDialog from './ModelSettingsDialog.vue'
+import type { ChatMsg } from '../composables/chat-types'
+import { useAutoScroll } from '../composables/useAutoScroll'
+import { useMessageRender } from '../composables/useMessageRender'
+// 设置弹窗低频且体积大（117KB）：异步组件 + v-if，打开时才拉取
+const ModelSettingsDialog = defineAsyncComponent(() => import('./ModelSettingsDialog.vue'))
 import EngineConnectPopover from './EngineConnectPopover.vue'
 import SessionHistoryPopover from './SessionHistoryPopover.vue'
 import WorkflowHistoryPopover from './WorkflowHistoryPopover.vue'
-import WorkflowCard from './WorkflowCard.vue'
+// 工作流卡片仅在工作流消息中渲染：异步按需加载
+const WorkflowCard = defineAsyncComponent(() => import('./WorkflowCard.vue'))
 import WorkflowMembersDock from './WorkflowMembersDock.vue'
-import type { WorkflowState, WorkflowSummary } from '../api'
+import ChatComposer from './ChatComposer.vue'
+import type { WorkflowSummary } from '../api'
 import type { PreviewFeedbackRequest } from '../previewFeedback'
 
-const {
-  nodeExists, revealPath, jumpToLine,
-} = useWorkbench()
-
 // ---------------------------------------------------------------- 对话状态
-interface ChatMsg {
-  id: number
-  role: 'user' | 'assistant'
-  text: string
-  status: 'streaming' | 'done' | 'error' | 'stopped'
-  trace: { type: string; text: string; at?: number; elapsedMs?: number }[]
-  reasoning: string        // 深度思考模型的 reasoning_content 流
-  notices: string[]        // 系统通知（如上下文自动压缩）
-  plan: string[]           // 计划模式步骤
-  startedAt?: number
-  lastActivityAt?: number
-  finishedAt?: number
-  error?: string
-  recoverable?: boolean
-  imageCount?: number
-  /** 对话内工作流卡片（start_workflow 触发，后续全走 SSE，不再弹独立面板） */
-  workflow?: { workflowId: string; seed?: Partial<WorkflowState> }
-}
+// ChatMsg 契约在 composables/chat-types.ts，与问答首页共用同一份模型
 
 /** 活跃工作流团队（左下角成员抽屉数据源，终态自动移除） */
 interface WfTeam {
@@ -78,6 +64,12 @@ function onWfTeam(payload: WfTeam) {
   }
 }
 
+// 自动滚动（贴底跟随/上滚暂停/rAF 合批）抽到 useAutoScroll
+const {
+  scroller, stickToBottom, onScroll, onWheel,
+  followBottom, scrollToBottom, scheduleFollow, resumeAutoScroll,
+} = useAutoScroll()
+
 // ---------------------------------------------------------------- 孤儿工作流恢复
 // 探测/挂回/中断抽到 useOrphanWorkflow（问答页共用）：页面刷新后卡片丢失但后端
 // 同项目互斥仍存活时，给出恢复条避免新请求被拒且无操作入口。
@@ -105,9 +97,7 @@ async function focusWfMember(taskId: string) {
     collapsed.value = false
     await nextTick()
   }
-  window.dispatchEvent(new CustomEvent('docmind:wf-focus-member', {
-    detail: { workflowId: team.workflowId, taskId },
-  }))
+  appEvents.emit('docmind:wf-focus-member', { workflowId: team.workflowId, taskId })
 }
 
 interface InterruptedRecovery {
@@ -187,16 +177,11 @@ function onCardActivity() {
   scheduleFollow()
 }
 
-const scroller = ref<HTMLElement | null>(null)
-/** 仅当用户已贴底时才自动滚；用户上滚看历史时暂停自动滚动，回到底部再恢复 */
-const stickToBottom = ref(true)
-const inputEl = ref<HTMLTextAreaElement | null>(null)
-const imageInput = ref<HTMLInputElement | null>(null)
-const videoInput = ref<HTMLInputElement | null>(null)
+const composerEl = ref<InstanceType<typeof ChatComposer> | null>(null)
+function focusComposer() { composerEl.value?.focus() }
 const pendingImages = ref<File[]>([])
 const attachmentError = ref('')
 const videoBusy = ref(false)
-let suppressScrollEvent = false
 
 // ---------------------------------------------------------------- 折叠
 const collapsed = ref(window.localStorage.getItem('docmind.chatDockCollapsed') === '1')
@@ -208,7 +193,7 @@ function toggleDock() {
   // 否则 33px 裁剪会把居中审批模态吞掉
   if (gateBlocking.value) return
   collapsed.value = !collapsed.value
-  if (!collapsed.value) nextTick(() => inputEl.value?.focus())
+  if (!collapsed.value) nextTick(focusComposer)
 }
 
 // ---------------------------------------------------------------- 模型 / 联网 / 思考
@@ -219,7 +204,13 @@ const {
   modelLabel, thinkingMode, thinkingSupported, thinkingNative, thinkingEffective,
   visionLabel,
   loadModelConfig, openSettings, onModelSaved,
-} = useModelConfig({ onSaved: () => clearMessages() })
+} = useModelConfig({
+  onSaved: () => {
+    clearMessages()
+    // 切模型后窗口可能大变（如 16k → 256k）：立即重拉用量，避免仍显示旧窗口的剩余量
+    void loadContextUsage()
+  },
+})
 
 // ---------------------------------------------------------------- 上下文窗口用量
 // 后端按当前模型真实窗口估算（含系统提示/历史摘要/历史回放/当前问题），
@@ -407,25 +398,10 @@ function addImages(files: FileList | File[]) {
   pendingImages.value = merged
 }
 function removeImage(index: number) { pendingImages.value.splice(index, 1) }
-function onImagePick(ev: Event) {
-  const input = ev.target as HTMLInputElement
-  if (input.files) addImages(input.files)
-  input.value = ''
-}
-function onPaste(ev: ClipboardEvent) {
-  const files = Array.from(ev.clipboardData?.files || []).filter((f) => f.type.startsWith('image/'))
-  if (files.length) { ev.preventDefault(); addImages(files) }
-}
-function onDrop(ev: DragEvent) {
-  ev.preventDefault()
-  if (ev.dataTransfer?.files?.length) addImages(ev.dataTransfer.files)
-}
-function onDragover(ev: DragEvent) { ev.preventDefault() }
-async function onVideoPick(ev: Event) {
-  const fileInput = ev.target as HTMLInputElement
-  const file = fileInput.files?.[0]
-  fileInput.value = ''
-  if (!file || videoBusy.value) return
+/** ChatComposer 选图/粘贴/拖拽统一上抛文件列表，校验与暂存仍在父级 */
+function onImagesPicked(files: FileList | File[]) { addImages(files) }
+async function onVideoPicked(file: File) {
+  if (videoBusy.value) return
   videoBusy.value = true
   attachmentError.value = ''
   try {
@@ -433,7 +409,7 @@ async function onVideoPick(ev: Event) {
     if (!result.ok) throw new Error(result.error || '视频分析失败')
     const observation = (result.context || []).join('\n\n')
     input.value = observation
-    await nextTick(() => inputEl.value?.focus())
+    await nextTick(focusComposer)
   } catch (e) {
     attachmentError.value = (e as { message?: string }).message || '视频分析失败'
   } finally {
@@ -463,25 +439,11 @@ function resetChatContext() {
 function onPageHide() { preserveInterrupted(); stop() }
 function onBeforeLeave(e: BeforeUnloadEvent) { if (sending.value) { preserveInterrupted(); e.preventDefault(); e.returnValue = '' } }
 
-
-function onKeydown(ev: KeyboardEvent) {
-  if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
-    ev.preventDefault()
-    void send()
-  }
-}
-
 function clearMessages() {
   if (sending.value) stop()
   messages.value = []
   usage.value = null
-  answerHtmlCache.clear()
-  refsCache.clear()
-  webRefsCache.clear()
-  liveMdTimers.forEach(t => clearTimeout(t))
-  liveMdTimers.clear()
-  liveMdLastAt.clear()
-  liveHtml.clear()
+  resetRenderState()
   // 卡片随消息一起卸载，不会再发 team 事件；这里同步清掉左下角成员抽屉，
   // 否则会残留指向已消失卡片的幽灵成员
   wfTeams.value = []
@@ -579,7 +541,7 @@ async function createConversation() {
     orphanWf.value = null
     await refreshSessionList()
     void detectOrphanWorkflow()
-    await nextTick(() => inputEl.value?.focus())
+    await nextTick(focusComposer)
   } catch (e) {
     sessionError.value = (e as Error).message || '新建对话失败'
   } finally {
@@ -821,22 +783,20 @@ function demoReply(q: string): string {
 
 // 概览页「去问问 / 试试问 AI」：展开对话台、（可选）预填问题、定位输入框
 // 运行台「继续这段对话」：detail.reload=true 时按当前存储的会话 id 重新回灌历史
-function onFocusChat(ev?: Event) {
-  const detail = (ev as CustomEvent<{ q?: string; reload?: boolean }> | undefined)?.detail
+function onFocusChat(detail: FocusChatDetail) {
   const q = detail?.q
   collapsed.value = false
   if (detail?.reload) {
     resetChatContext()
-    void nextTick(() => inputEl.value?.focus())
+    void nextTick(focusComposer)
     return
   }
   nextTick(() => {
     if (q) input.value = q
-    inputEl.value?.focus()
+    focusComposer()
   })
 }
-async function onSendChat(ev: Event) {
-  const detail = (ev as CustomEvent<PreviewFeedbackRequest>).detail
+async function onSendChat(detail: PreviewFeedbackRequest) {
   const prompt = detail?.prompt?.trim()
   if (!prompt) { detail?.onStatus?.('failed', '反馈不能为空'); return }
   if (detail.projectId !== getProjectId()) { detail.onStatus?.('pending', '项目已切换，请回到原项目重试'); return }
@@ -860,10 +820,14 @@ async function onSendChat(ev: Event) {
     detail.onStatus?.('failed', '本次对话未完成，请检查项目当前状态后重试')
   }
 }
+let offFocusChat = () => {}
+let offSendChat = () => {}
+let offContextChanged = () => {}
 onMounted(() => {
-  window.addEventListener('docmind:focus-chat', onFocusChat as EventListener)
-  window.addEventListener('docmind:send-chat', onSendChat as EventListener)
-  window.addEventListener('docmind:project-context-changed', resetChatContext)
+  // 全局事件统一走类型化事件总线（eventBus.ts），返回值即取消订阅
+  offFocusChat = appEvents.on('docmind:focus-chat', onFocusChat)
+  offSendChat = appEvents.on('docmind:send-chat', onSendChat)
+  offContextChanged = appEvents.on('docmind:project-context-changed', resetChatContext)
   window.addEventListener('pagehide', onPageHide)
   window.addEventListener('beforeunload', onBeforeLeave)
   startTabProbe()   // 启动跨标签存活探测（供唯一性门禁判断）
@@ -874,40 +838,24 @@ onMounted(() => {
   void restoreHistory().then(() => detectOrphanWorkflow())
 })
 onBeforeUnmount(() => {
-  if (elapsedTimer !== null) { window.clearInterval(elapsedTimer); elapsedTimer = null }
-  liveMdTimers.forEach(t => clearTimeout(t))
-  liveMdTimers.clear()
   onPageHide()
-  window.removeEventListener('docmind:focus-chat', onFocusChat as EventListener)
-  window.removeEventListener('docmind:send-chat', onSendChat as EventListener)
-  window.removeEventListener('docmind:project-context-changed', resetChatContext)
+  offFocusChat()
+  offSendChat()
+  offContextChanged()
   window.removeEventListener('pagehide', onPageHide)
   window.removeEventListener('beforeunload', onBeforeLeave)
 })
 
-function isNearBottom(el: HTMLElement) {
-  return el.scrollHeight - el.scrollTop - el.clientHeight < 80
-}
-function onScroll() {
-  if (suppressScrollEvent) return
-  const el = scroller.value
-  if (el) stickToBottom.value = isNearBottom(el)
-}
-function onWheel(ev: WheelEvent) {
-  // A user scrolling upward is an explicit request to inspect history. Keep
-  // the stream running, but stop pulling the viewport back to the bottom.
-  if (ev.deltaY < 0) stickToBottom.value = false
-}
-function followBottom() {
-  const el = scroller.value
-  if (el && stickToBottom.value) {
-    suppressScrollEvent = true
-    el.scrollTop = el.scrollHeight
-    // 滚动事件在本帧内派发，下一帧解除即可；比每 token 排一个 setTimeout(0) 便宜
-    requestAnimationFrame(() => { suppressScrollEvent = false })
-  }
-}
-function scrollToBottom() { followBottom() }
+// 消息展示层（流式 markdown 节流/成稿引用缓存/trace 步骤/计时/思考折叠）
+const {
+  scheduleLiveMd, finishLiveMd, streamHtmlOf,
+  answerHtml, refsOf, webRefsOf, openRef, TRACE_GLYPH,
+  toggleActivity, activityIsOpen, traceTitle, traceSummary, traceState, traceStateLabel,
+  traceElapsed, elapsedLabel, slowResponseLabel, reasonOpen, toggleReason, resetRenderState,
+} = useMessageRender<ChatMsg>(() =>
+  sending.value
+  || messages.value.some(m => m.status === 'streaming' || (m.workflow?.workflowId && !m.finishedAt))
+  || activeWorkflowIds.value.length > 0)
 
 // 流式接收管线（帧合批/trace 计时/事件分类）抽到 useChatStream，问答页共用同一实现。
 const { drain, appendTrace, dispatch } = useChatStream<ChatMsg>({
@@ -928,188 +876,6 @@ const { drain, appendTrace, dispatch } = useChatStream<ChatMsg>({
     finishLiveMd(t.id, () => answerHtml(t))
   },
 })
-
-// 流式期的 markdown 是「节流富文本」折中：纯文本层最省，但用户想边出边看排版。
-// token 仍逐帧进 m.text（便宜），markdown 重渲染按消息限流到 ~8 次/秒——
-// 这是人眼「格式实时跟随」与「不逐 token 重建 DOM」之间的平衡点。
-const LIVE_MD_INTERVAL = 125
-const liveHtml = reactive(new Map<number, string>())
-const liveMdTimers = new Map<number, ReturnType<typeof setTimeout>>()
-let liveMdLastAt = new Map<number, number>()
-function renderLiveMd(turn: ChatMsg) {
-  liveMdTimers.delete(turn.id)
-  liveMdLastAt.set(turn.id, performance.now())
-  liveHtml.set(turn.id, mdToHtml(turn.text || ''))
-}
-function scheduleLiveMd(turn: ChatMsg) {
-  if (liveMdTimers.has(turn.id)) return
-  // 首个 token 帧立即成型，避免节流窗口内 fallback 每帧解析
-  if (!liveMdLastAt.has(turn.id)) { renderLiveMd(turn); return }
-  const last = liveMdLastAt.get(turn.id) ?? 0
-  const wait = Math.max(0, LIVE_MD_INTERVAL - (performance.now() - last))
-  liveMdTimers.set(turn.id, setTimeout(() => renderLiveMd(turn), wait))
-}
-/** 回合结束（done/stop/error/final 覆盖）：立即排一次待渲染并交还完成态渲染。 */
-function finishLiveMd(id: number, renderNow: () => string) {
-  const timer = liveMdTimers.get(id)
-  if (timer) { clearTimeout(timer); liveMdTimers.delete(id) }
-  liveMdLastAt.delete(id)
-  liveHtml.delete(id)
-  // 触发 answerHtml 缓存写入，完成态 v-html 与最后一帧不会出现格式回退
-  renderNow()
-}
-function streamHtmlOf(msg: ChatMsg): string {
-  return liveHtml.get(msg.id) ?? mdToHtml(msg.text || '')
-}
-
-// 工作流卡片自身高频事件（子代理每步都 emit activity）也按帧合批跟随，
-// 避免多代理并行时每步一次 nextTick + 强制布局。
-let followRaf = 0
-function scheduleFollow() {
-  if (!followRaf) followRaf = requestAnimationFrame(() => {
-    followRaf = 0
-    queueMicrotask(followBottom)
-  })
-}
-function resumeAutoScroll() {
-  stickToBottom.value = true
-  void nextTick(scrollToBottom)
-}
-
-// ---------------------------------------------------------------- 答案引用卡片
-// 模板每秒会因计时刷新重渲染；markdown 与引用提取都按 (消息 id, 文本) 缓存，
-// 文本不变时不做重复解析（流式期间走纯文本层，根本不进 markdown 解析）。
-const answerHtmlCache = new Map<number, { src: string; html: string }>()
-function answerHtml(msg: ChatMsg): string {
-  const hit = answerHtmlCache.get(msg.id)
-  if (hit && hit.src === msg.text) return hit.html
-  const html = mdToHtml(msg.text || '')
-  answerHtmlCache.set(msg.id, { src: msg.text, html })
-  return html
-}
-const refsCache = new Map<number, { src: string; refs: FileRef[] }>()
-function refsOf(msg: ChatMsg): FileRef[] {
-  // 只对真实存在于文件树中的路径生成卡片（过滤幻觉引用）
-  const hit = refsCache.get(msg.id)
-  if (hit && hit.src === msg.text) return hit.refs
-  const refs = extractFileRefs(msg.text).filter((r) => nodeExists(r.path))
-  refsCache.set(msg.id, { src: msg.text, refs })
-  return refs
-}
-
-const webRefsCache = new Map<number, { src: string; refs: ReturnType<typeof extractWebRefs> }>()
-function webRefsOf(msg: ChatMsg) {
-  const hit = webRefsCache.get(msg.id)
-  if (hit && hit.src === msg.text) return hit.refs
-  const refs = extractWebRefs(msg.text)
-  webRefsCache.set(msg.id, { src: msg.text, refs })
-  return refs
-}
-
-async function openRef(r: FileRef) {
-  await jumpToLine(r.path, r.line || 1)
-  revealPath(r.path)
-}
-
-const TRACE_LABEL: Record<string, string> = {
-  thought: '分析摘要', action: '执行动作', observation: '返回结果', reflection: '复核与重试',
-}
-const TRACE_GLYPH: Record<string, string> = {
-  thought: '◌', action: '↗', observation: '✓', reflection: '↻',
-}
-const activityOpen = ref<Set<string>>(new Set())
-const nowTick = ref(Date.now())
-let elapsedTimer: number | null = null
-// 计时钟只在「有活动回合」时走：空闲/全部结束后不再每 500ms 触发响应式刷新。
-// 工作流回合在工作流终结时由 onWfTeam 写入 finishedAt，秒表随之定格。
-const elapsedTicking = computed(() =>
-  sending.value
-  || messages.value.some(m => m.status === 'streaming' || (m.workflow?.workflowId && !m.finishedAt))
-  || activeWorkflowIds.value.length > 0)
-watch(elapsedTicking, (on) => {
-  if (on && elapsedTimer === null) {
-    nowTick.value = Date.now()
-    elapsedTimer = window.setInterval(() => { nowTick.value = Date.now() }, 500)
-  } else if (!on && elapsedTimer !== null) {
-    window.clearInterval(elapsedTimer)
-    elapsedTimer = null
-    nowTick.value = Date.now()
-  }
-})
-
-function activityKey(id: number, index: number) { return `${id}:${index}` }
-function toggleActivity(id: number, index: number) {
-  const key = activityKey(id, index)
-  const next = new Set(activityOpen.value)
-  if (next.has(key)) next.delete(key)
-  else next.add(key)
-  activityOpen.value = next
-}
-function activityIsOpen(id: number, index: number, msg: ChatMsg) {
-  return activityOpen.value.has(activityKey(id, index)) || (msg.status === 'streaming' && index === msg.trace.length - 1)
-}
-function traceTitle(item: { type: string; text: string }) {
-  const raw = item.text.trim()
-  const tool = raw.match(/^([\w.-]+)\s*\(/)?.[1]
-  if (item.type === 'action' && tool) {
-    const names: Record<string, string> = {
-      search_code: '检索代码', search_knowledge: '检索知识库', read_file: '读取文件',
-      grep: '定位代码', run_command: '运行命令', game_playtest: '运行校验',
-      web_search: '网页搜索', web_fetch: '读取网页', dev_mcp_call: '调用 MCP',
-      dev_list_connector_tools: '查看 MCP 工具', apply_edit: '修改文件', create_file: '创建文件',
-      delegate: '委派 Subagent', orchestrate: '编排任务',
-    }
-    return names[tool] || tool
-  }
-  return TRACE_LABEL[item.type] || item.type
-}
-function traceSummary(item: { type: string; text: string }) {
-  const raw = item.text.trim().replace(/\s+/g, ' ')
-  if (item.type === 'action') {
-    const open = raw.indexOf('(')
-    if (open > 0) return raw.slice(open).replace(/\s*\[已拦截.*$/, '')
-  }
-  if (raw.length <= 92) return raw
-  return raw.slice(0, 89) + '…'
-}
-function traceState(msg: ChatMsg, item: { type: string; text: string }, index: number): 'running' | 'ok' | 'warn' | 'error' {
-  const raw = item.text
-  if (/重复调用|重复空转/.test(raw)) return 'warn'
-  if (/失败|错误|超时|拦截|阻断|未执行|不可用|exception/i.test(raw)) return 'error'
-  if (item.type === 'reflection' && /重试|换思路|重新规划|注意/i.test(raw)) return 'warn'
-  if (msg.status === 'streaming' && index === msg.trace.length - 1) return 'running'
-  return 'ok'
-}
-function traceStateLabel(state: ReturnType<typeof traceState>, item?: { text: string }) {
-  if (state === 'warn' && item && /重复调用|重复空转/.test(item.text)) return '已拦截'
-  return state === 'running' ? '进行中' : state === 'error' ? '失败' : state === 'warn' ? '需关注' : '完成'
-}
-function traceElapsed(item: { elapsedMs?: number }) {
-  if (!item.elapsedMs) return ''
-  if (item.elapsedMs < 1000) return `${item.elapsedMs}ms`
-  return `${(item.elapsedMs / 1000).toFixed(1)}s`
-}
-function elapsedLabel(msg: ChatMsg) {
-  if (!msg.startedAt) return ''
-  const end = msg.finishedAt || nowTick.value
-  const seconds = Math.max(0, (end - msg.startedAt) / 1000)
-  return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`
-}
-function slowResponseLabel(msg: ChatMsg) {
-  if (msg.status !== 'streaming' || !msg.lastActivityAt) return ''
-  const quiet = Math.max(0, nowTick.value - msg.lastActivityAt)
-  if (quiet < 15000) return ''
-  return `已经 ${Math.round(quiet / 1000)} 秒没有收到新进展；模型可能仍在推理或执行工具。现场会保留，必要时可停止后继续。`
-}
-
-// 深度思考面板折叠态（reasoning_content 独立窗口）
-const reasonOpen = ref<Set<number>>(new Set())
-function toggleReason(id: number) {
-  const next = new Set(reasonOpen.value)
-  if (next.has(id)) next.delete(id)
-  else next.add(id)
-  reasonOpen.value = next
-}
 
 // 思考芯片：仅 toggle 家族可点；native 恒开；none 不渲染可点按钮
 function toggleThinking() {
@@ -1346,107 +1112,34 @@ const webTitle = computed(() => webOn.value
         </button>
       </div>
 
-      <footer class="cd-inputbar">
-        <div class="cd-tools">
-          <input ref="imageInput" class="cd-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple @change="onImagePick" />
-          <input ref="videoInput" class="cd-file-input" type="file" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,video/avi,image/gif" @change="onVideoPick" />
-          <button class="cd-chip cd-attach" :disabled="demoMode || sending" :title="visionLabel" @click="imageInput?.click()">
-            <span aria-hidden="true">▧</span><span>图片</span>
-          </button>
-          <button class="cd-chip cd-attach" :disabled="demoMode || sending || videoBusy" title="视频会由 Harness 抽帧并生成时间轴观察" @click="videoInput?.click()">
-            <span aria-hidden="true">▹</span><span>{{ videoBusy ? '分析视频…' : '视频' }}</span>
-          </button>
-          <span v-if="pendingImages.length" class="cd-attachments">
-            <span v-for="(img, i) in pendingImages" :key="img.name + i" class="cd-attachment">
-              {{ img.name || '图片' }}
-              <button type="button" title="移除图片" @click="removeImage(i)">×</button>
-            </span>
-          </span>
-          <span v-if="attachmentError" class="cd-attachment-error">{{ attachmentError }}</span>
-          <button
-            class="cd-chip cd-chip-model"
-            :disabled="demoMode"
-            :title="demoMode ? '离线演示模式无需配置模型' : '模型设置：切换云端 / 本地 / 任意 OpenAI 兼容接口'"
-            @click="openSettings"
-          >
-            <svg width="12" height="12" viewBox="0 0 12 12">
-              <rect x="2.6" y="2.6" width="6.8" height="6.8" rx="1" fill="none" stroke="currentColor" stroke-width="1"/>
-              <path d="M4.6 0.9v1.7M7.4 0.9v1.7M4.6 9.4v1.7M7.4 9.4v1.7M0.9 4.6h1.7M0.9 7.4h1.7M9.4 4.6h1.7M9.4 7.4h1.7" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
-            </svg>
-            <span class="cd-chip-text">{{ modelLabel }}</span>
-            <svg width="9" height="9" viewBox="0 0 9 9"><path d="M2 3.2 L4.5 5.7 L7 3.2" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </button>
-
-          <button
-            class="cd-chip"
-            :class="{ 'cd-chip-on': webOn }"
-            :title="webTitle"
-            @click="webOn = !webOn"
-          >
-            <svg width="12" height="12" viewBox="0 0 12 12">
-              <circle cx="6" cy="6" r="4.7" fill="none" stroke="currentColor" stroke-width="1"/>
-              <path d="M1.3 6h9.4" fill="none" stroke="currentColor" stroke-width="1"/>
-              <path d="M6 1.3c1.5 1.3 2.3 2.9 2.3 4.7S7.5 9.4 6 10.7C4.5 9.4 3.7 7.8 3.7 6S4.5 2.6 6 1.3z" fill="none" stroke="currentColor" stroke-width="1"/>
-            </svg>
-            <span>联网搜索</span>
-            <span class="cd-switch" :class="{ on: webOn }"><i /></span>
-          </button>
-
-          <button
-            v-if="thinkingSupported"
-            class="cd-chip"
-            :class="{ 'cd-chip-on': thinkingEffective, 'cd-chip-native': thinkingNative }"
-            :disabled="thinkingNative"
-            :title="thinkingTitle"
-            @click="toggleThinking"
-          >
-            <svg width="12" height="12" viewBox="0 0 12 12">
-              <path d="M6 1 L7.1 4.9 L11 6 L7.1 7.1 L6 11 L4.9 7.1 L1 6 L4.9 4.9 Z" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>
-            </svg>
-            <span>深度思考</span>
-            <span v-if="thinkingNative" class="cd-chip-badge">内置</span>
-            <span v-else class="cd-switch" :class="{ on: thinkingEffective }"><i /></span>
-          </button>
-          <span v-else class="cd-chip cd-chip-off" :title="thinkingTitle">
-            <svg width="12" height="12" viewBox="0 0 12 12">
-              <path d="M6 1 L7.1 4.9 L11 6 L7.1 7.1 L6 11 L4.9 7.1 L1 6 L4.9 4.9 Z" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>
-            </svg>
-            <span>深度思考</span>
-            <span class="cd-chip-badge">{{ thinkingMode === 'unknown' ? '待确认' : '不支持' }}</span>
-          </span>
-
-          <!-- 上下文窗口占用：按当前模型真实窗口估算，65% 转黄、80%（压缩触发线）转红 -->
-          <span
-            v-if="usage"
-            class="cd-chip cd-ctx cd-ctx-push"
-            :class="'cd-ctx-' + usage.level"
-            :title="usageTitle"
-          >
-            <svg width="12" height="12" viewBox="0 0 12 12">
-              <path d="M1.5 9.5a4.5 4.5 0 0 1 9 0" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
-              <path d="M3.3 9.5a2.7 2.7 0 0 1 5.4 0" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
-              <circle cx="6" cy="9.5" r=".7" fill="currentColor"/>
-            </svg>
-            <span>上下文 {{ usage.percent }}%</span>
-            <span class="cd-ctx-bar"><i :style="{ width: usage.percent + '%' }" /></span>
-          </span>
-        </div>
-        <div class="cd-input-row">
-          <textarea
-            ref="inputEl"
-            v-model="input"
-            class="cd-input"
-            rows="2"
-            placeholder="提问：角色数值在哪 / 解释这段逻辑 / 这个报错怎么改…（Ctrl+Enter 发送）"
-            @keydown="onKeydown"
-            @paste="onPaste"
-            @drop="onDrop"
-            @dragover="onDragover"
-          />
-          <button v-if="sending" class="cd-send cd-stop" @click="stop">停止</button>
-          <button v-else class="cd-send" :disabled="!input.trim() && !pendingImages.length" @click="send()">发送</button>
-        </div>
-      </footer>
+      <ChatComposer
+        ref="composerEl"
+        v-model="input"
+        :sending="sending"
+        :demo-mode="demoMode"
+        :video-busy="videoBusy"
+        :pending-images="pendingImages"
+        :attachment-error="attachmentError"
+        :model-label="modelLabel"
+        :vision-label="visionLabel"
+        :web-on="webOn"
+        :thinking-supported="thinkingSupported"
+        :thinking-effective="thinkingEffective"
+        :thinking-native="thinkingNative"
+        :thinking-mode="thinkingMode"
+        :thinking-title="thinkingTitle"
+        :web-title="webTitle"
+        :usage="usage"
+        :usage-title="usageTitle"
+        @submit="send()"
+        @stop="stop"
+        @images-picked="onImagesPicked"
+        @video-picked="onVideoPicked"
+        @remove-image="removeImage"
+        @update:web-on="webOn = $event"
+        @toggle-thinking="toggleThinking"
+        @open-settings="openSettings"
+      />
 
     <WorkflowMembersDock
       :active="!!wfActiveTeam"
@@ -1454,6 +1147,7 @@ const webTitle = computed(() => webOn.value
       @focus="focusWfMember"
     />
     <ModelSettingsDialog
+      v-if="settingsOpen"
       :visible="settingsOpen"
       :config="modelConfig"
       @close="settingsOpen = false"
@@ -1741,89 +1435,9 @@ const webTitle = computed(() => webOn.value
 .cd-web-source-url { grid-column: 1 / -1; color: var(--accent); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cd-web-source-score { color: var(--text-faint); font-size: 10px; }
 
-/* 输入区 */
-.cd-inputbar { display: flex; flex-direction: column; gap: 6px; padding: 7px 12px 9px; }
-.cd-input-row { display: flex; gap: 8px; align-items: flex-end; }
-.cd-input {
-  flex: 1; resize: none;
-  background: var(--bg); color: var(--text);
-  border: 1px solid var(--border); border-radius: 7px;
-  padding: 7px 10px; font-size: 12.5px; font-family: inherit;
-  outline: none; max-height: 110px;
-}
-.cd-input:focus { border-color: var(--accent); }
-.cd-send {
-  height: 30px; padding: 0 16px; border-radius: 7px;
-  border: 1px solid #2560d4; background: linear-gradient(180deg,#3b7ef2,#2f6fed);
-  color: #fff; font-size: 12px; font-weight: 600; cursor: pointer;
-}
-.cd-send:disabled { opacity: .4; cursor: default; }
-.cd-stop { background: transparent; color: var(--danger); border-color: var(--danger); }
 
-/* 工具行：模型芯片 / 联网开关 / 深度思考开关 */
-.cd-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.cd-chip {
-  display: inline-flex; align-items: center; gap: 5px;
-  height: 23px; padding: 0 8px;
-  border: 1px solid var(--border); border-radius: 12px;
-  background: transparent; color: var(--text-muted);
-  font-size: 11px; line-height: 1; cursor: pointer;
-  max-width: 60%;
-}
-.cd-chip:hover:not(:disabled):not(.cd-chip-off) { border-color: var(--border-strong); color: var(--text); }
-.cd-chip:disabled { cursor: default; }
-.cd-chip-text {
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  font-family: var(--font-mono);
-}
-.cd-chip-model { padding: 0 7px 0 8px; }
-.cd-chip-on {
-  color: var(--accent); border-color: var(--accent);
-  background: rgba(37, 96, 212, .07);
-}
-.cd-chip-native { color: var(--violet, #7c5cd6); border-color: var(--violet, #7c5cd6); background: rgba(124, 92, 214, .08); }
-.cd-chip-off { opacity: .6; cursor: default; }
-.cd-chip-badge { font-size: 10px; color: var(--text-faint); }
-.cd-chip-native .cd-chip-badge { color: var(--violet, #7c5cd6); }
 
-/* 迷你开关 */
-.cd-switch {
-  position: relative; flex: 0 0 auto;
-  width: 22px; height: 12px; border-radius: 7px;
-  background: var(--border-strong); transition: background .15s;
-}
-.cd-switch i {
-  position: absolute; top: 1.5px; left: 2px;
-  width: 9px; height: 9px; border-radius: 50%;
-  background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25);
-  transition: left .15s;
-}
-.cd-switch.on { background: var(--accent); }
-.cd-chip-native .cd-switch.on { background: var(--violet, #7c5cd6); }
-.cd-switch.on i { left: 11px; }
 
-/* 上下文窗口用量指示 */
-.cd-ctx-push { margin-left: auto; cursor: default; max-width: none; }
-.cd-ctx:hover { border-color: var(--border); color: var(--text-muted); }
-.cd-ctx-bar {
-  position: relative; flex: 0 0 auto;
-  width: 34px; height: 4px; border-radius: 2px;
-  background: var(--border-strong); overflow: hidden;
-}
-.cd-ctx-bar i {
-  position: absolute; inset: 0 auto 0 0;
-  border-radius: 2px; background: currentColor;
-  transition: width .25s ease;
-}
-.cd-ctx-ok { color: var(--text-faint); }
-.cd-ctx-high {
-  color: #b47a1e; border-color: rgba(180, 122, 30, .45);
-  background: rgba(180, 122, 30, .08);
-}
-.cd-ctx-warn {
-  color: #cc5347; border-color: rgba(204, 83, 71, .5);
-  background: rgba(204, 83, 71, .09);
-}
 
 /* 系统通知（上下文压缩等） */
 .cd-notice {
@@ -1841,12 +1455,6 @@ const webTitle = computed(() => webOn.value
   font-size: 11px; cursor: pointer;
 }
 .cd-msg-attachment { display: inline-flex; margin-right: 6px; color: var(--accent); font-size: 10.5px; }
-.cd-file-input { display: none; }
-.cd-attach { cursor: pointer; }
-.cd-attachments { display: inline-flex; gap: 4px; flex-wrap: wrap; max-width: 360px; }
-.cd-attachment { display: inline-flex; align-items: center; gap: 3px; max-width: 150px; padding: 2px 5px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-muted); font-size: 10px; }
-.cd-attachment button { border: 0; background: transparent; color: var(--text-faint); cursor: pointer; padding: 0 1px; }
-.cd-attachment-error { color: var(--danger); font-size: 10px; }
 .cd-resume:hover { background: rgba(47,111,237,.15); }
 
 /* 计划步骤 */

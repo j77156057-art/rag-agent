@@ -1,0 +1,272 @@
+<script setup lang="ts">
+// P0 对话输入条（薄封装）：只持有两个隐藏 file input 与 textarea 焦点；
+// 附件列表/视频分析/发送判定等状态与逻辑全部留在 ChatDock 父级，
+// 事件经显式 emit 上抛，避免父子双数据源。
+import { ref } from 'vue'
+import type { ContextUsage } from '../api'
+
+const props = defineProps<{
+  modelValue: string
+  sending: boolean
+  demoMode: boolean
+  videoBusy: boolean
+  pendingImages: File[]
+  attachmentError: string
+  modelLabel: string
+  visionLabel: string
+  webOn: boolean
+  thinkingSupported: boolean
+  thinkingEffective: boolean
+  thinkingNative: boolean
+  thinkingMode: string
+  thinkingTitle: string
+  webTitle: string
+  usage: ContextUsage | null
+  usageTitle: string
+}>()
+
+const emit = defineEmits<{
+  (e: 'update:modelValue', v: string): void
+  (e: 'submit'): void
+  (e: 'stop'): void
+  (e: 'images-picked', files: FileList | File[]): void
+  (e: 'video-picked', file: File): void
+  (e: 'remove-image', index: number): void
+  (e: 'update:webOn', v: boolean): void
+  (e: 'toggle-thinking'): void
+  (e: 'open-settings'): void
+}>()
+
+const inputEl = ref<HTMLTextAreaElement | null>(null)
+const imageInput = ref<HTMLInputElement | null>(null)
+const videoInput = ref<HTMLInputElement | null>(null)
+
+function focus() { inputEl.value?.focus() }
+defineExpose({ focus })
+
+function onKeydown(ev: KeyboardEvent) {
+  if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+    ev.preventDefault()
+    emit('submit')
+  }
+}
+
+function onImagePick(ev: Event) {
+  const el = ev.target as HTMLInputElement
+  if (el.files) emit('images-picked', el.files)
+  el.value = ''
+}
+function onPaste(ev: ClipboardEvent) {
+  const files = Array.from(ev.clipboardData?.files || []).filter(f => f.type.startsWith('image/'))
+  if (files.length) { ev.preventDefault(); emit('images-picked', files) }
+}
+function onDrop(ev: DragEvent) {
+  ev.preventDefault()
+  if (ev.dataTransfer?.files?.length) emit('images-picked', ev.dataTransfer.files)
+}
+function onDragover(ev: DragEvent) { ev.preventDefault() }
+function onVideoPick(ev: Event) {
+  const el = ev.target as HTMLInputElement
+  const file = el.files?.[0]
+  el.value = ''
+  if (file) emit('video-picked', file)
+}
+</script>
+
+<template>
+  <footer class="cd-inputbar">
+    <div class="cd-tools">
+      <input ref="imageInput" class="cd-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple @change="onImagePick" />
+      <input ref="videoInput" class="cd-file-input" type="file" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,video/avi,image/gif" @change="onVideoPick" />
+      <button class="cd-chip cd-attach" :disabled="demoMode || sending" :title="visionLabel" @click="imageInput?.click()">
+        <span aria-hidden="true">▧</span><span>图片</span>
+      </button>
+      <button class="cd-chip cd-attach" :disabled="demoMode || sending || videoBusy" title="视频会由 Harness 抽帧并生成时间轴观察" @click="videoInput?.click()">
+        <span aria-hidden="true">▹</span><span>{{ videoBusy ? '分析视频…' : '视频' }}</span>
+      </button>
+      <span v-if="pendingImages.length" class="cd-attachments">
+        <span v-for="(img, i) in pendingImages" :key="img.name + i" class="cd-attachment">
+          {{ img.name || '图片' }}
+          <button type="button" title="移除图片" @click="emit('remove-image', i)">×</button>
+        </span>
+      </span>
+      <span v-if="attachmentError" class="cd-attachment-error">{{ attachmentError }}</span>
+      <button
+        class="cd-chip cd-chip-model"
+        :disabled="demoMode"
+        :title="demoMode ? '离线演示模式无需配置模型' : '模型设置：切换云端 / 本地 / 任意 OpenAI 兼容接口'"
+        @click="emit('open-settings')"
+      >
+        <svg width="12" height="12" viewBox="0 0 12 12">
+          <rect x="2.6" y="2.6" width="6.8" height="6.8" rx="1" fill="none" stroke="currentColor" stroke-width="1"/>
+          <path d="M4.6 0.9v1.7M7.4 0.9v1.7M4.6 9.4v1.7M7.4 9.4v1.7M0.9 4.6h1.7M0.9 7.4h1.7M9.4 4.6h1.7M9.4 7.4h1.7" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+        </svg>
+        <span class="cd-chip-text">{{ modelLabel }}</span>
+        <svg width="9" height="9" viewBox="0 0 9 9"><path d="M2 3.2 L4.5 5.7 L7 3.2" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+
+      <button
+        class="cd-chip"
+        :class="{ 'cd-chip-on': webOn }"
+        :title="webTitle"
+        @click="emit('update:webOn', !webOn)"
+      >
+        <svg width="12" height="12" viewBox="0 0 12 12">
+          <circle cx="6" cy="6" r="4.7" fill="none" stroke="currentColor" stroke-width="1"/>
+          <path d="M1.3 6h9.4" fill="none" stroke="currentColor" stroke-width="1"/>
+          <path d="M6 1.3c1.5 1.3 2.3 2.9 2.3 4.7S7.5 9.4 6 10.7C4.5 9.4 3.7 7.8 3.7 6S4.5 2.6 6 1.3z" fill="none" stroke="currentColor" stroke-width="1"/>
+        </svg>
+        <span>联网搜索</span>
+        <span class="cd-switch" :class="{ on: webOn }"><i /></span>
+      </button>
+
+      <button
+        v-if="thinkingSupported"
+        class="cd-chip"
+        :class="{ 'cd-chip-on': thinkingEffective, 'cd-chip-native': thinkingNative }"
+        :disabled="thinkingNative"
+        :title="thinkingTitle"
+        @click="emit('toggle-thinking')"
+      >
+        <svg width="12" height="12" viewBox="0 0 12 12">
+          <path d="M6 1 L7.1 4.9 L11 6 L7.1 7.1 L6 11 L4.9 7.1 L1 6 L4.9 4.9 Z" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>
+        </svg>
+        <span>深度思考</span>
+        <span v-if="thinkingNative" class="cd-chip-badge">内置</span>
+        <span v-else class="cd-switch" :class="{ on: thinkingEffective }"><i /></span>
+      </button>
+      <span v-else class="cd-chip cd-chip-off" :title="thinkingTitle">
+        <svg width="12" height="12" viewBox="0 0 12 12">
+          <path d="M6 1 L7.1 4.9 L11 6 L7.1 7.1 L6 11 L4.9 7.1 L1 6 L4.9 4.9 Z" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>
+        </svg>
+        <span>深度思考</span>
+        <span class="cd-chip-badge">{{ thinkingMode === 'unknown' ? '待确认' : '不支持' }}</span>
+      </span>
+
+      <!-- 上下文窗口占用：按当前模型真实窗口估算，65% 转黄、80%（压缩触发线）转红 -->
+      <span
+        v-if="usage"
+        class="cd-chip cd-ctx cd-ctx-push"
+        :class="'cd-ctx-' + usage.level"
+        :title="usageTitle"
+      >
+        <svg width="12" height="12" viewBox="0 0 12 12">
+          <path d="M1.5 9.5a4.5 4.5 0 0 1 9 0" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+          <path d="M3.3 9.5a2.7 2.7 0 0 1 5.4 0" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+          <circle cx="6" cy="9.5" r=".7" fill="currentColor"/>
+        </svg>
+        <span>上下文 {{ usage.percent }}%</span>
+        <span class="cd-ctx-bar"><i :style="{ width: usage.percent + '%' }" /></span>
+      </span>
+    </div>
+    <div class="cd-input-row">
+      <textarea
+        ref="inputEl"
+        :value="modelValue"
+        class="cd-input"
+        rows="2"
+        placeholder="提问：角色数值在哪 / 解释这段逻辑 / 这个报错怎么改…（Ctrl+Enter 发送）"
+        @input="emit('update:modelValue', ($event.target as HTMLTextAreaElement).value)"
+        @keydown="onKeydown"
+        @paste="onPaste"
+        @drop="onDrop"
+        @dragover="onDragover"
+      />
+      <button v-if="sending" class="cd-send cd-stop" @click="emit('stop')">停止</button>
+      <button v-else class="cd-send" :disabled="!modelValue.trim() && !pendingImages.length" @click="emit('submit')">发送</button>
+    </div>
+  </footer>
+</template>
+
+<style scoped>
+/* 输入区 */
+.cd-inputbar { display: flex; flex-direction: column; gap: 6px; padding: 7px 12px 9px; }
+.cd-input-row { display: flex; gap: 8px; align-items: flex-end; }
+.cd-input {
+  flex: 1; resize: none;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 7px;
+  padding: 7px 10px; font-size: 12.5px; font-family: inherit;
+  outline: none; max-height: 110px;
+}
+.cd-input:focus { border-color: var(--accent); }
+.cd-send {
+  height: 30px; padding: 0 16px; border-radius: 7px;
+  border: 1px solid #2560d4; background: linear-gradient(180deg,#3b7ef2,#2f6fed);
+  color: #fff; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.cd-send:disabled { opacity: .4; cursor: default; }
+.cd-stop { background: transparent; color: var(--danger); border-color: var(--danger); }
+
+/* 工具行：模型芯片 / 联网开关 / 深度思考开关 */
+.cd-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cd-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  height: 23px; padding: 0 8px;
+  border: 1px solid var(--border); border-radius: 12px;
+  background: transparent; color: var(--text-muted);
+  font-size: 11px; line-height: 1; cursor: pointer;
+  max-width: 60%;
+}
+.cd-chip:hover:not(:disabled):not(.cd-chip-off) { border-color: var(--border-strong); color: var(--text); }
+.cd-chip:disabled { cursor: default; }
+.cd-chip-text {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-mono);
+}
+.cd-chip-model { padding: 0 7px 0 8px; }
+.cd-chip-on {
+  color: var(--accent); border-color: var(--accent);
+  background: rgba(37, 96, 212, .07);
+}
+.cd-chip-native { color: var(--violet, #7c5cd6); border-color: var(--violet, #7c5cd6); background: rgba(124, 92, 214, .08); }
+.cd-chip-off { opacity: .6; cursor: default; }
+.cd-chip-badge { font-size: 10px; color: var(--text-faint); }
+.cd-chip-native .cd-chip-badge { color: var(--violet, #7c5cd6); }
+
+/* 迷你开关 */
+.cd-switch {
+  position: relative; flex: 0 0 auto;
+  width: 22px; height: 12px; border-radius: 7px;
+  background: var(--border-strong); transition: background .15s;
+}
+.cd-switch i {
+  position: absolute; top: 1.5px; left: 2px;
+  width: 9px; height: 9px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25);
+  transition: left .15s;
+}
+.cd-switch.on { background: var(--accent); }
+.cd-chip-native .cd-switch.on { background: var(--violet, #7c5cd6); }
+.cd-switch.on i { left: 11px; }
+
+/* 上下文窗口用量指示 */
+.cd-ctx-push { margin-left: auto; cursor: default; max-width: none; }
+.cd-ctx:hover { border-color: var(--border); color: var(--text-muted); }
+.cd-ctx-bar {
+  position: relative; flex: 0 0 auto;
+  width: 34px; height: 4px; border-radius: 2px;
+  background: var(--border-strong); overflow: hidden;
+}
+.cd-ctx-bar i {
+  position: absolute; inset: 0 auto 0 0;
+  border-radius: 2px; background: currentColor;
+  transition: width .25s ease;
+}
+.cd-ctx-ok { color: var(--text-faint); }
+.cd-ctx-high {
+  color: #b47a1e; border-color: rgba(180, 122, 30, .45);
+  background: rgba(180, 122, 30, .08);
+}
+.cd-ctx-warn {
+  color: #cc5347; border-color: rgba(204, 83, 71, .5);
+  background: rgba(204, 83, 71, .09);
+}
+
+.cd-file-input { display: none; }
+.cd-attach { cursor: pointer; }
+.cd-attachments { display: inline-flex; gap: 4px; flex-wrap: wrap; max-width: 360px; }
+.cd-attachment { display: inline-flex; align-items: center; gap: 3px; max-width: 150px; padding: 2px 5px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-muted); font-size: 10px; }
+.cd-attachment button { border: 0; background: transparent; color: var(--text-faint); cursor: pointer; padding: 0 1px; }
+.cd-attachment-error { color: var(--danger); font-size: 10px; }
+</style>

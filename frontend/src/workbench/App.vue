@@ -24,6 +24,7 @@ import { useWorkbench, askConfirm } from './composables/workbench'
 import { probeBackend, demoMode, demoTagMap, demoRegionCards } from './composables/demo'
 import { regionColor } from './theme'
 import { projectApi, getProjectId, setProjectId, type ProjectInfo } from './api'
+import { appEvents } from './eventBus'
 
 // 重型弹层/视图按需加载：仅在首次打开时拉取独立 chunk（首屏不下载、不解析）
 const RelationGraph = defineAsyncComponent(() => import('./components/RelationGraph.vue'))
@@ -89,12 +90,37 @@ const canHistoryActive = computed(() => activeTab.value?.tracked === true)
 // 面板组件自带触发按钮已隐藏，仅保留 teleport 到 body 的弹层，经 ref 唤起。
 const mapMenuOpen = ref(false)
 const toolsMenuOpen = ref(false)
+// 菜单 position:fixed（逃离 .wb-topbar overflow-y:hidden 的裁剪），
+// 打开时按触发按钮实时量取坐标，左缘夹取避免溢出视口。
+const mapMenuStyle = ref<Record<string, string>>({})
+const toolsMenuStyle = ref<Record<string, string>>({})
+const MENU_WIDTH = 244
+function menuStyleFor(btn: HTMLElement): Record<string, string> {
+  const r = btn.getBoundingClientRect()
+  let left = Math.round(r.right - MENU_WIDTH) // 与按钮右缘对齐
+  left = Math.max(8, Math.min(left, window.innerWidth - MENU_WIDTH - 8))
+  return { top: `${Math.round(r.bottom + 6)}px`, left: `${left}px` }
+}
+function toggleMapMenu(e: MouseEvent) {
+  const willOpen = !mapMenuOpen.value
+  if (willOpen) mapMenuStyle.value = menuStyleFor(e.currentTarget as HTMLElement)
+  mapMenuOpen.value = willOpen
+}
+function toggleToolsMenu(e: MouseEvent) {
+  const willOpen = !toolsMenuOpen.value
+  if (willOpen) toolsMenuStyle.value = menuStyleFor(e.currentTarget as HTMLElement)
+  toolsMenuOpen.value = willOpen
+}
+function closeTopMenus() {
+  mapMenuOpen.value = false
+  toolsMenuOpen.value = false
+}
 const teRef = ref<InstanceType<typeof TaskEnginePanel> | null>(null)
 const gpRef = ref<InstanceType<typeof GpuPanel> | null>(null)
 const hpRef = ref<InstanceType<typeof HarnessPanel> | null>(null)
 const apRef = ref<InstanceType<typeof AgentPolicyPanel> | null>(null)
 function openEngineConnect() {
-  window.dispatchEvent(new CustomEvent('docmind:open-engine'))
+  appEvents.emit('docmind:open-engine')
 }
 
 // ---------------------------------------------------------------- P4 项目选择器
@@ -166,7 +192,7 @@ async function initProjects() {
     const backendCurrent = r.current || ''
     if (backendCurrent !== getProjectId()) {
       setProjectId(backendCurrent)
-      window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
+      appEvents.emit('docmind:focus-chat', { reload: true })
     }
     currentProjectId.value = backendCurrent
   } catch (e) {
@@ -198,7 +224,7 @@ async function applyProjectSwitch() {
   closeAllTabs()   // 关闭旧项目的编辑器标签
   closeRuntime()   // 关闭运行面板 → SceneRuntimePanel 自动 detach（引擎/画布归位）
   await loadTree() // 用新项目头重新拉文件树
-  window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { reload: true } }))
+  appEvents.emit('docmind:focus-chat', { reload: true })
   window.dispatchEvent(new CustomEvent('docmind:project-changed'))
 }
 
@@ -313,12 +339,15 @@ onMounted(() => {
   window.addEventListener('beforeunload', beforeUnload)
   window.addEventListener('keydown', onWorkspaceHotkey)
   window.addEventListener('docmind:open-settings', onOpenSettings)
+  // fixed 菜单坐标基于打开瞬间的布局：视口尺寸变化后直接收起，避免错位
+  window.addEventListener('resize', closeTopMenus)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', beforeUnload)
   window.removeEventListener('keydown', onWorkspaceHotkey)
   window.removeEventListener('docmind:open-settings', onOpenSettings)
+  window.removeEventListener('resize', closeTopMenus)
   if (noticeTimer !== null) { window.clearTimeout(noticeTimer); noticeTimer = null }
 })
 </script>
@@ -417,13 +446,13 @@ onBeforeUnmount(() => {
             class="wb-save-btn wb-menu-trigger"
             :class="{ 'wb-menu-on': mapMenuOpen }"
             title="代码可视化：定义调用 / 继承挂载 / Unity 引用 / AI 问答流"
-            @click="mapMenuOpen = !mapMenuOpen"
+            @click="toggleMapMenu($event)"
           >
             代码图
             <svg class="wb-menu-caret" width="9" height="9" viewBox="0 0 9 9" aria-hidden="true"><path d="M1.5 3.2 L4.5 6.2 L7.5 3.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
           <div v-show="mapMenuOpen" class="wb-menu-backdrop" @click="mapMenuOpen = false" />
-          <div v-show="mapMenuOpen" class="wb-menu wb-menu-right" @click="mapMenuOpen = false">
+          <div v-show="mapMenuOpen" class="wb-menu" :style="mapMenuStyle" @click="mapMenuOpen = false">
             <button v-if="tree" type="button" class="wb-menu-item" @click="openSymbolMap">
               <span class="wb-menu-item-name">代码地图</span>
               <small>函数/变量在哪定义、被谁调用</small>
@@ -449,14 +478,14 @@ onBeforeUnmount(() => {
             class="wb-save-btn wb-menu-trigger"
             :class="{ 'wb-menu-on': toolsMenuOpen }"
             title="高级工具：任务生成、GPU、AI 运行台、运行游戏、引擎连接"
-            @click="toolsMenuOpen = !toolsMenuOpen"
+            @click="toggleToolsMenu($event)"
           >
             工具
             <svg class="wb-menu-caret" width="9" height="9" viewBox="0 0 9 9" aria-hidden="true"><path d="M1.5 3.2 L4.5 6.2 L7.5 3.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
           <!-- 菜单用 v-show 常驻 DOM：#wb-sr-slot 须始终可被运行游戏按钮 teleport 挂载 -->
           <div v-show="toolsMenuOpen" class="wb-menu-backdrop" @click="toolsMenuOpen = false" />
-          <div v-show="toolsMenuOpen" class="wb-menu wb-menu-right" @click="toolsMenuOpen = false">
+          <div v-show="toolsMenuOpen" class="wb-menu" :style="toolsMenuStyle" @click="toolsMenuOpen = false">
             <button type="button" class="wb-menu-item" @click="teRef?.show()">
               <span class="wb-menu-item-name">任务与生成</span>
               <small>任务分支、Godot 控制、ComfyUI 画图、Unreal</small>

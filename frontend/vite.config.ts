@@ -93,6 +93,16 @@ export default defineConfig({
           if (id.includes('@vue') || id.includes('vue') || id.includes('@vitejs')) {
             return 'vendor-vue'
           }
+          // html2canvas（含 css-line-break / text-segmentation）只在工作流预览截图时
+          // 动态 import：若归入命名 vendor 块，Rollup 会把它提升成入口的静态依赖，
+          // 208KB 白进首屏。返回 undefined 让它保留独立异步 chunk。
+          if (
+            norm.includes('/node_modules/html2canvas/')
+            || norm.includes('/node_modules/css-line-break/')
+            || norm.includes('/node_modules/text-segmentation/')
+          ) {
+            return
+          }
           return 'vendor-misc'
         },
       },

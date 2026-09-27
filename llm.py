@@ -411,7 +411,11 @@ def probe_ollama_context(model: str, base_url: str = "", timeout: float = 3.0,
         win = parse_ollama_show_context(data)
     except Exception:  # noqa: BLE001 —— 探测只做锦上添花，任何失败都退回画像
         win = None
-    _OLLAMA_CTX_CACHE[key] = win
+    # 只缓存成功结果：失败（Ollama 暂时不可达 / 模型冷启动）若也缓存 None，
+    # 之后新建的会话 Agent 在整个进程生命周期内都只能拿到画像默认窗口（十几 k），
+    # 即使 Ollama 已恢复——正是「上下文一直按小窗口算」的来源之一。
+    if win is not None:
+        _OLLAMA_CTX_CACHE[key] = win
     return win
 
 
@@ -745,8 +749,12 @@ class LLMClient:
             out.append(nm)
         return out
 
-    # ollama 原生 /api/chat 单次请求的连接/读超时：冷加载 22GB 模型可达 1-2 分钟
-    _OLLAMA_TIMEOUT = 600
+    # ollama 原生 /api/chat 单次请求的连接/读超时。默认 180s：旧值 600s 会让一次卡死的
+    # 生成长达 10 分钟占着唯一推理槽，把同机其它请求一起拖死。流式下每收到一个 token
+    # 都会刷新读，只有真正的"沉默"才触发，故 180s 足够（冷加载 22GB 实测 ~27s）。
+    # 可用 DOCMIND_OLLAMA_TIMEOUT 覆盖（不设则回落 DOCMIND_LLM_TIMEOUT / 180）。
+    _OLLAMA_TIMEOUT = float(os.getenv("DOCMIND_OLLAMA_TIMEOUT",
+                                      os.getenv("DOCMIND_LLM_TIMEOUT", "180")))
 
     def _ollama_url(self, path):
         root = str(self.client.base_url).rstrip("/").removesuffix("/v1").rstrip("/")

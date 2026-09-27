@@ -2,17 +2,12 @@
 // 代码编辑/预览：CodeMirror 6（oneDark）。
 // 每个标签页持有独立 EditorState（保留各自 undo 历史），切换标签用 setState；
 // 非活动标签的文本取 state.doc，保存时不依赖当前 DOM view。
+// CodeMirror 全家桶（650KB）在首次打开文件时才动态加载（./codeEditor.ts），
+// 工作台启动默认在概览页，CodeView 此阶段只渲染 OverviewView，不碰编辑器运行时。
 import { onMounted, onBeforeUnmount, ref, watch } from 'vue'
-import { basicSetup } from 'codemirror'
-import { Compartment, EditorState } from '@codemirror/state'
-import { EditorView, keymap } from '@codemirror/view'
-import { python } from '@codemirror/lang-python'
-import { javascript } from '@codemirror/lang-javascript'
-import { json } from '@codemirror/lang-json'
-import { html } from '@codemirror/lang-html'
-import { css } from '@codemirror/lang-css'
-import { markdown } from '@codemirror/lang-markdown'
-import type { EditorTab } from '../composables/workbench'
+import type { EditorState } from '@codemirror/state'
+import type { EditorView } from '@codemirror/view'
+import type { EditorTab } from '../composables/workbench-types'
 import { useWorkbench } from '../composables/workbench'
 import { regionColor, formatMtime, gitState } from '../theme'
 import OverviewView from './OverviewView.vue'
@@ -23,27 +18,11 @@ const {
   saveActive, closeTab, tabs, registerContentGetter, registerDocReplacer, setSelection,
 } = useWorkbench()
 
-// 浅色编辑器主题（壳是浅色，代码区也用白底；语法色走 CM 默认高亮，浅底可读）。
-const MONO_FONT = "'Cascadia Code','JetBrains Mono',Consolas,monospace"
-const lightEditorTheme = EditorView.theme({
-  '&': { height: '100%', fontSize: '12.5px', backgroundColor: '#ffffff', color: '#222b38' },
-  '.cm-scroller': { fontFamily: MONO_FONT },
-  '.cm-content': { caretColor: '#2f6fed' },
-  '&.cm-focused .cm-cursor': { borderLeftColor: '#2f6fed' },
-  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection':
-    { backgroundColor: 'rgba(47,111,237,.16)' },
-  '.cm-gutters': { backgroundColor: '#f6f8fb', color: '#9aa5b6', borderRight: '1px solid #e4e9f2' },
-  '.cm-activeLine': { backgroundColor: 'rgba(47,111,237,.05)' },
-  '.cm-activeLineGutter': { backgroundColor: '#eef3fc', color: '#2f6fed' },
-  '.cm-foldPlaceholder': {
-    backgroundColor: '#eef1f7', border: '1px solid #dde3ee', color: '#5a6778',
-  },
-})
-
 const host = ref<HTMLElement | null>(null)
 let view: EditorView | null = null
+let viewPromise: Promise<EditorView> | null = null
+let destroyed = false
 const states = new Map<number, EditorState>()
-const readOnlyComp = new Compartment()
 
 // ---- P2：把当前非空选区上报给选区 AI（含视口坐标，供浮条定位） ----
 function publishSelection(v: EditorView, tab: EditorTab) {
@@ -86,68 +65,40 @@ function onEditorScrollOrResize() {
   scheduleRepublish()
 }
 
-function langExtension(lang: string) {
-  switch (lang) {
-    case 'python': return python()
-    case 'javascript': return javascript()
-    case 'jsx': return javascript({ jsx: true })
-    case 'typescript': return javascript({ typescript: true })
-    case 'tsx': return javascript({ jsx: true, typescript: true })
-    case 'json': return json()
-    case 'html': return html()
-    case 'css': return css()
-    case 'markdown': return markdown()
-    // gdscript / ini(tscn/tres/cfg) / yaml / toml / csv 等无专用语言包，按纯文本渲染
-    default: return []
-  }
-}
-
 /**
- * CRLF 归一化比较：Windows 仓库（core.autocrlf=true）git checkout 落盘为 CRLF，
- * 而 CodeMirror 建 state 时会把所有换行统一存成 \n，直接逐字符比较会误判 dirty。
+ * 懒加载 CodeMirror 运行时并创建单例 EditorView。
+ * view 单例不变，切标签只替换其 state；桥接到 window.__docmind_cm 供选区 AI/jumpToLine 使用。
  */
-function isDocDirty(docText: string, saved: string): boolean {
-  const norm = (s: string) => s.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-  return norm(docText) !== norm(saved)
+function ensureView(): Promise<EditorView> {
+  if (!viewPromise) {
+    viewPromise = import('./codeEditor').then((m) => {
+      const v = m.createEditorView(host.value!)
+      if (destroyed) {
+        // 极端竞态：块还没加载完组件就卸载了
+        v.destroy()
+        throw new Error('CodeView unmounted before editor ready')
+      }
+      view = v
+      ;(window as unknown as { __docmind_cm?: EditorView }).__docmind_cm = v
+      // 选区浮条是 fixed 定位：编辑器滚动或窗口缩放时刷新锚点坐标
+      v.scrollDOM.addEventListener('scroll', onEditorScrollOrResize, { passive: true })
+      window.addEventListener('resize', onEditorScrollOrResize)
+      return v
+    })
+  }
+  return viewPromise
 }
 
-function buildState(tab: EditorTab): EditorState {
-  return EditorState.create({
-    doc: tab.draftContent ?? tab.savedContent,
-    extensions: [
-      basicSetup,
-      langExtension(tab.lang),
-      lightEditorTheme,
-      readOnlyComp.of(EditorState.readOnly.of(!tab.writable)),
-      keymap.of([{
-        key: 'Mod-s',
-        preventDefault: true,
-        run: () => {
-          void saveActive()
-          return true
-        },
-      }]),
-      EditorView.updateListener.of((u) => {
-        // CM6 state 不可变：dispatch 后是全新 state 对象，必须回写 Map，
-        // 否则非活动标签/保存时 contentGetter 取到的还是旧引用。
-        states.set(tab.id, u.state)
-        // P2：选区或文档变化时刷新选区快照（文档替换后变光标则隐藏浮条）
-        if (u.selectionSet || u.docChanged) publishSelection(u.view, tab)
-        if (!u.docChanged) return
-        const t = tabs.value.find((x) => x.id === tab.id)
-        if (t) {
-          t.draftContent = u.state.doc.toString()
-          t.dirty = isDocDirty(t.draftContent, t.savedContent)
-        }
-      }),
-    ],
-  })
-}
-
-function ensureState(tab: EditorTab): EditorState {
+async function ensureState(tab: EditorTab): Promise<EditorState> {
   let st = states.get(tab.id)
   if (!st) {
-    st = buildState(tab)
+    const m = await import('./codeEditor')
+    st = m.buildEditorState(tab, {
+      saveActive: () => void saveActive(),
+      tabs,
+      commitState: (t, state) => states.set(t.id, state),
+      publishSelection,
+    })
     states.set(tab.id, st)
     registerContentGetter(tab.id, () => states.get(tab.id)!.doc.toString())
     registerDocReplacer(tab.id, (content) => replaceTabDoc(tab.id, content))
@@ -176,44 +127,52 @@ function replaceTabDoc(tabId: number, content: string) {
   )
 }
 
-function syncView() {
-  if (!view) return
+// 连续 watch 触发只认最后一次：异步加载编辑器期间标签可能已再次切换
+let syncToken = 0
+async function syncView() {
   // 切换标签 / 进入加载或错误态：旧选区不再有效，隐藏选区浮条
   setSelection(null)
-  if (props.tab && !props.tab.loading && !props.tab.error) {
-    // 切走前把旧标签的最终 state 落回 Map（listener 已逐次回写，这里兜底）
-    const curId = (view as unknown as { __tabId?: number }).__tabId
-    if (curId != null && curId !== props.tab.id && states.has(curId)) {
-      states.set(curId, view.state)
-    }
-    ;(view as unknown as { __tabId?: number }).__tabId = props.tab.id
-    view.setState(ensureState(props.tab))
+  if (!props.tab || props.tab.loading || props.tab.error) return
+  const token = ++syncToken
+  const v = await ensureView()
+  const st = await ensureState(props.tab)
+  if (destroyed || token !== syncToken) return
+  // 切走前把旧标签的最终 state 落回 Map（listener 已逐次回写，这里兜底）
+  const curId = (v as unknown as { __tabId?: number }).__tabId
+  if (curId != null && curId !== props.tab.id && states.has(curId)) {
+    states.set(curId, v.state)
   }
+  ;(v as unknown as { __tabId?: number }).__tabId = props.tab.id
+  v.setState(st)
 }
 
 onMounted(() => {
-  view = new EditorView({ parent: host.value!, extensions: [lightEditorTheme] })
-  syncView()
-  // 编辑器桥：DevTools / 后续选区 AI（P2）经此读取当前 EditorView。
-  // view 单例不变，切标签只替换其 state。
-  ;(window as unknown as { __docmind_cm?: EditorView }).__docmind_cm = view
-  // 选区浮条是 fixed 定位：编辑器滚动或窗口缩放时刷新锚点坐标
-  view.scrollDOM.addEventListener('scroll', onEditorScrollOrResize, { passive: true })
-  window.addEventListener('resize', onEditorScrollOrResize)
+  // 无标签时只渲染概览，不触发编辑器块加载；首次有真实标签才异步建 view
+  void syncView()
 })
 
 onBeforeUnmount(() => {
-  view?.scrollDOM.removeEventListener('scroll', onEditorScrollOrResize)
-  window.removeEventListener('resize', onEditorScrollOrResize)
-  setSelection(null)
-  if ((window as unknown as { __docmind_cm?: unknown }).__docmind_cm === view) {
-    delete (window as unknown as { __docmind_cm?: EditorView }).__docmind_cm
+  destroyed = true
+  if (view) {
+    view.scrollDOM.removeEventListener('scroll', onEditorScrollOrResize)
+    window.removeEventListener('resize', onEditorScrollOrResize)
+    setSelection(null)
+    if ((window as unknown as { __docmind_cm?: unknown }).__docmind_cm === view) {
+      delete (window as unknown as { __docmind_cm?: EditorView }).__docmind_cm
+    }
+    view.destroy()
+    view = null
   }
-  view?.destroy()
 })
 
 // 切活动 tab / 加载完成 → 挂载对应 state
-watch(() => [props.tab?.id, props.tab?.loading, props.tab?.error], syncView)
+watch(() => [props.tab?.id, props.tab?.loading, props.tab?.error], () => void syncView())
+
+/** CRLF 归一化比较（与 codeEditor 工厂内实现保持一致）。 */
+function isDocDirty(docText: string, saved: string): boolean {
+  const norm = (s: string) => s.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  return norm(docText) !== norm(saved)
+}
 
 // 保存成功后（savedContent 变化）重算 dirty
 watch(() => props.tab?.savedContent, () => {

@@ -4,7 +4,7 @@
 // 用于刷新输入栏的模型标签与「深度思考」开关状态。
 import { ref, watch, computed } from 'vue'
 import { modelApi } from '../api'
-import type { ModelConfigInfo, ContextLookupResult } from '../api'
+import type { ModelConfigInfo, ContextLookupResult, ModelPreset } from '../api'
 
 const props = defineProps<{ visible: boolean; config: ModelConfigInfo | null }>()
 const emit = defineEmits<{
@@ -33,6 +33,23 @@ const accessMode = ref<'safe' | 'high'>('safe')
 const thinkingCapability = ref('')
 const visionCapability = ref('')
 const videoCapability = ref('')
+
+// 命名模型预设：保存多套云端/自定义配置，切换免重填参数与 Key
+const presets = ref<ModelPreset[]>([])
+const presetLabel = ref('')
+const presetBusy = ref(false)
+// 模型选择模式：fixed=固定用当前表单模型；auto=Harness 按任务复杂度自动选本地/云端
+const llmMode = ref<'fixed' | 'auto'>('fixed')
+const autoCloudPresetId = ref('')
+const presetError = ref('')
+
+const cloudPresets = computed<ModelPreset[]>(() =>
+  presets.value.filter((p) => {
+    const m = props.config?.provider_meta?.[p.provider]
+    return m?.cloud || (p.provider === 'custom' && !!p.base_url)
+  }),
+)
+const autoReady = computed(() => llmMode.value === 'fixed' || !!autoCloudPresetId.value)
 
 const meta = computed(() => props.config?.provider_meta?.[provider.value])
 const isCustom = computed(() => provider.value === 'custom')
@@ -92,6 +109,11 @@ watch(
     thinkingCapability.value = props.config.capability?.thinking || 'unknown'
     visionCapability.value = props.config.capability?.vision || 'unknown'
     videoCapability.value = props.config.capability?.video || 'unknown'
+    presets.value = [...(props.config.model_presets || [])]
+    presetLabel.value = ''
+    presetError.value = ''
+    llmMode.value = props.config.llm_mode === 'auto' ? 'auto' : 'fixed'
+    autoCloudPresetId.value = props.config.auto_cloud_preset_id || ''
     ctxBusy.value = ''
     ctxMsg.value = ''
     lookupResult.value = null
@@ -161,9 +183,97 @@ function useCandidate(tokens: number) {
   ctxWindow.value = String(tokens)
 }
 
+// 把当前表单（含可选 Key）另存为命名预设；不切换当前模型
+async function saveAsPreset() {
+  errorMsg.value = ''
+  presetError.value = ''
+  const label = presetLabel.value.trim()
+  if (!label) { presetError.value = '请先填写预设名称。'; return }
+  if (isCustom.value && (!baseUrl.value.trim() || !model.value.trim())) {
+    presetError.value = '自定义端点需要先填好接口地址与模型名称。'
+    return
+  }
+  let ctxVal = 0
+  const rawCtx = normalizedContextWindow()
+  if (rawCtx) {
+    ctxVal = Number(rawCtx)
+    if (!Number.isInteger(ctxVal) || ctxVal < 1024 || ctxVal > 2_097_152) {
+      presetError.value = '上下文窗口需为 1024 ~ 2097152 tokens 的整数。'
+      return
+    }
+  }
+  presetBusy.value = true
+  try {
+    const res = await modelApi.savePreset({
+      label,
+      provider: provider.value,
+      model: model.value.trim(),
+      base_url: isCustom.value ? baseUrl.value.trim() : '',
+      context_window: ctxVal,
+      // Key 留空则不随预设保存（激活时可再补；项目里已存的同厂商 Key 也可兜底）
+      api_key: apiKey.value.trim() || undefined,
+    })
+    if (res.ok === false || !res.presets) {
+      presetError.value = res.error || '预设保存失败'
+      return
+    }
+    presets.value = res.presets
+    presetLabel.value = ''
+  } catch (e) {
+    presetError.value = (e as { message?: string }).message || '预设保存失败'
+  } finally {
+    presetBusy.value = false
+  }
+}
+
+async function removePreset(p: ModelPreset) {
+  if (!window.confirm(`确定删除预设「${p.label}」吗？（不影响当前正在使用的模型）`)) return
+  presetError.value = ''
+  try {
+    const res = await modelApi.deletePreset(p.id)
+    if (res.ok === false || !res.presets) {
+      presetError.value = res.error || '删除失败'
+      return
+    }
+    presets.value = res.presets
+    if (autoCloudPresetId.value === p.id) autoCloudPresetId.value = ''
+  } catch (e) {
+    presetError.value = (e as { message?: string }).message || '删除失败'
+  }
+}
+
+// 一键激活预设：后端走与「保存并切换」完全相同的探活/落盘/换客户端流程
+async function activatePreset(p: ModelPreset) {
+  errorMsg.value = ''
+  presetError.value = ''
+  saving.value = true
+  try {
+    const res = await modelApi.activatePreset(p.id)
+    if (res.ok === false || res.error) {
+      errorMsg.value = res.error || '切换失败'
+      return
+    }
+    presets.value = res.model_presets || presets.value
+    emit('saved', res)
+    emit('close')
+  } catch (e) {
+    errorMsg.value = (e as { message?: string }).message || '切换失败'
+  } finally {
+    saving.value = false
+  }
+}
+
+function presetProviderLabel(p: ModelPreset): string {
+  return props.config?.provider_meta?.[p.provider]?.label || p.provider
+}
+
 async function save() {
   errorMsg.value = ''
   warnings.value = []
+  if (!autoReady.value) {
+    errorMsg.value = '自动模式需要先选择一个云端模型预设（可在上方把当前配置另存为预设）。'
+    return
+  }
   // 窗口范围前端先拦一道（与后端 1024~2097152 保持一致）
   let ctxVal = 0
   const rawCtx = normalizedContextWindow()
@@ -189,6 +299,9 @@ async function save() {
       video_capability: videoCapability.value,
       // 越界访问模式：safe/high（与模型切换一并保存，幂等）
       external_access_mode: accessMode.value,
+      // 固定 / 自动模式；自动时附带复杂任务所用云端预设
+      llm_mode: llmMode.value,
+      auto_cloud_preset_id: llmMode.value === 'auto' ? autoCloudPresetId.value : '',
     })
     if (res.model_error) {
       // Ollama 探活失败：HTTP 200 + ok:false + model_error（切到 rawJson 后真正可达）
@@ -204,6 +317,9 @@ async function save() {
     warnings.value = res.warnings || []
     ctxWindow.value = res.context_window_override ? String(res.context_window_override) : ''
     accessMode.value = (res.external_access_mode as 'safe' | 'high') || accessMode.value
+    llmMode.value = res.llm_mode === 'auto' ? 'auto' : 'fixed'
+    autoCloudPresetId.value = res.auto_cloud_preset_id || ''
+    presets.value = res.model_presets || presets.value
     emit('saved', res)
     if (!warnings.value.length) emit('close')
   } catch (e) {
@@ -219,7 +335,74 @@ async function save() {
     <div class="ms-box" role="dialog" aria-modal="true">
       <h3 class="ms-title">模型设置</h3>
 
-      <label class="ms-label">模型服务</label>
+      <label class="ms-label">模型选择方式</label>
+      <div class="ms-seg" role="radiogroup" aria-label="模型选择方式">
+        <button type="button" class="ms-seg-opt" :class="{ 'ms-seg-on': llmMode === 'fixed' }"
+                :disabled="saving" @click="llmMode = 'fixed'">
+          <span class="ms-seg-name">固定模式</span>
+          <span class="ms-seg-desc">始终使用下面选择的模型</span>
+        </button>
+        <button type="button" class="ms-seg-opt" :class="{ 'ms-seg-on': llmMode === 'auto' }"
+                :disabled="saving" @click="llmMode = 'auto'">
+          <span class="ms-seg-name">自动模式</span>
+          <span class="ms-seg-desc">简单任务用本地模型，复杂任务自动升级云端</span>
+        </button>
+      </div>
+      <div v-if="llmMode === 'auto'" class="ms-auto-row">
+        <select v-model="autoCloudPresetId" class="ms-input" :disabled="saving">
+          <option value="" disabled>选择复杂任务使用的云端模型预设…</option>
+          <option v-for="p in cloudPresets" :key="p.id" :value="p.id">
+            {{ p.label }}（{{ presetProviderLabel(p) }}）
+          </option>
+        </select>
+        <p class="ms-hint" v-if="!cloudPresets.length">
+          还没有云端预设：在下方填好云端厂商参数与名称，点「另存为预设」即可。
+        </p>
+      </div>
+
+      <div class="ms-sep"></div>
+      <label class="ms-label">
+        已保存的模型预设
+        <span class="ms-preset-count" v-if="presets.length">{{ presets.length }}</span>
+      </label>
+      <div v-if="presets.length" class="ms-preset-list">
+        <div v-for="p in presets" :key="p.id" class="ms-preset-item">
+          <div class="ms-preset-info">
+            <span class="ms-preset-name">{{ p.label }}</span>
+            <span class="ms-preset-meta">
+              {{ presetProviderLabel(p) }} · {{ p.model || '默认模型' }}
+              <span class="ms-preset-key" :class="{ 'ms-preset-key-off': !p.has_key }">
+                {{ p.has_key ? 'Key 已存' : '未存 Key' }}
+              </span>
+              <span v-if="config?.llm_provider === p.provider && config?.llm_model === p.model"
+                    class="ms-preset-current">使用中</span>
+            </span>
+          </div>
+          <div class="ms-preset-actions">
+            <button type="button" class="ms-mini" :disabled="saving" @click="activatePreset(p)">切换</button>
+            <button type="button" class="ms-mini ms-mini-danger" :disabled="saving" @click="removePreset(p)">删除</button>
+          </div>
+        </div>
+      </div>
+      <p v-else class="ms-hint ms-preset-empty">还没有预设：填好下面的参数并命名，点「另存为预设」，之后切换云端模型无需重填。</p>
+      <div class="ms-preset-save">
+        <input
+          v-model="presetLabel"
+          class="ms-input ms-preset-name-input"
+          placeholder="预设名称，如：通义千问-云端"
+          maxlength="40"
+          spellcheck="false"
+          :disabled="presetBusy || saving"
+          @keyup.enter="saveAsPreset"
+        />
+        <button type="button" class="ms-mini" :disabled="presetBusy || saving" @click="saveAsPreset">
+          {{ presetBusy ? '保存中…' : '另存为预设' }}
+        </button>
+      </div>
+      <p v-if="presetError" class="ms-hint ms-hint-err">{{ presetError }}</p>
+
+      <div class="ms-sep"></div>
+      <label class="ms-label">当前模型（固定模式 / 自动模式的本地模型）</label>
       <select v-model="provider" class="ms-input" :disabled="saving">
         <option v-for="p in props.config?.providers || []" :key="p" :value="p">
           {{ props.config?.provider_meta?.[p]?.label || p }}
@@ -386,7 +569,7 @@ async function save() {
       <div class="ms-actions">
         <button class="ms-btn" :disabled="saving" @click="emit('close')">{{ warnings.length ? '知道了' : '取消' }}</button>
         <button v-if="!warnings.length" class="ms-btn ms-primary"
-                :disabled="saving || (isCustom && (!baseUrl.trim() || !model.trim()))"
+                :disabled="saving || !autoReady || (isCustom && (!baseUrl.trim() || !model.trim()))"
                 @click="save">
           {{ saving ? '保存中…' : '保存并切换' }}
         </button>
@@ -497,6 +680,35 @@ async function save() {
 .ms-seg-desc { font-size: 11px; color: var(--text-faint); }
 .ms-acm-note { color: var(--text-faint); margin-top: 6px; line-height: 1.5; }
 .ms-acm-note code { background: var(--bg-selected); padding: 0 4px; border-radius: 4px; font-size: 11px; }
+/* 自动模式云端预设选择 */
+.ms-auto-row { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+/* 命名模型预设列表 / 另存行 */
+.ms-preset-count {
+  display: inline-block; min-width: 18px; text-align: center;
+  background: var(--bg-selected); border-radius: 999px;
+  font-size: 11px; color: var(--text-muted); padding: 0 6px;
+}
+.ms-preset-list { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.ms-preset-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px;
+  background: var(--bg);
+}
+.ms-preset-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ms-preset-name { font-size: 13px; font-weight: 600; }
+.ms-preset-meta { font-size: 11px; color: var(--text-faint); display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.ms-preset-key {
+  border: 1px solid var(--border); border-radius: 999px; padding: 0 7px;
+  color: #047857; background: #ecfdf5;
+}
+.ms-preset-key-off { color: #b45309; background: #fffbeb; }
+.ms-preset-current { color: var(--accent); }
+.ms-preset-actions { display: flex; gap: 6px; flex: none; }
+.ms-mini-danger:hover:not(:disabled) { border-color: #dc2626; color: #dc2626; }
+.ms-preset-empty { margin-top: 4px; }
+.ms-preset-save { display: flex; gap: 8px; margin-top: 8px; }
+.ms-preset-name-input { flex: 1; }
+.ms-box { max-height: 88vh; overflow-y: auto; }
 .ms-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .ms-btn {
   padding: 7px 16px; font-size: 13px; border-radius: 8px;

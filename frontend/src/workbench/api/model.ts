@@ -1,5 +1,5 @@
 // 模型配置 / 能力画像 / 视觉理解（由原 workbench/api.ts 按域切分；调用方继续从 barrel ../api 引入）。
-import { rawJson, request, withProject } from './_base'
+import { projectRequest, rawJson, request, withProject } from './_base'
 
 // ---------------------------------------------------------------- 模型设置（/api/config）
 export interface ProviderMeta {
@@ -65,6 +65,27 @@ export interface ModelConfigInfo {
   code_root?: string
   /** AI 改文件前是否需要人工确认 */
   edit_confirm?: boolean
+  /** 模型选择模式：fixed=固定模型；auto=按任务复杂度自动在本地/云端间路由 */
+  llm_mode?: 'fixed' | 'auto'
+  /** 自动模式下复杂任务使用的云端预设 id */
+  auto_cloud_preset_id?: string
+  /** 已保存的命名模型预设（含当前项目是否已存 Key） */
+  model_presets?: ModelPreset[]
+}
+
+/** 命名模型预设：一键切换整套云端/本地配置（Key 存项目密钥库，不回显） */
+export interface ModelPreset {
+  id: string
+  label: string
+  provider: string
+  model: string
+  base_url: string
+  /** 0=自动探测/画像 */
+  context_window: number
+  created_at?: string
+  updated_at?: string
+  /** 当前项目下该预设是否已保存 API Key */
+  has_key?: boolean
 }
 
 export interface SaveModelReq {
@@ -79,6 +100,20 @@ export interface SaveModelReq {
   video_capability?: string
   /** AI 越界访问模式：'safe' | 'high'；undefined=不改动 */
   external_access_mode?: 'safe' | 'high'
+  /** 模型选择模式：'fixed' | 'auto'；undefined=不改动 */
+  llm_mode?: 'fixed' | 'auto'
+  /** 自动模式云端预设 id（'' 可清空） */
+  auto_cloud_preset_id?: string
+}
+
+export interface SavePresetReq {
+  id?: string
+  label: string
+  provider: string
+  model?: string
+  base_url?: string
+  context_window?: number | null
+  api_key?: string
 }
 
 /** 联网识别出的候选窗口（附带出处片段，由用户判断后采用） */
@@ -118,5 +153,21 @@ export const modelApi = {
   /** 联网搜索模型公开的上下文窗口（返回候选列表，不自动写配置） */
   lookupModelContext(provider: string, model: string): Promise<ContextLookupResult> {
     return rawJson<ContextLookupResult>('/api/model_context_lookup', { provider, model })
+  },
+  /** 列出命名模型预设 */
+  listPresets(): Promise<{ ok: boolean; presets: ModelPreset[] }> {
+    return request('/api/model_presets')
+  },
+  /** 新增/更新预设（api_key 可选，随预设存入当前项目密钥库） */
+  savePreset(req: SavePresetReq): Promise<{ ok: boolean; presets?: ModelPreset[]; error?: string }> {
+    return rawJson('/api/model_presets', req)
+  },
+  /** 删除预设 */
+  deletePreset(id: string): Promise<{ ok: boolean; presets?: ModelPreset[]; error?: string }> {
+    return projectRequest(`/api/model_presets/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  },
+  /** 一键激活预设（等同在弹窗里填好整套参数后点保存并切换） */
+  activatePreset(id: string): Promise<ModelConfigInfo & { error?: string }> {
+    return rawJson(`/api/model_presets/${encodeURIComponent(id)}/activate`, {})
   },
 }

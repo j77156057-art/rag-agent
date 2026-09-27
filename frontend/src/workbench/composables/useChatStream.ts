@@ -5,17 +5,18 @@
 //  3) notice / plan / workflow / context / final 事件分类分发，业务差异通过钩子注入。
 // 不持有 messages 数组、不绑定请求生命周期（abort/epoch 仍由调用方管理）。
 import type { SseEvent } from '../api'
+import type { ChatTraceItem, ChatTraceKind, ChatWorkflowRef } from './chat-types'
 
-export type ChatTraceKind = 'thought' | 'action' | 'observation' | 'reflection'
+export type { ChatTraceKind, ChatTraceItem, ChatMsg, ChatMsgStatus, ChatWorkflowRef } from './chat-types'
 
 export interface ChatStreamTurn {
   id: number
   text: string
   reasoning: string
   notices: string[]
-  trace: Array<{ type: string; text: string; at?: number; elapsedMs?: number }>
+  trace: ChatTraceItem[]
   plan?: string[]
-  workflow?: { workflowId: string; seed?: unknown }
+  workflow?: ChatWorkflowRef
 }
 
 export interface ChatStreamHooks<T extends ChatStreamTurn> {
@@ -77,8 +78,7 @@ export function useChatStream<T extends ChatStreamTurn>(hooks: ChatStreamHooks<T
       const pending = [...turn.trace].reverse().find((item) => item.type === 'action' && !item.elapsedMs)
       if (pending?.at) pending.elapsedMs = Math.max(0, at - pending.at)
     }
-    // dispatch 只可能传入四种 trace 字面量；泛型下消息体的 trace 元素类型可能更窄
-    turn.trace.push({ type, text, at } as T['trace'][number])
+    turn.trace.push({ type, text, at })
   }
 
   function bufferFor(turn: T): StreamBuffer {

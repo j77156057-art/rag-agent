@@ -2,12 +2,13 @@
 // 单条对话气泡：用户消息（含图片）/ 助手消息。
 // 助手消息支持 SSE 流式渲染：深度思考折叠块、ReAct 轨迹（分析/动作/观察/复核）、
 // Markdown 正文、文件行号引用 chips（点击打开只读源码弹窗）。
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, ref, watch } from 'vue'
 import { mdToHtml, extractFileRefs } from '../../workbench/markdown'
-import WorkflowCard from '../../workbench/components/WorkflowCard.vue'
-import type { AskChatMsg, AskTraceItem } from '../types'
+// 工作流卡片 104KB，只有触发工作流的消息才渲染：按需加载，问答首屏不背
+const WorkflowCard = defineAsyncComponent(() => import('../../workbench/components/WorkflowCard.vue'))
+import type { ChatMsg, ChatTraceItem } from '../../workbench/composables/chat-types'
 
-const props = defineProps<{ msg: AskChatMsg }>()
+const props = defineProps<{ msg: ChatMsg }>()
 const emit = defineEmits<{
   (e: 'openFile', path: string, line: number): void
   (e: 'wfGate', open: boolean): void
@@ -58,7 +59,7 @@ function oneLine(s: string, n = 80): string {
   const t = s.trim().replace(/\s+/g, ' ')
   return t.length > n ? t.slice(0, n) + '…' : t
 }
-function stepTitle(item: AskTraceItem): string {
+function stepTitle(item: ChatTraceItem): string {
   const raw = item.text.trim()
   if (item.type === 'action') {
     const tool = /^([\w.-]+)\s*\(/.exec(raw)?.[1]
@@ -66,7 +67,7 @@ function stepTitle(item: AskTraceItem): string {
   }
   return TRACE_LABEL[item.type] || item.type
 }
-function stepSummary(item: AskTraceItem): string {
+function stepSummary(item: ChatTraceItem): string {
   const raw = item.text.trim()
   if (item.type === 'action') {
     const tool = /^([\w.-]+)\s*\(([^)]*)\)/.exec(raw)

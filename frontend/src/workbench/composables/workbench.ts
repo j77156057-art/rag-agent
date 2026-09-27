@@ -1,36 +1,27 @@
 // 工作台共享状态（模块级单例）：文件树、多标签编辑、保存/冲突、新建/改名/删除流程、
 // 对话框与右键菜单。组件只负责渲染与转发事件。
 import { computed, ref, shallowRef } from 'vue'
-import { EditorView } from '@codemirror/view'
-import { aiApi, fsApi, regionsApi, semanticApi, FsApiError, getProjectId, getActiveTask } from '../api'
+// 仅类型需要；运行时调用（scrollIntoView）在 jumpToLine 内动态 import，避免拖大首屏
+import type { EditorView } from '@codemirror/view'
+import { fsApi, FsApiError, getProjectId, getActiveTask } from '../api'
 import type {
-  TreeNode, TreeResp, GitCommit, RegionInfo, ContractsResp,
-  SemanticTagRecord, LocateResp, RegionCard,
+  TreeNode, TreeResp,
 } from '../api'
+// 对话框域（确认/输入/警告/保存冲突）已独立成 dialogs.ts，这里仅做再导出聚合
+export { askConfirm, askPrompt, askAlert, resolveDialog } from './dialogs'
+export type { DialogSpec } from './dialogs'
+import { dialog, askConflict, askConfirm, askPrompt, askAlert, resolveDialog } from './dialogs'
+import { initSemanticDeps, useSemantic } from './workbench-semantic'
+import { initAiDeps, useAiSelection } from './workbench-ai'
+import { initRegionDeps, useRegionMap } from './workbench-regions'
+import { initMenuDeps, useContextMenu } from './workbench-menu'
+import { initGitDeps, useGitHistory } from './workbench-git'
+import { initRuntimeDeps, useRuntime } from './workbench-runtime'
+import { initRecentDeps, useRecentFiles } from './workbench-recent'
 
 // ---------------------------------------------------------------- 标签页
-export interface EditorTab {
-  id: number
-  path: string
-  name: string
-  lang: string
-  region: string | null
-  regionName: string | null
-  mtime: number
-  writable: boolean
-  /** 只读快照：建编辑器时作为初始 doc，保存成功后更新 */
-  savedContent: string
-  draftContent?: string
-  dirty: boolean
-  loading: boolean
-  error: string | null
-  errorStatus: number | null
-  saving: boolean
-  savedAt: number | null
-  tracked: boolean | null
-  gitDirty: boolean | null
-  reindexWarn: string | null
-}
+export type { EditorTab } from './workbench-types'
+import type { EditorTab } from './workbench-types'
 
 let tabSeq = 1
 
@@ -45,48 +36,8 @@ const CONTRACT_READONLY = new Set([
   'dev_changesets.jsonl',
 ])
 
-// ---------------------------------------------------------------- 对话框
-interface ConfirmSpec {
-  kind: 'confirm'
-  title: string
-  message: string
-  detail?: string
-  confirmText?: string
-  danger?: boolean
-  resolve: (ok: boolean) => void
-}
-interface PromptSpec {
-  kind: 'prompt'
-  title: string
-  message?: string
-  defaultValue: string
-  placeholder?: string
-  resolve: (v: string | null) => void
-}
-interface AlertSpec {
-  kind: 'alert'
-  title: string
-  message: string
-  detail?: string
-  resolve: () => void
-}
-interface ConflictSpec {
-  kind: 'conflict'
-  path: string
-  serverMtime: number
-  resolve: (overwrite: boolean) => void
-}
-export type DialogSpec = ConfirmSpec | PromptSpec | AlertSpec | ConflictSpec
-
 // ---------------------------------------------------------------- 右键菜单
-export interface MenuItem {
-  label: string
-  danger?: boolean
-  disabled?: boolean
-  separatorBefore?: boolean
-  run: () => void
-}
-export interface MenuPos { x: number; y: number; items: MenuItem[] }
+export type { MenuItem, MenuPos } from './workbench-menu'
 
 // ---------------------------------------------------------------- 状态
 const tree = shallowRef<TreeResp | null>(null)
@@ -96,9 +47,6 @@ const treeError = ref<FsApiError | null>(null)
 const tabs = ref<EditorTab[]>([])
 const activeId = ref<number | null>(null)
 const selectedPath = ref<string | null>(null)
-
-const dialog = ref<DialogSpec | null>(null)
-const ctxMenu = ref<MenuPos | null>(null)
 
 /** 点击 AI 答案引用时，文件树展开祖先目录并闪烁目标行（nonce 保证同一路径重复触发也有动画）。 */
 const treeReveal = ref<{ path: string; nonce: number } | null>(null)
@@ -113,186 +61,28 @@ function revealPath(path: string) {
   treeReveal.value = { path, nonce: Date.now() }
 }
 
-// ================================================================ 阶段 1：语义标签 + 大白话定位
-/** 路径 → 业务标签记录（供文件树徽章与定位结果展示）。 */
-const tagMap = shallowRef<Record<string, SemanticTagRecord>>({})
-const tagLoading = ref(false)
-const tagError = ref('')
-const tagMeta = ref({ total: 0, tagged: 0, pending: 0, stale: 0 })
+// 语义标签 / 大白话定位 / 概览分区卡 抽到 workbench-semantic.ts（依赖在文件末尾注入）
+const {
+  tagMap, tagLoading, tagError, tagMeta, loadTags, refreshTags,
+  locateQuery, locateLoading, locatePaths, locateResult,
+  runLocate, clearLocate, openLocateFile, openLocateRegion,
+  regionCards, regionCardsLoading, loadRegionCards, seedDemoRegionCards,
+} = useSemantic()
 
-/** 定位态：locatePaths 中的文件在树里持续高亮，直到清空查询。 */
-const locateQuery = ref('')
-const locateLoading = ref(false)
-const locatePaths = ref<Set<string>>(new Set())
-const locateResult = shallowRef<LocateResp | null>(null)
+// 工作区视图 + 画布/运行面板抽到 workbench-runtime.ts（tabs 在文件末尾注入）
+export type { WorkspaceView, RuntimePanelTab } from './workbench-runtime'
+const {
+  workspace, setWorkspace,
+  runtimeOpen, runtimeTab, runtimeResident,
+  openRuntime, openRuntimeResident, closeRuntimeResident, closeRuntime,
+  symbolMapOpen, openSymbolMap, closeSymbolMap,
+  relationGraphOpen, openRelationGraph, closeRelationGraph,
+  unityGraphOpen, openUnityGraph, closeUnityGraph,
+  flowOpen, openFlow, closeFlow,
+} = useRuntime()
 
-async function loadTags() {
-  try {
-    const r = await semanticApi.tags()
-    if (r.error) {
-      tagError.value = r.error
-      return
-    }
-    tagMap.value = r.files || {}
-    tagMeta.value = { total: r.total_files, tagged: r.tagged_files, pending: r.pending, stale: r.stale }
-    tagError.value = ''
-  } catch {
-    /* 标签是增强层：加载失败不打扰主流程 */
-  }
-}
-
-/** 调模型增量打标签；剩余文件可再次点击直到 pending=0。 */
-async function refreshTags(limit = 60) {
-  tagLoading.value = true
-  tagError.value = ''
-  try {
-    const r = await semanticApi.refreshTags(limit)
-    if (r.error) { tagError.value = r.error; return r }
-    tagMap.value = r.files || {}
-    tagMeta.value = { total: r.total_files, tagged: r.tagged_files, pending: r.pending, stale: r.stale }
-    return r
-  } finally {
-    tagLoading.value = false
-  }
-}
-
-async function runLocate(q: string) {
-  const query = q.trim()
-  locateQuery.value = query
-  if (!query) {
-    clearLocate()
-    return
-  }
-  locateLoading.value = true
-  try {
-    const r = await semanticApi.locate(query)
-    locateResult.value = r
-    locatePaths.value = new Set((r.files || []).map((f) => f.path))
-  } finally {
-    locateLoading.value = false
-  }
-}
-
-function clearLocate() {
-  locateQuery.value = ''
-  locateResult.value = null
-  locatePaths.value = new Set()
-}
-
-/** 命中某文件：打开并跳到符号所在行，同时让文件树展开/闪烁，定位高亮保留。 */
-async function openLocateFile(hit: { path: string; line: number | null }) {
-  revealPath(hit.path)
-  await jumpToLine(hit.path, hit.line || 1)
-}
-
-/** 命中某分区：展开并闪烁该分区文件夹。 */
-function openLocateRegion(dir: string) {
-  revealPath(dir.replace(/\\/g, '/').replace(/\/+$/, ''))
-}
-
-// ================================================================ 分区卡片（概览驾驶舱共享）
-const regionCards = shallowRef<RegionCard[]>([])
-const regionCardsLoading = ref(false)
-
-/** 概览页分区卡：统计文件数/未提交/最近提交；增强层，失败静默。 */
-async function loadRegionCards(force = false) {
-  if (!force && regionCardsLoading.value) return
-  if (!tree.value?.regions_enabled) {
-    regionCards.value = []
-    return
-  }
-  regionCardsLoading.value = true
-  try {
-    const r = await semanticApi.regionCards()
-    regionCards.value = r.regions || []
-  } catch {
-    /* 分区卡是导航增强层：读取失败保留旧数据，不弹错打扰 */
-  } finally {
-    regionCardsLoading.value = false
-  }
-}
-
-/** 离线演示态由 App 注入示例卡片（composable 不反向依赖 demo 模块）。 */
-function seedDemoRegionCards(cards: RegionCard[]) {
-  regionCards.value = cards
-}
-
-// ================================================================ 工作区视图
-// Godot 式工作区切换：概览 / 代码编辑 / 素材中心。画布、运行为后续阶段预留标签。
-export type WorkspaceView = 'overview' | 'code' | 'assets'
-const workspace = ref<WorkspaceView>('overview')
-
-function setWorkspace(v: WorkspaceView) {
-  // 没有打开的文件时，代码工作区无内容可看，忽略切换
-  if (v === 'code' && !tabs.value.length) return
-  workspace.value = v
-}
-
-// ---------------------------------------------------------------- 画布 / 运行：顶层 tab 联动 SceneRuntimePanel
-// 顶层「画布 / 运行」是真实功能入口（场景画布 / 运行游戏），点击打开弹窗并切到对应 tab。
-// 阶段 4：新增「常驻」态——「运行」入口把面板常驻进主区（docked），边玩边改不用来回开关弹窗。
-export type RuntimePanelTab = 'play' | 'scene' | 'timeline'
-const runtimeOpen = ref(false)
-const runtimeTab = ref<RuntimePanelTab>('play')
-// 常驻态：true = 面板停靠在主区（docked），false = 传统弹窗（popup）。与 runtimeOpen 互斥。
-const runtimeResident = ref(false)
-
-function openRuntime(t: RuntimePanelTab) {
-  runtimeTab.value = t
-  runtimeResident.value = false   // 弹窗与常驻互斥，避免弹层叠在常驻面板上
-  runtimeOpen.value = true
-}
-/** 把运行面板常驻进主区（docked），并切到指定 tab。 */
-function openRuntimeResident(t: RuntimePanelTab) {
-  runtimeTab.value = t
-  runtimeOpen.value = false
-  runtimeResident.value = true
-}
-function closeRuntimeResident() {
-  runtimeResident.value = false
-}
-function closeRuntime() {
-  runtimeOpen.value = false
-  runtimeResident.value = false
-}
-
-// ---------------------------------------------------------------- 最近打开的文件
-interface RecentFile { root: string; path: string; name: string }
-const RECENT_KEY = 'docmind:recent-files'
-const RECENT_MAX = 12
-
-function readRecent(): RecentFile[] {
-  try {
-    const v = JSON.parse(window.localStorage.getItem(RECENT_KEY) || '[]')
-    return Array.isArray(v) ? v as RecentFile[] : []
-  } catch {
-    return []
-  }
-}
-
-/** 只列当前项目根下的最近文件，切换项目不串味。 */
-const recentFiles = computed<RecentFile[]>(() => {
-  const root = tree.value?.code_root
-  if (!root) return []
-  return readRecent().filter((r) => r.root === root)
-})
-
-function pushRecent(path: string) {
-  const root = tree.value?.code_root
-  if (!root) return
-  const name = path.split('/').pop() || path
-  const list = readRecent().filter((r) => !(r.root === root && r.path === path))
-  list.unshift({ root, path, name })
-  try {
-    window.localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, RECENT_MAX)))
-  } catch {
-    /* 隐私模式等场景写入失败可忽略 */
-  }
-}
-
-async function openRecent(path: string) {
-  await openPath(path)
-}
+// 最近打开的文件抽到 workbench-recent.ts（tree/openPath 在文件末尾注入）
+const { recentFiles, pushRecent, openRecent } = useRecentFiles()
 
 /** tab.id -> 取当前编辑器文本（由 CodeView 注册，保存时取最新内容） */
 const contentGetters = new Map<number, () => string>()
@@ -370,38 +160,6 @@ const gitActive = computed(() => {
   }
   return false
 })
-
-// ---------------------------------------------------------------- 对话框 API
-export function askConfirm(spec: Omit<ConfirmSpec, 'kind' | 'resolve'>): Promise<boolean> {
-  return new Promise((resolve) => {
-    dialog.value = { ...spec, kind: 'confirm', resolve }
-  })
-}
-export function askPrompt(spec: Omit<PromptSpec, 'kind' | 'resolve'>): Promise<string | null> {
-  return new Promise((resolve) => {
-    dialog.value = { ...spec, kind: 'prompt', resolve }
-  })
-}
-export function askAlert(spec: Omit<AlertSpec, 'kind' | 'resolve'>): Promise<void> {
-  return new Promise((resolve) => {
-    dialog.value = { ...spec, kind: 'alert', resolve: () => resolve() }
-  })
-}
-function askConflict(path: string, serverMtime: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    dialog.value = { kind: 'conflict', path, serverMtime, resolve }
-  })
-}
-
-export function resolveDialog(value?: boolean | string | null) {
-  const d = dialog.value
-  if (!d) return
-  dialog.value = null
-  if (d.kind === 'confirm') d.resolve(value === true)
-  else if (d.kind === 'prompt') d.resolve((value as string | null) ?? null)
-  else if (d.kind === 'alert') d.resolve()
-  else d.resolve(value === true)
-}
 
 // ---------------------------------------------------------------- 树辅助
 function* walkNodes(nodes: TreeNode[]): Generator<TreeNode> {
@@ -519,47 +277,12 @@ function openNode(node: TreeNode) {
   if (node.type === 'file') void openPath(node.path, node.writable)
 }
 
-// ---------------------------------------------------------------- P1：符号跳转 / 地图开关
-
-const symbolMapOpen = ref(false)
-
-function openSymbolMap() {
-  symbolMapOpen.value = true
-}
-function closeSymbolMap() {
-  symbolMapOpen.value = false
-}
-
-const relationGraphOpen = ref(false)
-
-function openRelationGraph() {
-  relationGraphOpen.value = true
-}
-function closeRelationGraph() {
-  relationGraphOpen.value = false
-}
-
-const unityGraphOpen = ref(false)
-
-function openUnityGraph() {
-  unityGraphOpen.value = true
-}
-function closeUnityGraph() {
-  unityGraphOpen.value = false
-}
-
-const flowOpen = ref(false)
-
-function openFlow() {
-  flowOpen.value = true
-}
-function closeFlow() {
-  flowOpen.value = false
-}
-
 /** 打开文件（必要时等待异步加载与 CM 挂载）并把光标定位/滚动到指定行。 */
 async function jumpToLine(path: string, line: number): Promise<void> {
   await openPath(path)
+  // 此时编辑器块必已随首个标签加载；动态取值避免本模块静态引入 CodeMirror（会把
+  // 650KB vendor-codemirror 拖成工作台入口的静态依赖，概览首屏白背）。
+  const { EditorView: EV } = await import('@codemirror/view')
   const target = Math.max(1, line | 0)
   await new Promise<void>((resolve) => {
     const t0 = Date.now()
@@ -575,7 +298,7 @@ async function jumpToLine(path: string, line: number): Promise<void> {
           view.focus()
           view.dispatch({
             selection: { anchor: pos },
-            effects: EditorView.scrollIntoView(pos, { y: 'center' }),
+            effects: EV.scrollIntoView(pos, { y: 'center' }),
           })
           resolve()
           return
@@ -867,628 +590,48 @@ async function deleteNode(node: TreeNode) {
   }
 }
 
-// ---------------------------------------------------------------- 右键菜单
-function openNodeMenu(ev: MouseEvent, node: TreeNode) {
-  const isDir = node.type === 'dir'
-  const items: MenuItem[] = isDir
-    ? [
-        { label: '新建文件', run: () => createAt(node, 'file') },
-        { label: '新建文件夹', run: () => createAt(node, 'folder') },
-        { label: '重命名', separatorBefore: true, run: () => renameNode(node) },
-        { label: '删除', danger: true, run: () => deleteNode(node) },
-      ]
-    : [
-        { label: node.writable ? '打开' : '只读打开', run: () => openNode(node) },
-        {
-          label: '放弃未提交修改',
-          separatorBefore: true,
-          disabled: !(node.tracked === true && node.dirty === true),
-          run: () => revertPath(node.path, node.name),
-        },
-        {
-          label: '历史版本…',
-          disabled: node.tracked !== true,
-          run: () => openHistory(node.path, node.name),
-        },
-        { label: '重命名', separatorBefore: true, run: () => renameNode(node) },
-        { label: '删除', danger: true, run: () => deleteNode(node) },
-      ]
-  ctxMenu.value = { x: ev.clientX, y: ev.clientY, items }
-}
+// 右键菜单抽到 workbench-menu.ts（文件操作回调在文件末尾注入）
+const { ctxMenu, openNodeMenu, openRootMenu, closeContextMenu } = useContextMenu()
 
-function openRootMenu(ev: MouseEvent) {
-  ctxMenu.value = {
-    x: ev.clientX,
-    y: ev.clientY,
-    items: [
-      { label: '新建文件', run: () => createAt(null, 'file') },
-      { label: '新建文件夹', run: () => createAt(null, 'folder') },
-    ],
-  }
-}
-
-function closeContextMenu() {
-  ctxMenu.value = null
-}
-
-// ================================================================ P3：git 回滚 + 历史版本
-/** git 改写磁盘后，把最新内容同步回可能已打开的标签（活动/非活动标签都要换）。 */
-async function resyncTabAfterGit(path: string, mtime: number): Promise<void> {
-  const tab = tabs.value.find((t) => t.path === path)
-  if (!tab) return
-  const f = await fsApi.read(path)
-  tab.mtime = mtime || f.mtime
-  tab.savedContent = f.content
-  tab.tracked = f.tracked
-  tab.gitDirty = f.dirty
-  tab.dirty = false
-  tab.savedAt = Date.now()
-  tab.reindexWarn = null
-  docReplacers.get(tab.id)?.(f.content)
-}
-
-/** P3：放弃单个文件的全部未提交改动（含暂存与编辑器未保存内容），恢复到 HEAD。 */
-async function revertPath(path: string, name?: string): Promise<void> {
-  const label = name ?? path.split('/').pop() ?? path
-  const tab = tabs.value.find((t) => t.path === path)
-  const ok = await askConfirm({
-    title: `放弃「${label}」的未提交修改？`,
-    message: '文件将恢复到上次提交（HEAD）时的内容。',
-    detail: [
-      tab?.dirty ? '· 编辑器里尚未保存的改动也会一并丢弃。' : '',
-      '· 已暂存（git add）的改动同样撤销。',
-      '· 只影响这一个文件，提交历史不受影响。',
-    ].filter(Boolean).join('\n'),
-    confirmText: '回滚',
-    danger: true,
-  })
-  if (!ok) return
-  try {
-    const r = await fsApi.revert(path)
-    if (!r.reverted) {
-      await askAlert({ title: '无需回滚', message: '该文件没有未提交改动，内容与上次提交一致。' })
-      return
-    }
-    await resyncTabAfterGit(path, r.mtime)
-    await loadTree(path)
-  } catch (e) {
-    const err = e as FsApiError
-    await askAlert({
-      title: '回滚失败',
-      message: err.message,
-      detail: err.status === 403
-        ? '契约文件/受保护文件禁止在工作台回滚。'
-        : err.status ? `HTTP ${err.status}` : undefined,
-    })
-  }
-}
-
-export interface HistoryState {
-  path: string
-  name: string
-  loading: boolean
-  error: string | null
-  commits: GitCommit[]
-  selected: GitCommit | null
-  previewLoading: boolean
-  previewError: string | null
-  preview: string
-  restoring: boolean
-}
-const history = ref<HistoryState | null>(null)
-
-async function openHistory(path: string, name?: string): Promise<void> {
-  history.value = {
-    path, name: name ?? path.split('/').pop() ?? path,
-    loading: true, error: null, commits: [],
-    selected: null, previewLoading: false, previewError: null, preview: '', restoring: false,
-  }
-  try {
-    const r = await fsApi.gitlog(path, 50)
-    if (!history.value || history.value.path !== path) return
-    history.value.commits = r.commits
-    history.value.loading = false
-  } catch (e) {
-    const err = e as FsApiError
-    if (history.value) {
-      history.value.loading = false
-      history.value.error = err.message
-    }
-  }
-}
-
-function closeHistory(): void {
-  history.value = null
-}
-
-async function selectHistoryVersion(c: GitCommit): Promise<void> {
-  const h = history.value
-  if (!h || h.restoring) return
-  h.selected = c
-  h.previewLoading = true
-  h.previewError = null
-  try {
-    const r = await fsApi.gitShow(h.path, c.full_hash)
-    // 异步往返期间用户可能点了别的提交/关了弹窗
-    if (history.value !== h || h.selected?.full_hash !== c.full_hash) return
-    h.preview = r.content
-  } catch (e) {
-    const err = e as FsApiError
-    if (history.value === h && h.selected?.full_hash === c.full_hash) {
-      h.previewError = err.message
-    }
-  } finally {
-    if (history.value === h) h.previewLoading = false
-  }
-}
-
-async function restoreSelectedVersion(): Promise<void> {
-  const h = history.value
-  if (!h || !h.selected || h.restoring) return
-  const c = h.selected
-  const ok = await askConfirm({
-    title: '恢复为该历史版本？',
-    message: `「${h.name}」将恢复为提交 ${c.hash} 时的内容。`,
-    detail: '只改写工作区文件，不会改动提交历史；恢复后仍是未提交状态，不满意可再点「回滚」撤销。',
-    confirmText: '恢复此版本',
-    danger: true,
-  })
-  if (!ok) return
-  h.restoring = true
-  try {
-    const r = await fsApi.restoreAt(h.path, c.full_hash)
-    await resyncTabAfterGit(h.path, r.mtime)
-    await loadTree(h.path)
-    history.value = null
-  } catch (e) {
-    const err = e as FsApiError
-    await askAlert({
-      title: err.status === 422 ? '语法校验未通过，恢复已取消' : '恢复历史版本失败',
-      message: err.message,
-      detail: err.status ? `HTTP ${err.status}` : undefined,
-    })
-    h.restoring = false
-  }
-}
+// git 回滚 + 历史版本抽到 workbench-git.ts（tabs/docReplacers/loadTree 在文件末尾注入）
+export type { HistoryState } from './workbench-git'
+const {
+  history, revertPath, openHistory, closeHistory,
+  selectHistoryVersion, restoreSelectedVersion,
+} = useGitHistory()
 
 // ================================================================ P2：选区 AI
-export type AiAction = 'explain' | 'review' | 'rewrite' | 'ask'
+// 选区 AI 面板 / 改写 diff 抽到 workbench-ai.ts（activeTab/contentGetters 在文件末尾注入）
+export type { AiAction, AiSelection, AiOrigin, AiTraceItem, AiTurn, RewriteDiffState } from './workbench-ai'
+const {
+  activeSelection, setSelection,
+  aiPanelOpen, openAiPanel, closeAiPanel, clearTurns,
+  turns, aiStreaming, askComposing, startAskCompose,
+  runAi, stopAi, applyRewrite, copyAnswer,
+  rewriteDiff, openRewriteDiff, closeRewriteDiff, acceptRewriteDiff,
+} = useAiSelection()
 
-/** 编辑器当前非空选区快照（CodeView 上报；坐标为相对视口 fixed）。 */
-export interface AiSelection {
-  path: string
-  name: string
-  lang: string
-  writable: boolean
-  text: string
-  from: number
-  to: number
-  startLine: number
-  endLine: number
-  /** 选区末端锚点视口坐标，用于浮条定位 */
-  x: number
-  y: number
-}
 
-export interface AiOrigin {
-  path: string
-  lang: string
-  startLine: number
-  endLine: number
-  from: number
-  to: number
-  selection: string
-  writable: boolean
-}
+// 分区可视化面板 / 创建分区 / 补齐导出桩 抽到 workbench-regions.ts
+export type { RegionMapState } from './workbench-regions'
+const {
+  regionMapOpen, regionMap, openRegionMap, closeRegionMap, locateRegion,
+  busyRegionKey, createRegion, fillRegionExports,
+} = useRegionMap()
 
-export interface AiTraceItem {
-  type: 'thought' | 'action' | 'observation' | 'reflection' | string
-  text: string
-}
-
-export interface AiTurn {
-  id: number
-  action: AiAction
-  /** 动作标题：解释 / 代码审查 / 改写 / 提问 */
-  title: string
-  /** ask=用户问题；rewrite=改写要求 */
-  instruction: string
-  origin: AiOrigin
-  status: 'streaming' | 'done' | 'error' | 'stopped'
-  /** 流式累积答案（agent: markdown；rewrite: 纯代码） */
-  answer: string
-  trace: AiTraceItem[]
-  replaced: boolean
-  error: string | null
-}
-
-const AI_ACTION_TITLE: Record<AiAction, string> = {
-  explain: '解释选中代码',
-  review: '代码审查',
-  rewrite: '改写选中代码',
-  ask: '就选区提问',
-}
-
-const AI_FENCE_LANG: Record<string, string> = {
-  python: 'python', javascript: 'javascript', typescript: 'typescript',
-  json: 'json', html: 'html', css: 'css', markdown: 'markdown',
-  gdscript: 'gdscript',
-}
-
-const aiPanelOpen = ref(false)
-const turns = ref<AiTurn[]>([])
-const activeSelection = ref<AiSelection | null>(null)
-/** 浮条点「提问」后，面板进入输入态 */
-const askComposing = ref(false)
-let turnSeq = 1
-let aiAbort: AbortController | null = null
-
-const aiStreaming = computed(() => turns.value.some((t) => t.status === 'streaming'))
-
-function setSelection(sel: AiSelection | null) {
-  activeSelection.value = sel
-}
-
-function openAiPanel() {
-  aiPanelOpen.value = true
-}
-function closeAiPanel() {
-  // 关闭面板不丢历史；若仍在流式则一并停止
-  if (aiStreaming.value) stopAi()
-  aiPanelOpen.value = false
-  askComposing.value = false
-}
-function clearTurns() {
-  if (aiStreaming.value) stopAi()
-  turns.value = []
-  askComposing.value = false
-}
-
-function startAskCompose() {
-  askComposing.value = true
-  aiPanelOpen.value = true
-}
-
-/** 去掉模型偶发多包的一层 markdown 围栏（快通道强约束纯代码，这里双保险）。 */
-function stripCodeFence(s: string): string {
-  const t = s.trim()
-  const m = /^```[A-Za-z0-9_+\-.]*\s*\n([\s\S]*?)\n?```$/.exec(t)
-  return m ? m[1].replace(/\s+$/, '') : s.replace(/\s+$/, '')
-}
-
-/** 解释 / Review / 自由提问：把选区与任务拼成一条带检索引导的问题，交给 ReAct agent。 */
-function buildGroundedQuestion(action: AiAction, sel: AiSelection, instruction?: string): string {
-  const fence = '```'
-  const fenceLang = AI_FENCE_LANG[sel.lang] || ''
-  const header =
-    `【选区上下文】文件：${sel.path}（语言：${sel.lang}），` +
-    `我在编辑器中选中了第 ${sel.startLine}–${sel.endLine} 行。\n\n` +
-    `选中的代码：\n${fence}${fenceLang}\n${sel.text}\n${fence}`
-  let task: string
-  if (action === 'explain') {
-    task =
-      '请解释这段选中代码：先用一句话说明它的职责，再分点讲清关键逻辑、输入/输出、状态修改与副作用，' +
-      '必要时指出它依赖的项目内其他类/函数。'
-  } else if (action === 'review') {
-    task =
-      '请对这段选中代码做代码审查：找出潜在 bug、边界条件、空值/异常、性能、可读性与命名问题，' +
-      '按严重程度从高到低排列；每条给出对应行号、问题原因与具体修改建议（可附最小代码）。' +
-      '若没有明显问题，也要明确说明"未发现阻断性问题"并可给出可选改进。'
-  } else {
-    task = (instruction || '').trim()
-  }
-  const tail =
-    '\n\n选中的代码已经完整贴在上面，请优先直接基于它作答，不要逐个浏览或读取文件。' +
-    '只有当确实需要确认选区引用到的外部类/函数/信号的定义或调用点时，才使用 search_code / read_file / grep，' +
-    '且工具调用总计不超过 2 次；拿到必要信息后立即给出最终答案，不要反复检索。' +
-    '引用外部内容时标注文件路径与行号；只围绕选中片段及其直接相关代码，不要臆造不存在的符号。'
-  return `${header}\n\n【任务】${task}${tail}`
-}
-
-async function runAi(action: AiAction, instruction?: string): Promise<void> {
-  const sel = activeSelection.value
-  if (!sel || aiStreaming.value) return
-  if (action === 'rewrite' && !sel.writable) return
-  const origin: AiOrigin = {
-    path: sel.path,
-    lang: sel.lang,
-    startLine: sel.startLine,
-    endLine: sel.endLine,
-    from: sel.from,
-    to: sel.to,
-    selection: sel.text,
-    writable: sel.writable,
-  }
-  const turn: AiTurn = {
-    id: turnSeq++,
-    action,
-    title: AI_ACTION_TITLE[action],
-    instruction: (instruction || '').trim(),
-    origin,
-    status: 'streaming',
-    answer: '',
-    trace: [],
-    replaced: false,
-    error: null,
-  }
-  turns.value = [...turns.value, turn]
-  aiPanelOpen.value = true
-  askComposing.value = false
-
-  const ac = new AbortController()
-  aiAbort = ac
-  const live = () => turns.value.find((t) => t.id === turn.id)
-
-  const onEvent = (ev: { type: string; text?: string }) => {
-    const t = live()
-    if (!t) return
-    if (ev.type === 'token' && ev.text) {
-      // 快通道（rewrite）单轮直出，token 即纯代码，可逐字显示；
-      // agent（解释/Review/提问）每轮 ReAct 都会转发 token（含 Thought/Action 草稿），
-      // 不能直接当答案——只在最终 final 事件渲染干净答案，过程靠 trace + thinking 反馈。
-      if (action === 'rewrite') t.answer += ev.text
-    } else if (ev.type === 'final') {
-      // 两通道最终都以 final 给全文：以它为准（agent 通道由此得到干净答案）
-      if (typeof ev.text === 'string' && ev.text) t.answer = ev.text
-    } else if (ev.type === 'thought' || ev.type === 'action' || ev.type === 'observation' || ev.type === 'reflection') {
-      if (ev.text) t.trace.push({ type: ev.type, text: ev.text })
-    }
-  }
-
-  try {
-    if (action === 'rewrite') {
-      // 文件全文作上下文（超过快通道上限则省略，仅靠选区）
-      const tab = activeTab.value
-      let fileCtx = ''
-      const getter = tab ? contentGetters.get(tab.id) : null
-      if (getter) fileCtx = getter()
-      if (fileCtx.length > 56_000) fileCtx = ''
-      await aiApi.rewriteSelection(
-        {
-          path: sel.path,
-          lang: sel.lang,
-          start_line: sel.startLine,
-          end_line: sel.endLine,
-          selection: sel.text,
-          instruction,
-          file_context: fileCtx,
-          task_id: getActiveTask().id || undefined,
-          task_region: getActiveTask().region || undefined,
-          allowed_paths: getActiveTask().allowedPaths,
-          engine: window.localStorage.getItem('docmind.engine') || 'godot',
-        },
-        { onEvent, signal: ac.signal },
-      )
-    } else {
-      const q = buildGroundedQuestion(action, sel, instruction)
-      await aiApi.askGrounded(q, { onEvent, signal: ac.signal })
-    }
-    const t = live()
-    if (t) t.status = 'done'
-  } catch (e) {
-    const t = live()
-    if (!t) return
-    if ((e as Error).name === 'AbortError') {
-      t.status = t.answer ? 'stopped' : 'stopped'
-    } else {
-      const err = e as FsApiError
-      t.status = 'error'
-      t.error = err.message || '请求失败'
-    }
-  } finally {
-    if (aiAbort === ac) aiAbort = null
-  }
-}
-
-function stopAi() {
-  aiAbort?.abort()
-  aiAbort = null
-}
-
-/** 把改写结果替换回编辑器原选区；返回 null=成功，否则为不可替换原因。 */
-function applyRewrite(turn: AiTurn): string | null {
-  const view = (window as unknown as { __docmind_cm?: EditorView }).__docmind_cm
-  const tab = activeTab.value
-  if (!view) return '编辑器未就绪。'
-  if (!tab || tab.path !== turn.origin.path) return '目标文件不是当前打开的标签，已取消替换。'
-  if (!tab.writable) return '该文件为只读保护，不能替换。'
-  const o = turn.origin
-  // 陈旧坐标护栏：异步往返期间该范围必须仍是原选区文本
-  let current: string
-  try {
-    current = view.state.doc.sliceString(o.from, o.to)
-  } catch {
-    return '选区坐标已失效，请重新选择后再替换。'
-  }
-  if (current !== o.selection) {
-    return '自 AI 生成后该段代码已被改动，为避免覆盖你的修改，请重新选择再替换。'
-  }
-  const code = stripCodeFence(turn.answer)
-  if (!code.trim()) return 'AI 未返回可替换的代码。'
-  view.focus()
-  view.dispatch({
-    changes: { from: o.from, to: o.to, insert: code },
-    selection: { anchor: o.from + code.length },
-  })
-  turn.replaced = true
-  return null
-}
-
-async function copyAnswer(turn: AiTurn): Promise<boolean> {
-  const text = turn.action === 'rewrite' ? stripCodeFence(turn.answer) : turn.answer
-  try {
-    await navigator.clipboard.writeText(text)
-    return true
-  } catch {
-    return false
-  }
-}
-
-// ================================================================ P3：AI 改写字级 diff 预览
-export interface RewriteDiffState {
-  turn: AiTurn
-  name: string
-  /** 改写要求（可能为空） */
-  instruction: string
-  /** 编辑器中的原选区文本 */
-  oldCode: string
-  /** 去围栏后的 AI 结果 */
-  newCode: string
-  startLine: number
-  endLine: number
-}
-
-const rewriteDiff = ref<RewriteDiffState | null>(null)
-
-function openRewriteDiff(turn: AiTurn) {
-  const newCode = stripCodeFence(turn.answer)
-  if (!newCode.trim()) return
-  rewriteDiff.value = {
-    turn,
-    name: turn.origin.path.split('/').pop() || turn.origin.path,
-    instruction: turn.instruction,
-    oldCode: turn.origin.selection,
-    newCode,
-    startLine: turn.origin.startLine,
-    endLine: turn.origin.endLine,
-  }
-}
-
-function closeRewriteDiff() {
-  rewriteDiff.value = null
-}
-
-/** 接受差异：复用 applyRewrite 的陈旧坐标/只读护栏；成功关闭弹窗，失败返回原因。 */
-function acceptRewriteDiff(): string | null {
-  const st = rewriteDiff.value
-  if (!st) return null
-  const reason = applyRewrite(st.turn)
-  if (!reason) rewriteDiff.value = null
-  return reason
-}
-
-// ================================================================ P3：分区可视化
-export interface RegionMapState {
-  loading: boolean
-  error: string | null
-  codeRoot: string
-  regions: RegionInfo[]
-  /** 契约校验结果；独立请求，失败时为 null（不影响分区状态展示） */
-  contracts: ContractsResp | null
-  contractsError: string | null
-}
-
-const regionMapOpen = ref(false)
-const regionMap = ref<RegionMapState>({
-  loading: false,
-  error: null,
-  codeRoot: '',
-  regions: [],
-  contracts: null,
-  contractsError: null,
-})
-
-/** 契约校验独立拉取（HTTP 200+{ok:false} 是正常业务结果），失败只置错误文案。 */
-async function refreshContracts() {
-  try {
-    regionMap.value.contracts = await regionsApi.contracts()
-    regionMap.value.contractsError = null
-  } catch (e) {
-    regionMap.value.contracts = null
-    regionMap.value.contractsError = (e as FsApiError).message || '契约校验不可用。'
-  }
-}
-
-async function openRegionMap() {
-  regionMapOpen.value = true
-  regionMap.value = {
-    loading: true, error: null,
-    codeRoot: regionMap.value.codeRoot,
-    regions: regionMap.value.regions,
-    contracts: regionMap.value.contracts,
-    contractsError: regionMap.value.contractsError,
-  }
-  try {
-    const r = await regionsApi.list()
-    regionMap.value.codeRoot = r.code_root
-    regionMap.value.regions = r.regions
-    regionMap.value.error = null
-  } catch (e) {
-    regionMap.value.error = (e as FsApiError).message || '分区信息加载失败。'
-  }
-  // 契约校验单独失败不拖垮整块面板
-  await refreshContracts()
-  regionMap.value.loading = false
-}
-
-function closeRegionMap() {
-  regionMapOpen.value = false
-}
-
-/** 点击分区卡片：在文件树中选中该分区目录（分区均为顶层目录，默认展开）并关闭面板。 */
-function locateRegion(dir: string) {
-  selectedPath.value = dir
-  regionMapOpen.value = false
-}
-
-/** 正在执行分区写操作的 key（创建/补齐按钮 spinner），同一时刻只允许一个 */
-const busyRegionKey = ref<string | null>(null)
-
-/** missing 卡片一键创建：确认后建目录 + 导出桩/README，并就地刷新分区状态/契约/文件树。 */
-async function createRegion(r: RegionInfo): Promise<boolean> {
-  const detail = [
-    r.exports.length
-      ? `将生成导出接口桩：${r.exports.join('、')}`
-      : '该分区无对外接口文件，仅创建目录与 README.md',
-    '不会改动其它分区，也不会重写 regions.json。',
-  ].join('\n')
-  const confirmed = await askConfirm({
-    title: `创建分区：${r.name}`,
-    message: `将在代码库根目录下创建 ${r.dir}/`,
-    detail,
-    confirmText: '创建',
-  })
-  if (!confirmed) return false
-  busyRegionKey.value = r.key
-  try {
-    const resp = await regionsApi.createRegion(r.key)
-    regionMap.value.regions = resp.regions
-    // 面板保持打开：卡片与 DAG 节点就地翻为「已存在」，契约横幅同步更新
-    await Promise.all([refreshContracts(), loadTree()])
-    if (resp.git_warning) {
-      await askAlert({ title: `分区「${r.name}」已创建`, message: resp.git_warning })
-    }
-    return true
-  } catch (e) {
-    await askAlert({ title: '创建分区失败', message: (e as FsApiError).message || '未知错误。' })
-    return false
-  } finally {
-    busyRegionKey.value = null
-  }
-}
-
-/** 已存在卡片补齐缺失导出桩：确认后只生成缺失文件，就地刷新分区状态/契约/文件树。 */
-async function fillRegionExports(r: RegionInfo): Promise<boolean> {
-  const confirmed = await askConfirm({
-    title: `补齐导出桩：${r.name}`,
-    message: `将在 ${r.dir}/ 下生成缺失的导出接口文件`,
-    detail: [`将生成：${r.missing_exports.join('、')}`, '仅补缺失文件，不改动其它内容，也不会自动提交。'].join('\n'),
-    confirmText: '补齐',
-  })
-  if (!confirmed) return false
-  busyRegionKey.value = r.key
-  try {
-    const resp = await regionsApi.fillExports(r.key)
-    regionMap.value.regions = resp.regions
-    await Promise.all([refreshContracts(), loadTree()])
-    return true
-  } catch (e) {
-    await askAlert({ title: '补齐导出桩失败', message: (e as FsApiError).message || '未知错误。' })
-    return false
-  } finally {
-    busyRegionKey.value = null
-  }
-}
+// 语义域依赖树/跳转能力（函数声明已提升，此处注入一次）
+initSemanticDeps({ tree, revealPath, jumpToLine })
+// 选区 AI 域依赖当前标签与编辑器内容取值器
+initAiDeps({ activeTab, contentGetters })
+// 分区域依赖文件树选中态与刷新
+initRegionDeps({ selectedPath, loadTree })
+// 右键菜单依赖文件操作（函数声明已提升）
+initMenuDeps({ createAt, renameNode, deleteNode, openNode, revertPath, openHistory })
+// git 域依赖标签列表、编辑器内容替换器与文件树刷新
+initGitDeps({ tabs, docReplacers, loadTree })
+// 外壳域依赖标签列表；最近文件依赖树与打开文件
+initRuntimeDeps({ tabs })
+initRecentDeps({ tree, openPath })
 
 export function useWorkbench() {
   return {

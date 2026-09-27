@@ -1,11 +1,12 @@
 <script setup lang="ts">
 // 游戏引擎连接弹层（MCP 服务器：godot-ai stdio / unity / unreal HTTP + godot-ai 插件引导）。
-// 自包含：监听 window 的 docmind:open-engine 事件开关，Teleport 到 body，
+// 自包含：监听事件总线的 docmind:open-engine 事件开关，Teleport 到 body，
 // 折叠态/外部容器裁剪均不影响显示。父组件只负责派发事件，不持有任何状态。
 import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { askConfirm, askAlert } from '../composables/workbench'
 import { mcpApi } from '../api'
 import type { McpServer } from '../api'
+import { appEvents } from '../eventBus'
 
 const open = ref(false)
 const servers = ref<McpServer[]>([])
@@ -40,16 +41,16 @@ watch(open, (v) => {
   if (v) void refreshEnginePop()
 })
 
-function onOpenEvent() { open.value = true }
 function onDocKey(ev: KeyboardEvent) {
   if (ev.key === 'Escape' && open.value) open.value = false
 }
+let offOpenEngine = () => {}
 onMounted(() => {
-  window.addEventListener('docmind:open-engine', onOpenEvent)
+  offOpenEngine = appEvents.on('docmind:open-engine', () => { open.value = true })
   window.addEventListener('keydown', onDocKey)
 })
 onBeforeUnmount(() => {
-  window.removeEventListener('docmind:open-engine', onOpenEvent)
+  offOpenEngine()
   window.removeEventListener('keydown', onDocKey)
 })
 

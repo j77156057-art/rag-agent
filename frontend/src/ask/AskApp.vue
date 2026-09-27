@@ -2,12 +2,12 @@
 // AI 问答首页（/）：用大白话提问，AI 自动检索当前项目代码/资料后流式作答。
 // 与代码工作台共享 api.ts / markdown / 主题变量 / 会话 session.js；
 // 重操作（建索引、分区开发）统一收口到工作台，本页只保留问答必需能力。
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onMounted, ref } from 'vue'
 import {
-  aiApi, modelResidencyApi, projectApi, kbApi, promptApi, harnessApi,
-  getProjectId, setProjectId,
+  aiApi, modelResidencyApi, projectApi, kbApi, promptApi, harnessApi, contextApi,
+  getProjectId, setProjectId, setSessionId, startTabProbe, probeSoleDocMindTab,
 } from '../workbench/api'
-import type { ModelStatus, ProjectInfo, SseEvent } from '../workbench/api'
+import type { ModelStatus, ProjectInfo, SseEvent, SessionInfo, ContextUsage } from '../workbench/api'
 import { demoMode, probeBackend } from '../workbench/composables/demo'
 import { useModelConfig } from '../workbench/composables/useModelConfig'
 import { useWorkflowGate } from '../workbench/composables/useWorkflowGate'
@@ -15,16 +15,18 @@ import { useOrphanWorkflow } from '../workbench/composables/useOrphanWorkflow'
 import { useChatStream } from '../workbench/composables/useChatStream'
 import AskSidebar from './components/AskSidebar.vue'
 import AskMessage from './components/AskMessage.vue'
+import AskHistoryPopover from './components/AskHistoryPopover.vue'
 import FileViewer from './components/FileViewer.vue'
-import ModelSettingsDialog from '../workbench/components/ModelSettingsDialog.vue'
-import type { AskChatMsg, AskTraceItem } from './types'
+// 设置弹窗体积大（117KB）且低频：异步组件 + v-if，打开时才拉取
+const ModelSettingsDialog = defineAsyncComponent(() => import('../workbench/components/ModelSettingsDialog.vue'))
+import type { ChatMsg, ChatTraceItem } from '../workbench/composables/chat-types'
 
 // ---------------- 全局状态 ----------------
 const power = ref<ModelStatus | null>(null)
 const projects = ref<ProjectInfo[]>([])
 const currentPid = ref(getProjectId())
 
-const messages = ref<AskChatMsg[]>([])
+const messages = ref<ChatMsg[]>([])
 let msgSeq = 1
 const sending = ref(false)
 const historyLoading = ref(false)
@@ -44,6 +46,8 @@ const {
 } = useModelConfig({
   onSaved: (info) => {
     void loadPower()
+    usage.value = null
+    void loadAskContext()
     if (info.ollama_status?.guidance) showToast('设置已保存，但 Ollama 状态需要关注')
     else showToast('模型设置已保存')
   },
@@ -83,7 +87,7 @@ const {
   appendWorkflowCard: (wf) => {
     messages.value.push({
       id: msgSeq++, role: 'assistant', text: '', status: 'done',
-      trace: [], reasoning: '', notices: [],
+      trace: [], reasoning: '', notices: [], plan: [],
       workflow: { workflowId: wf.workflow_id, seed: wf },
       startedAt: Date.now(),
     })
@@ -94,6 +98,157 @@ const {
 function sid(): string { return window.DocMindSession.get() }
 function interruptedKey(): string { return `docmind.interrupted:${currentPid.value}:${sid()}` }
 function draftKey(): string { return `docmind.questionDraft:${currentPid.value}` }
+// 本项目「最近一次问答会话」指针：刷新/重开浏览器后自动续接（仅单标签时，防串台）
+function lastSessionKey(): string { return `docmind_session_last:ask:${currentPid.value}` }
+function persistLastSession(id?: string) {
+  try { localStorage.setItem(lastSessionKey(), id || sid()) } catch { /* ignore */ }
+}
+function clearLastSession() {
+  try { localStorage.removeItem(lastSessionKey()) } catch { /* ignore */ }
+}
+
+// ---------------- 问答历史弹层 ----------------
+const historyOpen = ref(false)
+const sessionItems = ref<SessionInfo[]>([])
+const sessionBusy = ref(false)
+const sessionError = ref('')
+
+// ---------------- 上下文窗口用量（与工作台同口径，后端按当前模型真实窗口估算）----------------
+const usage = ref<ContextUsage | null>(null)
+function applyUsage(ev: SseEvent) {
+  if (typeof ev.percent !== 'number' || typeof ev.context_window !== 'number') return
+  usage.value = {
+    used_tokens: ev.used_tokens ?? 0,
+    context_window: ev.context_window,
+    prompt_budget: ev.prompt_budget ?? 0,
+    percent: Math.max(0, Math.min(100, ev.percent)),
+    level: (ev.level as ContextUsage['level']) || 'ok',
+    history_tokens: ev.history_tokens,
+    compact_trigger_tokens: ev.compact_trigger_tokens,
+    compact_percent: typeof ev.compact_percent === 'number'
+      ? Math.max(0, Math.min(100, ev.compact_percent)) : undefined,
+  }
+}
+function fmtTokens(n: number): string {
+  if (n >= 1000) {
+    const k = n / 1000
+    return `${k >= 100 ? Math.round(k) : k.toFixed(k >= 10 ? 0 : 1)}k`
+  }
+  return String(n)
+}
+const usageLabel = computed(() => {
+  const u = usage.value
+  if (!u) return ''
+  return `上下文 ${fmtTokens(u.used_tokens)}/${fmtTokens(u.prompt_budget)}`
+})
+const usageTitle = computed(() => {
+  const u = usage.value
+  if (!u) return ''
+  const tail = u.level === 'high'
+    ? '（历史已达压缩触发线，早期对话会被自动压缩为摘要）'
+    : u.level === 'warn'
+      ? '（历史接近压缩触发线，即将自动压缩早期对话）'
+      : '（历史达到触发线后早期对话会自动压缩为摘要，不影响新问答）'
+  return `上下文已用 ${fmtTokens(u.used_tokens)} / 可用额度 ${fmtTokens(u.prompt_budget)} tokens`
+    + `（模型窗口 ${fmtTokens(u.context_window)}，已预留输出空间）${tail}`
+})
+async function loadAskContext() {
+  if (demoMode.value) return
+  try {
+    const u = await contextApi.get()
+    usage.value = u
+  } catch { /* 未启动/无会话时不显示 */ }
+}
+
+async function refreshSessionList() {
+  if (demoMode.value) return
+  try {
+    const result = await harnessApi.sessions()
+    // 问答页只列 ask- 域会话（工作台 web- 域不混入），后端已按当前项目分桶
+    sessionItems.value = (Array.isArray(result.items) ? result.items : [])
+      .filter(i => String(i.session_id || '').startsWith('ask-'))
+    sessionError.value = ''
+  } catch (e) {
+    sessionError.value = (e as Error).message || '问答历史加载失败'
+  }
+}
+async function openHistory() {
+  historyOpen.value = true
+  await refreshSessionList()
+}
+async function switchAskSession(id: string) {
+  const target = String(id || '').trim()
+  if (!target || target === sid() || sessionBusy.value) { historyOpen.value = false; return }
+  if (messages.value.length
+      && !window.confirm('当前对话会保留在历史中，切换后将显示另一段对话。继续？')) return
+  sessionBusy.value = true
+  sessionError.value = ''
+  stop()
+  try {
+    const claimed = await setSessionId(target)
+    if (!claimed) throw new Error('这个会话正在其他标签页使用，无法切换。')
+    messages.value = []
+    usage.value = null
+    pendingImages.value = []
+    try { sessionStorage.removeItem(interruptedKey()) } catch { /* ignore */ }
+    historyOpen.value = false
+    await restoreHistory()
+    persistLastSession(target)
+    await loadAskContext()
+  } catch (e) {
+    showToast((e as Error).message || '切换会话失败')
+  } finally {
+    sessionBusy.value = false
+  }
+}
+async function deleteAskSession(id: string) {
+  const target = String(id || '').trim()
+  if (!target || sessionBusy.value) return
+  if (target === sid()) {
+    // 删除当前问答：清磁盘 + 开新会话（等同「新会话」并删掉旧记录）
+    if (messages.value.length && !window.confirm('确定清空当前问答吗？此操作不可恢复。')) return
+    sessionBusy.value = true
+    try {
+      try { await harnessApi.deleteSession(target) } catch { /* 文件可能已不存在 */ }
+      clearLastSession()
+      historyOpen.value = false
+      await newSession()
+      await refreshSessionList()
+    } finally {
+      sessionBusy.value = false
+    }
+    return
+  }
+  if (!window.confirm('确定删除这段问答历史？此操作不可恢复。')) return
+  sessionBusy.value = true
+  try {
+    const r = await harnessApi.deleteSession(target)
+    if (r?.ok === false) throw new Error('服务端拒绝删除')
+    await refreshSessionList()
+  } catch (e) {
+    showToast((e as Error).message || '删除失败')
+  } finally {
+    sessionBusy.value = false
+  }
+}
+
+// 单标签且本项目有「最近问答」时自动续接（多标签保守不接，避免两个标签共用会话）
+async function resumeLastSession(): Promise<boolean> {
+  let last = ''
+  try { last = localStorage.getItem(lastSessionKey()) || '' } catch { /* ignore */ }
+  if (!last || last === sid()) return false
+  if (!(await probeSoleDocMindTab())) return false
+  try {
+    const detail = await harnessApi.sessionDetail(last)
+    if (!(detail.turns || []).length) return false
+    const claimed = await setSessionId(last)
+    if (!claimed) return false
+    await restoreHistory()
+    return true
+  } catch {
+    return false
+  }
+}
 
 // ---------------- 通用提示 ----------------
 function showToast(msg: string) {
@@ -137,12 +292,13 @@ async function restoreHistory() {
   try {
     const detail = await harnessApi.sessionDetail(sid())
     if (messages.value.length) return
+    if ((detail.turns || []).length) persistLastSession(detail.session_id || sid())
     for (const turn of detail.turns || []) {
       if (turn.user) {
-        messages.value.push({ id: msgSeq++, role: 'user', text: turn.user, status: 'done', trace: [], reasoning: '', notices: [] })
+        messages.value.push({ id: msgSeq++, role: 'user', text: turn.user, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
       }
       if (turn.assistant) {
-        messages.value.push({ id: msgSeq++, role: 'assistant', text: turn.assistant, status: 'done', trace: [], reasoning: '', notices: [] })
+        messages.value.push({ id: msgSeq++, role: 'assistant', text: turn.assistant, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
       }
     }
     // 中断未恢复的半条回答：只回放内容，不自动重试
@@ -154,11 +310,11 @@ async function restoreHistory() {
         if (dup) {
           sessionStorage.removeItem(interruptedKey())
         } else {
-          messages.value.push({ id: msgSeq++, role: 'user', text: partial.user, status: 'done', trace: [], reasoning: '', notices: [] })
+          messages.value.push({ id: msgSeq++, role: 'user', text: partial.user, status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
           messages.value.push({
             id: msgSeq++, role: 'assistant',
             text: partial.assistant + '\n\n（上次回答已中断，仅恢复已收到的内容，不会自动重试。）',
-            status: 'stopped', trace: [], reasoning: '', notices: [],
+            status: 'stopped', trace: [], reasoning: '', notices: [], plan: [],
           })
         }
       }
@@ -175,6 +331,7 @@ async function newSession() {
   const next = await window.DocMindSession.create()
   if (!next) { showToast('这个会话正在其他标签页使用，无法新建'); return }
   messages.value = []
+  usage.value = null
   pendingImages.value = []
   try { sessionStorage.removeItem(interruptedKey()) } catch { /* ignore */ }
   orphanWf.value = null
@@ -191,9 +348,10 @@ let partial: { user: string; assistant: string } | null = null
 let finalApplied = false
 
 // 流式接收管线与工作台共用 useChatStream：rAF 帧合批、trace 计时、事件分类
-const { drain, appendTrace, dispatch } = useChatStream<AskChatMsg>({
+const { drain, appendTrace, dispatch } = useChatStream<ChatMsg>({
   onFrame: () => followScroll(),
   onStructural: () => followScroll(),
+  onContext: (ev) => applyUsage(ev),
   onFinal: (t, text) => {
     drain()
     if (finalApplied) { t.notices.push(text); return }
@@ -216,13 +374,13 @@ async function send(preset?: string) {
   const q = (preset ?? draft.value).trim()
   if (!q && pendingImages.value.length === 0) return
   const imgs = pendingImages.value.slice()
-  const userMsg: AskChatMsg = {
+  const userMsg: ChatMsg = {
     id: msgSeq++, role: 'user', text: q || '请分析附件图片', status: 'done',
-    images: imgs.map((i) => i.url), trace: [], reasoning: '', notices: [],
+    images: imgs.map((i) => i.url), trace: [], reasoning: '', notices: [], plan: [],
   }
-  const turn: AskChatMsg = {
+  const turn: ChatMsg = {
     id: msgSeq++, role: 'assistant', text: '', status: 'streaming',
-    trace: [], reasoning: '', notices: [],
+    trace: [], reasoning: '', notices: [], plan: [],
     startedAt: Date.now(),
   }
   messages.value.push(userMsg, turn)
@@ -266,6 +424,8 @@ async function send(preset?: string) {
     if (epoch === chatEpoch) {
       turn.status = turn.text ? 'done' : 'stopped'
       if (!turn.text) turn.text = '（没有返回内容）'
+      // 一轮问答落盘后记录「最近会话」：刷新/重开浏览器可自动续接
+      if (turn.status === 'done') persistLastSession()
     }
   } catch (e) {
     drain()
@@ -307,10 +467,10 @@ function stop() {
 }
 
 // ---------------- 演示模式脚本回答 ----------------
-async function demoAnswer(turn: AskChatMsg, q: string) {
+async function demoAnswer(turn: ChatMsg, q: string) {
   const epoch = ++chatEpoch
   const sleep = (ms: number) => new Promise((r) => window.setTimeout(r, ms))
-  const steps: Array<[AskTraceItem['type'], string]> = [
+  const steps: Array<[ChatTraceItem['type'], string]> = [
     ['thought', `分析问题：在示例项目里定位「${q.slice(0, 24) || '该功能'}」相关实现。`],
     ['action', `search_code(query="${q.slice(0, 30) || '伤害逻辑'}", k=8)`],
     ['observation', '命中 8 个切片，最相关：scripts/combat/damage_calc.gd:31 calc_final_damage；scripts/player/player_stats.gd:14 take_damage。'],
@@ -445,8 +605,10 @@ async function onActivate(pid: string) {
     setProjectId(pid)
     currentPid.value = pid
     messages.value = []
-    await window.DocMindSession.create()
     await reloadAll()
+    // 切回某项目时优先续接它最近一次问答（单标签门禁内），没有才开空白新会话
+    const resumed = await resumeLastSession()
+    if (!resumed) await window.DocMindSession.create()
     showToast('已切换项目：' + (r.project?.name || pid))
     await nextTick(scrollToBottom)
   } catch (e) {
@@ -483,6 +645,7 @@ function followScroll() {
 
 // ---------------- 生命周期 ----------------
 onMounted(async () => {
+  startTabProbe()
   try { draft.value = sessionStorage.getItem(draftKey()) || '' } catch { /* ignore */ }
   window.addEventListener('pagehide', () => {
     try { sessionStorage.setItem(draftKey(), draft.value) } catch { /* ignore */ }
@@ -501,6 +664,9 @@ onMounted(async () => {
   try {
     await reloadAll()
     await restoreHistory()
+    // 当前 sid 没有内容（新标签/重开浏览器）时，单标签下自动续接本项目最近问答
+    if (!messages.value.length) await resumeLastSession()
+    await loadAskContext()
     void detectOrphanWorkflow()
   } catch (e) {
     showToast('读取配置失败：' + (e as Error).message)
@@ -531,6 +697,13 @@ onMounted(async () => {
           <span class="topbar-sub">提问 → 自动检索当前项目代码与资料 → 给出带文件行号的答案</span>
         </div>
         <div class="topbar-actions">
+          <span v-if="usageLabel" class="tb-usage"
+                :class="{ 'tb-usage-warn': usage?.level === 'warn', 'tb-usage-high': usage?.level === 'high' }"
+                :title="usageTitle">{{ usageLabel }}</span>
+          <button class="tb-btn" title="查看并恢复本项目的历史问答" @click="openHistory">
+            <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M13 3a9 9 0 108.94 10h-2.02A7 7 0 1113 5v3l4-4-4-4v3zm-1 5v5l4.25 2.52.75-1.23-3.5-2.08V8H12z"/></svg>
+            历史
+          </button>
           <button class="tb-btn" title="清空当前标签页对话并开始新会话" @click="newSession">
             <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M12 5V2L7 6l5 4V7a5 5 0 11-5 5H5a7 7 0 107-7z"/></svg>
             新会话
@@ -540,6 +713,18 @@ onMounted(async () => {
             <svg viewBox="0 0 24 24" width="13" height="13"><path fill="currentColor" d="M8.5 16.5L16 9H9V7h10v10h-2v-7l-7.5 7.5z"/></svg>
           </a>
         </div>
+        <AskHistoryPopover
+          :open="historyOpen"
+          :items="sessionItems"
+          :busy="sessionBusy"
+          :error="sessionError"
+          :current-id="sid()"
+          @close="historyOpen = false"
+          @refresh="refreshSessionList"
+          @create="(async () => { await newSession(); historyOpen = false; await refreshSessionList() })()"
+          @select="switchAskSession"
+          @delete="deleteAskSession"
+        />
       </header>
 
       <div v-if="demoMode" class="banner info">
@@ -650,6 +835,7 @@ onMounted(async () => {
       </transition>
 
       <ModelSettingsDialog
+        v-if="settingsVisible"
         :visible="settingsVisible"
         :config="config"
         @close="settingsVisible = false"
@@ -684,7 +870,15 @@ onMounted(async () => {
 }
 .topbar-title h1 { margin: 0; font-size: 15px; font-weight: 700; }
 .topbar-sub { font-size: 12px; color: var(--text-faint); margin-left: 10px; }
-.topbar-actions { display: flex; gap: 8px; }
+.topbar-actions { display: flex; gap: 8px; align-items: center; }
+.tb-usage {
+  font-size: 11px; color: var(--text-muted, #667085);
+  border: 1px solid var(--border, #e4e8ef); border-radius: 999px;
+  padding: 3px 10px; background: var(--bg-selected, #f1f5fb);
+  white-space: nowrap;
+}
+.tb-usage-warn { color: #b45309; border-color: #fcd34d; background: #fffbeb; }
+.tb-usage-high { color: #b91c1c; border-color: #fca5a5; background: #fef2f2; }
 .tb-btn {
   display: inline-flex;
   align-items: center;

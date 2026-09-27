@@ -4,6 +4,7 @@ import { agentApi, getProjectId, withProject } from '../api'
 import type { VisualFeedbackRecord, WorkflowPreviewArtifact, WorkflowState } from '../api'
 import { blobDataUrl } from '../previewFeedback'
 import type { PreviewFeedbackRequest } from '../previewFeedback'
+import { appEvents } from '../eventBus'
 import { capturePreviewFrame, refreshPreviewFrame } from '../workflowPreviewCapture'
 
 const props = defineProps<{ workflow: WorkflowState }>()
@@ -256,8 +257,8 @@ function dispatchFeedback(item: VisualFeedbackRecord, prompt: string, images: Bl
     })
   }
   const request: PreviewFeedbackRequest = { prompt, images, projectId, onStatus }
-  window.dispatchEvent(new CustomEvent('docmind:send-chat', { detail: request }))
-  window.dispatchEvent(new CustomEvent('docmind:focus-chat'))
+  appEvents.emit('docmind:send-chat', request)
+  appEvents.emit('docmind:focus-chat', {})
 }
 async function sendFeedback(artifact: WorkflowPreviewArtifact) {
   const note = feedbackText.value.trim()

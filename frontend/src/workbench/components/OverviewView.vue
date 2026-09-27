@@ -6,6 +6,7 @@ import { computed, ref } from 'vue'
 import RegionHomeView from './RegionHomeView.vue'
 import { demoMode, demoRegionCards } from '../composables/demo'
 import { useWorkbench } from '../composables/workbench'
+import { appEvents } from '../eventBus'
 
 const {
   tree, regionCards, recentFiles, openRecent, openSymbolMap,
@@ -47,7 +48,7 @@ function restoreChecklist() {
 }
 
 function focusChat(q?: string) {
-  window.dispatchEvent(new CustomEvent('docmind:focus-chat', { detail: { q } }))
+  appEvents.emit('docmind:focus-chat', { q })
 }
 function showSymbolMap() {
   if (demoMode.value) return

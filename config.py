@@ -4,6 +4,7 @@ import contextvars
 import os
 import re
 import sys
+from datetime import datetime
 import tempfile
 
 from dotenv import load_dotenv
@@ -706,6 +707,84 @@ def clear_model_capability_override(provider: str, model: str):
     save_state("model_capability_overrides", dict(_MODEL_CAPABILITY_OVERRIDES))
 
 
+# ---- 已保存的模型预设（命名配置，供一键切换；密钥不在这里，走项目 secrets_store）----
+# 结构：[{id, label, provider, model, base_url, context_window, created_at, updated_at}]
+# context_window 为 0/缺省 = 自动（探测/画像）。预设全局存储（与 llm_provider 等选择一致），
+# API Key 按项目存在 secrets_store 的 "preset:<id>" 槽位。
+def _normalize_preset(raw, preset_id=None):
+    if not isinstance(raw, dict):
+        return None
+    provider = str(raw.get("provider") or "").strip().lower()
+    model = str(raw.get("model") or "").strip()
+    if provider not in PROVIDERS:
+        return None
+    label = str(raw.get("label") or "").strip()[:40]
+    base_url = str(raw.get("base_url") or "").strip().rstrip("/")
+    if provider == "custom":
+        if not base_url.startswith(("http://", "https://")) or not model:
+            return None
+    if not label:
+        label = f"{PROVIDERS[provider].get('label', provider)} · {model or '默认模型'}"
+    try:
+        ctx = int(raw.get("context_window") or 0)
+    except (TypeError, ValueError):
+        ctx = 0
+    if ctx and not (1024 <= ctx <= 2_097_152):
+        ctx = 0
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "id": preset_id or str(raw.get("id") or "").strip()[:48],
+        "label": label,
+        "provider": provider,
+        "model": model,
+        "base_url": base_url if provider == "custom" else "",
+        "context_window": ctx,
+        "created_at": raw.get("created_at") or now,
+        "updated_at": now,
+    }
+
+
+def load_model_presets():
+    """读取全部模型预设；损坏/非法条目静默丢弃，永不抛错。"""
+    raw = load_state("llm_model_presets", [])
+    out = []
+    if isinstance(raw, list):
+        for item in raw:
+            p = _normalize_preset(item)
+            if p and p["id"]:
+                out.append(p)
+    return out
+
+
+def save_model_presets(presets):
+    save_state("llm_model_presets", presets)
+
+
+def upsert_model_preset(preset):
+    """新增/更新一个预设（id 为空时生成）；返回 (preset, error)。"""
+    import uuid
+    pid = str(preset.get("id") or "").strip()[:48] or "mp-" + uuid.uuid4().hex[:12]
+    norm = _normalize_preset(preset, preset_id=pid)
+    if norm is None:
+        return None, "预设参数无效：需要已知厂商与模型名（自定义端点还要合法 http(s) 地址）。"
+    items = load_model_presets()
+    norm["created_at"] = next((x["created_at"] for x in items if x["id"] == pid), norm["created_at"])
+    items = [x for x in items if x["id"] != pid]
+    items.append(norm)
+    items.sort(key=lambda x: x.get("updated_at") or "", reverse=True)
+    save_model_presets(items)
+    return norm, ""
+
+
+def remove_model_preset(preset_id):
+    items = load_model_presets()
+    kept = [x for x in items if x["id"] != preset_id]
+    if len(kept) == len(items):
+        return False
+    save_model_presets(kept)
+    return True
+
+
 def _apply_persisted_state():
     """恢复上次持久化的本地选择（模型 / code_root / GPU 偏好 / 自定义窗口）。
 
@@ -786,6 +865,13 @@ def _apply_persisted_state():
     m = data.get("external_access_mode")
     if m in ("safe", "high") and "external_access_mode" not in _RUNTIME:
         _RUNTIME["external_access_mode"] = m
+    # 模型选择模式：fixed=固定模型（默认）；auto=每轮按任务复杂度在本地/云端预设间自动路由
+    mode = data.get("llm_mode")
+    if mode in ("fixed", "auto") and "llm_mode" not in _RUNTIME:
+        _RUNTIME["llm_mode"] = mode
+    acp = data.get("auto_cloud_preset_id")
+    if isinstance(acp, str) and acp.strip() and "auto_cloud_preset_id" not in _RUNTIME:
+        _RUNTIME["auto_cloud_preset_id"] = acp.strip()
 
     # 网络搜索 / URL 获取配置恢复
     _apply_web_search_state(data)
