@@ -157,7 +157,8 @@ def _write(session_id, data, project_id=None) -> bool:
 
 def history(session_id, project_id=None):
     """返回给 Agent 回放的 turns 列表（list[{user, assistant}]）。"""
-    return [{"user": t.get("user", ""), "assistant": t.get("assistant", "")}
+    return [{"user": t.get("user", ""), "assistant": t.get("assistant", ""),
+             **({"resume_context": str(t["resume_context"])[-6000:]} if "resume_context" in t else {})}
             for t in load(session_id, project_id).get("turns", []) if isinstance(t, dict)]
 
 
@@ -174,7 +175,8 @@ def save(session_id, turns, summary=None, project_id=None) -> bool:
             data["summary"] = summary
         data["turns"] = [
             {"user": t.get("user", ""), "assistant": t.get("assistant", ""),
-             "ts": t.get("ts") or datetime.now().isoformat(timespec="seconds")}
+             "ts": t.get("ts") or datetime.now().isoformat(timespec="seconds"),
+             **({"resume_context": str(t["resume_context"])[-6000:]} if "resume_context" in t else {})}
             for t in (turns or []) if isinstance(t, dict)
         ]
         return _write(session_id, data, project_id)
@@ -196,6 +198,7 @@ def _est_tokens(text: str) -> int:
 def _turns_tokens(turns, counter) -> int:
     text = "\n".join(
         (t.get("user", "") or "") + "\n" + (t.get("assistant", "") or "")
+        + ("\n" + str(t["resume_context"]) if t.get("resume_context") else "")
         for t in (turns or []) if isinstance(t, dict)
     )
     return int(counter(text) or 0)

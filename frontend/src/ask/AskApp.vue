@@ -422,7 +422,7 @@ async function send(preset?: string) {
     })
     drain()
     if (epoch === chatEpoch) {
-      turn.status = turn.text ? 'done' : 'stopped'
+      if (turn.status !== 'error') turn.status = turn.text ? 'done' : 'stopped'
       if (!turn.text) turn.text = '（没有返回内容）'
       // 一轮问答落盘后记录「最近会话」：刷新/重开浏览器可自动续接
       if (turn.status === 'done') persistLastSession()

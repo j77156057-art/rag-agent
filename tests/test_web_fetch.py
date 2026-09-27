@@ -45,7 +45,7 @@ class WebSearchFailoverTests(unittest.TestCase):
                 patch("tools._bing_search", return_value=bing_result) as mb:
             out = tools.web_search("今天新闻")
         self.assertEqual(out, bing_result)
-        mb.assert_called_once_with("今天新闻")
+        mb.assert_called_once_with(tools._search_recency_query("今天新闻").split(" after:")[0])
 
     def test_ddg_success_can_merge_parallel_backends(self):
         ddg_result = "· DDG 标题\n  摘要\n  https://ddg.test/x"

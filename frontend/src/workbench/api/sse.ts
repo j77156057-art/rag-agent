@@ -8,6 +8,8 @@ export interface SseEvent {
     | 'reasoning' | 'notice' | 'plan' | 'route' | 'final' | 'done'
     | 'context' | string
   text?: string
+  status?: 'error' | string
+  error_kind?: string
   steps?: string[]
   /** type=context 时的上下文窗口用量 */
   used_tokens?: number

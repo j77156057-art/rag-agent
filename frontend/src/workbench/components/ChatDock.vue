@@ -326,10 +326,11 @@ async function send(text?: string, attached?: File[], onAccepted?: () => void): 
     drain()
     const t = live()
     if (t) {
-      t.status = t.text ? 'done' : 'stopped'
+      if (t.status !== 'error') t.status = t.text ? 'done' : 'stopped'
       t.finishedAt = Date.now()
       finishLiveMd(t.id, () => answerHtml(t))
-      finished = !!t.text
+      finished = !!t.text && t.status !== 'error'
+      if (t.status === 'error') t.recoverable = true
     }
   } catch (e) {
     drain()

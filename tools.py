@@ -1207,6 +1207,11 @@ _SEARCH_EMPTY_MARKERS = ("搜索失败", "搜索未返回结果")
 def _search_recency_query(q: str) -> str:
     """默认偏好近一年结果：给查询追加 after:<去年>；可用 env WEB_SEARCH_PREFER_RECENT=0 关闭，
     或查询已含 after:/before:/年份范围时跳过，避免重复拼接。"""
+    if re.search(r"今天|今日|明天", q) and not re.search(r"\d{4}[-年/]\d{1,2}", q):
+        day = datetime.datetime.now().astimezone().date()
+        if "明天" in q:
+            day += datetime.timedelta(days=1)
+        q = f"{q} {day.isoformat()}"
     if os.getenv("WEB_SEARCH_PREFER_RECENT", "1").strip().lower() in ("0", "false", "no"):
         return q
     if re.search(r"\b(after|before):", q) or re.search(r"\b\d{4}\.\.\d{4}\b", q):
@@ -1366,6 +1371,54 @@ def _json_request(url, *, headers=None, timeout=15):
     req = urllib.request.Request(url, headers=headers or {"User-Agent": "DocMind/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def web_weather(arg):
+    """从结构化天气 API 读取当前日期的预报；城市和日期不能凭搜索结果猜测。"""
+    try:
+        data = json.loads(str(arg or ""))
+    except (TypeError, ValueError):
+        data = {"city": str(arg or "").strip()}
+    if not isinstance(data, dict):
+        return "天气查询失败：输入应为城市名或包含 city 的 JSON。"
+    city = str(data.get("city") or "").strip()
+    if not city or city in {"今天", "今天天气", "天气", "当地", "当前位置"}:
+        return "天气查询失败：需要用户明确的城市，不能从搜索结果或 IP 猜测所在地。"
+    today = datetime.datetime.now().astimezone().date().isoformat()
+    try:
+        geo_url = "https://geocoding-api.open-meteo.com/v1/search?" + urllib.parse.urlencode(
+            {"name": city, "count": 5, "language": "zh", "format": "json"})
+        locations = (_json_request(geo_url).get("results") or [])
+        if not locations:
+            return f"天气查询失败：未找到城市 {city}，请补充省份、国家或英文城市名。"
+        country = str(data.get("country_code") or "").upper()
+        if country:
+            locations = [item for item in locations if item.get("country_code") == country]
+        # 同名城市不能自动挑第一条。
+        if len(locations) != 1:
+            options = [{k: item.get(k) for k in ("name", "admin1", "country", "country_code")}
+                       for item in locations]
+            return "天气查询需要明确地点：" + json.dumps(options, ensure_ascii=False)
+        place = locations[0]
+        forecast_url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode({
+            "latitude": place["latitude"], "longitude": place["longitude"], "timezone": "auto",
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m",
+            "start_date": today, "end_date": today,
+        })
+        forecast = _json_request(forecast_url)
+        daily = forecast.get("daily") or {}
+        if daily.get("time") != [today]:
+            return "天气查询失败：返回数据的日期与今天不一致，不能当作今日天气。"
+        return json.dumps({"city": place.get("name"), "region": place.get("admin1"),
+                           "country": place.get("country"), "date": today,
+                           "timezone": forecast.get("timezone"), "current": forecast.get("current"),
+                           "current_units": forecast.get("current_units"), "daily": daily,
+                           "daily_units": forecast.get("daily_units"), "source": forecast_url,
+                           "note": "Open-Meteo 模型预报，非气象站实测；current 的时间单独核对。"},
+                          ensure_ascii=False)
+    except Exception as exc:
+        return f"天气查询失败：{type(exc).__name__}，可改用带明确城市及日期的权威天气来源核对。"
 
 
 def _github_search(q):
@@ -5482,6 +5535,7 @@ def recall_experience(arg=""):
 
 
 TOOLS = {
+    "web_weather": {"description": "查询今日结构化天气。先确认用户城市，禁止用搜索结果或 IP 猜位置。输入城市名或 JSON {\"city\":\"城市名\",\"country_code\":\"CN\"}；同名地点会要求澄清，返回有效日期、地点、天气字段、单位及来源 URL。失败可改用带城市和当前日期的权威来源，不得编造实时数据。", "func": web_weather},
     "web_research": {"description": "联网研究：先搜索，再读取多个公开网页正文（默认最多 5 个，可配置），返回来源和证据。适合教程、GitHub、引擎文档和需要最新资料的问题。推荐采用多轮策略：第一轮发现候选；看到候选后用 web_search_batch 并行查评价、口碑、教程或做法；若评价一般或证据不足，排除已见 URL/标题后提交下一批候选，最后再对关键来源调用 web_fetch。输入研究主题。", "func": web_research},
     "web_fetch": {"description": "读取公开网页正文并返回来源、标题和清理后的文本。输入完整 http/https URL。联网研究时先 web_search，再对关键来源调用。", "func": web_fetch},
     "web_subtitles": {"description": "读取公开 B 站视频字幕。输入包含 BV 号或 av 号的完整视频 URL；没有公开字幕、需要登录或被风控时返回明确原因。", "func": web_subtitles},

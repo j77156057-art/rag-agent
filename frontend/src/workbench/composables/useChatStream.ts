@@ -17,6 +17,8 @@ export interface ChatStreamTurn {
   trace: ChatTraceItem[]
   plan?: string[]
   workflow?: ChatWorkflowRef
+  status?: string
+  error?: string
 }
 
 export interface ChatStreamHooks<T extends ChatStreamTurn> {
@@ -98,6 +100,10 @@ export function useChatStream<T extends ChatStreamTurn>(hooks: ChatStreamHooks<T
     } else if (ev.type === 'final' && typeof ev.text === 'string' && ev.text) {
       buffers.delete(turn.id)
       hooks.onFinal?.(turn, ev.text)
+      if (ev.status === 'error') {
+        turn.status = 'error'
+        turn.error = ev.error_kind || '请求失败'
+      }
     } else if (ev.type === 'reasoning' && typeof ev.text === 'string') {
       bufferFor(turn).reasoning += ev.text
       hooks.onReasoning?.(turn)

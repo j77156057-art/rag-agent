@@ -288,7 +288,7 @@ class ThinkingResolutionTests(unittest.TestCase):
 class OllamaPayloadTests(unittest.TestCase):
     """ollama 原生 /api/chat：think 字段恒携带、num_ctx 按画像封顶、输出预算给满。"""
 
-    def _capture(self, model, thinking_on, messages=None, output_limit=None):
+    def _capture(self, model, thinking_on, messages=None, output_limit=None, reject_image=False):
         import json as _json
         from unittest.mock import patch
         from llm import LLMClient
@@ -304,6 +304,11 @@ class OllamaPayloadTests(unittest.TestCase):
 
         class _Opener:
             def open(self, req, timeout=None):
+                if reject_image and "payload" not in captured:
+                    import io
+                    from urllib.error import HTTPError
+                    captured["payload"] = _json.loads(req.data.decode("utf-8"))
+                    raise HTTPError(req.full_url, 400, "Bad Request", {}, io.BytesIO(b'{"error":"image input rejected"}'))
                 captured["payload"] = _json.loads(req.data.decode("utf-8"))
                 return _Resp()
 
@@ -314,6 +319,15 @@ class OllamaPayloadTests(unittest.TestCase):
                 messages if messages is not None else [{"role": "user", "content": "hi"}],
                 stream=False, thinking_on=thinking_on, max_output_tokens=output_limit)
         return captured["payload"], out
+
+    def test_image_rejection_retries_text_once_without_losing_evidence(self):
+        messages = [{"role": "user", "content": "source evidence", "images": ["data:image/png;base64,aGVsbG8="]}]
+        payload, out = self._capture("qwen3:8b", False, messages, reject_image=True)
+        self.assertEqual(out, "ok")
+        self.assertNotIn("images", payload["messages"][0])
+        self.assertIn("source evidence", payload["messages"][0]["content"])
+        self.assertIn("图片被模型服务拒绝", payload["messages"][0]["content"])
+        self.assertIn("images", messages[0])
 
     def test_request_output_limit_preserves_context_window(self):
         baseline, _ = self._capture("qwen3:8b", True)

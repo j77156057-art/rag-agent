@@ -37,7 +37,7 @@ _PROJECT_AUDIT = re.compile(
 )
 _KNOWLEDGE = re.compile(r"知识库|文档|资料|规范|手册|说明书|上传|教程|定义|讲了什么", re.I)
 _WEB = re.compile(
-    r"联网|网上|最新|近期|今天|当前版本|搜索|github|b站|哔哩哔哩|官方文档|下载地址|"
+    r"联网|网上|最新|近期|今天|天气|气温|当前版本|搜索|github|b站|哔哩哔哩|官方文档|下载地址|"
     r"\b(?:latest|current|news|release|github|bilibili)\b",
     re.I,
 )

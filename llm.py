@@ -866,6 +866,26 @@ class LLMClient:
         _t = self._OLLAMA_TIMEOUT if timeout is None else float(timeout)
         try:
             resp = opener.open(req, timeout=_t)
+        except urllib.error.HTTPError as exc:
+            # 部分本地模型/端点不接受图片。仅在服务端明确报告图片错误时
+            # 退回文本一次，不重新执行工具，也不把未读到的图片当作证据。
+            body = exc.read(4096).decode("utf-8", "replace")
+            image_error = any(word in body.lower() for word in ("image", "base64", "vision", "multimodal"))
+            if exc.code == 400 and image_error and any(m.get("images") for m in messages):
+                text_messages = []
+                for message in messages:
+                    copy = dict(message)
+                    if copy.pop("images", None):
+                        copy["content"] = str(copy.get("content") or "") + "\n（图片被模型服务拒绝，本次只能核对文本；不能声称看过图片。）"
+                    text_messages.append(copy)
+                _gpu_release("ollama")
+                return self._ollama_chat(
+                    text_messages, stream=stream, temperature=temperature, timeout=timeout,
+                    usage_sink=usage_sink, tool_sink=tool_sink, tools=tools,
+                    thinking_on=thinking_on, reasoning_sink=reasoning_sink,
+                    cancel_event=cancel_event, max_output_tokens=max_output_tokens)
+            _gpu_release("ollama")
+            raise RuntimeError(f"Ollama 请求被拒绝（HTTP {exc.code}），需核对输入或模型服务配置。") from exc
         except Exception:
             _gpu_release("ollama")
             raise

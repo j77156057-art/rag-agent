@@ -1934,7 +1934,7 @@ async def chat(
                 dev_capture_bug(f"title: Agent 对话异常\nerror: {err_msg}\ntraceback: {__import__('traceback').format_exc()}")
             except Exception:
                 pass
-            yield f"data: {json.dumps({'type':'final','text':f'模型无响应：{err_msg[:300]}。请到「⚙ 模型设置」换一个能加载的模型再试。'}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type':'final','status':'error','text':'本轮请求失败，未完成。已保留问题与工具现场，可继续重试；请查看具体错误后处理，不能仅凭此错误判断需要换模型。','error_kind':type(e).__name__}, ensure_ascii=False)}\n\n"
         finally:
             # 客户端断连时 Starlette 关闭本生成器（抛 GeneratorExit）：显式关闭内层
             # agent 生成器，触发其 aborted 分支 —— 落一条 trace 并停止后续工具调用。

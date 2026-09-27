@@ -1,0 +1,80 @@
+import datetime
+import unittest
+from unittest.mock import patch
+
+import agent
+import tools
+from tests.test_agent_trace import _FakeLLM, _IsoBase
+
+
+class WeatherTests(_IsoBase):
+    def test_missing_city_clarifies_without_model_or_search(self):
+        llm = _FakeLLM(["Final Answer: 不应调用"])
+        a = agent.Agent(llm=llm, session_id="weather")
+        events = list(a.run("查一下今天的天气怎么样", web_enabled=True))
+        self.assertEqual(llm.i, 0)
+        self.assertTrue(events[0]["clarification_required"])
+        restored = agent.Agent(llm=llm, session_id="weather")
+        self.assertEqual(restored.history[0]["user"], "查一下今天的天气怎么样")
+
+    def test_explicit_city_is_not_blocked(self):
+        self.assertFalse(agent._missing_weather_location("查一下北海今天的天气", []))
+        self.assertFalse(agent._missing_weather_location("今天天气", [{"user": "我在广西北海"}]))
+        self.assertTrue(agent._missing_weather_location("今天天气", [{"user": "你好", "assistant": "你可能在东莞"}]))
+
+    def test_forecast_date_is_checked(self):
+        place = {"name": "北海", "country_code": "CN", "latitude": 21.48, "longitude": 109.12}
+        with patch.object(tools, "_json_request", side_effect=[{"results": [place]}, {"daily": {"time": ["2024-02-22"]}}]):
+            self.assertIn("日期与今天不一致", tools.web_weather('北海'))
+
+    def test_forecast_returns_dated_city_evidence(self):
+        today = datetime.datetime.now().astimezone().date().isoformat()
+        place = {"name": "北海", "country_code": "CN", "latitude": 21.48, "longitude": 109.12}
+        with patch.object(tools, "_json_request", side_effect=[{"results": [place]}, {"daily": {"time": [today]}}]) as request:
+            out = tools.web_weather('北海')
+        self.assertIn(today, out)
+        self.assertIn("北海", out)
+        self.assertIn("start_date=" + today, request.call_args.args[0])
+
+    def test_ambiguous_city_requires_confirmation(self):
+        with patch.object(tools, "_json_request", return_value={"results": [{"name": "同名城"}, {"name": "同名城"}]}) as request:
+            self.assertIn("需要明确地点", tools.web_weather("同名城"))
+        self.assertEqual(request.call_count, 1)
+
+    def test_failure_restores_tool_evidence_on_continue(self):
+        a = agent.Agent(llm=_FakeLLM(["Final Answer: ok"]), session_id="recovery")
+        def broken(*args, **kwargs):
+            yield {"type": "action", "text": "web_search(北海天气)"}
+            yield {"type": "observation", "text": "来源：https://example.test/beihai\n尚未核对日期"}
+            raise RuntimeError("rejected")
+        with patch.object(a, "_run", side_effect=broken):
+            with self.assertRaises(RuntimeError):
+                list(a.run("查北海天气"))
+        restored = agent.Agent(llm=a.llm, session_id="recovery")
+        messages = restored._build_messages("继续")
+        self.assertTrue(any("example.test/beihai" in m["content"] for m in messages))
+        self.assertEqual(a.last_turn_record["outcome"], "failed")
+
+    def test_api_failure_is_marked_as_error_and_does_not_suggest_changing_model(self):
+        import json
+        import api
+        from starlette.testclient import TestClient
+        from types import SimpleNamespace
+        fake = SimpleNamespace(llm=_FakeLLM([]))
+        def fail(*args, **kwargs):
+            raise RuntimeError("backend failed")
+        fake.run = fail
+        with patch.object(api, "_agent_for", return_value=fake), \
+                patch.object(api, "check_ollama", return_value={"reachable": True}), \
+                patch.object(api, "dev_capture_bug", return_value=""), \
+                patch.object(api, "route_for", return_value={"route": "local", "complexity": 0, "reason": "test"}):
+            with TestClient(api.app) as client:
+                response = client.post("/api/chat", data={"question": "查北海天气"})
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+        final = next(item for item in events if item["type"] == "final")
+        self.assertEqual(final["status"], "error")
+        self.assertNotIn("换一个能加载", final["text"])
+
+
+if __name__ == "__main__":
+    unittest.main()
