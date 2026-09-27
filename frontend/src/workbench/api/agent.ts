@@ -28,6 +28,8 @@ export interface PreviewAdapterInfo {
   id: string; label?: string; kind?: string; evidence?: string
   capture_adapter?: string; available?: boolean; requires_connector?: boolean
   connector_key?: string; transport?: string; project_scoped?: boolean
+  generated?: boolean; status?: 'pending' | 'active' | 'rejected'
+  refresh_tool?: string; connector_hint?: string; validation?: string[]
 }
 export interface PreviewAdapterCatalogResp { ok?: boolean; adapters?: PreviewAdapterInfo[]; count?: number; error?: string }
 export interface PreviewAdapterConfigResp { ok?: boolean; profile?: ProjectProfile; error?: string }
@@ -333,6 +335,9 @@ export const agentApi = {
   },
   configurePreviewAdapters(adapters: string[]): Promise<PreviewAdapterConfigResp> {
     return rawJson('/api/agent/preview-adapters/config', { adapters })
+  },
+  decidePreviewAdapter(id: string, approved: boolean): Promise<{ ok?: boolean; manifest?: PreviewAdapterInfo; error?: string }> {
+    return rawJson(`/api/agent/preview-adapters/${encodeURIComponent(id)}/decision`, { approved })
   },
   workflowAcceptanceReport(id: string): Promise<{ ok?: boolean; report?: WorkflowAcceptanceReport; error?: string }> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/acceptance-report`)

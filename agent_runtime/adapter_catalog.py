@@ -52,6 +52,9 @@ def catalog(project_root: str | Path = "", *, connectors: list[dict[str, Any]] |
             "requires_connector": bool(manifest.get("connector_hint")),
             "project_scoped": True, "status": manifest["status"],
             "generated": True,
+            "refresh_tool": manifest.get("refresh_tool") or "",
+            "connector_hint": manifest.get("connector_hint") or "",
+            "validation": manifest.get("validation") or [],
         })
     return {"project_root": root, "adapters": rows, "count": len(rows)}
 

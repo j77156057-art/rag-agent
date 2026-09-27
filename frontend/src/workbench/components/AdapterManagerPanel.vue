@@ -12,6 +12,7 @@ const selected = ref<string[]>([])
 const loading = ref(false)
 const error = ref('')
 const rollbackBusy = ref(false)
+const decisionBusy = ref('')
 
 const changedFiles = computed(() => report.value?.preview?.changes?.files || props.workflow.preview?.changes?.files || [])
 const evaluation = computed(() => report.value?.evaluation)
@@ -48,6 +49,23 @@ async function saveConfig() {
   else emit('activity')
 }
 
+async function decideAdapter(item: PreviewAdapterInfo, approved: boolean) {
+  if (decisionBusy.value || !item.generated || item.status !== 'pending') return
+  if (approved && !window.confirm(`确认激活适配器“${item.label || item.id}”？`)) return
+  decisionBusy.value = item.id
+  error.value = ''
+  try {
+    const result = await agentApi.decidePreviewAdapter(item.id, approved)
+    if (!result.ok) throw new Error(result.error || '适配器审批失败')
+    await load()
+    emit('activity')
+  } catch (cause) {
+    error.value = (cause as Error).message || '适配器审批失败'
+  } finally {
+    decisionBusy.value = ''
+  }
+}
+
 function togglePath(path: string) {
   selected.value = selected.value.includes(path)
     ? selected.value.filter(item => item !== path)
@@ -79,9 +97,13 @@ onMounted(() => { void load() })
     <p v-if="error" class="adapter-error">{{ error }}</p>
     <div class="adapter-grid">
       <div v-for="item in adapters" :key="item.id" class="adapter-item">
-        <input v-if="!item.requires_connector" type="checkbox" :checked="configured.includes(item.id)" @change="toggleAdapter(item.id)" />
-        <div><b>{{ item.label || item.id }}</b><small>{{ item.evidence }}</small></div>
-        <span :class="item.available ? 'on' : 'off'">{{ item.available ? '可用' : '未连接' }}</span>
+        <input v-if="!item.requires_connector && (!item.generated || item.status === 'active')" type="checkbox" :checked="configured.includes(item.id)" @change="toggleAdapter(item.id)" />
+        <div><b>{{ item.label || item.id }}</b><small>{{ item.evidence }}</small><small v-if="item.generated && item.refresh_tool">刷新：{{ item.refresh_tool }}</small><small v-if="item.generated && item.validation?.length">验收：{{ item.validation.join('；') }}</small></div>
+        <span :class="item.available ? 'on' : 'off'">{{ item.generated ? (item.status === 'pending' ? '待确认' : item.status === 'rejected' ? '已拒绝' : '已激活') : (item.available ? '可用' : '未连接') }}</span>
+        <div v-if="item.generated && item.status === 'pending'" class="adapter-actions">
+          <button type="button" :disabled="!!decisionBusy" @click="decideAdapter(item, true)">{{ decisionBusy === item.id ? '处理中…' : '激活' }}</button>
+          <button type="button" :disabled="!!decisionBusy" @click="decideAdapter(item, false)">拒绝</button>
+        </div>
       </div>
     </div>
     <button type="button" class="adapter-save" @click="saveConfig">保存项目预览配置</button>

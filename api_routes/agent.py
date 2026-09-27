@@ -18,7 +18,9 @@ from agent_runtime.retrieval_eval import compare_reports, evaluate_modes
 from agent_runtime.workflow_eval import DEFAULT_DATASET_NAME, dataset_cases
 from agent_runtime.tool_install import ToolInstallError, ToolInstallManager
 from agent_runtime.project_profile import load_profile
-from agent_runtime.adapter_catalog import catalog as adapter_catalog, configure as configure_adapters
+from agent_runtime.adapter_catalog import (approve_generated as approve_generated_adapter,
+                                            catalog as adapter_catalog,
+                                            configure as configure_adapters)
 from agent_runtime.local_runtime import effective_subagent_limit, resource_profile
 from config import COLLECTION_NAME, LLM_MODEL, LLM_PROVIDER, PROVIDERS, get_runtime
 from game_workbench import approval as record_user_approval
@@ -115,6 +117,10 @@ class WorkflowProjectRollbackReq(BaseModel):
 
 class PreviewAdapterConfigReq(BaseModel):
     adapters: list[str] = []
+
+
+class PreviewAdapterDecisionReq(BaseModel):
+    approved: bool = False
 
 
 class WorkflowInterruptReq(BaseModel):
@@ -839,6 +845,19 @@ def build_router(ctx) -> APIRouter:
             if not root:
                 return {"ok": False, "error": "未配置代码库"}
             return {"ok": True, "profile": configure_adapters(root, req.adapters)}
+        except (OSError, ValueError, TypeError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @router.post("/preview-adapters/{adapter_id}/decision")
+    async def preview_adapter_decision(adapter_id: str, req: PreviewAdapterDecisionReq):
+        try:
+            root = ctx._project_root_or_error()
+            if not root:
+                return {"ok": False, "error": "未配置代码库"}
+            decision = record_user_approval(root, "preview_adapter", "workbench-user",
+                                            approved=req.approved, target=adapter_id)
+            manifest = approve_generated_adapter(root, adapter_id, req.approved)
+            return {"ok": True, "manifest": manifest, "approval": decision}
         except (OSError, ValueError, TypeError) as exc:
             return {"ok": False, "error": str(exc)}
 
