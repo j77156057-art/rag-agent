@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import difflib
+import hashlib
 from typing import Any
 
 from .preview_adapters import preview_adapters
@@ -16,6 +18,38 @@ _DESCRIPTIONS = {
     "eda": ("EDA 设计", "原理图、PCB 和 ERC/DRC 证据", "eda_mcp_or_editor_adapter"),
     "native": ("桌面软件", "原生窗口和专用软件状态", "native_window_adapter"),
 }
+
+
+def _code_review(project_root: str | Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Return bounded source evidence for the human approval card."""
+    runtime = str(manifest.get("runtime") or "").strip().lower()
+    if runtime not in {"python", "node"}:
+        return {}
+    try:
+        from .generated_adapter_runtime import _paths, _source_path
+        paths = _paths(project_root, manifest.get("id"))
+        active_path = _source_path(paths["active"], runtime)
+        pending_path = _source_path(paths["pending"], runtime)
+        active = active_path.read_text(encoding="utf-8") if active_path.is_file() else ""
+        pending = pending_path.read_text(encoding="utf-8") if pending_path.is_file() else ""
+    except (OSError, ValueError, TypeError):
+        return {"code_review": "unavailable"}
+    candidate = pending or active
+    if not candidate:
+        return {"code_review": "missing"}
+    diff = "".join(difflib.unified_diff(
+        active.splitlines(keepends=True), pending.splitlines(keepends=True),
+        fromfile="active/adapter.%s" % runtime, tofile="pending/adapter.%s" % runtime,
+    )) if pending and active else ""
+    return {
+        "code_review": "pending" if pending else "active",
+        "source_preview": candidate[:12000],
+        "source_truncated": len(candidate) > 12000,
+        "source_sha256": hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
+        "active_sha256": hashlib.sha256(active.encode("utf-8")).hexdigest() if active else "",
+        "code_diff": diff[:16000],
+        "code_diff_truncated": len(diff) > 16000,
+    }
 
 
 def catalog(project_root: str | Path = "", *, connectors: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -44,7 +78,7 @@ def catalog(project_root: str | Path = "", *, connectors: list[dict[str, Any]] |
             "transport": str(connector.get("transport") or "")[:40],
         })
     for manifest in generated(project_root):
-        rows.append({
+        row = {
             "id": manifest["id"], "label": manifest["label"],
             "kind": manifest["domain"], "evidence": manifest["evidence"],
             "capture_adapter": manifest["capture_adapter"],
@@ -59,7 +93,9 @@ def catalog(project_root: str | Path = "", *, connectors: list[dict[str, Any]] |
             "entrypoint": manifest.get("entrypoint") or "adapt",
             "module_path": manifest.get("module_path") or "",
             "source_sha256": manifest.get("source_sha256") or "",
-        })
+        }
+        row.update(_code_review(project_root, manifest))
+        rows.append(row)
     return {"project_root": root, "adapters": rows, "count": len(rows)}
 
 

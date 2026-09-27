@@ -784,9 +784,10 @@ class ContextRouter:
         if wants_adapter:
             route_lines.append(
                 "用户在询问新的领域或预览适配能力：先查现有 MCP/连接器和工具；"
-                "只有现有能力不足时才调用 dev_preview_adapter_create 生成当前项目的声明式草稿。"
-                "先向用户展示领域、产物、刷新方式和验收条件，用户明确确认后才调用 "
-                "dev_preview_adapter_approve( decision: approve ) 激活；不得执行草稿中的任意代码。"
+                "只有现有能力不足时才调用 dev_preview_adapter_create 生成当前项目的适配器草稿。"
+                "如果需要转换逻辑，可同时生成受控 Python/Node 的 adapt(payload) 模块；"
+                "先向用户展示领域、产物、刷新方式、代码摘要和验收条件，用户明确确认后才调用 "
+                "dev_preview_adapter_approve( decision: approve ) 激活；不得执行未审批或未通过静态检查的代码。"
             )
         add("\n".join(route_lines))
 

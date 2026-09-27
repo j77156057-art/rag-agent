@@ -43,6 +43,11 @@ function toggleAdapter(id: string) {
     : [...configured.value, id]
 }
 
+function approveMessage(item: PreviewAdapterInfo) {
+  const hash = item.source_sha256 ? `\n代码哈希：${item.source_sha256.slice(0, 16)}…` : ''
+  return `确认激活适配器“${item.label || item.id}”？${hash}\n请先查看下方源码和差异。`
+}
+
 async function saveConfig() {
   const result = await agentApi.configurePreviewAdapters(configured.value)
   if (!result.ok) error.value = result.error || '适配器配置保存失败'
@@ -51,11 +56,11 @@ async function saveConfig() {
 
 async function decideAdapter(item: PreviewAdapterInfo, approved: boolean) {
   if (decisionBusy.value || !item.generated || item.status !== 'pending') return
-  if (approved && !window.confirm(`确认激活适配器“${item.label || item.id}”？`)) return
+  if (approved && !window.confirm(approveMessage(item))) return
   decisionBusy.value = item.id
   error.value = ''
   try {
-    const result = await agentApi.decidePreviewAdapter(item.id, approved)
+    const result = await agentApi.decidePreviewAdapter(item.id, approved, item.source_sha256 || '')
     if (!result.ok) throw new Error(result.error || '适配器审批失败')
     await load()
     emit('activity')
@@ -104,6 +109,12 @@ onMounted(() => { void load() })
           <button type="button" :disabled="!!decisionBusy" @click="decideAdapter(item, true)">{{ decisionBusy === item.id ? '处理中…' : '激活' }}</button>
           <button type="button" :disabled="!!decisionBusy" @click="decideAdapter(item, false)">拒绝</button>
         </div>
+        <details v-if="item.generated && item.source_preview" class="adapter-code">
+          <summary>{{ item.code_diff ? '查看待审批代码与差异' : '查看适配器代码' }}</summary>
+          <small v-if="item.source_sha256">SHA-256：{{ item.source_sha256 }}</small>
+          <pre v-if="item.code_diff" class="adapter-diff">{{ item.code_diff }}<span v-if="item.code_diff_truncated">\n…差异已截断</span></pre>
+          <pre>{{ item.source_preview }}<span v-if="item.source_truncated">\n…源码已截断</span></pre>
+        </details>
       </div>
     </div>
     <button type="button" class="adapter-save" @click="saveConfig">保存项目预览配置</button>
@@ -131,6 +142,7 @@ onMounted(() => { void load() })
 .adapter-grid { display: grid; gap: 5px; }
 .adapter-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 7px; border: 1px solid var(--border); border-radius: 6px; }
 .adapter-item div { display: grid; gap: 2px; min-width: 0; }.adapter-item small { overflow-wrap: anywhere; }
+.adapter-code { grid-column: 1 / -1; width: 100%; color: var(--text-muted); }.adapter-code summary { cursor: pointer; color: var(--accent); }.adapter-code small { display: block; margin-top: 4px; }.adapter-code pre { max-height: 180px; overflow: auto; margin: 5px 0 0; padding: 6px; white-space: pre-wrap; font: 10px/1.45 var(--font-mono); color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 5px; }.adapter-code .adapter-diff { color: var(--text); border-color: var(--accent); }
 .adapter-item > span { flex: 0 0 auto; }.on, .ok { color: var(--green); }.off, .bad { color: var(--danger); }
 .acceptance-report, .rollback-box { display: grid; gap: 5px; border-top: 1px solid var(--border); padding-top: 8px; }
 .acceptance-report > small { color: var(--text-muted); }.acceptance-report details { border-top: 1px solid var(--border); padding-top: 5px; }.acceptance-report p { margin: 4px 0 0; }

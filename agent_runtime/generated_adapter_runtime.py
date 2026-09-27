@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import uuid
+from urllib.parse import urlsplit
 from typing import Any, Callable, Mapping
 
 
@@ -36,10 +37,56 @@ _PY_BLOCKED_NAMES = {
 _NODE_BLOCKED = re.compile(
     r"(?i)(?:require\s*\(|import\s+|process\b|child_process|(?:^|[^a-z])fs\b|"
     r"net\b|https?\b|fetch\s*\(|eval\s*\(|new\s+Function\b|exec\s*\()")
+_SECRET_KEY = re.compile(r"(?i)(?:api[_-]?key|token|password|passwd|secret|private[_-]?key)")
 
 
 class GeneratedAdapterError(ValueError):
     """用户可见的生成适配器验证/执行错误。"""
+
+
+def validate_output(value: Any, project_root: str | os.PathLike[str]) -> Any:
+    """Validate the bounded JSON/artifact contract returned by an adapter."""
+    root = _root(project_root)
+    count = 0
+
+    def walk(item: Any, depth: int = 0) -> Any:
+        nonlocal count
+        count += 1
+        if count > 512 or depth > 8:
+            raise GeneratedAdapterError("适配器输出层级或元素数量超过限制")
+        if isinstance(item, dict):
+            result = {}
+            for key, child in item.items():
+                key = str(key)
+                if _SECRET_KEY.search(key):
+                    raise GeneratedAdapterError("适配器输出包含凭据字段")
+                if key.lower() in {"path", "file", "filepath"} and isinstance(child, str):
+                    candidate = child
+                    if candidate.lower().startswith("file://"):
+                        candidate = candidate[7:]
+                    if candidate and not candidate.startswith(("http://", "https://", "data:")):
+                        target = Path(candidate).expanduser()
+                        if not target.is_absolute():
+                            target = root / target
+                        try:
+                            target.resolve().relative_to(root)
+                        except ValueError as exc:
+                            raise GeneratedAdapterError("适配器输出路径越过当前项目目录") from exc
+                if key.lower() in {"url", "uri"} and isinstance(child, str):
+                    parsed = urlsplit(child)
+                    if parsed.username or parsed.password or _SECRET_KEY.search(parsed.query):
+                        raise GeneratedAdapterError("适配器输出 URL 包含凭据")
+                result[key] = walk(child, depth + 1)
+            return result
+        if isinstance(item, list):
+            return [walk(child, depth + 1) for child in item[:512]]
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            return item
+        raise GeneratedAdapterError("适配器输出包含不支持的数据类型")
+
+    if not isinstance(value, (dict, list)):
+        raise GeneratedAdapterError("适配器必须返回 JSON 对象或数组")
+    return walk(value)
 
 
 def _clean_id(value: Any) -> str:
@@ -232,10 +279,9 @@ def execute(project_root: str | os.PathLike[str], manifest: Mapping[str, Any], p
             value = json.loads(stdout)
         except (TypeError, ValueError) as exc:
             raise GeneratedAdapterError("适配器没有返回合法 JSON") from exc
-        if not isinstance(value, (dict, list)):
-            raise GeneratedAdapterError("适配器必须返回 JSON 对象或数组")
+        value = validate_output(value, project_root)
         return {"ok": True, "value": value, "runtime": runtime,
                 "module": str(module.relative_to(_root(project_root))).replace("\\", "/")}
 
 
-__all__ = ["GeneratedAdapterError", "activate_source", "execute", "rollback", "stage_source", "validate_source"]
+__all__ = ["GeneratedAdapterError", "activate_source", "execute", "rollback", "stage_source", "validate_output", "validate_source"]

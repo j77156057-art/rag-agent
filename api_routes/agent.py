@@ -121,6 +121,7 @@ class PreviewAdapterConfigReq(BaseModel):
 
 class PreviewAdapterDecisionReq(BaseModel):
     approved: bool = False
+    source_sha256: str = ""
 
 
 class WorkflowInterruptReq(BaseModel):
@@ -854,6 +855,13 @@ def build_router(ctx) -> APIRouter:
             root = ctx._project_root_or_error()
             if not root:
                 return {"ok": False, "error": "未配置代码库"}
+            current = next((item for item in adapter_catalog(root).get("adapters", [])
+                            if item.get("id") == adapter_id and item.get("generated")), None)
+            if current and current.get("runtime") and req.approved:
+                expected = str(req.source_sha256 or "").strip().lower()
+                actual = str(current.get("source_sha256") or "").strip().lower()
+                if not expected or expected != actual:
+                    return {"ok": False, "error": "适配器代码已变化，请重新查看源码和哈希后再审批"}
             decision = record_user_approval(root, "preview_adapter", "workbench-user",
                                             approved=req.approved, target=adapter_id)
             manifest = approve_generated_adapter(root, adapter_id, req.approved)

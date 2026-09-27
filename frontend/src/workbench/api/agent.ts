@@ -33,6 +33,9 @@ export interface PreviewAdapterInfo {
   generated?: boolean; status?: 'pending' | 'active' | 'rejected'
   refresh_tool?: string; connector_hint?: string; validation?: string[]
   runtime?: 'python' | 'node' | string; entrypoint?: string; module_path?: string; source_sha256?: string
+  code_review?: 'pending' | 'active' | 'missing' | 'unavailable' | string
+  source_preview?: string; source_truncated?: boolean; active_sha256?: string
+  code_diff?: string; code_diff_truncated?: boolean
 }
 export interface PreviewAdapterCatalogResp { ok?: boolean; adapters?: PreviewAdapterInfo[]; count?: number; error?: string }
 export interface PreviewAdapterConfigResp { ok?: boolean; profile?: ProjectProfile; error?: string }
@@ -347,8 +350,8 @@ export const agentApi = {
   configurePreviewAdapters(adapters: string[]): Promise<PreviewAdapterConfigResp> {
     return rawJson('/api/agent/preview-adapters/config', { adapters })
   },
-  decidePreviewAdapter(id: string, approved: boolean): Promise<{ ok?: boolean; manifest?: PreviewAdapterInfo; error?: string }> {
-    return rawJson(`/api/agent/preview-adapters/${encodeURIComponent(id)}/decision`, { approved })
+  decidePreviewAdapter(id: string, approved: boolean, source_sha256 = ''): Promise<{ ok?: boolean; manifest?: PreviewAdapterInfo; error?: string }> {
+    return rawJson(`/api/agent/preview-adapters/${encodeURIComponent(id)}/decision`, { approved, source_sha256 })
   },
   workflowAcceptanceReport(id: string): Promise<{ ok?: boolean; report?: WorkflowAcceptanceReport; error?: string }> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/acceptance-report`)

@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 import config
 import tools
-from agent_runtime.adapter_catalog import create_generated, approve_generated, generated
-from agent_runtime.generated_adapter_runtime import GeneratedAdapterError, execute, validate_source
+from agent_runtime.adapter_catalog import catalog, create_generated, approve_generated, generated
+from agent_runtime.generated_adapter_runtime import GeneratedAdapterError, execute, validate_output, validate_source
 from game_workbench import approval
 
 
@@ -50,6 +50,13 @@ class GeneratedAdapterRuntimeTests(unittest.TestCase):
         with self.assertRaises(GeneratedAdapterError):
             validate_source("python", "def adapt(payload):\n    return payload.__class__\n")
 
+    def test_output_schema_rejects_secrets_and_project_escape(self):
+        with self.assertRaises(GeneratedAdapterError):
+            validate_output({"api_key": "secret"}, self.root)
+        with self.assertRaises(GeneratedAdapterError):
+            validate_output({"path": "../outside.png"}, self.root)
+        self.assertEqual(validate_output({"artifacts": [{"kind": "image", "path": "out.png"}]}, self.root)["artifacts"][0]["kind"], "image")
+
     def test_tool_create_accepts_multiline_source_and_keeps_it_pending(self):
         source = "def adapt(payload):\n    return {'ok': True}\n"
         result = json.loads(tools.dev_preview_adapter_create(
@@ -59,6 +66,10 @@ class GeneratedAdapterRuntimeTests(unittest.TestCase):
         self.assertEqual(result["manifest"]["status"], "pending")
         self.assertEqual(result["manifest"]["runtime"], "python")
         self.assertTrue(os.path.isfile(os.path.join(self.root, ".docmind", "preview-adapters", ".pending", "cad-code", "adapter.py")))
+        row = next(item for item in catalog(self.root)["adapters"] if item["id"] == "cad-code")
+        self.assertEqual(row["code_review"], "pending")
+        self.assertIn("def adapt", row["source_preview"])
+        self.assertTrue(row["source_sha256"])
 
     def test_refresh_runs_generated_adapter_after_approved_builtin(self):
         source = "def adapt(payload):\n    return {'artifact': payload.get('value', '')}\n"
