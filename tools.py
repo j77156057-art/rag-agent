@@ -4544,6 +4544,52 @@ def dev_desktop_capture(arg=""):
         idempotency_key=result.idempotency_key, replayed=result.replayed)
 
 
+def dev_desktop_action(arg=""):
+    """Perform one approved click/type/drag/key action on a project window."""
+    fields = _parse_keyed(str(arg or ""), [
+        "action", "target", "x", "y", "to_x", "to_y", "text", "key",
+    ])
+    action = (fields.get("action") or "").strip().lower()
+    target = (fields.get("target") or "embedded").strip().lower()
+    if action not in {"click", "type", "drag", "key", "save"}:
+        return json.dumps({"ok": False, "error": "action 只能是 click、type、drag、key 或 save。"}, ensure_ascii=False)
+    if target not in {"embedded", "foreground"}:
+        return json.dumps({"ok": False, "error": "target 只能是 embedded 或 foreground。"}, ensure_ascii=False)
+    root = _get_code_root()
+    if not root:
+        return json.dumps({"ok": False, "error": "未配置当前项目"}, ensure_ascii=False)
+    def integer(name):
+        value = fields.get(name)
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise ValueError("%s 必须是整数" % name)
+    try:
+        payload = {
+            "action": action, "target": target,
+            "x": integer("x"), "y": integer("y"),
+            "to_x": integer("to_x"), "to_y": integer("to_y"),
+            "key": (fields.get("key") or "")[:80],
+            "text_sha256": hashlib.sha256((fields.get("text") or "").encode("utf-8")).hexdigest()[:16],
+        }
+        approval_target = "desktop:%s:%s:%s" % (
+            action, target, hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12])
+        gate = _mcp_gate_blocked(root, "desktop_action", approval_target)
+        if gate:
+            gate["hint"] = "请用户确认当前桌面动作；确认后必须用完全相同的参数重试。"
+            return json.dumps(gate, ensure_ascii=False)
+        import desktop_actions
+        result = desktop_actions.perform(
+            action, target=target, project_id=None,
+            x=payload["x"], y=payload["y"], to_x=payload["to_x"], to_y=payload["to_y"],
+            text=fields.get("text") or "", key=fields.get("key") or "")
+        return json.dumps(result, ensure_ascii=False)
+    except (OSError, TypeError, ValueError) as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+
 def preview_project(arg=""):
     """在正式开发舱中捕获当前项目的真实网页画面。
 
@@ -5159,6 +5205,7 @@ TOOLS = {
     "game_playtest": {"description": "在项目根目录运行 Playtest 命令，输入 command/timeout。", "func": game_playtest},
     "game_screenshot": {"description": "截取当前引擎运行画面作为视觉观察：可选输入 target: embedded|foreground（默认 embedded，嵌入窗口不可用时自动改抓前台窗口）。优先使用已启用引擎连接器的截图能力，其次抓取工作台内嵌窗口；JPEG 保存到项目 .docmind/screenshots/ 并回传图片。截图只是某一瞬间的观察，不是代码事实；无窗口/无头环境会明确失败，那时改用运行日志或受控 playtest 证据，不要臆测画面。", "func": game_screenshot},
     "dev_desktop_capture": {"description": "桌面自动化视觉技能的安全观察入口：截取当前项目嵌入窗口或前台窗口，输入 target: embedded|foreground。只返回真实画面和 native 预览 artifact，不直接点击、输入或修改软件状态；状态修改必须调用已批准的应用 MCP、插件或其他明确工具。", "func": dev_desktop_capture},
+    "dev_desktop_action": {"description": "执行一个经过项目审批的桌面动作：action=click|type|drag|key|save，target=embedded|foreground。click/drag 使用窗口客户区 x/y（drag 另给 to_x/to_y），type 使用 text，key 使用安全键名或 Control_L+s。首次调用会返回 desktop_action 审批请求；用户确认后必须用完全相同参数重试。禁止终端、Win 键、任意 HWND 和窗口枚举。", "func": dev_desktop_action},
     "preview_project": {"description": "正式开发舱真实视觉验收：在当前项目内启动安全的本地网页预览，用真实 Edge/Chromium 截取当前画面并把截图送给视觉模型，同时登记工作流预览证据。输入可选 entry/index.html、width、height、timeout。修改网页后必须再次调用，截图失败或项目不是网页时如实报告并改用领域专用工具。", "func": preview_project},
     "start_workflow": {"description": (
         "当目标是【长链路开发流程】时升级为跨窗口持久开发工作流：满足多阶段/多角色协作、"

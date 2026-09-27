@@ -1,0 +1,207 @@
+"""Small, project-scoped Windows input bridge for approved desktop actions.
+
+The module intentionally accepts only a resolved embedded or foreground target.
+It does not enumerate arbitrary windows, run a shell, or expose HWND values to
+the Agent. Every action is one shot; callers must capture a fresh observation
+before issuing the next action.
+"""
+from __future__ import annotations
+
+import ctypes
+import ctypes.wintypes
+import os
+import time
+from typing import Any
+
+
+_KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_UNICODE = 0x0004
+_MOUSEEVENTF_LEFTDOWN = 0x0002
+_MOUSEEVENTF_LEFTUP = 0x0004
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", ctypes.c_ulong), ("u", _INPUTUNION)]
+
+
+_VK = {
+    "backspace": 0x08, "tab": 0x09, "enter": 0x0D, "return": 0x0D,
+    "escape": 0x1B, "space": 0x20, "pageup": 0x21, "pagedown": 0x22,
+    "end": 0x23, "home": 0x24, "left": 0x25, "up": 0x26,
+    "right": 0x27, "down": 0x28, "insert": 0x2D, "delete": 0x2E,
+    "shift": 0x10, "shift_l": 0x10, "control": 0x11, "ctrl": 0x11,
+    "control_l": 0x11, "alt": 0x12, "alt_l": 0x12,
+}
+_VK.update({f"f{i}": 0x6F + i for i in range(1, 13)})
+
+
+def _user32():
+    if os.name != "nt":
+        return None
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+    user32.SetForegroundWindow.restype = ctypes.wintypes.BOOL
+    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    user32.SetCursorPos.restype = ctypes.wintypes.BOOL
+    user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int]
+    user32.SendInput.restype = ctypes.c_uint
+    return user32
+
+
+def _resolve_target(target: str, project_id: str | None = None):
+    if os.name != "nt":
+        return None, None, "桌面操作仅支持 Windows。"
+    try:
+        import desktop_bridge
+        import screen_capture
+        if target == "embedded":
+            hwnd = screen_capture._embedded_target(project_id)
+        else:
+            hwnd = int(_user32().GetForegroundWindow() or 0)
+        if not hwnd or not desktop_bridge.is_window(hwnd):
+            return None, None, "没有找到可操作的目标窗口。"
+        origin = desktop_bridge.client_origin(hwnd) or desktop_bridge.window_rect(hwnd)
+        rect = desktop_bridge.client_rect(hwnd)
+        if not origin or not rect or rect.get("width", 0) <= 0 or rect.get("height", 0) <= 0:
+            return None, None, "无法读取目标窗口客户区。"
+        return hwnd, {"origin": origin, "rect": rect}, ""
+    except Exception as exc:  # noqa: BLE001
+        return None, None, "目标窗口解析失败（%s）。" % type(exc).__name__
+
+
+def _focus(hwnd: int, target: str, project_id: str | None = None) -> tuple[bool, str]:
+    try:
+        import desktop_bridge
+        if target == "embedded":
+            host = desktop_bridge.host_hwnd(project_id)
+            result = desktop_bridge.focus(hwnd, hwnd_host=host, keep_attached=False)
+            return bool(result.get("ok")), str(result.get("error") or "")
+        ok = bool(_user32().SetForegroundWindow(ctypes.c_void_p(hwnd)))
+        return ok, "" if ok else "无法激活前台窗口"
+    except Exception as exc:  # noqa: BLE001
+        return False, "窗口激活失败（%s）。" % type(exc).__name__
+
+
+def _send(events: list[_INPUT]) -> tuple[bool, int]:
+    user32 = _user32()
+    if user32 is None or not events:
+        return False, 0
+    array = (_INPUT * len(events))(*events)
+    inserted = int(user32.SendInput(len(events), array, ctypes.sizeof(_INPUT)))
+    return inserted == len(events), inserted
+
+
+def _mouse_click(x: int, y: int) -> tuple[bool, int]:
+    user32 = _user32()
+    if user32 is None or not user32.SetCursorPos(int(x), int(y)):
+        return False, 0
+    down = _INPUT(type=0, mi=_MOUSEINPUT(0, 0, 0, _MOUSEEVENTF_LEFTDOWN, 0, None))
+    up = _INPUT(type=0, mi=_MOUSEINPUT(0, 0, 0, _MOUSEEVENTF_LEFTUP, 0, None))
+    return _send([down, up])
+
+
+def _mouse_drag(x1: int, y1: int, x2: int, y2: int) -> tuple[bool, int]:
+    user32 = _user32()
+    if user32 is None or not user32.SetCursorPos(int(x1), int(y1)):
+        return False, 0
+    down = _INPUT(type=0, mi=_MOUSEINPUT(0, 0, 0, _MOUSEEVENTF_LEFTDOWN, 0, None))
+    up = _INPUT(type=0, mi=_MOUSEINPUT(0, 0, 0, _MOUSEEVENTF_LEFTUP, 0, None))
+    ok_down, count_down = _send([down])
+    time.sleep(0.08)
+    user32.SetCursorPos(int(x2), int(y2))
+    ok_up, count_up = _send([up])
+    return ok_down and ok_up, count_down + count_up
+
+
+def _unicode_type(text: str) -> tuple[bool, int]:
+    raw = str(text or "")
+    if not raw or len(raw) > 8000:
+        return False, 0
+    units = raw.encode("utf-16-le", "surrogatepass")
+    events = []
+    for index in range(0, len(units), 2):
+        scan = int.from_bytes(units[index:index + 2], "little")
+        events.append(_INPUT(type=1, ki=_KEYBDINPUT(0, scan, _KEYEVENTF_UNICODE, 0, None)))
+        events.append(_INPUT(type=1, ki=_KEYBDINPUT(0, scan, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP, 0, None)))
+    return _send(events)
+
+
+def _key_code(name: str) -> int | None:
+    value = str(name or "").strip().lower()
+    if value in _VK:
+        return _VK[value]
+    if len(value) == 1 and value.isalnum():
+        return ord(value.upper())
+    return None
+
+
+def _press_key(key: str) -> tuple[bool, int]:
+    parts = [part.strip() for part in str(key or "").split("+") if part.strip()]
+    codes = [_key_code(part) for part in parts]
+    if not parts or any(code is None for code in codes):
+        return False, 0
+    downs = [_INPUT(type=1, ki=_KEYBDINPUT(code, 0, 0, 0, None)) for code in codes]
+    ups = [_INPUT(type=1, ki=_KEYBDINPUT(code, 0, _KEYEVENTF_KEYUP, 0, None)) for code in reversed(codes)]
+    return _send(downs + ups)
+
+
+def _inside(point: tuple[int, int], rect: dict[str, Any]) -> bool:
+    x, y = point
+    return 0 <= x < int(rect.get("width", 0)) and 0 <= y < int(rect.get("height", 0))
+
+
+def perform(action: str, *, target: str = "embedded", project_id: str | None = None,
+            x: int | None = None, y: int | None = None,
+            to_x: int | None = None, to_y: int | None = None,
+            text: str = "", key: str = "") -> dict[str, Any]:
+    action = str(action or "").strip().lower()
+    if action == "save":
+        key = "Control_L+s"
+        action = "key"
+    if action not in {"click", "type", "drag", "key"}:
+        return {"ok": False, "error": "action 只能是 click、type、drag、key 或 save。"}
+    hwnd, info, error = _resolve_target(target, project_id)
+    if error:
+        return {"ok": False, "error": error}
+    focused, focus_error = _focus(hwnd, target, project_id)
+    if not focused:
+        return {"ok": False, "error": focus_error or "目标窗口未能获得焦点。"}
+    origin, rect = info["origin"], info["rect"]
+    ox, oy = int(origin.get("x", 0)), int(origin.get("y", 0))
+    if action == "click":
+        if x is None or y is None or not _inside((int(x), int(y)), rect):
+            return {"ok": False, "error": "click 坐标必须位于目标窗口客户区内。"}
+        ok, count = _mouse_click(ox + int(x), oy + int(y))
+    elif action == "drag":
+        if any(value is None for value in (x, y, to_x, to_y)) or not _inside((int(x), int(y)), rect) or not _inside((int(to_x), int(to_y)), rect):
+            return {"ok": False, "error": "drag 起点和终点必须位于目标窗口客户区内。"}
+        ok, count = _mouse_drag(ox + int(x), oy + int(y), ox + int(to_x), oy + int(to_y))
+    elif action == "type":
+        ok, count = _unicode_type(text)
+    else:
+        ok, count = _press_key(key)
+    return {"ok": bool(ok), "action": action, "target": target,
+            "events": count, "window": {"width": rect["width"], "height": rect["height"]},
+            "error": "" if ok else "Windows 未确认全部输入事件已送达，请重新观察后再决定是否重试。"}
+
+
+__all__ = ["perform"]

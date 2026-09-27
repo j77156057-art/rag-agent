@@ -120,6 +120,67 @@ class PreviewAdapterToolTests(unittest.TestCase):
         self.assertEqual(result.artifacts[0]["adapter"], "native")
         self.assertEqual(result.artifacts[0]["metadata"]["capture_adapter"], "desktop_computer_use")
 
+    def test_desktop_action_requires_project_and_rejects_invalid_inputs(self):
+        with patch.object(tools, "_get_code_root", return_value=""):
+            result = json.loads(tools.dev_desktop_action("action: click\ntarget: embedded\nx: 1\ny: 2"))
+        self.assertFalse(result["ok"])
+        self.assertIn("未配置当前项目", result["error"])
+
+        invalid_action = json.loads(tools.dev_desktop_action("action: shell\ntarget: embedded"))
+        self.assertFalse(invalid_action["ok"])
+        invalid_target = json.loads(tools.dev_desktop_action("action: click\ntarget: hwnd\nx: 1\ny: 2"))
+        self.assertFalse(invalid_target["ok"])
+
+    def test_desktop_action_approval_hides_text_and_binds_exact_parameters(self):
+        request = json.loads(tools.dev_desktop_action(
+            "action: type\ntarget: embedded\ntext: super secret"))
+        self.assertTrue(request["blocked"])
+        self.assertTrue(request["approval_required"])
+        self.assertEqual(request["action"], "desktop_action")
+        self.assertNotIn("super secret", request["target"])
+
+        with patch("desktop_actions.perform", return_value={"ok": True, "events": 2}) as perform:
+            # The exact same arguments are accepted after the user approval.
+            from game_workbench import approval
+            approval(self.root, "desktop_action", "user", approved=True, target=request["target"])
+            result = json.loads(tools.dev_desktop_action(
+                "action: type\ntarget: embedded\ntext: super secret"))
+        self.assertTrue(result["ok"])
+        perform.assert_called_once()
+
+        # Changing the text changes the approval binding and blocks again.
+        changed = json.loads(tools.dev_desktop_action(
+            "action: type\ntarget: embedded\ntext: another value"))
+        self.assertTrue(changed["blocked"])
+        self.assertNotEqual(changed["target"], request["target"])
+
+    def test_desktop_action_save_maps_to_control_s(self):
+        import desktop_actions
+        from game_workbench import approval
+        first = json.loads(tools.dev_desktop_action("action: save\ntarget: foreground"))
+        approval(self.root, "desktop_action", "user", approved=True, target=first["target"])
+        with patch("desktop_actions.perform", return_value={"ok": True}) as perform:
+            result = json.loads(tools.dev_desktop_action("action: save\ntarget: foreground"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(perform.call_args.kwargs["key"], "")
+        self.assertEqual(perform.call_args.args[0], "save")
+        with patch.object(desktop_actions, "_resolve_target", return_value=(1, {
+                "origin": {"x": 0, "y": 0}, "rect": {"width": 10, "height": 10}}, "")), \
+             patch.object(desktop_actions, "_focus", return_value=(True, "")), \
+             patch.object(desktop_actions, "_press_key", return_value=(True, 1)) as press:
+            direct = desktop_actions.perform("save", target="foreground")
+        self.assertTrue(direct["ok"])
+        press.assert_called_once_with("Control_L+s")
+
+    def test_desktop_action_does_not_fake_success_when_bridge_fails(self):
+        from game_workbench import approval
+        first = json.loads(tools.dev_desktop_action("action: click\ntarget: embedded\nx: 4\ny: 5"))
+        approval(self.root, "desktop_action", "user", approved=True, target=first["target"])
+        with patch("desktop_actions.perform", return_value={"ok": False, "error": "Windows 未确认输入事件"}):
+            result = json.loads(tools.dev_desktop_action("action: click\ntarget: embedded\nx: 4\ny: 5"))
+        self.assertFalse(result["ok"])
+        self.assertIn("Windows", result["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

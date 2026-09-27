@@ -13,6 +13,8 @@ export interface AgentApproval { id: string; status: string; summary?: string; d
 export interface AgentApprovalsResp { ok?: boolean; approvals?: AgentApproval[] }
 export interface AgentPermissionResp { ok?: boolean; recorded?: boolean; reason?: string }
 export interface AgentApprovalCreateResp { ok?: boolean; approval?: AgentApproval; error?: string }
+export interface AgentGateRequest { id: string; action: string; target: string; risk?: string; created_at?: string }
+export interface AgentGateRequestsResp { ok?: boolean; items?: AgentGateRequest[]; error?: string }
 export interface ProjectProfileMcp {
   key: string; name?: string; enabled?: boolean; transport?: string
   capabilities?: string[]; summary?: string
@@ -267,6 +269,14 @@ export const agentApi = {
   /** 审批决定：approved / rejected。 */
   decide(id: string, status: string): Promise<{ ok?: boolean }> {
     return rawJson<{ ok?: boolean }>('/api/agent/approvals/decide', { id, status })
+  },
+  /** 当前项目等待用户确认的工具动作（例如桌面点击/输入/保存）。 */
+  approvalRequests(): Promise<AgentGateRequestsResp> {
+    return rawJson<AgentGateRequestsResp>('/api/agent/approval-requests')
+  },
+  /** 通过或拒绝一个工具动作；通过后 Agent 必须用同样参数重试。 */
+  decideApprovalRequest(id: string, approved: boolean): Promise<{ ok?: boolean; error?: string }> {
+    return rawJson<{ ok?: boolean; error?: string }>('/api/agent/approval-requests/decide', { id, approved })
   },
   workflowBackend(): Promise<WorkflowBackendStatus> {
     return rawJson('/api/agent/workflow/backend')

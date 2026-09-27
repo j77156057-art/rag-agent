@@ -127,6 +127,7 @@ _ADMIN_TOOLS = {
     "dev_apply_regions", "dev_add_region", "init_regions", "dev_install_tool",
     "dev_mcp_add", "dev_mcp_decide", "dev_mcp_remove",
     "dev_preview_adapter_approve",
+    "dev_desktop_action",
     "start_workflow",
 }
 _WRITE_TOOLS = {
@@ -136,6 +137,7 @@ _WRITE_TOOLS = {
     "dev_preview_adapter_create",
     "dev_preview_adapter_refresh",
     "dev_desktop_capture",
+    "dev_desktop_action",
 }
 _IRREVERSIBLE_TOOLS = {"run_command", "game_playtest", "dev_mcp_call"}
 _NO_ARG_TOOLS = {
