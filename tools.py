@@ -796,6 +796,78 @@ def dev_preview_adapter_approve(arg):
         return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
 
+_PREVIEW_BUILTIN_REFRESH_TOOLS = frozenset({"preview_project", "game_screenshot", "self_verify"})
+
+
+def _preview_refresh_reference(value):
+    """Parse a generated adapter refresh reference without importing code."""
+    ref = str(value or "").strip()
+    if ref.startswith("builtin:"):
+        name = ref[len("builtin:"):].strip()
+        return ("builtin", name) if name in _PREVIEW_BUILTIN_REFRESH_TOOLS else None
+    if ref.startswith("mcp:"):
+        body = ref[len("mcp:"):].strip()
+        key, sep, name = body.partition("/")
+        if key and sep and name and re.fullmatch(r"[A-Za-z0-9_.-]+", key):
+            return "mcp", key, name
+    return None
+
+
+def dev_preview_adapter_refresh(arg):
+    """Execute an active adapter's approved refresh reference.
+
+    Generated adapters can reuse existing preview tools or an enabled MCP
+    tool. The manifest cannot point to a Python module, shell command, URL,
+    or arbitrary callable.
+    """
+    fields = _parse_keyed(str(arg or ""), ["id", "arguments"])
+    adapter_id = (fields.get("id") or "").strip().lower()
+    root = _get_code_root()
+    if not root:
+        return json.dumps({"ok": False, "error": "未配置当前项目"}, ensure_ascii=False)
+    if not adapter_id:
+        return json.dumps({"ok": False, "error": "需要适配器 id"}, ensure_ascii=False)
+    try:
+        from agent_runtime.adapter_catalog import generated
+        manifests = {str(item.get("id") or "").strip().lower(): item for item in generated(root)}
+        manifest = manifests.get(adapter_id)
+        if not manifest:
+            return json.dumps({"ok": False, "error": "没有找到该项目适配器"}, ensure_ascii=False)
+        if manifest.get("status") != "active":
+            return json.dumps({"ok": False, "error": "适配器尚未激活，不能刷新"}, ensure_ascii=False)
+        reference = _preview_refresh_reference(manifest.get("refresh_tool"))
+        if reference is None:
+            return json.dumps({
+                "ok": False,
+                "error": "refresh_tool 不是允许的 builtin:<tool> 或 mcp:<connector>/<tool> 引用",
+            }, ensure_ascii=False)
+        raw_args = (fields.get("arguments") or "").strip()
+        if raw_args:
+            try:
+                json.loads(raw_args)
+            except (TypeError, ValueError):
+                return json.dumps({"ok": False, "error": "arguments 必须是 JSON 对象"}, ensure_ascii=False)
+        else:
+            raw_args = "{}"
+        if reference[0] == "builtin":
+            name = reference[1]
+            spec = TOOLS.get(name)
+            if spec is None:
+                return json.dumps({"ok": False, "error": "内置刷新工具当前不可用"}, ensure_ascii=False)
+            result = spec["func"](raw_args)
+            if isinstance(result, ToolResult):
+                return result
+            return json.dumps({"ok": True, "adapter": adapter_id, "tool": name,
+                               "result": str(result)}, ensure_ascii=False)
+        _, key, name = reference
+        result = dev_mcp_call("key: %s\nname: %s\narguments: %s" % (key, name, raw_args))
+        return json.dumps({"ok": not str(result).startswith("MCP 调用失败"),
+                           "adapter": adapter_id, "connector": key, "tool": name,
+                           "result": result}, ensure_ascii=False)
+    except (OSError, ValueError, TypeError) as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+
 def dev_skill_approve(arg):
     """激活一个待审批技能：从 .pending 移到 SKILLS_DIR 并 reload（变为可用）。仅当用户已确认。"""
     name = str(arg or "").strip()
@@ -4946,6 +5018,7 @@ TOOLS = {
     "dev_skill_create": {"description": "起草用户技能（待审批，不会自动启用）。skill 是*可执行行为*，必须经用户确认才激活。多行输入 name/description/body；写入 SKILLS_DIR/.pending/<name>/SKILL.md（草稿不生效）。返回完整正文，代理须向用户完整展示并取得明确同意后，再 dev_skill_approve 激活。", "func": dev_skill_create},
     "dev_preview_adapter_create": {"description": "让 Agent 为当前项目自主生成领域预览适配器草稿（不会自动启用）。多行输入 id/label/domain/artifact_kinds/capture_adapter/refresh_tool/connector_hint/validation/evidence；写入项目 .docmind/preview-adapters/*.json。先展示方案与验证条件，用户明确确认后才可调用 dev_preview_adapter_approve。", "func": dev_preview_adapter_create},
     "dev_preview_adapter_approve": {"description": "激活或拒绝 Agent 生成的项目预览适配器。只有用户明确确认适配器方案、刷新工具和验证条件后才传 decision: approve；否则只用 reject。输入 id 与 decision。", "func": dev_preview_adapter_approve},
+    "dev_preview_adapter_refresh": {"description": "执行已激活项目预览适配器的受控刷新。适配器 manifest 的 refresh_tool 只能是 builtin:preview_project|game_screenshot|self_verify，或 mcp:<connector>/<tool>；禁止 Python、shell、URL 和任意 callable。输入 id 与可选 arguments(JSON)，MCP 仍遵守连接器启用和用户审批。", "func": dev_preview_adapter_refresh},
     "dev_skill_approve": {"description": "激活待审批技能：把 .pending/<name>/SKILL.md 移到 SKILLS_DIR 并 reload 生效。仅当用户已明确确认该技能正文安全时调用。输入 name: <技能名>。", "func": dev_skill_approve},
     "dev_skill_reject": {"description": "丢弃待审批技能草稿（不激活、不保留）。输入 name: <技能名>。", "func": dev_skill_reject},
     "search_knowledge": {

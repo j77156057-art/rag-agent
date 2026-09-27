@@ -134,6 +134,7 @@ _WRITE_TOOLS = {
     "dev_refactor", "dev_rebuild_index", "dev_asset_register", "dev_capture_bug",
     "dev_update_bug", "game_upsert_task",
     "dev_preview_adapter_create",
+    "dev_preview_adapter_refresh",
 }
 _IRREVERSIBLE_TOOLS = {"run_command", "game_playtest", "dev_mcp_call"}
 _NO_ARG_TOOLS = {

@@ -75,6 +75,39 @@ class PreviewAdapterToolTests(unittest.TestCase):
         self.assertIn("dev_preview_adapter_create", joined)
         self.assertIn("dev_preview_adapter_approve", joined)
 
+    def test_refresh_requires_active_and_rejects_arbitrary_code(self):
+        tools.dev_preview_adapter_create("id: cad\nrefresh_tool: python:open('x','w')")
+        pending = json.loads(tools.dev_preview_adapter_refresh("id: cad"))
+        self.assertFalse(pending["ok"])
+        tools.dev_preview_adapter_approve("id: cad\ndecision: approve")
+        rejected = json.loads(tools.dev_preview_adapter_refresh("id: cad"))
+        self.assertFalse(rejected["ok"])
+        self.assertIn("refresh_tool", rejected["error"])
+
+    def test_refresh_reuses_allowlisted_builtin_tool(self):
+        tools.dev_preview_adapter_create("id: cad\nrefresh_tool: builtin:game_screenshot")
+        tools.dev_preview_adapter_approve("id: cad\ndecision: approve")
+
+        def fake_capture(_arg):
+            return "captured"
+
+        with patch.dict(tools.TOOLS, {"game_screenshot": {"func": fake_capture}}):
+            result = json.loads(tools.dev_preview_adapter_refresh(
+                "id: cad\narguments: {}"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool"], "game_screenshot")
+        self.assertEqual(result["result"], "captured")
+
+    def test_refresh_forwards_mcp_through_existing_boundary(self):
+        tools.dev_preview_adapter_create("id: cad\nrefresh_tool: mcp:easyeda/capture_view")
+        tools.dev_preview_adapter_approve("id: cad\ndecision: approve")
+        with patch.object(tools, "dev_mcp_call", return_value='{"ok": true}') as call:
+            result = json.loads(tools.dev_preview_adapter_refresh(
+                'id: cad\narguments: {"scene":"main"}'))
+        self.assertTrue(result["ok"])
+        call.assert_called_once_with(
+            'key: easyeda\nname: capture_view\narguments: {"scene":"main"}')
+
 
 if __name__ == "__main__":
     unittest.main()
