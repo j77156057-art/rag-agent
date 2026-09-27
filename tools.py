@@ -739,6 +739,63 @@ def dev_skill_create(arg):
                       ensure_ascii=False)
 
 
+def dev_preview_adapter_create(arg):
+    """让 Agent 为当前项目生成一个待审批的领域预览适配器清单。"""
+    fields = _parse_keyed(str(arg or ""), [
+        "id", "name", "label", "domain", "artifact_kinds", "capture_adapter",
+        "refresh_tool", "connector_hint", "validation", "evidence",
+    ])
+    adapter_id = (fields.get("id") or fields.get("name") or "").strip()
+    if not adapter_id:
+        return json.dumps({"ok": False, "error": "id 或 name 必填"}, ensure_ascii=False)
+    def split_values(value):
+        try:
+            parsed = json.loads(value) if str(value).strip().startswith("[") else None
+            if isinstance(parsed, list):
+                return parsed
+        except (ValueError, TypeError):
+            pass
+        return [item.strip() for item in str(value or "").split(",") if item.strip()]
+    root = _get_code_root()
+    if not root:
+        return json.dumps({"ok": False, "error": "未配置当前项目"}, ensure_ascii=False)
+    try:
+        from agent_runtime.adapter_catalog import create_generated
+        manifest = create_generated(root, {
+            "id": adapter_id, "label": fields.get("label") or adapter_id,
+            "domain": fields.get("domain") or "generic",
+            "artifact_kinds": split_values(fields.get("artifact_kinds") or ""),
+            "capture_adapter": fields.get("capture_adapter") or "agent_generated",
+            "refresh_tool": fields.get("refresh_tool") or "",
+            "connector_hint": fields.get("connector_hint") or "",
+            "validation": split_values(fields.get("validation") or ""),
+            "evidence": fields.get("evidence") or "模型生成的领域预览适配器",
+        })
+        return json.dumps({"ok": True, "manifest": manifest, "next":
+                           "向用户展示适配器方案和验证条件；用户明确确认后再调用 dev_preview_adapter_approve"},
+                          ensure_ascii=False)
+    except (OSError, ValueError, TypeError) as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+
+def dev_preview_adapter_approve(arg):
+    """在用户明确确认后激活或拒绝 Agent 生成的项目适配器。"""
+    fields = _parse_keyed(str(arg or ""), ["id", "decision", "approved"])
+    adapter_id = (fields.get("id") or "").strip()
+    decision = (fields.get("decision") or fields.get("approved") or "").strip().lower()
+    if not adapter_id or decision not in {"approve", "approved", "yes", "true", "reject", "rejected", "no", "false"}:
+        return json.dumps({"ok": False, "error": "需要 id 和 decision: approve|reject"}, ensure_ascii=False)
+    root = _get_code_root()
+    if not root:
+        return json.dumps({"ok": False, "error": "未配置当前项目"}, ensure_ascii=False)
+    try:
+        from agent_runtime.adapter_catalog import approve_generated
+        manifest = approve_generated(root, adapter_id, decision in {"approve", "approved", "yes", "true"})
+        return json.dumps({"ok": True, "manifest": manifest}, ensure_ascii=False)
+    except (OSError, ValueError, TypeError) as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+
 def dev_skill_approve(arg):
     """激活一个待审批技能：从 .pending 移到 SKILLS_DIR 并 reload（变为可用）。仅当用户已确认。"""
     name = str(arg or "").strip()
@@ -4887,6 +4944,8 @@ TOOLS = {
     "dev_mcp_remove": {"description": "移除自定义 MCP 连接器（内置预设则禁用），用户确认后才会放行。输入连接器 key；会先关闭活动会话。", "func": dev_mcp_remove},
     "dev_mcp_discover_from_need": {"description": "从自然语言需求发现可装配的 MCP 连接器候选（不写盘、不自动启用）。输入需求描述（如『我需要查高铁票的 MCP』），可选多行 web_enabled: true 开启联网。流程：离线精选索引 →（联网时）GitHub 域限定搜索取仓库 README 解析官方命令，候选过 R1-R9 信任闸门。返回后须向用户展示候选，逐条 dev_mcp_add（审批）落盘，再 dev_mcp_probe 探活、dev_mcp_discover 生成能力候选。", "func": dev_mcp_discover_from_need},
     "dev_skill_create": {"description": "起草用户技能（待审批，不会自动启用）。skill 是*可执行行为*，必须经用户确认才激活。多行输入 name/description/body；写入 SKILLS_DIR/.pending/<name>/SKILL.md（草稿不生效）。返回完整正文，代理须向用户完整展示并取得明确同意后，再 dev_skill_approve 激活。", "func": dev_skill_create},
+    "dev_preview_adapter_create": {"description": "让 Agent 为当前项目自主生成领域预览适配器草稿（不会自动启用）。多行输入 id/label/domain/artifact_kinds/capture_adapter/refresh_tool/connector_hint/validation/evidence；写入项目 .docmind/preview-adapters/*.json。先展示方案与验证条件，用户明确确认后才可调用 dev_preview_adapter_approve。", "func": dev_preview_adapter_create},
+    "dev_preview_adapter_approve": {"description": "激活或拒绝 Agent 生成的项目预览适配器。只有用户明确确认适配器方案、刷新工具和验证条件后才传 decision: approve；否则只用 reject。输入 id 与 decision。", "func": dev_preview_adapter_approve},
     "dev_skill_approve": {"description": "激活待审批技能：把 .pending/<name>/SKILL.md 移到 SKILLS_DIR 并 reload 生效。仅当用户已明确确认该技能正文安全时调用。输入 name: <技能名>。", "func": dev_skill_approve},
     "dev_skill_reject": {"description": "丢弃待审批技能草稿（不激活、不保留）。输入 name: <技能名>。", "func": dev_skill_reject},
     "search_knowledge": {

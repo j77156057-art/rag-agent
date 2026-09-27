@@ -126,12 +126,14 @@ _ADMIN_TOOLS = {
     "dev_approve", "dev_commit", "dev_commit_all", "dev_rollback_changeset",
     "dev_apply_regions", "dev_add_region", "init_regions", "dev_install_tool",
     "dev_mcp_add", "dev_mcp_decide", "dev_mcp_remove",
+    "dev_preview_adapter_approve",
     "start_workflow",
 }
 _WRITE_TOOLS = {
     "apply_edit", "create_file", "create_artifact", "dev_region_edit",
     "dev_refactor", "dev_rebuild_index", "dev_asset_register", "dev_capture_bug",
     "dev_update_bug", "game_upsert_task",
+    "dev_preview_adapter_create",
 }
 _IRREVERSIBLE_TOOLS = {"run_command", "game_playtest", "dev_mcp_call"}
 _NO_ARG_TOOLS = {

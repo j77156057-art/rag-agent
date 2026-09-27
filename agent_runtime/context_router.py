@@ -46,6 +46,10 @@ _MCP_DISCOVERY = re.compile(
     r"(?:搜|找|连接|接入|添加|安装|配置|使用|调用).*(?:mcp|连接器)|"
     r"(?:eda|kicad|altium|easyeda|pcb).*(?:mcp|连接器)", re.I,
 )
+_ADAPTER_DISCOVERY = re.compile(
+    r"适配器|预览适配器|领域适配|连接能力|支持(?:某|这个|该)?(?:软件|工具|领域|格式)|"
+    r"(?:为|给).{0,24}(?:软件|工具|领域|格式).{0,24}(?:预览|连接|适配)", re.I,
+)
 _EXPERIENCE = re.compile(r"再次|之前|历史|经验|类似问题|复现|回归|修复|失败", re.I)
 _TERM_SPLIT = re.compile(r"[\s,，、/|;；:：()（）\[\]【】]+")
 
@@ -702,6 +706,7 @@ class ContextRouter:
         wants_knowledge = bool(has_knowledge and _KNOWLEDGE.search(query))
         wants_web = bool(web_enabled and _WEB.search(query))
         wants_mcp = bool(_MCP_DISCOVERY.search(query))
+        wants_adapter = bool(_ADAPTER_DISCOVERY.search(query))
         wants_experience = bool(experience_enabled and _EXPERIENCE.search(query))
 
         # Ambiguous questions may use both local stores.  A configured code
@@ -716,6 +721,8 @@ class ContextRouter:
             sources.append("web")
             groups.add("web")
         if wants_mcp:
+            groups.add("developer")
+        if wants_adapter:
             groups.add("developer")
         if wants_experience:
             sources.append("experience")
@@ -774,6 +781,13 @@ class ContextRouter:
                 "需要新 MCP 连接器时先调用 dev_mcp_search 查真实候选并展示给用户；"
                 "联网开关关闭时该工具只给离线指引。搜索结果不代表已连接，"
                 "添加连接器和启用能力仍需用户确认。")
+        if wants_adapter:
+            route_lines.append(
+                "用户在询问新的领域或预览适配能力：先查现有 MCP/连接器和工具；"
+                "只有现有能力不足时才调用 dev_preview_adapter_create 生成当前项目的声明式草稿。"
+                "先向用户展示领域、产物、刷新方式和验收条件，用户明确确认后才调用 "
+                "dev_preview_adapter_approve( decision: approve ) 激活；不得执行草稿中的任意代码。"
+            )
         add("\n".join(route_lines))
 
         if selected:

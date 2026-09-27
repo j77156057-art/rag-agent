@@ -8,10 +8,12 @@ add their own metadata without changing the workflow engine.
 from __future__ import annotations
 
 import mimetypes
+import json
 import re
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 PREVIEW_SCHEMA = "docmind.preview.v1"
@@ -92,6 +94,25 @@ def _adapter_inputs(raw: Mapping[str, Any], workflow: Mapping[str, Any]) -> Iter
     # contain a file path or screenshot and predate the adapter field.
     name = str(raw.get("adapter") or raw.get("domain") or workflow.get("kind") or "").strip().lower()
     handler = _ADAPTERS.get(name) if name else None
+    if handler is None and name:
+        # Agent-generated adapters are declarative project manifests. They can
+        # enrich evidence without importing or executing arbitrary project code.
+        root = str(workflow.get("project_root") or "").strip()
+        manifest = Path(root).resolve() / ".docmind" / "preview-adapters" / (re.sub(r"[^a-z0-9_.-]+", "-", name) + ".json") if root else None
+        try:
+            spec = json.loads(manifest.read_text(encoding="utf-8")) if manifest and manifest.is_file() else {}
+        except (OSError, ValueError, TypeError):
+            spec = {}
+        if isinstance(spec, Mapping) and spec.get("status") == "active":
+            enriched = dict(raw)
+            metadata = dict(enriched.get("metadata") or {})
+            metadata.setdefault("generated_adapter", "true")
+            metadata.setdefault("refresh_tool", str(spec.get("refresh_tool") or ""))
+            metadata.setdefault("connector_hint", str(spec.get("connector_hint") or ""))
+            enriched["metadata"] = metadata
+            enriched.setdefault("summary", spec.get("evidence") or "模型生成的领域预览适配器")
+            yield enriched
+            return
     if handler is None:
         yield raw
         return
