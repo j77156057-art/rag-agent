@@ -128,6 +128,7 @@ _ADMIN_TOOLS = {
     "dev_mcp_add", "dev_mcp_decide", "dev_mcp_remove",
     "dev_preview_adapter_approve",
     "dev_desktop_action",
+    "dev_preview_adapter_rollback",
     "start_workflow",
 }
 _WRITE_TOOLS = {
@@ -136,6 +137,7 @@ _WRITE_TOOLS = {
     "dev_update_bug", "game_upsert_task",
     "dev_preview_adapter_create",
     "dev_preview_adapter_refresh",
+    "dev_preview_adapter_rollback",
     "dev_desktop_capture",
     "dev_desktop_action",
 }

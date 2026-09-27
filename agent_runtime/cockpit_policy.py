@@ -22,6 +22,7 @@ _MAX_ROWS = 500
 RISK_LEVELS = {
     "mcp_server": "L2", "mcp_capability": "L2", "install_tool": "L2",
     "desktop_action": "L2",
+    "preview_adapter_rollback": "L2",
     "apply_regions": "L2", "commit_region": "L3", "commit_all": "L3",
     "rollback_changeset": "L3", "rollback_skill": "L3", "update_skill": "L2",
 }

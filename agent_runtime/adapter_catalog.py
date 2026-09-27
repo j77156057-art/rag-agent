@@ -55,6 +55,10 @@ def catalog(project_root: str | Path = "", *, connectors: list[dict[str, Any]] |
             "refresh_tool": manifest.get("refresh_tool") or "",
             "connector_hint": manifest.get("connector_hint") or "",
             "validation": manifest.get("validation") or [],
+            "runtime": manifest.get("runtime") or "",
+            "entrypoint": manifest.get("entrypoint") or "adapt",
+            "module_path": manifest.get("module_path") or "",
+            "source_sha256": manifest.get("source_sha256") or "",
         })
     return {"project_root": root, "adapters": rows, "count": len(rows)}
 
@@ -113,6 +117,16 @@ def create_generated(project_root: str | Path, spec: dict[str, Any]) -> dict[str
         "evidence": str(spec.get("evidence") or "模型生成的领域预览适配器")[:300],
         "status": "pending",
     }
+    runtime = str(spec.get("runtime") or "").strip().lower()
+    source = spec.get("source")
+    if runtime or source:
+        if runtime not in {"python", "node"} or not isinstance(source, str) or not source.strip():
+            raise ValueError("带代码的适配器必须同时提供 runtime: python|node 和 source")
+        from .generated_adapter_runtime import stage_source
+        code = stage_source(root, adapter_id, runtime, source,
+                            entrypoint=str(spec.get("entrypoint") or "adapt"))
+        manifest.update({"runtime": runtime, "entrypoint": code["entrypoint"],
+                         "source_sha256": code["sha256"], "source_bytes": code["source_bytes"]})
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
 
@@ -125,6 +139,12 @@ def approve_generated(project_root: str | Path, adapter_id: str, approved: bool)
         raise ValueError("没有找到该适配器草稿")
     import json
     path = root / _GENERATED_DIR / (clean + ".json")
+    if approved and rows[clean].get("runtime"):
+        from .generated_adapter_runtime import activate_source
+        info = activate_source(root, clean, rows[clean]["runtime"],
+                               entrypoint=str(rows[clean].get("entrypoint") or "adapt"))
+        rows[clean].update({"module_path": info["module_path"], "backup_path": info.get("backup_path", ""),
+                            "source_sha256": info["sha256"], "source_bytes": info["source_bytes"]})
     rows[clean]["status"] = "active" if approved else "rejected"
     path.write_text(json.dumps(rows[clean], ensure_ascii=False, indent=2), encoding="utf-8")
     return rows[clean]

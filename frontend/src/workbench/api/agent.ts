@@ -32,6 +32,7 @@ export interface PreviewAdapterInfo {
   connector_key?: string; transport?: string; project_scoped?: boolean
   generated?: boolean; status?: 'pending' | 'active' | 'rejected'
   refresh_tool?: string; connector_hint?: string; validation?: string[]
+  runtime?: 'python' | 'node' | string; entrypoint?: string; module_path?: string; source_sha256?: string
 }
 export interface PreviewAdapterCatalogResp { ok?: boolean; adapters?: PreviewAdapterInfo[]; count?: number; error?: string }
 export interface PreviewAdapterConfigResp { ok?: boolean; profile?: ProjectProfile; error?: string }

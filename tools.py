@@ -743,7 +743,7 @@ def dev_preview_adapter_create(arg):
     """让 Agent 为当前项目生成一个待审批的领域预览适配器清单。"""
     fields = _parse_keyed(str(arg or ""), [
         "id", "name", "label", "domain", "artifact_kinds", "capture_adapter",
-        "refresh_tool", "connector_hint", "validation", "evidence",
+        "refresh_tool", "connector_hint", "validation", "evidence", "runtime", "entrypoint", "source",
     ])
     adapter_id = (fields.get("id") or fields.get("name") or "").strip()
     if not adapter_id:
@@ -770,9 +770,12 @@ def dev_preview_adapter_create(arg):
             "connector_hint": fields.get("connector_hint") or "",
             "validation": split_values(fields.get("validation") or ""),
             "evidence": fields.get("evidence") or "模型生成的领域预览适配器",
+            "runtime": fields.get("runtime") or "",
+            "entrypoint": fields.get("entrypoint") or "adapt",
+            "source": fields.get("source") or "",
         })
         return json.dumps({"ok": True, "manifest": manifest, "next":
-                           "向用户展示适配器方案和验证条件；用户明确确认后再调用 dev_preview_adapter_approve"},
+                           "向用户展示适配器方案、代码摘要和验证条件；用户明确确认后再调用 dev_preview_adapter_approve"},
                           ensure_ascii=False)
     except (OSError, ValueError, TypeError) as exc:
         return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
@@ -855,15 +858,60 @@ def dev_preview_adapter_refresh(arg):
             if spec is None:
                 return json.dumps({"ok": False, "error": "内置刷新工具当前不可用"}, ensure_ascii=False)
             result = spec["func"](raw_args)
+            if manifest.get("runtime"):
+                from agent_runtime.generated_adapter_runtime import execute
+                payload = result.data if isinstance(result, ToolResult) else result
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except (TypeError, ValueError):
+                        payload = {"text": payload}
+                adapted = execute(root, manifest, payload)
+                return json.dumps({"ok": True, "adapter": adapter_id, "tool": name,
+                                   "generated": True, "result": adapted["value"]}, ensure_ascii=False)
             if isinstance(result, ToolResult):
                 return result
             return json.dumps({"ok": True, "adapter": adapter_id, "tool": name,
                                "result": str(result)}, ensure_ascii=False)
         _, key, name = reference
         result = dev_mcp_call("key: %s\nname: %s\narguments: %s" % (key, name, raw_args))
+        if manifest.get("runtime"):
+            from agent_runtime.generated_adapter_runtime import execute
+            payload = result
+            try:
+                payload = json.loads(str(result))
+            except (TypeError, ValueError):
+                pass
+            adapted = execute(root, manifest, payload)
+            return json.dumps({"ok": True, "adapter": adapter_id, "connector": key,
+                               "tool": name, "generated": True, "result": adapted["value"]}, ensure_ascii=False)
         return json.dumps({"ok": not str(result).startswith("MCP 调用失败"),
                            "adapter": adapter_id, "connector": key, "tool": name,
                            "result": result}, ensure_ascii=False)
+    except (OSError, ValueError, TypeError) as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+
+def dev_preview_adapter_rollback(arg):
+    """回滚当前项目生成适配器代码到上一个已激活版本。"""
+    fields = _parse_keyed(str(arg or ""), ["id", "runtime"])
+    adapter_id = (fields.get("id") or "").strip().lower()
+    root = _get_code_root()
+    if not root or not adapter_id:
+        return json.dumps({"ok": False, "error": "需要当前项目和适配器 id"}, ensure_ascii=False)
+    try:
+        from agent_runtime.adapter_catalog import generated
+        manifest = next((item for item in generated(root) if item.get("id") == adapter_id), None)
+        if not manifest or not manifest.get("runtime"):
+            return json.dumps({"ok": False, "error": "没有找到带代码的生成适配器"}, ensure_ascii=False)
+        from game_workbench import require_approval
+        target = "preview-adapter:%s" % adapter_id
+        gate = require_approval(root, "preview_adapter_rollback", target)
+        if gate:
+            return json.dumps(gate, ensure_ascii=False)
+        from agent_runtime.generated_adapter_runtime import rollback
+        result = rollback(root, adapter_id, fields.get("runtime") or manifest["runtime"])
+        return json.dumps({"ok": True, "adapter": adapter_id, **result}, ensure_ascii=False)
     except (OSError, ValueError, TypeError) as exc:
         return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
@@ -5092,9 +5140,10 @@ TOOLS = {
     "dev_mcp_remove": {"description": "移除自定义 MCP 连接器（内置预设则禁用），用户确认后才会放行。输入连接器 key；会先关闭活动会话。", "func": dev_mcp_remove},
     "dev_mcp_discover_from_need": {"description": "从自然语言需求发现可装配的 MCP 连接器候选（不写盘、不自动启用）。输入需求描述（如『我需要查高铁票的 MCP』），可选多行 web_enabled: true 开启联网。流程：离线精选索引 →（联网时）GitHub 域限定搜索取仓库 README 解析官方命令，候选过 R1-R9 信任闸门。返回后须向用户展示候选，逐条 dev_mcp_add（审批）落盘，再 dev_mcp_probe 探活、dev_mcp_discover 生成能力候选。", "func": dev_mcp_discover_from_need},
     "dev_skill_create": {"description": "起草用户技能（待审批，不会自动启用）。skill 是*可执行行为*，必须经用户确认才激活。多行输入 name/description/body；写入 SKILLS_DIR/.pending/<name>/SKILL.md（草稿不生效）。返回完整正文，代理须向用户完整展示并取得明确同意后，再 dev_skill_approve 激活。", "func": dev_skill_create},
-    "dev_preview_adapter_create": {"description": "让 Agent 为当前项目自主生成领域预览适配器草稿（不会自动启用）。多行输入 id/label/domain/artifact_kinds/capture_adapter/refresh_tool/connector_hint/validation/evidence；写入项目 .docmind/preview-adapters/*.json。先展示方案与验证条件，用户明确确认后才可调用 dev_preview_adapter_approve。", "func": dev_preview_adapter_create},
+    "dev_preview_adapter_create": {"description": "让 Agent 为当前项目生成领域预览适配器草稿（不会自动启用）。多行输入 id/label/domain/artifact_kinds/capture_adapter/refresh_tool/connector_hint/validation/evidence；若需要真正代码，再提供 runtime: python|node、entrypoint: adapt、source: 完整模块源码。系统只允许 adapt(payload) 把已批准工具结果转换为 JSON，静态检查通过后仍需用户确认；代码写入 .docmind/preview-adapters/.pending。", "func": dev_preview_adapter_create},
     "dev_preview_adapter_approve": {"description": "激活或拒绝 Agent 生成的项目预览适配器。只有用户明确确认适配器方案、刷新工具和验证条件后才传 decision: approve；否则只用 reject。输入 id 与 decision。", "func": dev_preview_adapter_approve},
-    "dev_preview_adapter_refresh": {"description": "执行已激活项目预览适配器的受控刷新。适配器 manifest 的 refresh_tool 只能是 builtin:preview_project|game_screenshot|dev_desktop_capture|self_verify，或 mcp:<connector>/<tool>；禁止 Python、shell、URL 和任意 callable。输入 id 与可选 arguments(JSON)，MCP 仍遵守连接器启用和用户审批。", "func": dev_preview_adapter_refresh},
+    "dev_preview_adapter_refresh": {"description": "执行已激活项目预览适配器的受控刷新。适配器可使用已批准的 builtin/MCP 获取原始结果，再交给隔离 Python/Node 的 adapt(payload) 转换为预览产物；禁止适配器自行联网、启动命令或读写项目。", "func": dev_preview_adapter_refresh},
+    "dev_preview_adapter_rollback": {"description": "回滚当前项目生成的 Python/Node 领域适配器到上一个已激活版本。首次调用需要用户批准 preview_adapter_rollback，批准后使用相同 id 重试。", "func": dev_preview_adapter_rollback},
     "dev_skill_approve": {"description": "激活待审批技能：把 .pending/<name>/SKILL.md 移到 SKILLS_DIR 并 reload 生效。仅当用户已明确确认该技能正文安全时调用。输入 name: <技能名>。", "func": dev_skill_approve},
     "dev_skill_reject": {"description": "丢弃待审批技能草稿（不激活、不保留）。输入 name: <技能名>。", "func": dev_skill_reject},
     "search_knowledge": {

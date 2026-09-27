@@ -98,7 +98,7 @@ onMounted(() => { void load() })
     <div class="adapter-grid">
       <div v-for="item in adapters" :key="item.id" class="adapter-item">
         <input v-if="!item.requires_connector && (!item.generated || item.status === 'active')" type="checkbox" :checked="configured.includes(item.id)" @change="toggleAdapter(item.id)" />
-        <div><b>{{ item.label || item.id }}</b><small>{{ item.evidence }}</small><small v-if="item.generated && item.refresh_tool">刷新：{{ item.refresh_tool }}</small><small v-if="item.generated && item.validation?.length">验收：{{ item.validation.join('；') }}</small></div>
+        <div><b>{{ item.label || item.id }}</b><small>{{ item.evidence }}</small><small v-if="item.generated && item.runtime">代码：隔离 {{ item.runtime }} / {{ item.entrypoint || 'adapt' }}()</small><small v-if="item.generated && item.refresh_tool">刷新：{{ item.refresh_tool }}</small><small v-if="item.generated && item.validation?.length">验收：{{ item.validation.join('；') }}</small></div>
         <span :class="item.available ? 'on' : 'off'">{{ item.generated ? (item.status === 'pending' ? '待确认' : item.status === 'rejected' ? '已拒绝' : '已激活') : (item.available ? '可用' : '未连接') }}</span>
         <div v-if="item.generated && item.status === 'pending'" class="adapter-actions">
           <button type="button" :disabled="!!decisionBusy" @click="decideAdapter(item, true)">{{ decisionBusy === item.id ? '处理中…' : '激活' }}</button>
