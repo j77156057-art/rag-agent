@@ -50,4 +50,5 @@ key: Control_L+s
 - `dev_desktop_capture` 只读；`dev_desktop_action` 只接受 `embedded`/`foreground` 目标，不提供任意窗口句柄、任意进程枚举、终端或脚本执行入口。
 - 适配器需要长期复用时，先生成项目级适配器草稿；用户批准后才能激活。
 - 领域适配器可以由 Agent 生成 `runtime: python|node` 的模块代码。模块入口固定为 `adapt(payload)`，只接收已批准工具的 JSON 结果并返回 JSON artifact；它在项目 `.docmind/preview-adapters/.pending` 中等待审批，激活后才会进入隔离子进程运行。模块不能自行联网、启动命令、读取项目外文件或写入项目。
+- Windows 上的适配器进程会加入 Job Object，限制进程树、内存、生命周期和未处理异常；如果无法建立该边界，运行会失败并等待处理，不会降级为普通无界进程。网络访问仍以代码静态检查和清理环境变量为边界，不能把它当作完整网络防火墙。
 - 适配器代码替换前会保存历史版本；执行失败不会伪造成功，用户需要回退时使用 `dev_preview_adapter_rollback`，该操作也必须经过审批。

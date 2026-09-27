@@ -261,13 +261,29 @@ def execute(project_root: str | os.PathLike[str], manifest: Mapping[str, Any], p
             if not node:
                 raise GeneratedAdapterError("未找到 Node.js，无法运行 Node 适配器")
             command = [node, "--no-warnings", "-e", _NODE_RUNNER, str(module), entrypoint, str(input_path)]
-        environment = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8", "NODE_NO_WARNINGS": "1"}
+        # Keep Windows process bootstrap variables (SystemRoot/TEMP/etc.) but
+        # remove inherited credentials and import hooks before entering the
+        # Job Object. Network proxy variables are also cleared by default.
+        environment = dict(os.environ)
+        for key in list(environment):
+            upper = key.upper()
+            if (any(token in upper for token in ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "PRIVATE_KEY"))
+                    or upper in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "PYTHONPATH", "NODE_PATH"}):
+                environment.pop(key, None)
+        environment.update({"PYTHONIOENCODING": "utf-8", "NODE_NO_WARNINGS": "1"})
         try:
-            completed = (runner or subprocess.run)(command, cwd=str(temp_path), capture_output=True,
-                                                   text=True, timeout=max(1, min(MAX_EXECUTION_SECONDS, int(timeout))),
-                                                   env=environment)
+            if runner is not None:
+                completed = runner(command, cwd=str(temp_path), capture_output=True,
+                                   text=True, timeout=max(1, min(MAX_EXECUTION_SECONDS, int(timeout))),
+                                   env=environment)
+            else:
+                from .windows_sandbox import run_isolated
+                completed = run_isolated(command, cwd=str(temp_path), env=environment,
+                                         timeout=max(1, min(MAX_EXECUTION_SECONDS, int(timeout))))
         except subprocess.TimeoutExpired as exc:
             raise GeneratedAdapterError("适配器执行超时") from exc
+        except (OSError, RuntimeError) as exc:
+            raise GeneratedAdapterError("适配器隔离启动失败：%s" % str(exc)[:200]) from exc
         code = int(getattr(completed, "returncode", 0) if not isinstance(completed, Mapping) else completed.get("returncode", 0))
         stdout = str(getattr(completed, "stdout", "") if not isinstance(completed, Mapping) else completed.get("stdout", ""))
         stderr = str(getattr(completed, "stderr", "") if not isinstance(completed, Mapping) else completed.get("stderr", ""))
