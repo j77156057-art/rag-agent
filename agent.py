@@ -216,7 +216,7 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - search_knowledge(query): 在本地知识库中检索相关文档片段。回答"某文档里讲了什么/某概念怎么定义"类问题。
 - search_assets(query): 在精选游戏素材目录中检索素材（角色精灵/tileset/UI/音效等），回答"找素材/美术资源/角色精灵/tileset"类问题。
 - calculate(expression): 计算数学表达式，如 '23*45+12'；也支持比较运算，如 '9.9 > 9.11'（结果为「成立/不成立」）。支持 + - * / % ** //、括号与 > < >= <= == !=。比较/差值类问题算出结果后，必须用自然语言给出结论（如「所以 9.9 更大」），不要只丢一个数字。
-- web_search(query): 联网搜索（DuckDuckGo/百度/Bing 自动故障转移，无需 Key）。当知识库不足、信息有时效性、或需要外部资料时使用。默认偏好近一年结果（自动追加 after:<去年>，可用 env WEB_SEARCH_PREFER_RECENT=0 关闭）。需要限定站点时，在输入里追加 `site: github.com` 或 `platform: github/b站/微博/贴吧`（自动映射域名），把结果收敛到指定站。
+- web_search(query): 联网搜索（自动模式同时请求通用引擎和相关站点，限时汇总，最多 30 条候选，无需 Key）。候选尚未核对正文，不代表可靠结论；相关性不足时改写关键词或限定站点，不得根据跑题结果作答。只有时效性查询追加日期筛选，普通教程不限制年份。需要限定站点时，在输入里追加 `site: github.com` 或 `platform: github/b站/微博/贴吧`（自动映射域名）。
 - web_fetch(url): 读取搜索结果中的公开网页正文，保留来源 URL 和标题后再总结。
 - web_research(query): 一步完成搜索与多个来源正文读取，适合教程、GitHub、引擎文档和最新资料；会标记来源排序参考与明显数字冲突。研究型问题可先用不同关键词、年份和平台做多轮 web_search，直到证据覆盖足够或达到本轮预算。
 - web_subtitles(url): 读取公开 B 站视频字幕（BV/av URL）；无公开字幕或需要登录时如实返回原因。
@@ -712,9 +712,9 @@ def _clip_tool_observation(text, base_limit, tool_name=""):
     """为联网观察保留首尾，避免来源正文和末尾复核提示一起丢失。"""
     tool = str(tool_name or "").strip().lower()
     limit = max(256, int(base_limit or 0))
-    if tool in {"web_search", "web_research"}:
+    if tool in {"web_search", "web_search_batch", "web_research"}:
         env_name = "DOCMIND_WEB_RESEARCH_OBS_CHARS" if tool == "web_research" else "DOCMIND_WEB_SEARCH_OBS_CHARS"
-        default = 7200 if tool == "web_research" else 3600
+        default = 7200 if tool == "web_research" else 12000
         try:
             limit = max(limit, min(12000, int(os.getenv(env_name, str(default)))))
         except (TypeError, ValueError):

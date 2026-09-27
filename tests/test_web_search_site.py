@@ -79,9 +79,9 @@ class BaiduBackendTests(unittest.TestCase):
     def test_baidu_used_when_ddg_fails(self):
         with patch.dict(tools.os.environ, self._auto(), clear=True), \
                 patch("tools._ddg_search", side_effect=OSError("blocked")), \
-                patch("tools._baidu_search", return_value="· 百度结果") as m:
+                patch("tools._baidu_search", return_value="· 某关键词百度结果") as m:
             out = tools.web_search("某关键词")
-        self.assertEqual(out, "· 百度结果")
+        self.assertEqual(out, "· 某关键词百度结果")
         m.assert_called_once()
 
     def test_forced_baidu_backend(self):

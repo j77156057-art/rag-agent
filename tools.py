@@ -19,8 +19,9 @@ import urllib.request
 import urllib.parse
 import datetime
 import hashlib
+import html as html_lib
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 import mcp_client
 import mcp_capabilities
 from artifact_tools import create_artifact
@@ -1201,11 +1202,46 @@ def calculate(expression):
     return str(result)
 
 
-_SEARCH_EMPTY_MARKERS = ("搜索失败", "搜索未返回结果")
+_SEARCH_EMPTY_MARKERS = ("搜索失败", "搜索未返回结果", "搜索结果相关性不足")
+
+
+_SEARCH_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="docmind-search")
+
+
+def _search_setting(name, default, low, high):
+    try:
+        return max(low, min(high, float(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _search_result_limit():
+    return int(_search_setting("DOCMIND_WEB_SEARCH_RESULTS", 30, 5, 50))
+
+
+def _run_search_jobs(jobs):
+    """在共享有界线程池并行发出请求，到总体时限就返回已完成结果。"""
+    futures = {_SEARCH_POOL.submit(fn, *args): name for name, fn, args in jobs}
+    results = {}
+    try:
+        for future in as_completed(futures, timeout=_search_setting("DOCMIND_WEB_SEARCH_WAIT_S", 5, 0.05, 15)):
+            name = futures[future]
+            try:
+                value = future.result()
+                results[name] = value[1] if isinstance(value, tuple) else value
+            except Exception as exc:
+                results[name] = f"搜索失败: {name}: {type(exc).__name__}"
+    except FuturesTimeoutError:
+        pass
+    pending = [name for name, _fn, _args in jobs if name not in results]
+    for future in futures:
+        if not future.done():
+            future.cancel()
+    return results, pending
 
 
 def _search_recency_query(q: str) -> str:
-    """默认偏好近一年结果：给查询追加 after:<去年>；可用 env WEB_SEARCH_PREFER_RECENT=0 关闭，
+    """时效性查询偏好近一年结果；可用 env WEB_SEARCH_PREFER_RECENT=0 关闭，
     或查询已含 after:/before:/年份范围时跳过，避免重复拼接。"""
     if re.search(r"今天|今日|明天", q) and not re.search(r"\d{4}[-年/]\d{1,2}", q):
         day = datetime.datetime.now().astimezone().date()
@@ -1215,6 +1251,8 @@ def _search_recency_query(q: str) -> str:
     if os.getenv("WEB_SEARCH_PREFER_RECENT", "1").strip().lower() in ("0", "false", "no"):
         return q
     if re.search(r"\b(after|before):", q) or re.search(r"\b\d{4}\.\.\d{4}\b", q):
+        return q
+    if not re.search(r"今天|今日|明天|最新|近期|最近|目前|新闻|\b(?:latest|recent|news)\b", q, re.I):
         return q
     year = datetime.date.today().year - 1
     return f"{q} after:{year}"
@@ -1285,10 +1323,10 @@ _SEARCH_SOURCE_LABELS = {
 }
 
 _SEARCH_SOURCE_RULES = (
-    ("github.com", ("github", "代码", "源码", "仓库", "开源", "库", "api", "sdk", "mcp", "插件", "报错", "bug", "issue", "godot", "unity", "unreal", "easyeda", "cad")),
-    ("bilibili.com", ("视频", "教程", "演示", "怎么做", "教学", "评测", "测评", "游戏", "剪辑", "编程")),
+    ("github.com", ("github", "代码", "源码", "仓库", "开源", "软件库", "api", "sdk", "mcp", "插件", "报错", "bug", "issue", "godot", "unity", "unreal", "easyeda", "cad")),
+    ("bilibili.com", ("视频", "教程", "演示", "怎么做", "做法", "教学", "评测", "测评", "游戏", "剪辑", "编程")),
     ("zhihu.com", ("为什么", "经验", "推荐", "评价", "口碑", "哪个好", "怎么选", "避坑", "值得", "原理", "方案")),
-    ("tieba.baidu.com", ("吧", "贴吧", "玩家", "经验", "求助", "推荐", "评价", "游戏")),
+    ("tieba.baidu.com", ("贴吧", "玩家", "经验", "求助", "推荐", "评价", "游戏")),
     ("xiaohongshu.com", ("小红书", "种草", "探店", "好吃", "美食", "旅行", "穿搭", "护肤", "购物", "推荐", "避坑", "评价", "口碑")),
     ("weibo.com", ("热搜", "舆论", "事件", "明星", "品牌", "评价")),
     ("csdn.net", ("代码", "报错", "教程", "编程", "python", "java", "前端", "后端", "部署")),
@@ -1351,20 +1389,13 @@ def _search_auxiliary_sources(query, base_result):
     if not domains:
         return base_result
     named = [("general", base_result)]
-    with ThreadPoolExecutor(max_workers=len(domains), thread_name_prefix="docmind-source") as pool:
-        futures = {pool.submit(_search_one_source, domain, query): domain for domain in domains}
-        for future in as_completed(futures):
-            domain = futures[future]
-            try:
-                label, result = future.result()
-            except Exception as exc:  # noqa: BLE001
-                label, result = _SEARCH_SOURCE_LABELS.get(domain, domain), f"搜索失败: {type(exc).__name__}: {exc}"
-            named.append((label, result))
+    results, _pending = _run_search_jobs([
+        (_SEARCH_SOURCE_LABELS.get(domain, domain), _search_one_source, (domain, query)) for domain in domains])
+    named.extend(results.items())
     merged = _merge_builtin_results(query, named)
     if not merged or any(merged.startswith(marker) for marker in _SEARCH_EMPTY_MARKERS):
         return base_result
-    return merged.replace("聚合搜索结果（已跨 DuckDuckGo、百度、Bing 去重排序）：",
-                          "聚合搜索结果（通用引擎 + 相关站点并行去重排序）：", 1)
+    return merged
 
 
 def _json_request(url, *, headers=None, timeout=15):
@@ -1428,14 +1459,14 @@ def _github_search(q):
         cached = _web_cache_read(key)
         if cached:
             return cached + "\n（缓存结果）"
-    url = "https://api.github.com/search/repositories?" + urllib.parse.urlencode({"q": q, "per_page": 5, "sort": "updated"})
+    url = "https://api.github.com/search/repositories?" + urllib.parse.urlencode({"q": q, "per_page": 10})
     try:
         data = _json_request(url, headers={"User-Agent": "DocMind/1.0", "Accept": "application/vnd.github+json"})
         rows = data.get("items") or []
         if not rows:
             return "搜索未返回结果，可能是网络受限或该关键词无结果。"
         lines = ["GitHub 专用搜索（仓库 API）："]
-        for item in rows[:5]:
+        for item in rows[:10]:
             desc = (item.get("description") or "").replace("\n", " ")
             meta = f"★{item.get('stargazers_count', 0)} · 最近更新 {item.get('updated_at', '')[:10]}"
             lines.append(_format_search_result(item.get("full_name") or item.get("name", ""), f"{desc}（{meta}）", item.get("html_url", "")))
@@ -1454,7 +1485,7 @@ def _bilibili_search(q):
         cached = _web_cache_read(key)
         if cached:
             return cached + "\n（缓存结果）"
-    params = urllib.parse.urlencode({"search_type": "video", "keyword": q, "page": 1, "page_size": 5})
+    params = urllib.parse.urlencode({"search_type": "video", "keyword": q, "page": 1, "page_size": 10})
     url = "https://api.bilibili.com/x/web-interface/search/type?" + params
     try:
         data = _json_request(url, headers={"User-Agent": "Mozilla/5.0 (DocMind/1.0)", "Referer": "https://www.bilibili.com/"})
@@ -1462,7 +1493,7 @@ def _bilibili_search(q):
         if not rows:
             return "B 站搜索未返回结果（可能需要验证码或该关键词无结果）。"
         lines = ["B 站专用视频搜索："]
-        for item in rows[:5]:
+        for item in rows[:10]:
             title = re.sub(r"<[^>]+>", "", item.get("title", ""))
             bvid = item.get("bvid") or ""
             link = "https://www.bilibili.com/video/" + bvid if bvid else item.get("arcurl", "")
@@ -1529,9 +1560,9 @@ def web_search(query, _allow_aux=True):
     - 追加 `site: github.com` 或 `platform: github`（自动映射为 site:github.com），
       把结果收敛到指定站（GitHub / 哔哩哔哩 / 微博 / 百度贴吧 等）。
 
-    服务商（设置中可切换）：auto（内置 ddg→baidu→bing 故障转移）/ ddg / bing / baidu /
+    服务商（设置中可切换）：auto（多来源同时检索、限时汇总）/ ddg / bing / baidu /
     exa / tavily / searxng / bocha / firecrawl / zhipu / querit / parallel / mcp_exa。
-    API 类服务商需先在设置填 API Key（或自建实例地址）。返回前 5 条标题/摘要/链接。
+    API 类服务商需先在设置填 API Key（或自建实例地址）。自动模式最多返回 30 条候选。
     """
     q, site = _parse_web_search_arg(query)
     if not q:
@@ -1555,20 +1586,15 @@ def web_search(query, _allow_aux=True):
         q = f"{q} site:{site}"
     q = _search_recency_query(q)
     provider = get_web_search_provider()
-    cache_key = _web_cache_key("search:" + provider, q)
+    cache_key = _web_cache_key(f"search:v3:{provider}:{_allow_aux}:{_search_result_limit()}", q)
     if _search_cache_enabled():
         cached = _web_cache_read(cache_key)
         if cached:
             return cached + "\n（缓存结果）"
     if provider in ("builtin_auto", "ddg", "bing", "baidu"):
-        result = _builtin_search(provider, q)
+        result = _builtin_search(provider, q, include_aux=(not site and _allow_aux))
     else:
         result = _api_web_search(provider, q)
-    # 自动模式在通用引擎结果之外，按查询语义并行补充相关社区/代码站点。
-    # 显式 site/platform 查询保持单站点语义；批量搜索会关闭此层，避免查询爆炸。
-    if provider == "builtin_auto" and not site and _allow_aux and not any(
-            result.startswith(marker) for marker in _SEARCH_EMPTY_MARKERS):
-        result = _search_auxiliary_sources(q, result)
     if specialized_error and not any(result.startswith(m) for m in _SEARCH_EMPTY_MARKERS):
         result = specialized_error + "\n\n通用搜索回退结果：\n" + result
     if _search_cache_enabled() and not any(result.startswith(m) for m in _SEARCH_EMPTY_MARKERS):
@@ -1642,15 +1668,18 @@ def web_search_batch(arg):
             if not key:
                 continue
             score, reason = _source_score(row.get("url", ""), row.get("title", ""), row.get("snippet", ""))
-            candidate = {**row, "query": query, "rank": score, "reason": reason}
+            terms = _search_terms(query)
+            matched = sum(term in (row.get("title", "") + " " + row.get("snippet", "")).lower() for term in terms)
+            rank = matched / max(1, len(terms)) * 3 + score * 0.15
+            candidate = {**row, "query": query, "rank": rank, "reason": reason}
             old = unique.get(key)
             if old is None or candidate["rank"] > old["rank"]:
                 unique[key] = candidate
     if not unique:
         return "\n".join(diagnostics) if diagnostics else "搜索未返回结果。"
     lines = [f"批量搜索结果（{len(queries)} 个查询并行，已跨查询去重）："]
-    for row in sorted(unique.values(), key=lambda item: item["rank"], reverse=True)[:24]:
-        snippet = row.get("snippet", "")[:320]
+    for row in sorted(unique.values(), key=lambda item: item["rank"], reverse=True)[:_search_result_limit()]:
+        snippet = row.get("snippet", "")[:120]
         query_hint = row.get("query", "")
         if query_hint:
             snippet = f"{snippet}（查询：{query_hint}）".strip()
@@ -1659,7 +1688,7 @@ def web_search_batch(arg):
     return "\n".join(lines)
 
 
-def _builtin_search(provider, q):
+def _builtin_search(provider, q, include_aux=False):
     """内置无 Key 后端。
 
     自动模式会并行取多个引擎的候选，再按主题匹配度、标题命中和来源质量
@@ -1673,24 +1702,34 @@ def _builtin_search(provider, q):
         except (TypeError, ValueError):
             fanout = 3
         selected = order[:fanout]
-        results = {}
-        with ThreadPoolExecutor(max_workers=len(selected), thread_name_prefix="docmind-search") as pool:
-            futures = {pool.submit(backends[name], q): name for name in selected}
-            for future in as_completed(futures):
-                name = futures[future]
-                try:
-                    results[name] = future.result()
-                except Exception as exc:  # noqa: BLE001
-                    results[name] = f"搜索失败: {name}: {type(exc).__name__}: {exc}"
+        jobs = [(name, backends[name], (q,)) for name in selected]
+        if include_aux:
+            domains = _infer_search_sources(q)
+            jobs.extend((_SEARCH_SOURCE_LABELS.get(domain, domain), _search_one_source, (domain, q))
+                        for domain in domains)
+        results, pending = _run_search_jobs(jobs)
+        selected = [name for name, _fn, _args in jobs]
         # 只有一个后端真正返回候选时保留原始格式，兼容旧调用方；多个后端
         # 都有结果时才输出聚合头、去重和统一可信度字段。
         meaningful = [raw for raw in (results.get(name, "") for name in selected)
                       if _formatted_search_rows(raw)]
-        if len(meaningful) == 1:
-            return meaningful[0]
-        merged = _merge_builtin_results(q, [(name, results.get(name, "")) for name in selected])
-        if merged and not any(merged.startswith(marker) for marker in _SEARCH_EMPTY_MARKERS):
-            return merged
+        if len(meaningful) == 1 and len(_search_terms(q)) < 2:
+            result = meaningful[0]
+        else:
+            result = _merge_builtin_results(q, [(name, results.get(name, "")) for name in selected])
+        if result and not any(result.startswith(marker) for marker in _SEARCH_EMPTY_MARKERS):
+            if len(meaningful) == 1 and len(_formatted_search_rows(meaningful[0])) == 1:
+                result = meaningful[0]
+            if pending:
+                result += "\n（限时返回已有候选；未完成来源：" + "、".join(pending) + "；未读取候选正文。）"
+            return result
+        # 同一轮不再串行重试已请求过的后端，避免全失败时多等几十秒。
+        if result.startswith("搜索结果相关性不足"):
+            return result
+        last = next((results[name] for name in reversed(selected) if name in results), "搜索失败：检索超时，尚无候选。")
+        if last.startswith("搜索失败"):
+            return last + "（所选后端均不可达或超时，可换关键词或配置搜索 API）"
+        return last
     last = ""
     for backend in order:
         try:
@@ -1729,15 +1768,21 @@ def _formatted_search_rows(text):
     return [row for row in rows if row.get("title") or row.get("url")]
 
 
-def _merge_builtin_results(query, named_results):
-    """合并自动模式候选，去重并把真正相关的结果排在前面。"""
+def _search_terms(query):
     terms = []
-    for word in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", str(query or "").lower()):
-        if len(word) > 3 and re.fullmatch(r"[\u4e00-\u9fff]+", word):
+    clean_query = re.sub(r"\b(?:site|after|before):\S+", " ", str(query or ""), flags=re.I)
+    for word in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", clean_query.lower()):
+        if len(word) > 2 and re.fullmatch(r"[\u4e00-\u9fff]+", word):
             terms.extend(word[i:i + 2] for i in range(len(word) - 1))
         else:
             terms.append(word)
-    terms = list(dict.fromkeys(terms))
+    return [term for term in dict.fromkeys(terms)
+            if term not in {"official", "docs", "documentation", "推荐", "今天", "如何", "怎么", "最新"}]
+
+
+def _merge_builtin_results(query, named_results):
+    """合并自动模式候选，去重并把真正相关的结果排在前面。"""
+    terms = _search_terms(query)
     unique = {}
     diagnostics = []
     for backend, raw in named_results:
@@ -1757,17 +1802,27 @@ def _merge_builtin_results(query, named_results):
             haystack = (row.get("title", "") + " " + row.get("snippet", "")).lower()
             matched = sum(1 for term in terms if term in haystack)
             score, reason = _source_score(row.get("url", ""), row.get("title", ""), row.get("snippet", ""))
-            rank = score + min(0.45, matched * 0.08) + (0.12 if terms and terms[0] in row.get("title", "").lower() else 0)
-            candidate = {**row, "backend": backend, "rank": rank, "reason": reason}
+            # 相关性优先，域名/‘官方’标签只能小幅辅助，不能把跑题资料顶到前面。
+            rank = (matched / max(1, len(terms))) * 3 + score * 0.15
+            rank += sum(term in row.get("title", "").lower() for term in terms) * 0.03
+            candidate = {**row, "backend": backend, "rank": rank, "reason": reason, "matched": matched}
             old = unique.get(key)
             if old is None or candidate["rank"] > old["rank"]:
                 unique[key] = candidate
     if not unique:
         return diagnostics[0] if diagnostics else ""
-    rows = sorted(unique.values(), key=lambda row: row["rank"], reverse=True)[:8]
-    lines = ["聚合搜索结果（已跨 DuckDuckGo、百度、Bing 去重排序）："]
+    ranked = sorted(unique.values(), key=lambda row: row["rank"], reverse=True)
+    # 多关键词问题仅命中一个泛词不能算有效搜索，例如 scene tree 只搜到引擎首页。
+    if len(terms) >= 2:
+        minimum = 2 if sum(bool(re.fullmatch(r"[a-z][a-z0-9_-]*", term)) for term in terms) >= 2 else 1
+        ranked = [row for row in ranked if row["matched"] >= minimum]
+        if not ranked:
+            return "搜索结果相关性不足：候选只匹配泛词，尚未找到查询细节的证据。请缩小关键词、限定具体站点或换搜索服务商；不得据此给出结论。"
+    rows = ranked[:_search_result_limit()]
+    sources = "、".join(name for name, raw in named_results if _formatted_search_rows(raw))
+    lines = [f"聚合搜索结果（{len(rows)} 条候选；来源：{sources}；已去重排序，尚未核对正文）："]
     for row in rows:
-        snippet = row.get("snippet", "")[:320]
+        snippet = row.get("snippet", "")[:120]
         source = row.get("backend", "")
         if source:
             snippet = (snippet + "（来源：%s）" % source).strip()
@@ -1804,7 +1859,7 @@ def _exa_search(q, key):
     if not key:
         return "Exa 需要 API Key，请在「网络搜索」设置中填写后保存。"
     api_url = "https://api.exa.ai/search"
-    payload = {"query": q, "numResults": 5, "contents": {"text": True}}
+    payload = {"query": q, "numResults": 20}
     req = urllib.request.Request(
         api_url, data=json.dumps(payload).encode("utf-8"),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
@@ -1814,7 +1869,7 @@ def _exa_search(q, key):
     if not results:
         return "搜索未返回结果，可能是网络受限或该关键词无结果。"
     lines = []
-    for it in results[:5]:
+    for it in results[:_search_result_limit()]:
         text = (it.get("text") or "").strip().replace("\n", " ")
         lines.append(f"· {it.get('title', '')}\n  {text[:200]}\n  {it.get('url', '')}")
     return "\n".join(lines)
@@ -1824,7 +1879,7 @@ def _tavily_search(q, key):
     if not key:
         return "Tavily 需要 API Key，请在「网络搜索」设置中填写后保存。"
     api_url = "https://api.tavily.com/search"
-    payload = {"api_key": key, "query": q, "max_results": 5, "search_depth": "basic"}
+    payload = {"api_key": key, "query": q, "max_results": 20, "search_depth": "basic"}
     req = urllib.request.Request(
         api_url, data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"})
@@ -1834,7 +1889,7 @@ def _tavily_search(q, key):
     if not results:
         return "搜索未返回结果，可能是网络受限或该关键词无结果。"
     lines = [f"· {it.get('title', '')}\n  {(it.get('content', '') or '')[:200]}\n  {it.get('url', '')}"
-             for it in results[:5]]
+             for it in results[:_search_result_limit()]]
     return "\n".join(lines)
 
 
@@ -1849,7 +1904,7 @@ def _searxng_search(q, url):
     if not results:
         return "搜索未返回结果，可能是网络受限或该关键词无结果。"
     lines = [f"· {it.get('title', '')}\n  {(it.get('content', '') or '')[:200]}\n  {it.get('url', '')}"
-             for it in results[:5]]
+             for it in results[:_search_result_limit()]]
     return "\n".join(lines)
 
 
@@ -1857,7 +1912,7 @@ def _bocha_search(q, key):
     if not key:
         return "Bocha 需要 API Key，请在「网络搜索」设置中填写后保存。"
     api_url = "https://api.bochaai.com/openapi/v1/web-search"
-    payload = {"query": q, "count": 5, "freshness": "noLimit"}
+    payload = {"query": q, "count": 30, "freshness": "noLimit"}
     req = urllib.request.Request(
         api_url, data=json.dumps(payload).encode("utf-8"),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
@@ -1867,7 +1922,7 @@ def _bocha_search(q, key):
     if not results:
         return "搜索未返回结果，可能是网络受限或该关键词无结果。"
     lines = [f"· {it.get('name', '')}\n  {(it.get('snippet', '') or '')[:200]}\n  {it.get('url', '')}"
-             for it in results[:5]]
+             for it in results[:_search_result_limit()]]
     return "\n".join(lines)
 
 
@@ -1875,7 +1930,7 @@ def _firecrawl_search(q, key):
     if not key:
         return "Firecrawl 需要 API Key，请在「网络搜索」设置中填写后保存。"
     api_url = "https://api.firecrawl.dev/v1/search"
-    payload = {"query": q, "limit": 5, "pageOptions": {"fetchPageContent": False}}
+    payload = {"query": q, "limit": 30, "pageOptions": {"fetchPageContent": False}}
     req = urllib.request.Request(
         api_url, data=json.dumps(payload).encode("utf-8"),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
@@ -1885,13 +1940,13 @@ def _firecrawl_search(q, key):
     if not results:
         return "搜索未返回结果，可能是网络受限或该关键词无结果。"
     lines = [f"· {it.get('title', '')}\n  {(it.get('description', '') or '')[:200]}\n  {it.get('url', '')}"
-             for it in results[:5]]
+             for it in results[:_search_result_limit()]]
     return "\n".join(lines)
 
 
 def _generic_api_search(provider, q, key, url):
     """zhipu/querit/parallel/mcp_exa 等未内置端点的服务商：通用 keyed POST。"""
-    payload = {"query": q, "q": q, "numResults": 5, "max_results": 5, "count": 5}
+    payload = {"query": q, "q": q, "numResults": 20, "max_results": 20, "count": 20}
     headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (DocMind/1.0)"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
@@ -1904,7 +1959,7 @@ def _generic_api_search(provider, q, key, url):
     if not results:
         return "搜索未返回结果，可能是网络受限或该关键词无结果。"
     lines = []
-    for it in results[:5]:
+    for it in results[:_search_result_limit()]:
         if isinstance(it, dict):
             lines.append(f"· {it.get('title', it.get('name', ''))}\n"
                          f"  {(it.get('snippet', it.get('content', it.get('description', '')) or '')[:200])}\n"
@@ -1924,19 +1979,21 @@ def _ddg_search(q):
 
     def _clean(s):
         s = re.sub(r"<[^>]+>", "", s or "")
-        return urllib.parse.unquote(s).strip()
+        return html_lib.unescape(s).strip()
 
-    titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', page, re.S)
-    links = re.findall(r'class="result__a"[^>]*href="(.*?)"', page)
+    anchors = re.findall(r'<a\b([^>]*\bclass=["\'][^"\']*result__a[^"\']*["\'][^>]*)>(.*?)</a>', page, re.S)
+    titles, links = [], []
+    for attrs, title in anchors:
+        href = re.search(r'\bhref=["\']([^"\']+)["\']', attrs, re.I)
+        if href:
+            titles.append(title)
+            links.append(html_lib.unescape(href.group(1)))
     snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
-    if not titles:
-        # 兜底：DDG 偶尔换结构，尝试更宽松的抓取
-        titles = re.findall(r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>', page, re.S)
     if not titles:
         return "搜索未返回结果，可能是网络受限或该关键词无结果。"
 
     lines = []
-    for i in range(min(5, len(titles))):
+    for i in range(min(10, len(titles))):
         t = _clean(titles[i])
         s = _clean(snippets[i]) if i < len(snippets) else ""
         link = links[i] if i < len(links) else ""
@@ -1981,7 +2038,7 @@ def _bing_search(q):
 
     def _clean(s):
         s = re.sub(r"<[^>]+>", "", s or "")
-        return urllib.parse.unquote(s).strip()
+        return html_lib.unescape(s).strip()
 
     # 每个结果都在 <li class="b_algo"> 块内：
     #   标题 = <h2 ...><a ... href="URL">文本</a></h2>（注意 h2 可能带 class 属性）
@@ -1995,12 +2052,12 @@ def _bing_search(q):
         )
         if not hm:
             continue
-        link = _bing_real_url(hm.group(1))
+        link = _bing_real_url(html_lib.unescape(hm.group(1)))
         title = _clean(hm.group(2))
         sm = re.search(r'<p class="b_lineclamp[^"]*"[^>]*>(.*?)</p>', blk, re.S)
         snippet = _clean(sm.group(1)) if sm else ""
         results.append((title, snippet, link))
-        if len(results) >= 5:
+        if len(results) >= 10:
             break
     if not results:
         return "搜索未返回结果，可能是网络受限或该关键词无结果。"
@@ -2023,7 +2080,7 @@ def _baidu_search(q):
 
     def _clean(s):
         s = re.sub(r"<[^>]+>", "", s or "")
-        return urllib.parse.unquote(s).strip()
+        return html_lib.unescape(s).strip()
 
     # 每个自然结果在 <div class="result ..."> 块内：标题 <h3 ...><a href="URL">文本</a></h3>，
     # 摘要 <div class="c-abstract ...">文本</div>。百度偶把跳转塞进链接参数，原样保留即可。
@@ -2042,7 +2099,7 @@ def _baidu_search(q):
             sm = re.search(r'class="[^"]*content-right[^"]*"[^>]*>(.*?)</span>', blk, re.S)
         snippet = _clean(sm.group(1)) if sm else ""
         results.append((title, snippet, link))
-        if len(results) >= 5:
+        if len(results) >= 10:
             break
     if not results:
         return "搜索未返回结果，可能是网络受限或该关键词无结果。"

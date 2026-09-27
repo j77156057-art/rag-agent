@@ -5,6 +5,8 @@ import sys
 import tempfile
 import types
 import unittest
+import time
+import threading
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,6 +32,75 @@ class _FakeToolResult:
 
 
 class WebResearchProductTests(unittest.TestCase):
+    def test_slow_engine_does_not_delay_fast_candidates(self):
+        release = threading.Event()
+        def blocked(_q):
+            release.wait(2)
+            return "· slow\n  late\n  https://slow.test"
+        try:
+            with patch.dict(os.environ, {"DOCMIND_WEB_SEARCH_WAIT_S": "0.05"}), \
+                    patch.object(tools, "_ddg_search", side_effect=blocked), \
+                    patch.object(tools, "_baidu_search", return_value="· fast\n  ok\n  https://fast.test"), \
+                    patch.object(tools, "_bing_search", return_value="搜索未返回结果"):
+                start = time.monotonic()
+                out = tools._builtin_search("builtin_auto", "fast")
+                self.assertLess(time.monotonic() - start, 0.5)
+            self.assertIn("https://fast.test", out)
+            self.assertIn("未完成来源：ddg", out)
+        finally:
+            release.set()
+
+    def test_failures_are_not_requested_twice(self):
+        with patch.object(tools, "_ddg_search", side_effect=OSError()) as ddg, \
+                patch.object(tools, "_baidu_search", side_effect=OSError()) as baidu, \
+                patch.object(tools, "_bing_search", side_effect=OSError()) as bing:
+            out = tools._builtin_search("builtin_auto", "q")
+        self.assertIn("均不可达", out)
+        for backend in (ddg, baidu, bing):
+            backend.assert_called_once()
+
+    def test_keeps_thirty_candidates_and_prefers_topic_over_domain(self):
+        candidates = "\n".join(f"· Godot scene tree {i}\n  reference\n  https://example.test/{i}" for i in range(30))
+        irrelevant = "· official cooking docs\n  unrelated\n  https://docs.github.com/unrelated"
+        out = tools._merge_builtin_results("Godot scene tree", [("ddg", irrelevant), ("bing", candidates)])
+        rows = tools._formatted_search_rows(out)
+        self.assertEqual(len(rows), 30)
+        self.assertNotIn("unrelated", out)
+
+    def test_ddg_links_stay_with_their_titles_regardless_of_attribute_order(self):
+        page = '<a href="https://example.test/a?x=1&amp;y=2" class="result__a">A &amp; B</a>'
+        with patch.object(tools.urllib.request, "urlopen", return_value=io.BytesIO(page.encode())):
+            out = tools._ddg_search("q")
+        self.assertIn("A & B", out)
+        self.assertIn("https://example.test/a?x=1&y=2", out)
+
+    def test_generic_engine_homepages_cannot_answer_detailed_query(self):
+        raw = "· Godot official home\n  Godot engine\n  https://godotengine.org"
+        with patch.object(tools, "_ddg_search", return_value=raw), \
+                patch.object(tools, "_baidu_search", return_value=raw), \
+                patch.object(tools, "_bing_search", return_value=raw):
+            out = tools._builtin_search("builtin_auto", "Godot scene tree official docs")
+        self.assertTrue(out.startswith("搜索结果相关性不足"))
+        self.assertNotIn("https://godotengine.org", out)
+
+    def test_bing_encoded_redirect_recovers_original_source(self):
+        import base64
+        target = "https://docs.godotengine.org/en/stable/scene.html"
+        encoded = base64.urlsafe_b64encode(target.encode()).decode().rstrip("=")
+        page = f'<li class="b_algo"><h2><a href="https://www.bing.com/ck/a?p=x&amp;u=a1{encoded}&amp;ntb=1">Scene tree</a></h2></li>'
+        with patch.object(tools.urllib.request, "urlopen", return_value=io.BytesIO(page.encode())):
+            out = tools._bing_search("Godot scene tree")
+        self.assertEqual(tools._formatted_search_rows(out)[0]["url"], target)
+
+    def test_batch_observation_keeps_thirty_compact_candidates(self):
+        raw = "\n".join(f"· candidate {i}\n  {'detail ' * 15}\n  https://example.test/{i}" for i in range(30))
+        self.assertEqual(_clip_tool_observation(raw, 1800, "web_search_batch"), raw)
+
+    def test_non_temporal_queries_do_not_exclude_old_reference_material(self):
+        with patch.dict(os.environ, {"WEB_SEARCH_PREFER_RECENT": "1"}):
+            self.assertNotIn("after:", tools._search_recency_query("Godot 场景树教程"))
+            self.assertIn("after:", tools._search_recency_query("最新 Godot 版本"))
+
     def test_source_score_is_explainable(self):
         score, reason = tools._source_score("https://github.com/a/b", "official docs", "")
         self.assertGreater(score, .6)
@@ -104,10 +175,10 @@ class WebResearchProductTests(unittest.TestCase):
         self.assertIn("正文：窗口上下文说明", out)
 
     def test_auto_search_adds_relevant_platform_sources(self):
-        base = "· 通用结果\n  摘要\n  https://example.com/general"
+        base = "· 通用结果\n  菜品好吃体验\n  https://example.com/general"
         platform_rows = {
-            "知乎": "· 知乎评价\n  用户口碑\n  https://www.zhihu.com/question/1",
-            "小红书": "· 小红书探店\n  实拍体验\n  https://www.xiaohongshu.com/explore/1",
+            "知乎": "· 知乎评价\n  菜品好吃口碑\n  https://www.zhihu.com/question/1",
+            "小红书": "· 小红书探店\n  菜品好吃实拍体验\n  https://www.xiaohongshu.com/explore/1",
         }
         with patch.object(tools, "_infer_search_sources", return_value=["zhihu.com", "xiaohongshu.com"]), \
                 patch.object(tools, "_search_one_source", side_effect=lambda domain, _q: (

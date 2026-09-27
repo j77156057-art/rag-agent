@@ -37,7 +37,7 @@ class WebSearchFailoverTests(unittest.TestCase):
         return {**os.environ, "WEB_SEARCH_PREFER_RECENT": "0"}
 
     def test_ddg_empty_falls_back_to_bing(self):
-        bing_result = "· 真实标题\n  摘要\n  https://example.test/real"
+        bing_result = "· 今天新闻真实标题\n  新闻摘要\n  https://example.test/real"
         with patch.dict(tools.os.environ, self._env_no_recency(), clear=True), \
                 patch("tools.get_web_search_provider", return_value="builtin_auto"), \
                 patch("tools._ddg_search", return_value="搜索未返回结果，可能是网络受限或该关键词无结果。"), \
