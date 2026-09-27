@@ -77,10 +77,11 @@ class GeneratedAdapterRuntimeTests(unittest.TestCase):
                                      "source": source, "refresh_tool": "builtin:game_screenshot"})
         approve_generated(self.root, "cad", True)
         with patch.dict(tools.TOOLS, {"game_screenshot": {"func": lambda _arg: {"value": "ok"}}}):
-            result = json.loads(tools.dev_preview_adapter_refresh("id: cad"))
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["generated"])
-        self.assertEqual(result["result"]["artifact"], "ok")
+            result = tools.dev_preview_adapter_refresh("id: cad")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["artifact"], "ok")
+        self.assertTrue(result.artifacts)
+        self.assertEqual(result.artifacts[0]["metadata"]["generated_adapter"], "true")
 
     def test_fixture_tool_replays_active_adapter_without_mcp(self):
         source = "def adapt(payload):\n    return {'artifact': payload.get('name', '').upper()}\n"

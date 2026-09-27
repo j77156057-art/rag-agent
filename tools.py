@@ -802,6 +802,52 @@ def dev_preview_adapter_approve(arg):
 _PREVIEW_BUILTIN_REFRESH_TOOLS = frozenset({"preview_project", "game_screenshot", "dev_desktop_capture", "self_verify"})
 
 
+def _generated_adapter_tool_result(adapter_id, source_tool, adapted, module=""):
+    """Convert generated adapter JSON into a durable preview ToolResult.
+
+    The adapter remains responsible only for data conversion.  This boundary
+    adds the standard preview protocol metadata so the Agent event recorder
+    and workflow preview builder can retain the result as evidence.
+    """
+    from agent_runtime.preview_adapters import normalize_artifact
+
+    rows = []
+    if isinstance(adapted, dict) and isinstance(adapted.get("artifacts"), list):
+        rows = [item for item in adapted["artifacts"] if isinstance(item, dict)]
+    elif isinstance(adapted, list):
+        rows = [item for item in adapted if isinstance(item, dict)]
+    elif isinstance(adapted, dict):
+        artifact_keys = {"id", "kind", "artifact_kind", "path", "uri", "url", "label",
+                         "summary", "description", "before", "after", "content", "evidence"}
+        if artifact_keys.intersection(adapted):
+            rows = [adapted]
+    if not rows:
+        rows = [{
+            "id": "%s-result" % adapter_id,
+            "kind": "structured",
+            "label": "%s 适配器结果" % adapter_id,
+            "summary": "生成适配器把 %s 的返回数据转换为结构化预览证据" % source_tool,
+            "after": json.dumps(adapted, ensure_ascii=False, separators=(",", ":")),
+        }]
+    artifacts = []
+    for index, row in enumerate(rows[:32], 1):
+        item = dict(row)
+        item.setdefault("adapter", adapter_id)
+        metadata = dict(item.get("metadata") or {})
+        metadata.update({"generated_adapter": "true", "source_tool": source_tool})
+        if module:
+            metadata.setdefault("module", module)
+        item["metadata"] = metadata
+        artifacts.append(normalize_artifact(item, fallback_id="%s-artifact-%s" % (adapter_id, index)))
+    text = json.dumps(adapted, ensure_ascii=False, separators=(",", ":"))[:12000]
+    return ToolResult(
+        ok=True,
+        text="适配器刷新完成（来源：%s），已生成 %d 条预览证据：%s" % (source_tool, len(artifacts), text),
+        data=adapted,
+        artifacts=artifacts,
+    )
+
+
 def _preview_refresh_reference(value):
     """Parse a generated adapter refresh reference without importing code."""
     ref = str(value or "").strip()
@@ -867,8 +913,8 @@ def dev_preview_adapter_refresh(arg):
                     except (TypeError, ValueError):
                         payload = {"text": payload}
                 adapted = execute(root, manifest, payload)
-                return json.dumps({"ok": True, "adapter": adapter_id, "tool": name,
-                                   "generated": True, "result": adapted["value"]}, ensure_ascii=False)
+                return _generated_adapter_tool_result(
+                    adapter_id, name, adapted["value"], adapted.get("module", ""))
             if isinstance(result, ToolResult):
                 return result
             return json.dumps({"ok": True, "adapter": adapter_id, "tool": name,
@@ -883,8 +929,8 @@ def dev_preview_adapter_refresh(arg):
             except (TypeError, ValueError):
                 pass
             adapted = execute(root, manifest, payload)
-            return json.dumps({"ok": True, "adapter": adapter_id, "connector": key,
-                               "tool": name, "generated": True, "result": adapted["value"]}, ensure_ascii=False)
+            return _generated_adapter_tool_result(
+                adapter_id, "%s/%s" % (key, name), adapted["value"], adapted.get("module", ""))
         return json.dumps({"ok": not str(result).startswith("MCP 调用失败"),
                            "adapter": adapter_id, "connector": key, "tool": name,
                            "result": result}, ensure_ascii=False)
