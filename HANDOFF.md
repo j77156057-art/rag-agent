@@ -1,5 +1,12 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-28 生成领域适配器 fixture 与预览证据
+
+- `3525b5c feat: add adapter fixture replay`：新增 `dev_preview_adapter_test`，用固定 JSON fixture 重放已激活的 Python/Node 适配器；不调用真实软件、MCP 或网络，便于先验证 EasyEDA/Godot/CAD 数据转换。
+- `a1939b3 feat: record generated adapter preview evidence`：生成适配器刷新结果现在转换为标准 `ToolResult` 和预览 artifact，带适配器、来源工具、模块路径元数据，并进入 Agent 事件和工作流预览证据链；原始结构化结果保留在 `data`。
+- 定向适配器/桌面回归：**42 passed**（仅现有 Starlette 弃用提示）。两个提交已推送到 `origin/main`。
+- 仍待具备对应软件或真实 MCP 后进行 EasyEDA/Godot/CAD 联验；通用链路已具备 fixture 测试、隔离执行、回滚、桌面捕获和审批动作入口。
+
 ## 2026-09-27 项目级能力画像
 
 - 新增 `agent_runtime/project_profile.py`，每个项目在 `.docmind/project-profile.json` 保存脱敏的能力摘要：所用工具、MCP 连接器、运行命令、验收方法/脚本、预览适配器、来源和领域类型。
