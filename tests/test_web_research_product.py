@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tools
+from agent import _clip_tool_observation
 
 
 class _FakeToolResult:
@@ -65,6 +66,28 @@ class WebResearchProductTests(unittest.TestCase):
             out = tools.web_search("platform: b站\n教程")
         self.assertIn("B 站专用搜索暂不可用", out)
         self.assertIn("通用搜索回退结果", out)
+
+    def test_builtin_auto_merges_and_deduplicates_backends(self):
+        rows = {
+            "ddg": "· Godot official docs\n  scene tree reference\n  https://docs.godotengine.org/en/stable/scene.html",
+            "baidu": "· Godot 场景树教程\n  scene tree reference\n  https://docs.godotengine.org/en/stable/scene.html\n"
+                     "· Godot community guide\n  scene tree guide\n  https://example.com/godot",
+            "bing": "· Godot scene tree\n  scene tree reference\n  https://example.net/godot",
+        }
+        with patch.dict(tools.os.environ, {"WEB_SEARCH_FANOUT": "3"}, clear=False), \
+                patch.object(tools, "_ddg_search", side_effect=lambda _q: rows["ddg"]), \
+                patch.object(tools, "_baidu_search", side_effect=lambda _q: rows["baidu"]), \
+                patch.object(tools, "_bing_search", side_effect=lambda _q: rows["bing"]):
+            out = tools._builtin_search("builtin_auto", "Godot scene tree")
+        self.assertIn("聚合搜索结果", out)
+        self.assertEqual(out.count("https://docs.godotengine.org/en/stable/scene.html"), 1)
+        self.assertIn("https://example.com/godot", out)
+
+    def test_web_observation_clip_keeps_research_tail(self):
+        raw = "研究主题：上下文窗口\n搜索摘要：\n" + ("前段资料\n" * 1800) + "\n冲突提示（自动抽取）：\n来源尾部：128K"
+        clipped = _clip_tool_observation(raw, 1800, "web_research")
+        self.assertIn("中间来源正文已折叠", clipped)
+        self.assertIn("来源尾部：128K", clipped)
 
     def test_web_research_coerces_toolresult_without_raising(self):
         # 回归 #2：web_search / web_fetch 返回不可切片的 ToolResult（非图片分支）

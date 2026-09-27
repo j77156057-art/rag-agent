@@ -20,6 +20,7 @@ import urllib.parse
 import datetime
 import hashlib
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import mcp_client
 import mcp_capabilities
 from artifact_tools import create_artifact
@@ -1419,9 +1420,31 @@ def web_search(query):
 
 
 def _builtin_search(provider, q):
-    """内置无 Key 后端：auto 走 ddg→baidu→bing 故障转移；指定单后端则只走该后端。"""
+    """内置无 Key 后端。
+
+    自动模式会并行取多个引擎的候选，再按主题匹配度、标题命中和来源质量
+    去重排序；单一 provider 仍保持原来的单后端行为。
+    """
     backends = {"ddg": _ddg_search, "bing": _bing_search, "baidu": _baidu_search}
     order = [provider] if provider in backends else ["ddg", "baidu", "bing"]
+    if provider not in backends:
+        try:
+            fanout = max(1, min(len(order), int(os.getenv("WEB_SEARCH_FANOUT", "3"))))
+        except (TypeError, ValueError):
+            fanout = 3
+        selected = order[:fanout]
+        results = {}
+        with ThreadPoolExecutor(max_workers=len(selected), thread_name_prefix="docmind-search") as pool:
+            futures = {pool.submit(backends[name], q): name for name in selected}
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    results[name] = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    results[name] = f"搜索失败: {name}: {type(exc).__name__}: {exc}"
+        merged = _merge_builtin_results(q, [(name, results.get(name, "")) for name in selected])
+        if merged and not any(merged.startswith(marker) for marker in _SEARCH_EMPTY_MARKERS):
+            return merged
     last = ""
     for backend in order:
         try:
@@ -1436,6 +1459,75 @@ def _builtin_search(provider, q):
     return (last or "搜索失败：所有搜索后端均不可用。") + (
         "" if (not hard_error and last.startswith(_SEARCH_EMPTY_MARKERS)) else
         "（DuckDuckGo/百度/Bing 均不可达，请确认运行环境能访问外网，或配置带 Key 的搜索引擎）")
+
+
+def _formatted_search_rows(text):
+    """解析内置搜索器的统一三行格式，兼容标题/摘要缺失的结果。"""
+    rows, current = [], None
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if line.startswith("· "):
+            if current:
+                rows.append(current)
+            current = {"title": line[2:].strip(), "snippet": "", "url": ""}
+            continue
+        if current is None or not line or line.startswith("可信度参考"):
+            continue
+        match = re.search(r"https?://\S+", line)
+        if match and not current["url"]:
+            current["url"] = match.group(0).rstrip(".,;）)")
+        elif not current["snippet"]:
+            current["snippet"] = line
+    if current:
+        rows.append(current)
+    return [row for row in rows if row.get("title") or row.get("url")]
+
+
+def _merge_builtin_results(query, named_results):
+    """合并自动模式候选，去重并把真正相关的结果排在前面。"""
+    terms = []
+    for word in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", str(query or "").lower()):
+        if len(word) > 3 and re.fullmatch(r"[\u4e00-\u9fff]+", word):
+            terms.extend(word[i:i + 2] for i in range(len(word) - 1))
+        else:
+            terms.append(word)
+    terms = list(dict.fromkeys(terms))
+    unique = {}
+    diagnostics = []
+    for backend, raw in named_results:
+        if not raw:
+            continue
+        if any(str(raw).startswith(marker) for marker in _SEARCH_EMPTY_MARKERS):
+            diagnostics.append(str(raw))
+            continue
+        rows = _formatted_search_rows(raw)
+        if not rows:
+            diagnostics.append(str(raw))
+            continue
+        for row in rows:
+            key = (row.get("url") or row.get("title") or "").strip().lower()
+            if not key:
+                continue
+            haystack = (row.get("title", "") + " " + row.get("snippet", "")).lower()
+            matched = sum(1 for term in terms if term in haystack)
+            score, reason = _source_score(row.get("url", ""), row.get("title", ""), row.get("snippet", ""))
+            rank = score + min(0.45, matched * 0.08) + (0.12 if terms and terms[0] in row.get("title", "").lower() else 0)
+            candidate = {**row, "backend": backend, "rank": rank, "reason": reason}
+            old = unique.get(key)
+            if old is None or candidate["rank"] > old["rank"]:
+                unique[key] = candidate
+    if not unique:
+        return diagnostics[0] if diagnostics else ""
+    rows = sorted(unique.values(), key=lambda row: row["rank"], reverse=True)[:8]
+    lines = ["聚合搜索结果（已跨 DuckDuckGo、百度、Bing 去重排序）："]
+    for row in rows:
+        snippet = row.get("snippet", "")[:320]
+        source = row.get("backend", "")
+        if source:
+            snippet = (snippet + "（来源：%s）" % source).strip()
+        lines.append(_format_search_result(row.get("title", ""), snippet,
+                                           row.get("url", ""), source=source or "web"))
+    return "\n".join(lines)
 
 
 def _api_web_search(provider, q):

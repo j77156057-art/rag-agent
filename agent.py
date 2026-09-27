@@ -707,6 +707,27 @@ def _clip(text, limit, suffix="…（内容过长，已截断）"):
     return text if len(text) <= limit else text[:limit] + suffix
 
 
+def _clip_tool_observation(text, base_limit, tool_name=""):
+    """为联网观察保留首尾，避免来源正文和末尾复核提示一起丢失。"""
+    tool = str(tool_name or "").strip().lower()
+    limit = max(256, int(base_limit or 0))
+    if tool in {"web_search", "web_research"}:
+        env_name = "DOCMIND_WEB_RESEARCH_OBS_CHARS" if tool == "web_research" else "DOCMIND_WEB_SEARCH_OBS_CHARS"
+        default = 7200 if tool == "web_research" else 3600
+        try:
+            limit = max(limit, min(12000, int(os.getenv(env_name, str(default)))))
+        except (TypeError, ValueError):
+            limit = max(limit, default)
+        value = str(text or "")
+        if len(value) <= limit:
+            return value
+        # 头部保留主题/搜索摘要，尾部保留最后来源和冲突提示，中间才省略。
+        head = max(400, int(limit * 0.62))
+        tail = max(240, limit - head - 80)
+        return value[:head] + "\n…（中间来源正文已折叠，展开原始结果可继续核对）…\n" + value[-tail:]
+    return _clip(text, limit)
+
+
 _PRUNABLE_PREFIXES = ("Observation:", "Reflection:", "Nudge:")
 
 
@@ -2024,7 +2045,7 @@ class Agent:
             if turn is not None:
                 turn.outcome = "evidence_fallback"
             steps_used = "；".join(evidence) or "（无）"
-            last = _clip(last_obs or "", observation_limit)
+            last = _clip_tool_observation(last_obs or "", observation_limit, last_action)
             return {
                 "type": "final",
                 "text": (
@@ -2112,7 +2133,7 @@ class Agent:
                     })
                     for nm, ar, obs, _ok, imgs in results:
                         _obs_msg = {"role": "user",
-                                    "content": f"Observation: {_clip(obs, observation_limit)}"}
+                                    "content": f"Observation: {_clip_tool_observation(obs, observation_limit, nm)}"}
                         if imgs:
                             _obs_msg["images"] = list(imgs)
                         trail.append(_obs_msg)
@@ -2511,7 +2532,7 @@ class Agent:
                     obs = (
                         "搜索结果相关性不足：当前候选与查询主题缺少足够共同信号，"
                         "请更换关键词、年份、平台或地区后继续搜索；不得把以下候选直接当作证据。\n"
-                        + _clip(obs, observation_limit)
+                        + _clip_tool_observation(obs, observation_limit, action_name)
                     )
                     _tool_ok = False
                 _duration_ms = int((time.monotonic() - _t_tool) * 1000)
@@ -2630,7 +2651,7 @@ class Agent:
                                 "content": (
                                     f"Reflection: 上一工具 {parsed['action']} 未得到有效结果，请换一种方式"
                                     f"（例如改用 web_search，或换关键词）。\n\nObservation was: "
-                                    f"{_clip(obs, observation_limit)}"
+                                    f"{_clip_tool_observation(obs, observation_limit, parsed['action'])}"
                                 ),
                             }
                         )
@@ -2663,7 +2684,7 @@ class Agent:
                             {"role": "assistant", "content": _clip(acc, TRAIL_ASSISTANT_CHARS)}
                         )
                         trail.append(
-                            {"role": "user", "content": "Observation: " + _clip(_sv_obs, observation_limit)}
+                            {"role": "user", "content": "Observation: " + _clip_tool_observation(_sv_obs, observation_limit, "self_verify")}
                         )
                         yield {"type": "observation", "text": _sv_obs}
                         turn.verification_targets[_target] = _sv_passed
@@ -2688,7 +2709,7 @@ class Agent:
                 _obs_entry = {
                     "role": "user",
                     "content": (
-                        f"Observation: {_clip(obs, observation_limit)}"
+                        f"Observation: {_clip_tool_observation(obs, observation_limit, parsed['action'])}"
                         "\n\n（请基于观察继续，或给出 Final Answer）"
                     ),
                 }
