@@ -18,7 +18,7 @@ from agent_runtime.retrieval_eval import compare_reports, evaluate_modes
 from agent_runtime.workflow_eval import DEFAULT_DATASET_NAME, dataset_cases
 from agent_runtime.tool_install import ToolInstallError, ToolInstallManager
 from agent_runtime.project_profile import load_profile
-from agent_runtime.adapter_catalog import catalog as adapter_catalog
+from agent_runtime.adapter_catalog import catalog as adapter_catalog, configure as configure_adapters
 from agent_runtime.local_runtime import effective_subagent_limit, resource_profile
 from config import COLLECTION_NAME, LLM_MODEL, LLM_PROVIDER, PROVIDERS, get_runtime
 from game_workbench import approval as record_user_approval
@@ -111,6 +111,10 @@ class WorkflowCheckpointReq(BaseModel):
 class WorkflowProjectRollbackReq(BaseModel):
     approved: bool = False
     paths: list[str] = []
+
+
+class PreviewAdapterConfigReq(BaseModel):
+    adapters: list[str] = []
 
 
 class WorkflowInterruptReq(BaseModel):
@@ -827,6 +831,16 @@ def build_router(ctx) -> APIRouter:
             return {"ok": True, **adapter_catalog(root, connectors=connectors)}
         except Exception as exc:
             return {"ok": False, "error": type(exc).__name__}
+
+    @router.post("/preview-adapters/config")
+    async def preview_adapters_config(req: PreviewAdapterConfigReq):
+        try:
+            root = ctx._project_root_or_error()
+            if not root:
+                return {"ok": False, "error": "未配置代码库"}
+            return {"ok": True, "profile": configure_adapters(root, req.adapters)}
+        except (OSError, ValueError, TypeError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @router.get("/workflow/{workflow_id}/acceptance-report")
     async def workflow_acceptance_report(workflow_id: str):

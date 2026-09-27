@@ -30,6 +30,7 @@ export interface PreviewAdapterInfo {
   connector_key?: string; transport?: string; project_scoped?: boolean
 }
 export interface PreviewAdapterCatalogResp { ok?: boolean; adapters?: PreviewAdapterInfo[]; count?: number; error?: string }
+export interface PreviewAdapterConfigResp { ok?: boolean; profile?: ProjectProfile; error?: string }
 export interface WorkflowAcceptanceReport {
   workflow_id?: string; status?: string; kind?: string; request?: string
   acceptance?: AcceptanceContract; evaluation?: WorkflowEvaluation
@@ -329,6 +330,9 @@ export const agentApi = {
   },
   previewAdapters(): Promise<PreviewAdapterCatalogResp> {
     return rawJson('/api/agent/preview-adapters')
+  },
+  configurePreviewAdapters(adapters: string[]): Promise<PreviewAdapterConfigResp> {
+    return rawJson('/api/agent/preview-adapters/config', { adapters })
   },
   workflowAcceptanceReport(id: string): Promise<{ ok?: boolean; report?: WorkflowAcceptanceReport; error?: string }> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/acceptance-report`)

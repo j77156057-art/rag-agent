@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .preview_adapters import preview_adapters
+from .project_profile import load_profile, save_profile
 
 
 _DESCRIPTIONS = {
@@ -43,4 +44,19 @@ def catalog(project_root: str | Path = "", *, connectors: list[dict[str, Any]] |
     return {"project_root": root, "adapters": rows, "count": len(rows)}
 
 
-__all__ = ["catalog"]
+def configure(project_root: str | Path, adapter_ids: list[str]) -> dict[str, Any]:
+    """Persist only known non-secret preview adapter IDs for this project."""
+    root = Path(project_root).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError("项目目录不存在")
+    allowed = set(preview_adapters()) | {"visual"}
+    selected = list(dict.fromkeys(str(item or "").strip().lower() for item in adapter_ids))
+    unknown = [item for item in selected if item and item not in allowed]
+    if unknown:
+        raise ValueError("未知预览适配器：" + ",".join(unknown[:8]))
+    profile = load_profile(root)
+    profile["preview_adapters"] = [item for item in selected if item]
+    return save_profile(root, profile)
+
+
+__all__ = ["catalog", "configure"]

@@ -6,6 +6,7 @@ import type { PreviewAdapterInfo, WorkflowAcceptanceReport, WorkflowState } from
 const props = defineProps<{ workflow: WorkflowState }>()
 const emit = defineEmits<{ (e: 'activity'): void }>()
 const adapters = ref<PreviewAdapterInfo[]>([])
+const configured = ref<string[]>([])
 const report = ref<WorkflowAcceptanceReport | null>(null)
 const selected = ref<string[]>([])
 const loading = ref(false)
@@ -22,13 +23,29 @@ async function load() {
     agentApi.previewAdapters(),
     agentApi.workflowAcceptanceReport(props.workflow.workflow_id),
   ])
-  if (catalog.status === 'fulfilled' && catalog.value.ok) adapters.value = catalog.value.adapters || []
+  if (catalog.status === 'fulfilled' && catalog.value.ok) {
+    adapters.value = catalog.value.adapters || []
+    const profileAdapters = props.workflow.project_profile?.preview_adapters || []
+    configured.value = profileAdapters.length ? [...profileAdapters] : adapters.value.filter(item => item.available && !item.requires_connector).map(item => item.id)
+  }
   if (acceptance.status === 'fulfilled' && acceptance.value.ok) report.value = acceptance.value.report || null
   if ((catalog.status === 'rejected' || (catalog.status === 'fulfilled' && !catalog.value.ok)) &&
       (acceptance.status === 'rejected' || (acceptance.status === 'fulfilled' && !acceptance.value.ok))) {
     error.value = '适配器或验收报告暂时无法读取'
   }
   loading.value = false
+}
+
+function toggleAdapter(id: string) {
+  configured.value = configured.value.includes(id)
+    ? configured.value.filter(item => item !== id)
+    : [...configured.value, id]
+}
+
+async function saveConfig() {
+  const result = await agentApi.configurePreviewAdapters(configured.value)
+  if (!result.ok) error.value = result.error || '适配器配置保存失败'
+  else emit('activity')
 }
 
 function togglePath(path: string) {
@@ -62,10 +79,12 @@ onMounted(() => { void load() })
     <p v-if="error" class="adapter-error">{{ error }}</p>
     <div class="adapter-grid">
       <div v-for="item in adapters" :key="item.id" class="adapter-item">
+        <input v-if="!item.requires_connector" type="checkbox" :checked="configured.includes(item.id)" @change="toggleAdapter(item.id)" />
         <div><b>{{ item.label || item.id }}</b><small>{{ item.evidence }}</small></div>
         <span :class="item.available ? 'on' : 'off'">{{ item.available ? '可用' : '未连接' }}</span>
       </div>
     </div>
+    <button type="button" class="adapter-save" @click="saveConfig">保存项目预览配置</button>
     <div v-if="evaluation" class="acceptance-report">
       <div class="report-head"><b>真实验收报告</b><strong :class="evaluation.passed ? 'ok' : 'bad'">{{ Math.round((evaluation.score || 0) * 100) }}%</strong></div>
       <small>{{ evaluation.passed ? '检查通过' : '仍有检查未通过' }} · {{ evaluation.task_count || 0 }} 个任务 · {{ evaluation.steps || 0 }} 步</small>
@@ -88,11 +107,12 @@ onMounted(() => { void load() })
 .adapter-head small, .adapter-head span, .report-head small, .adapter-item small { color: var(--text-faint); }
 .adapter-error { margin: 0; color: var(--danger); }
 .adapter-grid { display: grid; gap: 5px; }
-.adapter-item { display: flex; justify-content: space-between; gap: 8px; padding: 6px 7px; border: 1px solid var(--border); border-radius: 6px; }
+.adapter-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 7px; border: 1px solid var(--border); border-radius: 6px; }
 .adapter-item div { display: grid; gap: 2px; min-width: 0; }.adapter-item small { overflow-wrap: anywhere; }
 .adapter-item > span { flex: 0 0 auto; }.on, .ok { color: var(--green); }.off, .bad { color: var(--danger); }
 .acceptance-report, .rollback-box { display: grid; gap: 5px; border-top: 1px solid var(--border); padding-top: 8px; }
 .acceptance-report > small { color: var(--text-muted); }.acceptance-report details { border-top: 1px solid var(--border); padding-top: 5px; }.acceptance-report p { margin: 4px 0 0; }
 .report-head strong { font-size: 18px; }.rollback-file { display: flex; align-items: center; gap: 6px; }.rollback-file span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.rollback-file small { color: var(--text-faint); }
 .rollback-box button { justify-self: start; border: 1px solid var(--accent); border-radius: 6px; padding: 5px 8px; color: #fff; background: var(--accent); cursor: pointer; font: inherit; }.rollback-box button:disabled { opacity: .5; cursor: default; }
+.adapter-save { justify-self: start; border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; color: var(--text); background: var(--bg-raised); cursor: pointer; font: inherit; }
 </style>
