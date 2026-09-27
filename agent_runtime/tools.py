@@ -116,7 +116,7 @@ class ToolSpec(Mapping[str, Any]):
 
 
 _NETWORK_TOOLS = {
-    "web_search", "web_fetch", "web_research", "web_subtitles",
+    "web_search", "web_search_batch", "web_fetch", "web_research", "web_subtitles",
     "dev_http_request", "dev_mcp_call", "dev_list_connector_tools",
     "dev_mcp_probe", "dev_mcp_discover",
     "dev_mcp_search",

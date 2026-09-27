@@ -103,7 +103,7 @@ export function useChatStream<T extends ChatStreamTurn>(hooks: ChatStreamHooks<T
       hooks.onReasoning?.(turn)
       scheduleFlush()
     } else if (ev.type === 'notice' && ev.text) {
-      turn.notices.push(ev.text)
+      if (turn.notices[turn.notices.length - 1] !== ev.text) turn.notices.push(ev.text)
     } else if (ev.type === 'plan' && Array.isArray(ev.steps)) {
       turn.plan = ev.steps as string[]
     } else if (ev.type === 'thought' || ev.type === 'action'

@@ -1054,7 +1054,7 @@ const webTitle = computed(() => webOn.value
               </div>
             </div>
             <div v-if="m.status === 'streaming'" class="cd-thinking">
-              {{ m.reasoning ? '正在整理最终回答' : 'AI 正在翻代码、组织回答' }}<span class="cd-dots">…</span>
+              {{ m.reasoning ? 'AI 正在思考、处理请求' : '正在等待模型或工具返回' }}<span class="cd-dots">…</span>
             </div>
             <div v-if="slowResponseLabel(m)" class="cd-slow-notice" role="status">
               {{ slowResponseLabel(m) }}

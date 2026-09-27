@@ -130,7 +130,7 @@ const phaseLabel = computed(() => {
     if (last.type === 'reflection') return '正在复核思路'
   }
   if (t.reasoning) return '正在深度思考'
-  return 'AI 正在翻代码'
+  return '正在等待模型或工具返回'
 })
 </script>
 

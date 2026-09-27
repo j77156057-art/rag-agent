@@ -88,6 +88,30 @@ class RetryCallTests(unittest.TestCase):
 
 
 class OllamaStreamCancellationTests(unittest.TestCase):
+    def test_thinking_is_available_before_first_content(self):
+        sink = []
+        response = self._Response([
+            b'{"message":{"thinking":"planning"}}',
+            b'{"message":{"content":"answer"},"done":true}',
+        ])
+        stream = iter(_OllamaStream(response, reasoning_sink=sink))
+        self.assertEqual(next(stream), "")
+        self.assertEqual(sink, ["planning"])
+        self.assertEqual(list(stream), ["answer"])
+
+    def test_cloud_reasoning_is_available_before_first_content(self):
+        sink = []
+        chunks = [SimpleNamespace(usage=None, choices=[SimpleNamespace(
+            finish_reason=None, delta=SimpleNamespace(
+                reasoning_content="planning", content=None, tool_calls=None))]),
+            SimpleNamespace(usage=None, choices=[SimpleNamespace(
+                finish_reason="stop", delta=SimpleNamespace(
+                    reasoning_content=None, content="answer", tool_calls=None))])]
+        stream = iter(StreamChat(chunks, reasoning_sink=sink))
+        self.assertEqual(next(stream), "")
+        self.assertEqual(sink, ["planning"])
+        self.assertEqual(list(stream), ["answer"])
+
     class _Response:
         def __init__(self, rows=()):
             self.rows = list(rows)
@@ -264,7 +288,7 @@ class ThinkingResolutionTests(unittest.TestCase):
 class OllamaPayloadTests(unittest.TestCase):
     """ollama 原生 /api/chat：think 字段恒携带、num_ctx 按画像封顶、输出预算给满。"""
 
-    def _capture(self, model, thinking_on, messages=None):
+    def _capture(self, model, thinking_on, messages=None, output_limit=None):
         import json as _json
         from unittest.mock import patch
         from llm import LLMClient
@@ -288,8 +312,20 @@ class OllamaPayloadTests(unittest.TestCase):
                 patch("llm.urllib.request.build_opener", return_value=_Opener()):
             out = client._ollama_chat(
                 messages if messages is not None else [{"role": "user", "content": "hi"}],
-                stream=False, thinking_on=thinking_on)
+                stream=False, thinking_on=thinking_on, max_output_tokens=output_limit)
         return captured["payload"], out
+
+    def test_request_output_limit_preserves_context_window(self):
+        baseline, _ = self._capture("qwen3:8b", True)
+        bounded, _ = self._capture("qwen3:8b", True, output_limit=1024)
+        self.assertLessEqual(bounded["options"]["num_predict"], 1024)
+        self.assertEqual(baseline["options"]["num_ctx"], bounded["options"]["num_ctx"])
+
+    def test_quick_lookup_limit_does_not_apply_to_development(self):
+        from agent import _quick_lookup_output_limit
+        self.assertEqual(_quick_lookup_output_limit("帮我搜索一下今天的天气"), 1024)
+        self.assertIsNone(_quick_lookup_output_limit("帮我开发一个天气查询系统"))
+        self.assertIsNone(_quick_lookup_output_limit("分析今天的天气异常原因"))
 
     def test_image_data_urls_normalized_without_mutating_messages(self):
         png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"

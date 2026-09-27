@@ -262,6 +262,9 @@ class StreamChat:
                 content = getattr(delta, "content", None)
                 if content:
                     yield content
+                elif reasoning and self._reasoning_sink is not None:
+                    # 唤醒 Agent 消费思考队列，不必等到第一段正文才显示思考。
+                    yield ""
         finally:
             # 消费方提前中断（如客户端断连）也要把已收到的工具调用交给上层
             self._flush_tools()
@@ -341,6 +344,8 @@ class _OllamaStream:
             content = msg.get("content")
             if content:
                 yield content
+            elif thinking and self._reasoning_sink is not None:
+                yield ""
             # ollama 原生 /api/chat 的末行带 prompt_eval_count / eval_count
             for k in ("prompt_eval_count", "eval_count"):
                 v = obj.get(k)
@@ -551,7 +556,7 @@ class LLMClient:
         return False
 
     def chat(self, messages, stream=False, temperature=LLM_TEMPERATURE, timeout=None, deadline=None, tools=None,
-             enable_thinking=None, reasoning_sink=None, cancel_event=None):
+             enable_thinking=None, reasoning_sink=None, cancel_event=None, max_output_tokens=None):
         """统一的对话入口。stream=True 时返回一个 token 生成器。
 
         timeout：单次调用超时（秒），默认 self.timeout。
@@ -596,6 +601,7 @@ class LLMClient:
                     tool_sink=self.last_tool_calls, tools=tools,
                     thinking_on=thinking_on, reasoning_sink=reasoning_sink,
                     cancel_event=cancel_event,
+                    max_output_tokens=max_output_tokens,
                 ),
                 deadline=deadline, attempts=self.max_retries, base=self.retry_base,
             )
@@ -617,7 +623,10 @@ class LLMClient:
         # max_tokens 兜底：思考型模型偶发不按格式收尾而无限生成，到顶后由
         # finish_reason=length 触发 Agent 的续写纠偏，避免单轮烧几分钟/上万 token。
         # 由模型真实窗口派生（output_budget），云端大模型给足输出余量，不再写死 3072。
-        kwargs = {"max_tokens": self.output_budget}
+        output_limit = self.output_budget
+        if max_output_tokens is not None:
+            output_limit = min(output_limit, max(1, int(max_output_tokens)))
+        kwargs = {"max_tokens": output_limit}
         # qwen3 toggle 家族（含 DashScope 兼容模式/自建端点）：按开关透传 enable_thinking。
         # 不支持思考的模型绝不带这个参数，避免 400；native 模型本身始终推理，无需传。
         if self.capability.get("thinking") == "toggle":
@@ -780,7 +789,7 @@ class LLMClient:
 
     def _ollama_chat(self, messages, stream=False, temperature=LLM_TEMPERATURE, timeout=None,
                      usage_sink=None, tool_sink=None, tools=None,
-                     thinking_on=False, reasoning_sink=None, cancel_event=None):
+                     thinking_on=False, reasoning_sink=None, cancel_event=None, max_output_tokens=None):
         if not _gpu_acquire("ollama", 2): raise RuntimeError("GPU 正忙：ComfyUI 正在使用中，请稍后重试。")
         # 打点：空闲卸载计时器以"真正发起 Ollama 推理"为活动依据，
         # 仅持有租约（排队等待）不算活动，避免把等待误判成模型在用。
@@ -803,6 +812,9 @@ class LLMClient:
             # 注意用 budget 而非 num_ctx：num_ctx 已被窗口封顶，win - num_ctx 恒≈512，
             # 会错误地把输出掐到地板；按真实 prompt 占用给输出留量才是正确裁剪。
             num_predict = min(out_budget, max(512, win - budget - 512))
+        # 请求级输出上限不改变 num_ctx，避免每次简单查询重载模型。
+        if max_output_tokens is not None:
+            num_predict = min(num_predict, max(1, int(max_output_tokens)))
         # Ollama 原生 /api/chat 的 images 只接受**纯 base64**；内部来源（tools/web_fetch、
         # screen_capture 等）会产出 data URL。不剥前缀会被 Ollama 直接拒绝（实测 400
         # "illegal base64 data at input byte 4"），整轮问答因此失败、历史也一并丢失。

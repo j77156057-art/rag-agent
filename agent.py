@@ -728,6 +728,16 @@ def _clip_tool_observation(text, base_limit, tool_name=""):
     return _clip(text, limit)
 
 
+def _quick_lookup_output_limit(question):
+    """简短实时查询限制单次生成量，复杂研究/开发继续使用模型预算。"""
+    q = str(question or "").strip()
+    if len(q) > 80 or re.search(r"分析|设计|开发|实现|研究|比较|报告|为什么|原理|原因", q):
+        return None
+    if re.search(r"天气|气温|汇率|几点|日期", q):
+        return 1024
+    return None
+
+
 _PRUNABLE_PREFIXES = ("Observation:", "Reflection:", "Nudge:")
 
 
@@ -2011,6 +2021,7 @@ class Agent:
         消息分两部分：head（系统提示/项目规则/历史滑窗/当前问题，固定）+
         trail（本轮 ReAct 决策与观察，动态增长，超预算时成对丢弃最早的往返）。
         """
+        yield {"type": "notice", "text": "正在准备本轮上下文。"}
         head = self._build_messages(question, images=images)
         trail = []
         # 本轮开工前上报一次上下文用量（仅顶层会话代理；子代理不刷 UI 指示）。
@@ -2033,6 +2044,7 @@ class Agent:
         # 该值在 _run_child 已被夹到 [1, SUBAGENT_STEPS_HARD_CAP]。
         tool_step_limit = int(self.tool_step_override or 0) or _step_budget(question)
         observation_limit = _observation_budget(question)
+        lookup_output_limit = _quick_lookup_output_limit(question)
         repeats = 0  # 完全相同参数重复调用同一工具的次数
         tool_fail_streak = {}  # 同一工具连续失败次数（换参数也算；防同工具反复失败死循环）
         fail_total = 0  # 连续失败总次数（任一工具；成功即清零）
@@ -2185,6 +2197,7 @@ class Agent:
                 finish_reason = "tool_calls"
             else:
                 _t_llm = time.monotonic()
+                yield {"type": "notice", "text": "正在等待模型输出；接收到思考或回答后会实时显示。"}
                 if stream:
                     # 思考流（reasoning_content / thinking）与正文分开收集，
                     # 每收到正文 token 就把已到达的思考片段作为 reasoning 事件上抛。
@@ -2213,6 +2226,8 @@ class Agent:
                         # 兼容旧的测试/插件 LLM：只有真正提供取消事件时才传入新参数。
                         if cancel_event is not None:
                             chat_kwargs["cancel_event"] = cancel_event
+                        if lookup_output_limit and isinstance(self.llm, LLMClient):
+                            chat_kwargs["max_output_tokens"] = lookup_output_limit
                         chat_stream = self.llm.chat(**chat_kwargs)
                         for tok in chat_stream:
                             while reasoning_q:
@@ -2251,6 +2266,8 @@ class Agent:
                         }
                         if cancel_event is not None:
                             chat_kwargs["cancel_event"] = cancel_event
+                        if lookup_output_limit and isinstance(self.llm, LLMClient):
+                            chat_kwargs["max_output_tokens"] = lookup_output_limit
                         acc = self.llm.chat(**chat_kwargs)
                         _raise_if_cancelled()
                 if turn is not None:
