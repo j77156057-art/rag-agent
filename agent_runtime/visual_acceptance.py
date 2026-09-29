@@ -20,6 +20,8 @@ import threading
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+from .dev_server import loopback_url
 import urllib.request
 
 
@@ -188,9 +190,31 @@ def _entry_file(root: Path, entry: str = "") -> Path:
     raise VisualAcceptanceError("当前项目没有可用于真实网页验收的 index.html 入口。")
 
 
+def preview_target(root: str | Path, entry: str = "",
+                   url: str = "") -> tuple[str, "Path | None"]:
+    """这次要打开的本机地址：给了 `url` 就用已经在跑的服务，否则用项目里的 HTML 入口。
+
+    拆出来是为了让「url 模式不需要 index.html」这件事可以不启动浏览器就验证到。
+    """
+    root_path = Path(root).resolve()
+    if not root_path.is_dir():
+        raise VisualAcceptanceError("当前项目目录不存在。")
+    if str(url or "").strip():
+        target, err = loopback_url(url)
+        if err:
+            raise VisualAcceptanceError(err)
+        return target, None
+    return "", _entry_file(root_path, entry)
+
+
 def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: str | Path = "",
-                            width: int = 960, height: int = 540, timeout: float = 25.0) -> dict[str, Any]:
+                            width: int = 960, height: int = 540, timeout: float = 25.0,
+                            url: str = "") -> dict[str, Any]:
     """Capture a same-project browser preview and return bounded evidence.
+
+    默认把项目目录临时当静态站服务并打开其中的 HTML 入口。给 `url`（只允许本机回环，
+    如 dev_serve 起来的 http://127.0.0.1:5173/）时【不再起静态服务】，直接截那个已经
+    在跑的服务——Vite/Vue 这类必须跑 dev server 的前端才预览得到。
 
     The returned ``image`` is transient model input.  The saved relative path
     is the durable workflow artifact and is served only through the workflow
@@ -199,7 +223,7 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
     root_path = Path(root).resolve()
     if not root_path.is_dir():
         raise VisualAcceptanceError("当前项目目录不存在。")
-    entry_path = _entry_file(root_path, entry)
+    target, entry_path = preview_target(root_path, entry, url)
     width = max(320, min(1920, int(width)))
     height = max(220, min(1200, int(height)))
     edge = _edge_binary()
@@ -214,11 +238,15 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
     if target_dir != root_path and root_path not in target_dir.parents:
         raise VisualAcceptanceError("视觉证据目录必须位于当前项目内。")
     target_dir.mkdir(parents=True, exist_ok=True)
-    server = ThreadingHTTPServer(("127.0.0.1", 0),
-                                 functools.partial(_QuietHandler, directory=str(root_path)))
-    server_thread = threading.Thread(target=server.serve_forever,
-                                     name="visual-preview-http", daemon=True)
-    server_thread.start()
+    server = None
+    server_thread = None
+    if not target:
+        # 已经指定了本机 URL 就直接打那个服务，不再多起一个静态站
+        server = ThreadingHTTPServer(("127.0.0.1", 0),
+                                     functools.partial(_QuietHandler, directory=str(root_path)))
+        server_thread = threading.Thread(target=server.serve_forever,
+                                         name="visual-preview-http", daemon=True)
+        server_thread.start()
     profile = tempfile.TemporaryDirectory(prefix="docmind-visual-preview-",
                                            ignore_cleanup_errors=True)
     process = None
@@ -256,8 +284,16 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
             "width": width, "height": height, "deviceScaleFactor": 1,
             "mobile": False,
         })
-        url = f"http://127.0.0.1:{server.server_port}/{entry_path.relative_to(root_path).as_posix()}?docmind={time.time_ns()}"
-        devtools.call("Page.navigate", {"url": url})
+        if target:
+            separator = "&" if "?" in target else "?"
+            preview_url = "%s%sdocmind=%d" % (target, separator, time.time_ns())
+            shown_entry = preview_url
+        else:
+            rel_entry = entry_path.relative_to(root_path).as_posix()
+            preview_url = ("http://127.0.0.1:%d/%s?docmind=%d"
+                           % (server.server_port, rel_entry, time.time_ns()))
+            shown_entry = rel_entry
+        devtools.call("Page.navigate", {"url": preview_url})
         devtools.evaluate(
             "(async()=>{for(let n=0;n<120;n++){if(document.readyState==='complete')return true;"
             "await new Promise(r=>setTimeout(r,50))}throw Error('页面加载超时')})()"
@@ -300,7 +336,7 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
                 "evidence": ["browser:Page.captureScreenshot",
                              "browser:Runtime.consoleAPICalled",
                              "browser:Network.responseReceived",
-                             "entry:" + entry_path.relative_to(root_path).as_posix()],
+                             "entry:" + shown_entry],
                 "metadata": {"width": str(width), "height": str(height), "title": title,
                              "console_errors": str(len(console_errors)),
                              "failed_requests": str(len(devtools.failed_requests))},
@@ -331,9 +367,10 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
                 except Exception:
                     pass
         profile.cleanup()
-        server.shutdown()
-        server.server_close()
-        server_thread.join(timeout=2)
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
 
 
-__all__ = ["VisualAcceptanceError", "capture_project_preview"]
+__all__ = ["VisualAcceptanceError", "capture_project_preview", "preview_target"]

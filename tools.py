@@ -5960,17 +5960,87 @@ def dev_desktop_action(arg=""):
         return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
 
+def dev_serve(arg):
+    """启动/停止本机开发服务器（vite、next、python -m http.server 等），并等到它真的能应答。
+
+    输入（多行 keyed）：
+      action: start|stop|status        # 默认 start
+      cmd: npm run dev                 # start 必填；与 run_command 同一道命令黑名单
+      cwd: frontend                    # 可选，代码根目录内的子目录
+      port: 5173                       # 可选；不给就从服务自己的日志里认端口
+      wait: 20                         # 就绪等待秒数，上限 120
+      job_id: <id>                     # stop/status 用
+    就绪之后用 `preview_project` 的 `url:` 打这个地址，就能拿到真实截图与 console/失败请求。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    keys = ["action", "cmd", "cwd", "port", "wait", "job_id"]
+    fields = _parse_keyed(arg, keys)
+    bare = [ln.strip() for ln in (arg or "").splitlines()
+            if ln.strip() and not re.match(r"^\s*(" + "|".join(keys) + r")\s*[:：]", ln)]
+
+    def _one(key):
+        value = fields.get(key) or ""
+        return value.splitlines()[0].strip() if value else ""
+
+    action = (_one("action") or "start").lower()
+    from agent_runtime import dev_server
+    if action in ("stop", "cancel"):
+        job_id = _one("job_id") or (bare[0] if bare else "")
+        if not job_id:
+            return "dev_serve stop 需要 job_id: <后台任务 id>（start 的返回里就有）。"
+        rep = dev_server.stop(job_id)
+        if not rep.get("ok"):
+            return "回收失败：" + str(rep.get("error"))
+        return "已回收本机服务（job_id=%s，state=%s）。" % (rep.get("job_id"), rep.get("state"))
+    if action == "status":
+        job_id = _one("job_id") or (bare[0] if bare else "")
+        if not job_id:
+            return "dev_serve status 需要 job_id: <后台任务 id>。"
+        view = dev_server.status(job_id)
+        return json.dumps({key: value for key, value in (view or {}).items()
+                           if key != "logs"}, ensure_ascii=False)
+
+    command = _one("cmd") or (bare[0] if bare else "")
+    if not command:
+        return ("dev_serve start 需要 cmd，例如：\ncmd: npm run dev\ncwd: frontend\n"
+                "（命令与 run_command 共用同一道黑名单，构建类命令请让它专心做服务。）")
+    blocked, why = _cmd_is_blocked(command)
+    if blocked:
+        return "命令被门禁拦下（%s）：%s" % (why, command)
+    try:
+        port = int(_one("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    try:
+        wait = float(_one("wait") or 20)
+    except (TypeError, ValueError):
+        wait = 20.0
+    try:
+        rep = dev_server.start(root, command, argv=_shell_argv(command),
+                               cwd=_one("cwd"), port=port, wait=wait)
+    except Exception as exc:  # noqa: BLE001
+        return "dev_serve 无法运行：%s: %s" % (type(exc).__name__, str(exc)[:200])
+    return dev_server.render(rep)
+
+
 def preview_project(arg=""):
     """在正式开发舱中捕获当前项目的真实网页画面。
 
     这是视觉验收适配器的通用入口：截图会同时作为模型视觉观察和工作流
     preview artifact 保存。非网页项目应改用领域工具（如 game_screenshot 或
     已启用的 EDA MCP），不能把缺少画面误报成通过。
+
+    两种打法：① 不给 url 时，把项目目录当静态站临时服务并打开 entry（默认
+    index.html / web/index.html）；② 给 `url: http://127.0.0.1:5173/` 时直接打这个
+    【已经在跑的本机服务】——Vite/Vue 这类必须起 dev server 的前端要用这种，
+    服务由 dev_serve 起来。url 只允许回环地址。
     """
     root = _get_code_root()
     if not root:
         return ToolResult(False, "真实预览失败：尚未配置当前项目。", error_kind="configuration")
-    fields = _parse_keyed(arg or "", ["entry", "width", "height", "timeout"])
+    fields = _parse_keyed(arg or "", ["entry", "width", "height", "timeout", "url"])
     try:
         from agent_runtime.visual_acceptance import capture_project_preview
         report = capture_project_preview(
@@ -5979,6 +6049,7 @@ def preview_project(arg=""):
             width=int(fields.get("width") or 960),
             height=int(fields.get("height") or 540),
             timeout=float(fields.get("timeout") or 25),
+            url=(fields.get("url") or "").splitlines()[0].strip() if fields.get("url") else "",
         )
     except Exception as exc:  # noqa: BLE001
         return ToolResult(False, f"真实预览失败：{type(exc).__name__}：{str(exc)[:300]}",
@@ -6668,10 +6739,28 @@ TOOLS = {
     "game_screenshot": {"description": "截取当前引擎运行画面作为视觉观察：可选输入 target: embedded|foreground（默认 embedded，嵌入窗口不可用时自动改抓前台窗口）。优先使用已启用引擎连接器的截图能力，其次抓取工作台内嵌窗口；JPEG 保存到项目 .docmind/screenshots/ 并回传图片。截图只是某一瞬间的观察，不是代码事实；无窗口/无头环境会明确失败，那时改用运行日志或受控 playtest 证据，不要臆测画面。", "func": game_screenshot},
     "dev_desktop_capture": {"description": "桌面自动化视觉技能的安全观察入口：截取当前项目嵌入窗口或前台窗口，输入 target: embedded|foreground。只返回真实画面和 native 预览 artifact，不直接点击、输入或修改软件状态；状态修改必须调用已批准的应用 MCP、插件或其他明确工具。", "func": dev_desktop_capture},
     "dev_desktop_action": {"description": "执行一个经过项目审批的桌面动作：action=click|type|drag|key|save，target=embedded|foreground。click/drag 使用窗口客户区 x/y（drag 另给 to_x/to_y），type 使用 text，key 使用安全键名或 Control_L+s。首次调用会返回 desktop_action 审批请求；用户确认后必须用完全相同参数重试。禁止终端、Win 键、任意 HWND 和窗口枚举。", "func": dev_desktop_action},
+    "dev_serve": {
+        "description": (
+            "启动/停止【本机开发服务器】并等它真的能应答：vite、next、`python -m http.server` 之类。"
+            "harness 原本只会把项目目录当静态站临时服务一下，Vue/React 这类必须跑 dev server 的前端"
+            "不 build 就预览不到——本工具补的就是这一段。\n"
+            "输入 keyed 多行：`action: start|stop|status`（默认 start）、`cmd: npm run dev`、"
+            "`cwd: frontend`（代码根目录内的子目录）、`port: 5173`（可省，不给就从服务自己的日志里认端口）、"
+            "`wait: 20`（就绪等待秒数，上限 120）、`job_id: <id>`（stop/status 用）。\n"
+            "命令与 run_command 共用同一道黑名单，`rm -rf`/`git` 写操作之类会被直接拦下；进程只在 code_root "
+            "或其子目录内启动。就绪判定以【实际连通】为准：先探端口，再发一次 GET；4xx/5xx 也算已在响应，"
+            "但只有进程起来却没探测到就绪时会分开如实报告，不会谎称就绪。\n"
+            "拿到 URL 后立刻用 `preview_project` 的 `url:` 打它，就能拿到真实截图 + console 错误 + 失败请求。"
+            "用完必须 `action: stop` 回收（后台任务额度有限，上限 8 个）。"
+        ),
+        "func": dev_serve,
+    },
     "preview_project": {
         "description": (
-            "正式开发舱真实视觉验收：在当前项目内启动安全的本地网页预览，用真实 Edge/Chromium 截取当前画面并把截图"
-            "送给视觉模型，同时登记工作流预览证据。输入可选 entry/index.html、width、height、timeout。\n"
+            "正式开发舱真实视觉验收：用真实 Edge/Chromium 截取当前画面并把截图"
+            "送给视觉模型，同时登记工作流预览证据。输入可选 entry/index.html、width、height、timeout；"
+            "也可以给 `url: http://127.0.0.1:5173/` 直接打【已经在跑的本机服务】（服务由 dev_serve 起，"
+            "url 只允许回环地址）——Vite/Vue 这类必须跑 dev server 的前端要用这种。\n"
             "除截图外还会返回运行时异常、console 错误（含报错文本）与失败请求（4xx/5xx/网络失败，含 URL），"
             "这些信号与截图同权：只要存在 console 错误或失败请求，验收判定为未通过。"
             "看到报错就按报错修，不要因为截图「看起来正常」就判定通过。"

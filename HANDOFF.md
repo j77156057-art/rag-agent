@@ -1,5 +1,17 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-30 Vibecoding 能力补全 Wave6：`dev_serve` + 预览可指向已运行的服务（本会话，不占 R 槽位）
+
+- **先纠正范围（重要，别重造轮子）**：我原来把 Wave6 写成「缺 dev_serve + 缺浏览器观测」。**实测发现后半句是错的**：`agent_runtime/visual_acceptance.py` 早就在用 CDP 采 console（`_record_console`）和失败请求（`Network.responseReceived` / `loadingFailed` → `failed_requests`）并截图，`preview_project` 就是它的入口。真正缺的只有两件：① 它只会把项目目录当**静态站**临时服务，Vite/Vue 这类必须跑 dev server 的前端不 build 就预览不到；② 没有任何工具会**启动** dev server。本波只做这两件。
+- **产物**：新模块 `agent_runtime/dev_server.py`（`free_port / loopback_url / parse_port_hint / probe / start / stop / render`）；`visual_acceptance.py` 新增 `preview_target(root, entry, url)` 并让 `capture_project_preview` 支持 `url:`；`tools.py` 新增 `dev_serve` + 扩展 `preview_project` 的 `url:` 入参；`agent.py` 提示两行；`tests/test_dev_serve_preview.py` **26 项**。
+- **就绪判定不谎报**：先探 TCP 端口、再发一次 GET。**4xx/5xx 也算「已在响应」**（404 说明服务起来了，判成没就绪会逼 Agent 白等）；进程状态进入 `done/failed/timeout/cancelled` 立刻分开报告「进程已退出」而不是继续空等；「进程起来了但没探测到就绪」与「启动失败」是两条不同结论，前者 `ok=True + ready=False` 并回传日志尾部。`free_port()` 只是**建议端口**，从返回到子进程 bind 之间仍可能被抢，所以任何就绪结论都以实际连通为准。
+- **安全边界**：`loopback_url` 只允许 `127.0.0.1 / localhost / ::1`（含 `127.*`），拒绝 `http://example.com`、`http://10.0.0.5`、`file://`、`ftp://`——**这不是网页浏览器**，不能被拿去访问内网/外网机器；命令复用 `_cmd_is_blocked`（`rm -rf /` 直接被拦下），进程 cwd 必须在 code_root 内（越界拒绝）；回收走既有 `process_runner.job_cancel`，后台任务上限仍是 8 个。
+- **端到端证明（真浏览器，不是断言拼装）**：临时项目里放一个页面，内含 `console.error("boom-from-page")` 与 `<script src="/missing.js">`。`dev_serve` 起 `python -m http.server` → 就绪 → `preview_project(url=...)`：截图落地 3098 字节、`console_errors` 抓到 `boom-from-page` 与一条 `network: Failed to load resource`、`failed_requests` 抓到 `http_404 /missing.js`，**`ok=False`**——坏页面没有被判成通过，这正是这条链路存在的意义。
+- **顺手做的可测试性重构**：把 URL/入口的决策抽成 `preview_target()`，这样「url 模式不需要 index.html」「非回环在启动浏览器之前就被拒绝」这两件事**不必真开浏览器**就能断言（避免 CI 上依赖 Edge）。`capture_project_preview` 现在调用它，行为不变。
+- **发现并修掉的自身缺陷**：`dev_server.py` 初稿把进程状态写成 `finished/exited/killed`，而 `process_runner` 实际用的是 `done/timeout/failed/cancelled` → 秒退的服务会被当成「还在启动」白等到超时。已按真实状态名修正，并加用例 `test_command_that_exits_immediately_is_not_ready`。
+- **验证**：Wave6 用例 **26 passed**；全量 pytest **2366 passed / 6 skipped / 0 failed**（另有二次确认跑）。
+- **未做**：console/network 仍绑在一次 capture 里，没有「不截图只读日志」的独立动作（`dev_job_logs` 能读服务日志，但读不到页面 console）；没有自动等待某个选择器/DOM 状态（只有 `readyState==='complete'`）；没有页面内交互（点击/输入），所以「点一下按钮再截图」这条路仍缺；`dev_serve` 不做端口占用检测与自动换端口（只给建议端口 + 就绪探测）。
+
 ## 2026-09-30 Vibecoding 能力补全 Wave10：连接器工具一等公民化（本会话，不占 R 槽位）
 
 - **补什么**：调外部 MCP 工具原本只有一条间接路——`dev_list_connector_tools` 先查、再 `dev_mcp_call(server, tool, json)`。模型看不见真实工具名与 schema，只能靠名字猜参数，连接器一多选择质量就掉。现在打了指纹的连接器工具会作为 `mcp__<server>__<tool>` 直接进本轮工具表。
