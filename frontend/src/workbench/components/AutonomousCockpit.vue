@@ -21,6 +21,11 @@ import {
   appendCaptionTurn, describeLiveCapabilities,
 } from '../liveStreamControl'
 import type { LivePhase, LiveCaptionTurn } from '../liveStreamControl'
+import {
+  createChunkPump, createVoiceGate, encodeAudioPacket, frameRms, resample,
+  OUTPUT_SAMPLE_RATE, TARGET_SAMPLE_RATE,
+} from '../liveAudioControl'
+import { REALTIME_PROTOCOL_VERSION } from '../realtimeProtocol'
 import CockpitApprovalQueue from './CockpitApprovalQueue.vue'
 import CockpitModelBar from './CockpitModelBar.vue'
 import WorkflowCard from './WorkflowCard.vue'
@@ -188,14 +193,157 @@ async function refreshLiveVisionMode() {
     liveVisionLimitations.value = []
   }
 }
-function interruptLiveStream() {
+function stopAiPlayback() {
+  for (const source of liveAudioSources) { try { source.stop() } catch { /* 已自然结束 */ } }
+  liveAudioSources.clear()
+  liveAudioNextAt = 0
+  liveAiSpeaking.value = false
+}
+function interruptLiveStream(reason = '用户在开发舱打断') {
   const socket = liveStreamSocket
   if (!socket || socket.readyState !== WebSocket.OPEN) return
-  try { socket.send(JSON.stringify(realtimeCancel('用户在开发舱打断'))) } catch { return }
+  try { socket.send(JSON.stringify(realtimeCancel(reason))) } catch { return }
+  stopAiPlayback()
   liveLedger.clear()
   liveStreamFrames.clear()
   liveVisionPhase.value = 'viewing'
   liveVisionStatus.value = '已打断：旧帧的理解结果不再返回，AI 只看接下来的新画面。'
+}
+
+// ---- R2 语音闭环：麦克风采集 → audio.chunk 上行 → model.audio 播放 → 抢话自动打断 ----
+// 分片/VAD/静音尾/包封的数学全在 liveAudioControl.ts（node 契约测试覆盖）；
+// 这里只做浏览器 API 接线。静音尾时序：tail 期把等长零样本喂进分片泵，按实时节奏
+// 自然产 100ms 全零片——停止说话后绝不掐流（AI-D 真机契约，0db20ff）。
+const liveMicActive = ref(false)
+const liveAiSpeaking = ref(false)
+const liveMicStatus = ref('')
+let liveAudioStream: MediaStream | null = null
+let liveAudioContext: AudioContext | null = null
+let liveAudioNode: AudioWorkletNode | null = null
+const liveAudioSources = new Set<AudioBufferSourceNode>()
+let liveAudioNextAt = 0
+let liveAudioSequence = 0
+let liveVoiceGate = createVoiceGate()
+let liveChunkPump = createChunkPump()
+
+function getLiveAudioContext(): AudioContext | null {
+  if (liveAudioContext && liveAudioContext.state !== 'closed') return liveAudioContext
+  try { liveAudioContext = new AudioContext() } catch { return null }
+  return liveAudioContext
+}
+function sendLiveAudioChunk(payload: Uint8Array) {
+  const socket = liveStreamSocket
+  if (!socket || socket.readyState !== WebSocket.OPEN || socket.bufferedAmount > 500_000) return
+  liveAudioSequence += 1
+  try {
+    socket.send(encodeAudioPacket({ version: REALTIME_PROTOCOL_VERSION,
+      sequence: liveAudioSequence, capturedAt: Date.now(), payload }))
+  } catch { /* 断线由重连路径接管 */ }
+}
+function handleLiveAudioFrame(frame: Float32Array) {
+  const context = liveAudioContext
+  if (!context) return
+  const signal = liveVoiceGate.feed(frameRms(frame), Date.now(), liveAiSpeaking.value)
+  if (signal.bargeIn) {
+    stopAiPlayback()
+    const socket = liveStreamSocket
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      try { socket.send(JSON.stringify(realtimeCancel('用户抢话'))) } catch { /* 忽略 */ }
+    }
+    liveMicStatus.value = '已抢话：AI 停止说话，继续听你讲。'
+  }
+  if (!signal.sending) {
+    if (signal.tailDone && liveChunkPump.pending() > 0) liveChunkPump.reset()
+    return
+  }
+  const tailLength = Math.round(frame.length * TARGET_SAMPLE_RATE / context.sampleRate)
+  const samples = signal.state === 'tail'
+    ? new Float32Array(tailLength)
+    : resample(frame, context.sampleRate, TARGET_SAMPLE_RATE)
+  for (const chunk of liveChunkPump.push(samples)) sendLiveAudioChunk(chunk)
+}
+async function startLiveMic() {
+  if (liveMicActive.value) return
+  if (!navigator.mediaDevices?.getUserMedia) { liveMicStatus.value = '当前浏览器不支持麦克风采集。'; return }
+  if (!liveStreamSocket || liveStreamSocket.readyState !== WebSocket.OPEN) {
+    liveMicStatus.value = '请先连接实时视频流再开麦。'
+    return
+  }
+  try {
+    liveAudioStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }, video: false })
+    const context = getLiveAudioContext()
+    if (!context) throw new Error('当前浏览器不支持音频上下文')
+    await context.resume()
+    const workletSource = `class LiveMicTap extends AudioWorkletProcessor {
+  process(inputs) {
+    const frame = new Float32Array(inputs[0][0])
+    this.port.postMessage(frame.buffer, [frame.buffer])
+    return true
+  }
+}
+registerProcessor('live-mic-tap', LiveMicTap)`
+    const url = URL.createObjectURL(new Blob([workletSource], { type: 'application/javascript' }))
+    await context.audioWorklet.addModule(url)
+    URL.revokeObjectURL(url)
+    liveAudioNode = new AudioWorkletNode(context, 'live-mic-tap')
+    liveAudioNode.port.onmessage = (message: MessageEvent) => {
+      handleLiveAudioFrame(new Float32Array(message.data))
+    }
+    // 零增益汇接：维持回调节拍，但绝不把麦克风原声送回扬声器（监听回授）。
+    const sink = context.createGain()
+    sink.gain.value = 0
+    liveAudioNode.connect(sink)
+    sink.connect(context.destination)
+    context.createMediaStreamSource(liveAudioStream).connect(liveAudioNode)
+    liveVoiceGate = createVoiceGate()
+    liveChunkPump = createChunkPump()
+    liveAudioSequence = 0
+    liveMicActive.value = true
+    liveMicStatus.value = '语音已连接：说完会自动补静音尾收句，AI 说话时可直接抢话。'
+  } catch (cause) {
+    await stopLiveMic()
+    liveMicStatus.value = (cause as Error).name === 'NotAllowedError'
+      ? '未获得麦克风授权。' : `麦克风启动失败：${(cause as Error).message || '未知原因'}`
+  }
+}
+async function stopLiveMic(message = '麦克风已关闭。') {
+  liveMicActive.value = false
+  if (liveAudioNode) { try { liveAudioNode.port.onmessage = null; liveAudioNode.disconnect() } catch { /* 忽略 */ } liveAudioNode = null }
+  for (const track of liveAudioStream?.getAudioTracks() ?? []) track.stop()
+  liveAudioStream = null
+  liveVoiceGate.reset()
+  liveChunkPump.reset()
+  stopAiPlayback()
+  if (message) liveMicStatus.value = message
+}
+function playLiveModelAudio(raw: { audio?: unknown; encoding?: unknown }) {
+  if (typeof raw.audio !== 'string' || !raw.audio) return
+  const context = getLiveAudioContext()
+  if (!context) return
+  try {
+    const binary = atob(raw.audio)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+    const samples = new Float32Array(bytes.length / 2)
+    const view = new DataView(bytes.buffer)
+    for (let i = 0; i < samples.length; i++) samples[i] = view.getInt16(i * 2, true) / 32767
+    if (!samples.length) return
+    const buffer = context.createBuffer(1, samples.length, OUTPUT_SAMPLE_RATE)
+    buffer.copyToChannel(samples, 0)
+    const source = context.createBufferSource()
+    source.buffer = buffer
+    source.connect(context.destination)
+    const startAt = Math.max(context.currentTime + 0.02, liveAudioNextAt)
+    source.start(startAt)
+    liveAudioNextAt = startAt + buffer.duration
+    liveAudioSources.add(source)
+    source.onended = () => {
+      liveAudioSources.delete(source)
+      if (liveAudioSources.size === 0) liveAiSpeaking.value = false
+    }
+    liveAiSpeaking.value = true
+  } catch { /* 畸形音频片直接丢弃，不谎报播放 */ }
 }
 const clickDescription = ref('')
 const clickGoal = ref('')
@@ -840,6 +988,7 @@ function stopLiveVision(message = '') {
   liveStreamCapabilities.value = ''
   liveVisionMetrics.value = { latencyMs: null, intervalMs: 500, dropped: 0 }
   liveVisionPhase.value = 'idle'
+  void stopLiveMic('')
   liveStreamFrames.clear()
   liveStreamSequence = 0
   liveVisionRequest?.abort()
@@ -961,12 +1110,18 @@ function receiveLiveStreamObservation(raw: string, ticket: number, projectId: st
     liveStreamCapabilities.value = describeLiveCapabilities(event.provider_capabilities)
     liveStreamCaptions.value = []
     liveVisionLimitations.value = mode === 'native-realtime'
-      ? ['模型连接失败时会自动降级为兼容抽帧模式。']
+      ? ['模型连接失败时会自动降级为兼容抽帧模式。', '语音回复按 pcm16 / 24kHz 播放；若真机有噪声需按服务端实际格式校正（liveAudioControl 单点常量）。']
       : ['当前只处理最新视频帧，不提供原生音频流回复。', '理解结果可能晚于正在播放的画面。']
     if (mode === 'sampled-frames' && typeof event.degraded_to === 'string' && event.degraded_to
       && event.degraded_to !== 'sampled-frames') {
       liveVisionLimitations.value = [...liveVisionLimitations.value, `原生通道未起：已回退到 ${event.degraded_to}。`]
     }
+    return
+  }
+  if (event.type === 'model.audio') {
+    liveStreamLastObservationAt = Date.now()
+    refreshLiveVisionPhase()
+    playLiveModelAudio(event as typeof event & { audio?: unknown; encoding?: unknown })
     return
   }
   if (event.type === 'model.delta' || event.type === 'audio.transcript') {
@@ -1953,6 +2108,11 @@ onBeforeUnmount(() => {
           <p v-if="visualInspectStatus" class="acp-visual-inspect-status" role="status">{{ visualInspectStatus }}</p>
           <section v-if="liveVisionActive || liveVisionStatus || liveVisionObservation" class="acp-live-vision-panel" aria-live="polite">
             <div><b><i :class="{ pulse: liveVisionActive && !liveVisionPaused }" />{{ screenSharing || cameraSharing ? '实时视频 · ' + liveVisionPhaseLabel : liveVisionActive ? 'AI 持续视觉观察中' : '实时视觉' }}</b><small v-if="screenSharing || cameraSharing">{{ liveVisionSource }} · 每 {{ (liveVisionMetrics.intervalMs / 1000).toFixed(1) }} 秒上传新画面 · 理解延迟 {{ liveVisionMetrics.latencyMs === null ? '—' : (liveVisionMetrics.latencyMs / 1000).toFixed(1) + ' 秒' }} · 丢弃旧帧 {{ liveVisionMetrics.dropped }}</small><small v-else>{{ liveVisionSource }}</small><button v-if="liveVisionActive && (screenSharing || cameraSharing)" :disabled="!liveStreamConnected || liveVisionPaused" @click="interruptLiveStream()">打断</button><button v-if="liveVisionActive" @click="toggleLiveVisionPause()">{{ liveVisionPaused ? '继续观察' : '暂停观察' }}</button><button v-if="liveVisionActive" @click="stopLiveVision('已停止持续视觉观察。')">停止</button></div>
+            <div v-if="liveStreamConnected" class="acp-live-audio">
+              <button :disabled="!liveVisionActive" @click="liveMicActive ? stopLiveMic() : startLiveMic()">{{ liveMicActive ? '闭麦' : '开麦对话' }}</button>
+              <span><i :class="{ pulse: liveAiSpeaking }" />{{ liveAiSpeaking ? 'AI 正在说话，可直接开口打断' : (liveMicActive ? '正在听你说话' : '麦克风未开') }}</span>
+              <small>{{ liveMicStatus || '说完会自动补一段静音让服务端收句；无需手动结束。' }}</small>
+            </div>
             <video v-if="screenSharing || cameraSharing" ref="sharedVideo" class="acp-shared-video" autoplay muted playsinline aria-label="正在共享给 AI 的实时画面" />
             <div v-if="liveVisionActive && liveVisionSnapshotUrl" class="acp-focus-controls"><span>{{ liveVisionFocus ? '正在观察圈选区域' : '正在观察整个画面' }}</span><button v-if="!liveVisionSelecting" @click="beginFocusSelection()">{{ liveVisionFocus ? '重新圈选' : '圈选重点区域' }}</button><button v-if="liveVisionSelecting" @click="liveVisionSelecting = false; focusPointerCancel()">取消圈选</button><button v-if="liveVisionFocus" @click="clearFocusSelection()">恢复整屏</button></div>
             <div v-if="liveVisionActive && liveVisionSnapshotUrl" class="acp-focus-viewport"><div class="acp-focus-snapshot" :class="{ selecting: liveVisionSelecting }" @pointerdown="focusPointerDown" @pointermove="focusPointerMove" @pointerup="focusPointerUp" @pointercancel="focusPointerCancel"><img :src="liveVisionSnapshotUrl" alt="用于圈选重点区域的当前画面快照" draggable="false"><span v-if="liveVisionDraftFocus || liveVisionFocus" class="acp-focus-region" :style="focusRegionStyle(liveVisionDraftFocus || liveVisionFocus)" /></div></div>
@@ -2211,6 +2371,9 @@ button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent);
 .acp-focus-region { position: absolute; box-sizing: border-box; border: 2px solid #26bd8b; background: rgba(38, 189, 139, .16); pointer-events: none; }
 .acp-live-vision-panel p { margin: 7px 0 0; color: var(--text-muted); font-size: 11px; }
 .acp-live-vision-mode { padding: 7px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-raised); }
+.acp-live-audio { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 7px 0 0; padding: 7px 8px; border: 1px dashed var(--border); border-radius: 6px; font-size: 11px; color: var(--text-muted); }
+.acp-live-audio span { display: inline-flex; align-items: center; gap: 5px; color: var(--text); }
+.acp-live-audio small { flex-basis: 100%; }
 .acp-live-vision-mode b { color: var(--text); }
 .acp-live-vision-limitations { margin: 7px 0 0; padding-left: 18px; color: var(--text-muted); font-size: 10px; line-height: 1.5; }
 .acp-live-captions { margin: 9px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow: auto; }

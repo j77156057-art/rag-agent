@@ -29,7 +29,7 @@ pytestmark = pytest.mark.skipif(
     reason="node / 前端 typescript 工具链不可用，跳过前端逻辑行为测试",
 )
 
-_HARNESS = """\
+_HARNESS = r"""
 import assert from 'node:assert';
 import { createAdaptiveSender, classifyLivePhase, LIVE_PHASE_LABELS, createInFlightLedger,
   appendCaptionTurn, describeLiveCapabilities } from './liveStreamControl.js';
@@ -198,4 +198,8 @@ def test_cockpit_wiring_uses_the_control_module():
         "cockpit 必须消费 R4 的回答流/转写事件，否则字幕区是死组件"
     assert "describeLiveCapabilities" in source and "provider_capabilities" in source, \
         "hello.ok 送到的模型能力必须在 UI 呈现（R13 验收：界面说明当前模式和限制）"
+    assert "liveAudioControl" in source and "createVoiceGate" in source and "encodeAudioPacket" in source, \
+        "麦克风上行必须复用 liveAudioControl 的 VAD/分片/封包，不得在组件里另写一套数学"
+    assert "model.audio" in source and "playLiveModelAudio" in source, \
+        "原生语音回复必须接播放管线"
     assert "1280 / video.videoWidth, 720" not in source, "固定 1280/720 采集应已被自适应档位取代"

@@ -1,5 +1,15 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 R2 语音闭环前端（liveAudioControl + cockpit 麦克风/播放接线）【AI-A/AI-B，本轮局部提交】
+
+- **定位**：把豆包式"边说边聊"缺的语音上行/下行/自动抢话缝起来。纯数学与状态机全部放**新模块 `frontend/src/workbench/liveAudioControl.ts`**（零浏览器依赖，可脱离页面跑）；`AutonomousCockpit.vue` 只做 getUserMedia/AudioWorklet/AudioContext 接线。未动 `realtimeProtocol.ts`、网关、`voice_dialogue.py`。
+- **契约来源（必须遵守，非我发明）**：AI-D 真机结论——服务端 VAD 靠 **~1s 尾部静音**收句，"停止说话 ≠ 停止推流"（HANDOFF 0db20ff / /root 已在 provider 侧加 `send_silence_tail` 双保险，前端这层是第一条防线）；输入 pcm16@16k、输出线报 `encoding:"pcm24"` **采样率未明**——播放按 pcm16@24k 单点假设 `OUTPUT_SAMPLE_RATE`，界面限制已如实标注，真机噪声只改这一个常量（R12）。
+- **模块行为**（`tests/test_live_audio_control.py`，node 真跑 34 断言）：`resample/floatToInt16Le/frameRms` 采集数学（LE 字节序逐字节钉死）；`createVoiceGate` 能量 VAD idle→speech→tail→idle：起说 2 帧去抖、300ms 迟滞判说完、**tail 全程 sending=True**、推满 1s 才 tailDone；抢话（AI 在说时起说）报 `bargeIn`；`createChunkPump` 只产 100ms 整片不吐碎片，tail 期喂等长零样本按实时节奏自然产静音尾；`encodeAudioPacket` 沿用 R0 媒体包头，负序号/零载荷/非整 captured_at 全拒。
+- **cockpit 接线**：`开麦对话` 按钮（流连接后可用）→ worklet tap（零增益回授防护）→ VAD→分片→**复用现有 live-stream WebSocket** 上行 `audio.chunk`；`model.audio` base64→Int16@24k 排队播放 + `liveAiSpeaking` 状态；barging 时**自动停播 + 自动发 `realtimeCancel`**；`stopLiveVision`/卸载路径全量复位；打断按钮同步停播。面板显示"AI 正在说话，可直接开口打断"。
+- **验证**：`tests/test_live_audio_control.py` 3 passed + `test_live_stream_control.py` 3 passed（含新增音频接线回归）；混跑 `-k "realtime or live_vision or live_stream or live_audio or voice"` = **277 passed / 0 failed**；前端 `npm run typecheck`/`build` 通过。调试坑两处：raw 字符串里 `""" \` 续行符会成字面量把 harness 首行炸掉；测试断言 VAD 时序必须"喂到信号出现"而不是硬编码帧序。
+- **未验证（不谎报）**：麦克风采集与扬声器播放是浏览器 API，本机无设备环境——**上行听感、播放音质（含 24k/位深假设）、真实 barge-in 手感全部属 R12 真机**；上行依赖原生模式（`hello.ok.mode=native`），抽帧模式下开麦会收 `audio_not_ready`（协议既有行为，正确）。
+- **冲突面**：`AutonomousCockpit.vue` 是多人交叠文件，本次提交为整文件（含其他 AI 已在工作区的前端改动），如归属有异议以 diff 中 `liveAudioControl/startLiveMic/playLiveModelAudio/acp-live-audio` 相关块为本轮新增。
+
 ## 2026-09-29 R12 provider 可靠性三条收口（/root，已完成代码·勿重复）
 
 - **范围**：本轮只处理 R12 指定的 provider/网关/验收 runner 可靠性契约；AI-G 仍负责真实摄像头、麦克风、屏幕共享和驾驶舱 UX 联验。不要重复修改这三条。
