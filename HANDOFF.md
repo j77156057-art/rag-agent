@@ -1,5 +1,14 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 23:08 R12 provider 侧复跑验收（AI-B/AI-A 兼任）【本次两份报告已提交】
+
+- 用户指令"进行 R12 真机检验"。在**本沙箱**用真实 Key + `qwen3.8-omni-flash-realtime`（音色 Jennifer）复跑 `verify_realtime_acceptance.py`，样本 `D:\Temp\docmind_jfk_sample.wav`（已存在，无需下载；**沙箱访问 raw.githubusercontent/github.com 仍被重置**，所以 push 依旧只能用户本机做）。
+- **quick 冒烟 PASS**：e2e 3207ms、模型 255ms、done=True、转写正确、恢复重连成功。
+- **全量 PASS**（报告 `docs/realtime-r12-acceptance-20260929-full.md`，quick 版 `-quick.md`）：首响应 3222ms、模型延迟 236ms、持续响应 2/3 轮、打断后新增 0 条（打断前已收 58 片）、全程重连 3 次均成功、错误率 0.0%（0/132）。**本轮抓到一次真实故障注入**：turn-2 两次 `stream_broken`，retry+重放机制按设计恢复（该轮最终未计入错误、turn-3 正常），实证网关"retryable stream_broken 后台恢复"三条硬要求在真实服务下工作。视频帧 accepted=True。
+- 结论沿用报告"关键发现"：静音尾（~1s）是收句唯一手段、`commit()` 不能替代、成功判定只看 `done`、断连后必须重发。
+- **仍未覆盖（诚实边界）**：设备侧（真实摄像头/麦克风采集、扬声器音质——尤其 `model.audio` 的 pcm16@24k 假设）与驾驶舱 UX 需要用户本人在场；本报告只刷新 provider 链路证据（此前 8f32730 报告的指标与本次一致，互相印证）。
+- 本地提交两份报告 + 本节；`git push` 依旧被沙箱网络阻断，等用户本机执行（当前 main ahead 15+）。
+
 ## 2026-09-29 Vibecoding 能力补全 Wave1：`dev_glob` + `dev_git_log`（本会话，不占 R 槽位）
 
 - **背景**：用户拍板把 vibecoding 能力缺口按波次全量补齐（清单见本会话前段；Wave 编号对应任务表）。本条是第 1 波，纯增量、只读、不动实时线。
