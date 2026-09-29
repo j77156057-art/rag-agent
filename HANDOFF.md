@@ -1,5 +1,12 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 R0/R3 收口：实时信封字段完整保护（/root，已完成·勿重复）
+
+- **修复**：实时协议与 provider 事件序列化现在统一保护完整信封字段 `v/type/sent_at/sequence/captured_at/session_id`；不可信 provider payload 不能覆盖网关生成的会话、序号或采集时间。
+- **范围**：仅修改 `agent_runtime/realtime_protocol.py`、`agent_runtime/realtime_provider.py` 的序列化边界和 R0 契约测试；没有新增事件类型、没有改变 R3 网关路由或 R4/R5/R10 接线。
+- **验证**：`tests/test_realtime_protocol_contract.py tests/test_realtime_gateway_faults.py tests/test_realtime_gateway_stress.py` **105 passed**；`py_compile` 与 `git diff --check` 通过。
+- **重复防护**：R0/R3 收口已完成，后续不要在协议或网关重复添加第二套信封过滤逻辑；真实设备联验仍属于 R12。
+
 ## 2026-09-29 visual_targeting 7 漂移收尾 + 编码回退真实修复（AI-F，接续同文件下一节的工作）
 
 - 用户指派处理 7 个 visual_targeting 失败。下一节记录的端点补齐工作（并发 AI-F 会话）在我
@@ -97,13 +104,54 @@
 - **给后续 AI 的提示**：这两条属「单跑绿、混跑红」，不要为了让它们变绿去改断言语义；
   要动就动预算或把未 patch 的后端 patch 掉。
 
-### 提交状态（**刻意未提交**）
+### 提交状态：**已按用户指令做全量收口提交（5 个 commit）**
 
-`api.py` 有多个 AI 的未提交改动（`git status` 显示 `M api.py`，另有 725 行未提交的 `tools.py` 等），
-`agent_runtime/realtime_bridge.py` 至今是**未跟踪**文件（`?? `）——`git add api.py` 会把别人的在飞改动
-一起卷进来，且本轮新增用例在干净检出上是红的（`visual_targeting` 的后端此前不存在）。
-**故本轮不提交**，由用户/集成方决定提交切分。冲突热点：`api.py`（我新增了 2 个端点、`chat()` 首参与
-1 个 helper，均为**追加**，未改既有分支的语义）；`agent_runtime/realtime_bridge.py`（改的是我自己的文件）。
+用户确认走「全量收口提交」（工作树里 138 个路径，大部分是其他 lane 的累积改动）。按目录分 5 批入库：
+
+| commit | 范围 |
+|---|---|
+| `503e27e` | 后端与运行时：`agent_runtime/**`、`api.py`、其余后端模块、`web/` |
+| `c19aacf` | 前端工作台：`frontend/**` |
+| `e35ce8e` | 测试套件：`tests/**`（含新增 `conftest.py`） |
+| `5f1209c` | 文档：`HANDOFF.md`、`docs/**` |
+| `326da8e` | 补遗：`realtime_bench.py`、`verify_realtime_acceptance.py` |
+
+**没有**按特性拆分的原因写在 commit message 里：多数改动落在同一文件（`api.py` 未提交部分 1319 行，
+我只占约 220 行），不做 hunk 拆分就无法按特性切。
+
+**刻意未纳入**：`.tmp/`（诊断脚本与临时输出）；`artifacts/*.png|pdf`（无任何文件引用的生成物）；
+`tests/test_realtime_resource_security.py`（另一 lane 在收口期间正在写、且当时是红的，见下）。
+
+### HEAD 干净检出验证（**重要，别只信工作树**）
+
+`git worktree add D:/Temp/docmind-head-check HEAD` + 复制 `.env` 后跑全量：
+**2108 passed / 4 failed / 9 skipped**（247s）。逐个交代这 4 个：
+
+- `tests/test_desktop_entry.py` ×3（`/workbench` 与 `/workbench.html` 404）：**验证方法的产物，不是缺陷**。
+  `web/workbench.html` 是前端构建产物，被根 `.gitignore:46` 明确忽略——干净检出没有它，
+  而主工作树里前端已经构建过，所以同一批用例在主工作树里是通过的。
+- `tests/test_realtime_resource_security.py::test_rapid_session_cycles_do_not_leak_timelines_or_metric_scopes`：
+  **HEAD 上就是红的**（该文件的 HEAD 版本），属本文件已记录的「客户端 socket 退出不等服务端异步
+  `finally`」同类——5s 预算在负载下不够（失败那几次整轮 17.7s = 5s + 夹具 10s，通过时 ~2s）。
+  该文件不是我这条线的，且其作者此刻仍在改它。
+
+**给下一个 AI 的提醒**：工作树与 HEAD 的差异**不代表** HEAD 绿/红——必须用独立 worktree 验证；
+`web/workbench.html` 这类被忽略的构建产物会让 `test_desktop_entry` 在干净检出上假红。
+
+### 收口期间仍在动的文件（**属于别的 lane，我没有提交**）
+
+提交过程中工作树持续变化（`/root` 正在做 R12）：`agent_runtime/realtime_protocol.py`、
+`agent_runtime/realtime_provider.py`、`tests/test_realtime_protocol_contract.py`、
+`docs/realtime-r12-acceptance-20260929.md`。**其中前两个是 R0 独占的协议文件，我一行没碰**
+（AI-A 的边界原文也禁止我改）。这些留给对应 lane 收口。
+
+### 另一 lane 的 R9 审计指出我这条线的一个真实缺口（**未修，待用户定**）
+
+`tests/test_realtime_resource_security.py::test_known_gap_interrupt_is_not_guarded_and_kills_the_session`
+记录了：`api.py` 的 `cancel` / 媒体分支里 `bridge.interrupt()`、`send_frame()`、`take_audio()` 三处
+**没有 try 守卫**——provider 基类契约写明「每个方法都应 fail-closed，返回 False 而非外抛」，而我只在
+`start()` 与 pump 循环加了守卫。provider 真外抛时会连会话一起打死。修法很小（三处包 try），
+但它改的是 `api.py` 热路径且不在此前用户给的三项范围内，**未动**。
 
 ## 2026-09-29 R13 字幕与能力呈现（AI-A/AI-B 兼任）【本轮局部提交】
 
