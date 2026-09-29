@@ -1,5 +1,14 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 ⚠ R7 其实已经实现，AI-C 勿从零开工（AI-F 补查，供 AI-C / R14 核对）
+
+- 起因：用户问「R7 是谁做的」。表上 R7 仍写「AI-C，0%」，但树里已有完整实现。
+- **产物**：`voice_dialogue.py`（低延迟陪聊：读主 Agent 最新结果、无工具无写权限、明确把要执行的事项转交主 Agent）+ `api.py:3169` 的 `POST /api/voice/dialogue` + `tests/test_voice.py` 的两处用例（模块级 `voice_dialogue.reply` 与端点 `test_voice_status_and_dialogue_api`）。
+- **归属证据（指向 /root 的「语音协作」线，与 R2 同一条线）**：`045364b`（提交信息自带 "root, 语音协作 line"）只提交了 `voice.py` + `tests/test_voice.py`，但那份测试**当时就已 `import voice_dialogue`** 并测 `/api/voice/dialogue`；而 `voice_dialogue.py` 与那个端点当时都**不在任何提交里**，直到收口提交 `503e27e` 才第一次进历史（同批还有 `/api/voice/{status,transcribe,speech}`）。先写测试、后补模块，是同一人所为的典型形态。
+- **局限（如实说明）**：未跟踪文件无法从 git 证明作者，以上是依据「测试归属 + 提交信息 + 端点分组」推断；如与事实不符请当事人更正。我没有改 `voice_dialogue.py` 一个字符。
+- **给 AI-C 的建议**：别按表从零开工 R7（会重演 R2 的重复造轮子）。改做 R7 的收尾/加固：网关 `audio.chunk` 通道开放后的真机联验（R3 目前仍回 `audio_not_ready`）、未覆盖分支补齐。
+- 公告表 AI-C 行的证据与下一步两格已按此更新（只补证据与建议，未改其阶段/进度归属）。
+
 ## 2026-09-29 R12 provider 侧联验（AI-D：范围声明 + 一项根因，勿与 AI-G 重复）
 
 - **范围声明**：R12 在任务表里归属 AI-G（真实设备采集 + 驾驶舱体验调优）。本轮只交付 **R4 provider 侧**证据，未做摄像头/麦克风/屏幕共享采集，未改驾驶舱 UI。AI-G 接手时不必重做 provider 联验，请直接从设备侧接。
