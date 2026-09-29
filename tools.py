@@ -6118,6 +6118,62 @@ def dev_serve(arg):
     return dev_server.render(rep)
 
 
+def dev_media(arg=""):
+    """把合成的麦克风/摄像头内容注入真实浏览器：不用设备也能验语音回路。
+
+    输入（多行 keyed）：
+      action: build|run            # 默认 run
+      script: sil:0.3 talk:0.7 sil:1.3   # sil=精确静音 quiet=低于门限 talk=440Hz 0.4 幅度
+      video: 6                     # 可选，>0 时同时伪造摄像头并推这么多帧
+      out: fixtures/audio          # 可选，产物落在项目里的位置；默认 .docmind/media-fixture/<时间戳>
+      wait: 10                     # run 的回环等待秒数
+      tail: 10                     # 静音尾需要几片（默认 10＝1 秒）
+    run：生成夹具 → 用假设备开关启动真实 Edge → 页面真的 getUserMedia → 回环 WS 探针按
+    R0 协议逐包判定（包形 16k mono 100ms、内容对得上夹具、说完仍有 ≥10 片静音尾、静音尾
+    让服务端收口、音频包先于视频包）。build：只出夹具文件与 `flags:` 参数，把它交给
+    `preview_project` 就能让【项目自己的页面】在假设备上跑。
+    判定说清边界：这条回路验的是采集→协议线上；能量 VAD 门限本身不在这里跑。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    keys = ["action", "script", "video", "out", "wait", "tail"]
+    fields = _parse_keyed(arg or "", keys)
+
+    def _one(key, default=""):
+        value = (fields.get(key) or "").strip()
+        return value.splitlines()[0].strip() if value else default
+
+    action = (_one("action") or "run").lower()
+    from agent_runtime import media_fixture
+    try:
+        frames = int(_one("video") or 0)
+    except (TypeError, ValueError):
+        return "video 必须是整数帧数（0 表示不伪造摄像头）。"
+    try:
+        tail = int(_one("tail") or media_fixture.TAIL_CHUNKS)
+    except (TypeError, ValueError):
+        tail = media_fixture.TAIL_CHUNKS
+    try:
+        if action == "build":
+            fixtures = media_fixture.build_fixtures(root, script=_one("script"),
+                                                    video_frames=frames, out=_one("out"))
+            return media_fixture.render_fixtures(fixtures)
+        if action != "run":
+            return "dev_media 只支持 action: build|run，收到 %r。" % action
+        try:
+            wait = float(_one("wait") or 0)
+        except (TypeError, ValueError):
+            wait = 0.0
+        report = media_fixture.run_media_loop(root, script=_one("script"), video_frames=frames,
+                                              wait=wait, tail_chunks=tail, out=_one("out"))
+        return media_fixture.render(report)
+    except media_fixture.MediaFixtureError as exc:
+        return "媒体夹具无法构造：%s" % str(exc)[:300]
+    except Exception as exc:  # noqa: BLE001
+        return "dev_media 失败：%s: %s" % (type(exc).__name__, str(exc)[:240])
+
+
 def preview_project(arg=""):
     """在正式开发舱中捕获当前项目的真实网页画面。
 
@@ -6129,11 +6185,18 @@ def preview_project(arg=""):
     index.html / web/index.html）；② 给 `url: http://127.0.0.1:5173/` 时直接打这个
     【已经在跑的本机服务】——Vite/Vue 这类必须起 dev server 的前端要用这种，
     服务由 dev_serve 起来。url 只允许回环地址。
+
+    还能注入合成媒体：`flags:` 后面每行一条浏览器启动参数，直接用 dev_media
+    （action: build）返回的那几条，把麦克风/摄像头换成 WAV/Y4M 夹具的内容，这样项目
+    自己的页面在没有真设备时也能跑语音/摄像头回路。参数只接受 `--开关` 形态，且
+    `--user-data-dir`、`--load-extension` 一类能改写浏览器行为的一律拒绝。
     """
     root = _get_code_root()
     if not root:
         return ToolResult(False, "真实预览失败：尚未配置当前项目。", error_kind="configuration")
-    fields = _parse_keyed(arg or "", ["entry", "width", "height", "timeout", "url"])
+    fields = _parse_keyed(arg or "", ["entry", "width", "height", "timeout", "url", "flags"])
+    extra_flags = [line.strip() for line in (fields.get("flags") or "").splitlines()
+                   if line.strip()]
     try:
         from agent_runtime.visual_acceptance import capture_project_preview
         report = capture_project_preview(
@@ -6143,6 +6206,7 @@ def preview_project(arg=""):
             height=int(fields.get("height") or 540),
             timeout=float(fields.get("timeout") or 25),
             url=(fields.get("url") or "").splitlines()[0].strip() if fields.get("url") else "",
+            extra_flags=extra_flags,
         )
     except Exception as exc:  # noqa: BLE001
         return ToolResult(False, f"真实预览失败：{type(exc).__name__}：{str(exc)[:300]}",
@@ -6848,12 +6912,35 @@ TOOLS = {
         ),
         "func": dev_serve,
     },
+    "dev_media": {
+        "description": (
+            "合成媒体夹具：把「对着麦克风说话/对着摄像头」换成一个确定性的 WAV/Y4M 文件，"
+            "喂进【真实浏览器】的采集链路，再用回环 WS 探针按 R0 线上协议逐包判定。"
+            "R12 的语音回路原来只能在真机上有人说话才验得到，这一条把它变成可以不插电、"
+            "不装 Playwright、 CI 里也能跑的检查。\n"
+            "输入 keyed 多行：`action: build|run`（默认 run）、"
+            "`script: sil:0.3 talk:0.7 sil:1.3`（sil=精确静音 quiet=低于门限 talk=440Hz 0.4 幅度）、"
+            "`video: 6`（>0 时同时伪造摄像头并推这么多帧）、`out: fixtures/audio`（产物落项目里的位置，"
+            "默认写进已 gitignore 的 .docmind/media-fixture/<时间戳>）、`wait: 10`、`tail: 10`。\n"
+            "run 判定的是线上可观测的事实：片形是不是 16k mono 100ms（3200 字节）、内容对不对得上夹具、"
+            "说完之后是否仍推 ≥10 片静音尾、静音尾有没有让服务端收口、音频包是否先于视频包。"
+            "畸形包会记成协议违规而不是被丢掉；浏览器不可用时如实报未通过，绝不报通过。\n"
+            "能量 VAD 门限本身【不在这条回路里跑】（探针页面刻意不接门限，逐帧无条件推流），"
+            "本工具只断言夹具的逐帧能量确实跨过 startRms/endRms。\n"
+            "action: build 只出夹具与假设备启动参数，把那些参数逐行放进 `preview_project` 的 `flags:`，"
+            "就能让项目自己的页面（比如开发舱的语音回路）在假设备上跑。"
+        ),
+        "func": dev_media,
+    },
     "preview_project": {
         "description": (
             "正式开发舱真实视觉验收：用真实 Edge/Chromium 截取当前画面并把截图"
             "送给视觉模型，同时登记工作流预览证据。输入可选 entry/index.html、width、height、timeout；"
             "也可以给 `url: http://127.0.0.1:5173/` 直接打【已经在跑的本机服务】（服务由 dev_serve 起，"
             "url 只允许回环地址）——Vite/Vue 这类必须跑 dev server 的前端要用这种。\n"
+            "还能注入合成媒体：`flags:` 后面每行一条浏览器启动参数，用 dev_media（action: build）"
+            "返回的那几条，把麦克风/摄像头换成 WAV/Y4M 夹具的内容，没有真设备也能跑语音/摄像头回路。"
+            "参数只接受 `--开关` 形态，`--user-data-dir`、`--load-extension` 一类会改写浏览器行为的一律拒绝。\n"
             "除截图外还会返回运行时异常、console 错误（含报错文本）与失败请求（4xx/5xx/网络失败，含 URL），"
             "这些信号与截图同权：只要存在 console 错误或失败请求，验收判定为未通过。"
             "看到报错就按报错修，不要因为截图「看起来正常」就判定通过。"

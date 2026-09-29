@@ -1,5 +1,17 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-30 Vibecoding 能力补全 Wave7：合成媒体夹具（`dev_media`）——R12 的设备依赖降到只剩听感（本会话，不占 R 槽位）
+
+- **补什么**：backlog 里那条「没法把合成麦克风/摄像头内容注入浏览器」——R12 的语音回路每次都要人对着真设备说话才验得到，「静音尾」「音频先于视频」这类契约无法回归。现在输入变成了一个**确定性文件**：自己生成的 WAV/Y4M，经 Chromium 自带的假设备开关喂给**真实浏览器**的 `getUserMedia`，再由一个懂 R0 协议线的回环探针服务逐包判定。
+- **产物**：`agent_runtime/media_fixture.py`（工具 `dev_media`，`action: build|run`）、`agent_runtime/visual_acceptance.py` 抽出可复用的 `browser_session()` / `serve_static()` / `stop_static()` / `sanitize_flags()` 与 `_DevTools.set_timeout`、`preview_project` 新增 `flags:`（把假设备开关交给项目自己的页面）、`tools.py` 实现 + TOOLS 注册、`agent.py` 提示目录 2 行、`tests/test_media_fixture.py` **54 项**、门禁加 1 题（题集 16→17，基线已刷）、`requirements.txt` 显式声明 `websockets`（裸 `uvicorn` 不带它，探针直接实现 WS 协议）、`mcp_server.py` 把 `dev_media` 归进 WRITE_TOOLS（会落文件、开监听端口、起浏览器）。
+- **先测量再设计**（省掉了 Playwright 与浏览器内核下载）：实测 headless Edge 的 `--use-file-for-fake-audio-capture=<wav>` 真的把我们的 WAV 变成了麦克风内容——440Hz、幅度 0.4 的正弦经 48k 采集回到线上是 **RMS 0.2828**，与解析值 `0.4/√2` 一致；静音段实测**精确 0.0**；`--use-file-for-fake-video-capture=<y4m>` 同样成立（`getSettings()` 回 width/height/frameRate 与我们的 Y4M 头一致，逐帧亮度差在画布回读里可见）。假设备会**循环播放**夹具文件，所以 pattern 匹配按循环窗口算而不是硬对齐。
+- **判定的是线上可观测的事实**：片形是不是 16k mono 100ms（3200 字节）、内容对不对得上夹具、序列单调、`captured_at` 在协议新鲜窗内、说完之后是否仍推 ≥10 片静音尾、静音尾有没有让探针回 `model.delta final:true`、音频包是否先于视频包（探针页面照抄生产 `sendNativeAudioReady` 的规则：任何视频帧出门前先推一片 3200 字节静音）。畸形包记成 `violations` **而不是被静默丢掉**——「假干净」是这一波最贵的错。
+- **边界写清楚，别越界宣称**：探针页面**刻意不接能量门**（逐帧无条件推流，内容对齐才是确定的），所以这条回路验的是「采集 → WS → R0 解析」，`createVoiceGate` 本身不在这里跑；`media_fixture` 只断言夹具的逐帧能量确实跨过 `startRms=0.02`/`endRms=0.012`（即「喂给真门的信号形状是对的」），门限逻辑归前端单测（Wave8）。真机听感、回声消除、蓝牙热插拔仍然只有人能判断。
+- **几处刻意的取舍**：① 探针服务复用 `realtime_protocol.parse_binary_packet`/`server_event`，验线上契约而不是造私有回声；只绑回环，`MediaProbe(host="10.0.0.1")` 直接拒。② 夹具默认写进 `.docmind/media-fixture/`（已 gitignore），显式 `out:` 才落项目可见处，且必须过越界/`-`前缀检查——与 Wave12「产物不弄脏仓库」是同一条纪律。③ 浏览器启动路径抽成 `browser_session()`：两条启动路径各自演化，迟早出现「预览能过、媒体过不了」这种解释不了的差集。④ `flags:` 会以 argv 直接给浏览器，但入口仍要自己拦：只接受 `--开关`，`--user-data-dir`/`--load-extension`/`--inspect`/`--remote-debugging-pipe` 一律拒绝。
+- **实测发现并修掉的真缺陷**（三个都是「会误报通过/失败」级）：① `sanitize_flags` 原本把反斜杠当非法字符，Windows 上**每一条夹具路径都会被打回**；改成只拒换行/CR/NUL 并补了用例。② `_DevTools.drain` 为不卡住把 recv 超时压到 0.3s 却不恢复，之后的 `evaluate` 可能假超时；现在 drain 结束自动恢复。③ 跨段的 128 样本帧（半帧说话半帧静音）被算进「静音段最大能量」，导致 `closes_gate` 对**任何**夹具都失败；改为帧首尾同段才算干净帧，实测剔除 1 片跨界帧。另外 `audio_before_video` 一开始判不过，查明是**我页面自己的竞态**（视频首帧 120ms 与音频首片 ~100ms 抢跑），不是浏览器或生产逻辑的问题——补上生产的 audio-ready 规则后 100% 稳定。
+- **验证**：`tests/test_media_fixture.py` **54 passed**（含 5 项真实浏览器回环，整套 46s）；门禁 `python -m agent_runtime.dev_eval` **17/17**（新题 `media-fixture-closes-without-a-device`，不启动浏览器也能跑，基线已重刷）；`dev_media action: run` 在本仓真跑一次 **11/11 项通过**，pattern 与夹具 100% 对齐、speech 中位 RMS 0.2828、最长静音连段 14；`tests/test_dev_serve_preview.py` 26 项在 `visual_acceptance` 重构后仍全绿；全量 pytest 见下方补记。
+- **未做**：① R12 用它验的是「线」不是「听感」，真网关（`api.py` 的 `live_vision_stream` + DashScope）那条路仍要人跑一次才算完整闭环——探针是测试替身，不接 provider。② 屏幕共享 `getDisplayMedia` 没有假设备路径（只做麦克风与摄像头）。③ 浏览器那 5 项依赖本机有 Edge：GitHub ubuntu runner 是否装了 msedge **没验证**，缺浏览器时那几条明确 skip 而不是假通过。④ 探针页面与生产 `handleLiveAudioFrame` 是同形不同码（不共享实现），把它换成项目真页面的路要靠 `preview_project(flags:)`，那条只测到了「能拿到麦克风」，端到端跑真开发舱语音回路属 R12。
+
 ## 2026-09-30 Vibecoding 能力补全 Wave12：`dev_propose` + `dev_ci_status`（本会话，不占 R 槽位）
 
 - **补什么**：交付的后半环。命令黑名单拦住了 `git commit/push`（提交与推送是人的决定，这没改），但代价是 Agent 只能口头描述「我改了什么、CI 怎么样了」。现在有了两份能交给别人看的东西。
@@ -174,6 +186,30 @@
 - 结论：**闸门确实在抑制这个错误，且该错误可稳定复现**——不是偶发，也不是探测方式测不出来。AI-G 设备报告里那条 P1 阻塞（`docs/realtime-r12-device-acceptance-20260929.md`）在代码层面已被解除，**现在 R12 只剩"必须有真实摄像头/麦克风"这一条环境阻塞**。
 - 建议收口时把「绕过闸门必须仍能复现原错误」写成回归用例，否则这个闸门以后被误删没人会发现。
 - 另注：本地较 `origin/main` 多 8 个他人提交尚未推送（远端仍停在 `8f32730`），我没有代推别人的 WIP。
+
+## 2026-09-30 R15 评审优化：核实入口的上下文修正（③）+ 忽略期内不再弹（①）（AI-F）
+
+R15 已由实现者落地（R15-0 决定 + R15-1/2/3），我做了独立验证后按价值排序做了两条优化。
+
+**③ `reviewRealtimeAlert` 不再复用 `app_interface_inspect`（功能错误，不是体验瑕疵）**
+那段系统提示写的是「本轮用户意图**就是**触发『浏览当前界面』，请直接执行，不要回答『没有新问题』」——
+与 prompt 里"核实这条提醒"**互相矛盾**，会把 Agent 带成泛泛扫一眼界面。而这是 C **唯一的用户主动
+入口**（其他都是内部自动行为），每次点击都受影响。现在新增专用 `uiContext=verify_realtime_alert`：
+提示点明该提醒是实时模型自述、**未核实、可能幻觉**，附件是**报出它那一刻**的画面（不是当前画面），
+要求围绕这一条核实；确认没事或证据不足就直说没找到证据、**不要为了交差而编造问题**、不要泛泛浏览界面。
+
+**① 忽略过的提醒在窗口期内不再弹**
+后端相似度去重只有 45 秒窗口，过了窗口同一处会再弹 —— 用户刚点完「忽略」又看到同一条，会以为按钮
+没生效。新增两个纯函数（`liveStreamControl.ts`）：`pruneDismissedVisualAlerts()`（10 分钟窗口、
+最多 20 条、超窗自动裁）与 `isDismissedVisualAlert()`（复用 `sameVisualFocus` 判"同一处"，换说法也认）；
+忽略时记下这一处，新提醒到达时先查。**带时间窗是刻意的**：10 分钟后同一位置真的又出问题，仍应能提醒。
+
+**未做（建议等 R15-3 误报/漏报数字再定）**：② 同一轮多条异常被 2s 全局节流砍掉——一轮里报两个
+**不同**异常很罕见，改动要动网关合并逻辑 + 补测试，性价比最低。
+
+**验证**：`test_live_stream_control.py` + `test_voice_turn_context.py` **7 passed**（新增：忽略判据的
+四个方向 + 窗口过期 + 有界裁剪；`verify_realtime_alert` 的提示不得继承"就是浏览界面"那段）；前端
+`npm run build`（含 typecheck）通过；全量套件见提交信息。
 
 ## 2026-09-30 【任务表】C：实时模型「发现」回流 —— 待调研后由 4 个 AI 分工（**未认领**）
 

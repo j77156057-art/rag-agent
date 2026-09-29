@@ -45,6 +45,8 @@ WRITE_TOOLS = (
     "dev_apply_edits",
     "dev_patch",
     "dev_move",
+    # 会落夹具文件、起监听端口并启动真实浏览器，属于有副作用的一档
+    "dev_media",
 )
 #: 无论如何都不暴露：任意命令执行、越界文件操作、以及会二次放大权限的连接器跳转
 NEVER_EXPOSED = (

@@ -2,6 +2,9 @@ openai
 chromadb
 fastapi
 uvicorn
+# 媒体夹具的探针服务直接实现 WS 协议（agent_runtime/media_fixture.py）；
+# 裸 `uvicorn` 只在 [standard] extra 里带它，所以必须显式声明。
+websockets>=12,<17
 pypdf
 python-dotenv
 httpx

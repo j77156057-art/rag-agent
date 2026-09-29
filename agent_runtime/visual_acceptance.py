@@ -9,6 +9,7 @@ entry point is reported as an explicit verification failure.
 from __future__ import annotations
 
 import base64
+import contextlib
 import functools
 import json
 import os
@@ -66,6 +67,126 @@ def _edge_binary() -> str:
     )
 
 
+_BASE_FLAGS = ("--headless=new", "--disable-gpu", "--no-first-run",
+               "--no-default-browser-check", "--remote-debugging-port=0",
+               "--remote-allow-origins=*")
+_MAX_EXTRA_FLAGS = 32
+
+
+def sanitize_flags(flags: Any) -> list[str]:
+    """浏览器启动参数只接受 `--开关` / `--开关=值` 形态。
+
+    参数会以 argv 直接交给浏览器（不过 shell），但一个能自由写 argv 的入口仍然是
+    注入面：`--user-data-dir`、`--load-extension` 这类能改变浏览器行为与落盘位置的
+    开关一律拒绝，长度与非空白字符也限死。
+    """
+    denied = ("--user-data-dir", "--load-extension", "--disable-extensions-except",
+              "--extension-process", "--profiler-output", "--inspect", "--remote-debugging-pipe")
+    accepted: list[str] = []
+    for item in flags or ():
+        text = str(item).strip()
+        if not text:
+            continue
+        if not text.startswith("--") or len(text) > 1_000:
+            raise VisualAcceptanceError("浏览器启动参数必须是 --开关 形态且不能过长：%r" % text[:60])
+        if any(ch in text for ch in ("\n", "\r", "\x00")):
+            raise VisualAcceptanceError("浏览器启动参数含有非法字符：%r" % text[:60])
+        name = text.partition("=")[0]
+        if any(name.startswith(blocked) for blocked in denied):
+            raise VisualAcceptanceError("浏览器启动参数不允许：%s" % name)
+        accepted.append(text)
+    if len(accepted) > _MAX_EXTRA_FLAGS:
+        raise VisualAcceptanceError("浏览器启动参数最多 %s 条。" % _MAX_EXTRA_FLAGS)
+    return accepted
+
+
+def serve_static(root: str | Path) -> tuple[ThreadingHTTPServer, threading.Thread]:
+    """把一个目录临时当静态站服务（只绑回环、随机端口）；调用方负责 `stop_static`。"""
+    path = Path(root).resolve()
+    server = ThreadingHTTPServer(("127.0.0.1", 0),
+                                 functools.partial(_QuietHandler, directory=str(path)))
+    thread = threading.Thread(target=server.serve_forever, name="visual-preview-http",
+                              daemon=True)
+    thread.start()
+    return server, thread
+
+
+def stop_static(server: Any, thread: Any) -> None:
+    if server is None:
+        return
+    server.shutdown()
+    server.server_close()
+    if thread is not None:
+        thread.join(timeout=2)
+
+
+@contextlib.contextmanager
+def browser_session(timeout: float = 25.0, extra_flags: Any = ()):
+    """起一个带 CDP 的真实浏览器，交回 `_DevTools`；退出时进程与 profile 一定收干净。
+
+    拆出来是因为媒体夹具需要在同一批启动参数上追加假设备开关——两条启动路径各自演化
+    迟早会出现「预览能过、媒体过不了」这种无法解释的差集。
+    """
+    edge = _edge_binary()
+    try:
+        import websocket
+    except Exception as exc:  # pragma: no cover - depends on desktop bundle
+        raise VisualAcceptanceError("浏览器控制依赖 websocket-client 未安装。") from exc
+    flags = sanitize_flags(extra_flags)
+    profile = tempfile.TemporaryDirectory(prefix="docmind-visual-preview-",
+                                          ignore_cleanup_errors=True)
+    process = None
+    connection = None
+    try:
+        creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        process = subprocess.Popen([edge, *_BASE_FLAGS, *flags,
+                                    "--user-data-dir=%s" % profile.name, "about:blank"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   creationflags=creation)
+        active = Path(profile.name) / "DevToolsActivePort"
+        deadline = time.monotonic() + min(15.0, max(3.0, float(timeout) / 2))
+        while not active.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not active.exists():
+            raise VisualAcceptanceError("浏览器调试端口未就绪。")
+        port = active.read_text(encoding="utf-8").splitlines()[0].strip()
+        with urllib.request.urlopen("http://127.0.0.1:%s/json" % port, timeout=5) as response:
+            tabs = json.load(response)
+        page = next((row for row in tabs if row.get("type") == "page"), None)
+        if not page or not page.get("webSocketDebuggerUrl"):
+            raise VisualAcceptanceError("浏览器没有可用页面标签。")
+        connection = websocket.create_connection(page["webSocketDebuggerUrl"],
+                                                 timeout=max(5.0, float(timeout)),
+                                                 suppress_origin=True)
+        devtools = _DevTools(connection, recv_timeout=max(5.0, float(timeout)))
+        devtools.call("Page.enable")
+        devtools.call("Runtime.enable")
+        devtools.call("Log.enable")
+        devtools.call("Network.enable")
+        yield devtools
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        if process is not None:
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=5)
+                else:
+                    process.terminate()
+                process.wait(timeout=3)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        profile.cleanup()
+
+
 _MAX_CONSOLE = 30
 _MAX_REQUESTS = 30
 _IGNORED_REQUEST_SUFFIX = ("favicon.ico",)
@@ -74,9 +195,11 @@ _IGNORED_REQUEST_SUFFIX = ("favicon.ico",)
 class _DevTools:
     """Minimal CDP client that also records the signals a screenshot cannot show."""
 
-    def __init__(self, connection, runtime_errors: list[str] | None = None):
+    def __init__(self, connection, runtime_errors: list[str] | None = None,
+                 recv_timeout: float = 5.0):
         self.connection = connection
         self.sequence = 0
+        self.recv_timeout = max(1.0, float(recv_timeout))
         self.runtime_errors = runtime_errors if runtime_errors is not None else []
         self.console: list[dict[str, Any]] = []
         self.failed_requests: list[dict[str, Any]] = []
@@ -154,7 +277,19 @@ class _DevTools:
                     raise VisualAcceptanceError(str(message["error"]))
                 return message.get("result") or {}
 
-    def drain(self, seconds: float = 1.5) -> None:
+    def set_timeout(self, seconds: float) -> None:
+        """改回阻塞收包的等待时长。
+
+        `drain` 为不卡住会把 recv 超时压到 0.3s，之后任何一次 `call` 都可能因此假性
+        超时——所以要么显式恢复，要么用 drain 的默认恢复值。
+        """
+        self.recv_timeout = max(1.0, float(seconds))
+        try:
+            self.connection.settimeout(self.recv_timeout)
+        except Exception:
+            pass
+
+    def drain(self, seconds: float = 1.5, *, restore: bool = True) -> None:
         """Collect late console/network events without waiting on a response."""
         deadline = time.monotonic() + max(0.1, float(seconds))
         try:
@@ -167,6 +302,8 @@ class _DevTools:
             except Exception:
                 continue
             self._handle_event(message)
+        if restore:
+            self.set_timeout(self.recv_timeout)
 
     def evaluate(self, expression: str) -> Any:
         result = self.call("Runtime.evaluate", {
@@ -209,7 +346,7 @@ def preview_target(root: str | Path, entry: str = "",
 
 def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: str | Path = "",
                             width: int = 960, height: int = 540, timeout: float = 25.0,
-                            url: str = "") -> dict[str, Any]:
+                            url: str = "", extra_flags: Any = ()) -> dict[str, Any]:
     """Capture a same-project browser preview and return bounded evidence.
 
     默认把项目目录临时当静态站服务并打开其中的 HTML 入口。给 `url`（只允许本机回环，
@@ -226,12 +363,6 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
     target, entry_path = preview_target(root_path, entry, url)
     width = max(320, min(1920, int(width)))
     height = max(220, min(1200, int(height)))
-    edge = _edge_binary()
-    try:
-        import websocket
-    except Exception as exc:  # pragma: no cover - depends on desktop bundle
-        raise VisualAcceptanceError("浏览器控制依赖 websocket-client 未安装。") from exc
-
     target_dir = Path(evidence_dir).resolve() if evidence_dir else (
         root_path / ".docmind" / "visual-evidence" /
         (time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()))
@@ -242,135 +373,78 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
     server_thread = None
     if not target:
         # 已经指定了本机 URL 就直接打那个服务，不再多起一个静态站
-        server = ThreadingHTTPServer(("127.0.0.1", 0),
-                                     functools.partial(_QuietHandler, directory=str(root_path)))
-        server_thread = threading.Thread(target=server.serve_forever,
-                                         name="visual-preview-http", daemon=True)
-        server_thread.start()
-    profile = tempfile.TemporaryDirectory(prefix="docmind-visual-preview-",
-                                           ignore_cleanup_errors=True)
-    process = None
-    connection = None
-    runtime_errors: list[str] = []
+        server, server_thread = serve_static(root_path)
     try:
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        process = subprocess.Popen([
-            edge, "--headless=new", "--disable-gpu", "--no-first-run",
-            "--no-default-browser-check", "--remote-debugging-port=0",
-            "--remote-allow-origins=*", f"--user-data-dir={profile.name}",
-            "about:blank",
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
-        active = Path(profile.name) / "DevToolsActivePort"
-        deadline = time.monotonic() + min(15.0, max(3.0, timeout / 2))
-        while not active.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if not active.exists():
-            raise VisualAcceptanceError("浏览器调试端口未就绪。")
-        port = active.read_text(encoding="utf-8").splitlines()[0].strip()
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=5) as response:
-            tabs = json.load(response)
-        page = next((row for row in tabs if row.get("type") == "page"), None)
-        if not page or not page.get("webSocketDebuggerUrl"):
-            raise VisualAcceptanceError("浏览器没有可用页面标签。")
-        connection = websocket.create_connection(page["webSocketDebuggerUrl"],
-                                                   timeout=max(5.0, timeout),
-                                                   suppress_origin=True)
-        devtools = _DevTools(connection, runtime_errors)
-        devtools.call("Page.enable")
-        devtools.call("Runtime.enable")
-        devtools.call("Log.enable")
-        devtools.call("Network.enable")
-        devtools.call("Emulation.setDeviceMetricsOverride", {
-            "width": width, "height": height, "deviceScaleFactor": 1,
-            "mobile": False,
-        })
-        if target:
-            separator = "&" if "?" in target else "?"
-            preview_url = "%s%sdocmind=%d" % (target, separator, time.time_ns())
-            shown_entry = preview_url
-        else:
-            rel_entry = entry_path.relative_to(root_path).as_posix()
-            preview_url = ("http://127.0.0.1:%d/%s?docmind=%d"
-                           % (server.server_port, rel_entry, time.time_ns()))
-            shown_entry = rel_entry
-        devtools.call("Page.navigate", {"url": preview_url})
-        devtools.evaluate(
-            "(async()=>{for(let n=0;n<120;n++){if(document.readyState==='complete')return true;"
-            "await new Promise(r=>setTimeout(r,50))}throw Error('页面加载超时')})()"
-        )
-        devtools.drain(min(2.0, max(0.5, timeout * 0.1)))
-        title = str(devtools.evaluate("document.title || ''") or "")[:240]
-        body_text = str(devtools.evaluate("document.body?.innerText || ''") or "")[:1200]
-        shot = devtools.call("Page.captureScreenshot", {"format": "png"})
-        encoded = str(shot.get("data") or "")
-        if not encoded:
-            raise VisualAcceptanceError("浏览器没有返回截图。")
-        raw = base64.b64decode(encoded)
-        path = target_dir / "preview.png"
-        path.write_bytes(raw)
-        rel = path.relative_to(root_path).as_posix()
-        console_errors = [item for item in devtools.console if item["level"] == "error"]
-        console_warnings = [item for item in devtools.console if item["level"] == "warning"]
-        checks = {
-            "page_loaded": True,
-            "no_runtime_errors": not runtime_errors,
-            "no_console_errors": not console_errors,
-            "no_failed_requests": not devtools.failed_requests,
-        }
-        return {
-            "ok": all(checks.values()), "passed": all(checks.values()),
-            "checks": checks, "title": title, "body_excerpt": body_text,
-            "runtime_errors": runtime_errors,
-            "console_errors": console_errors,
-            "console_warnings": console_warnings,
-            "failed_requests": devtools.failed_requests,
-            "screenshot": rel,
-            "image": encoded, "width": width, "height": height,
-            "artifacts": [{
-                "id": "visual-preview",
-                "kind": "image",
-                "adapter": "visual",
-                "path": rel,
-                "label": "真实浏览器预览截图",
-                "summary": "正式开发舱 visual adapter 捕获的当前项目画面",
-                "evidence": ["browser:Page.captureScreenshot",
-                             "browser:Runtime.consoleAPICalled",
-                             "browser:Network.responseReceived",
-                             "entry:" + shown_entry],
-                "metadata": {"width": str(width), "height": str(height), "title": title,
-                             "console_errors": str(len(console_errors)),
-                             "failed_requests": str(len(devtools.failed_requests))},
-            }],
-        }
+        with browser_session(timeout, extra_flags) as devtools:
+            devtools.call("Emulation.setDeviceMetricsOverride", {
+                "width": width, "height": height, "deviceScaleFactor": 1,
+                "mobile": False,
+            })
+            if target:
+                separator = "&" if "?" in target else "?"
+                preview_url = "%s%sdocmind=%d" % (target, separator, time.time_ns())
+                shown_entry = preview_url
+            else:
+                rel_entry = entry_path.relative_to(root_path).as_posix()
+                preview_url = ("http://127.0.0.1:%d/%s?docmind=%d"
+                               % (server.server_port, rel_entry, time.time_ns()))
+                shown_entry = rel_entry
+            devtools.call("Page.navigate", {"url": preview_url})
+            devtools.evaluate(
+                "(async()=>{for(let n=0;n<120;n++){if(document.readyState==='complete')return true;"
+                "await new Promise(r=>setTimeout(r,50))}throw Error('页面加载超时')})()"
+            )
+            devtools.drain(min(2.0, max(0.5, timeout * 0.1)))
+            title = str(devtools.evaluate("document.title || ''") or "")[:240]
+            body_text = str(devtools.evaluate("document.body?.innerText || ''") or "")[:1200]
+            shot = devtools.call("Page.captureScreenshot", {"format": "png"})
+            encoded = str(shot.get("data") or "")
+            if not encoded:
+                raise VisualAcceptanceError("浏览器没有返回截图。")
+            raw = base64.b64decode(encoded)
+            path = target_dir / "preview.png"
+            path.write_bytes(raw)
+            rel = path.relative_to(root_path).as_posix()
+            console_errors = [item for item in devtools.console if item["level"] == "error"]
+            console_warnings = [item for item in devtools.console if item["level"] == "warning"]
+            checks = {
+                "page_loaded": True,
+                "no_runtime_errors": not devtools.runtime_errors,
+                "no_console_errors": not console_errors,
+                "no_failed_requests": not devtools.failed_requests,
+            }
+            return {
+                "ok": all(checks.values()), "passed": all(checks.values()),
+                "checks": checks, "title": title, "body_excerpt": body_text,
+                "runtime_errors": devtools.runtime_errors,
+                "console_errors": console_errors,
+                "console_warnings": console_warnings,
+                "failed_requests": devtools.failed_requests,
+                "screenshot": rel,
+                "image": encoded, "width": width, "height": height,
+                "artifacts": [{
+                    "id": "visual-preview",
+                    "kind": "image",
+                    "adapter": "visual",
+                    "path": rel,
+                    "label": "真实浏览器预览截图",
+                    "summary": "正式开发舱 visual adapter 捕获的当前项目画面",
+                    "evidence": ["browser:Page.captureScreenshot",
+                                 "browser:Runtime.consoleAPICalled",
+                                 "browser:Network.responseReceived",
+                                 "entry:" + shown_entry],
+                    "metadata": {"width": str(width), "height": str(height), "title": title,
+                                 "console_errors": str(len(console_errors)),
+                                 "failed_requests": str(len(devtools.failed_requests))},
+                }],
+            }
     except VisualAcceptanceError:
         raise
     except Exception as exc:
         raise VisualAcceptanceError(f"真实画面捕获失败：{type(exc).__name__}") from exc
     finally:
-        if connection is not None:
-            try:
-                connection.close()
-            except Exception:
-                pass
-        if process is not None:
-            try:
-                if os.name == "nt":
-                    subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   timeout=5)
-                else:
-                    process.terminate()
-                process.wait(timeout=3)
-            except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-        profile.cleanup()
-        if server is not None:
-            server.shutdown()
-            server.server_close()
-            server_thread.join(timeout=2)
+        stop_static(server, server_thread)
 
 
-__all__ = ["VisualAcceptanceError", "capture_project_preview", "preview_target"]
+__all__ = ["VisualAcceptanceError", "browser_session", "capture_project_preview",
+           "preview_target", "sanitize_flags", "serve_static", "stop_static"]

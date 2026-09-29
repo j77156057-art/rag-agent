@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Callable, Mapping
 
 import config
@@ -286,6 +287,65 @@ def _case_ci_never_invents_status(root: str, run: Callable[..., dict]) -> list[d
                    out[:160])]
 
 
+def _case_media_fixture_closes_without_a_device(root: str, run: Callable[..., dict]) -> list[dict]:
+    """语音回路不该只能靠人对着麦克风喊：夹具内容与线上包形必须算得出来。
+
+    这条刻意【不启动浏览器】——CI 上也要能跑；浏览器回环归 tests/test_media_fixture.py。
+    """
+    import wave
+
+    from agent_runtime import media_fixture
+
+    out = run("dev_media", "action: build\nscript: sil:0.3 talk:0.7 sil:1.3")["text"]
+    fixtures = media_fixture.build_fixtures(root, script="sil:0.3 talk:0.7 sil:1.3", stamp="eval")
+    with wave.open(str(fixtures["audio"]), "rb") as handle:
+        shape = (handle.getnchannels(), handle.getsampwidth(), handle.getframerate())
+        frames = handle.getnframes()
+    probe = media_fixture.MediaProbe()
+    tail_ok = garbage_ok = False
+    report: dict[str, Any] = {"violations": [], "packets": []}
+
+    def packet(sequence: int, payload: bytes) -> bytes:
+        header = json.dumps({"v": 1, "type": "audio.chunk", "sequence": sequence,
+                             "captured_at": int(time.time() * 1000)})
+        return header.encode("utf-8") + b"\n" + payload
+
+    try:
+        url = probe.start()
+        from websockets.sync.client import connect
+        with connect(url, open_timeout=5) as client:
+            client.send(json.dumps({"v": 1, "type": "hello"}))
+            client.recv(timeout=5)
+            client.send(b'{"v":9,"type":"audio.chunk","sequence":1,"captured_at":1}\n1234')
+            client.send(packet(1, media_fixture.build_pcm(media_fixture.parse_script("talk:0.1"))))
+            for sequence in range(2, 2 + media_fixture.TAIL_CHUNKS):
+                client.send(packet(sequence, bytes(media_fixture.CHUNK_BYTES)))
+            reply = json.loads(client.recv(timeout=5))
+            tail_ok = reply.get("type") == "model.delta" and reply.get("final") is True
+        report = probe.report()
+        garbage_ok = (bool(report["violations"])
+                      and len(report["packets"]) == 1 + media_fixture.TAIL_CHUNKS)
+    except Exception as exc:  # noqa: BLE001 - 门禁要如实报告缺什么依赖
+        return [_check("probe_runs", False, "%s: %s" % (type(exc).__name__, str(exc)[:160]))]
+    finally:
+        probe.stop()
+    pattern = str(fixtures["expected_pattern"])
+    return [_check("build_is_reachable", "假设备启动参数" in out, out[:160]),
+            _check("fake_device_flags_present",
+                   any(flag.startswith("--use-file-for-fake-audio-capture=")
+                       for flag in fixtures["flags"]), fixtures["flags"]),
+            _check("fixture_is_16k_mono_pcm16",
+                   shape == (1, 2, 16_000) and frames == int(fixtures["duration"] * 16_000),
+                   "%s %s" % (shape, frames)),
+            _check("tail_is_at_least_one_second", pattern.endswith("." * media_fixture.TAIL_CHUNKS),
+                   pattern),
+            _check("gate_shape_opens_and_closes",
+                   fixtures["gate_shape"]["opens_gate"] and fixtures["gate_shape"]["closes_gate"],
+                   fixtures["gate_shape"]),
+            _check("silence_tail_closes_the_turn", tail_ok, ""),
+            _check("junk_is_a_violation_not_a_drop", garbage_ok, report["violations"])]
+
+
 DEV_DATASET: tuple[dict[str, Any], ...] = (
     {
         "id": "lookup-by-filename", "fixture": "ts-refs",
@@ -403,6 +463,12 @@ DEV_DATASET: tuple[dict[str, Any], ...] = (
         "direct": _case_ci_never_invents_status,
         "uses": ["dev_ci_status"],
         "note": "读不到 CI 时必须明说，不能编一个通过状态出来",
+    },
+    {
+        "id": "media-fixture-closes-without-a-device", "fixture": "plain",
+        "direct": _case_media_fixture_closes_without_a_device,
+        "uses": ["dev_media"],
+        "note": "语音回路不再依赖真麦克风：夹具、包形、静音尾都算得出来",
     },
 )
 
