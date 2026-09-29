@@ -19,7 +19,7 @@ import { encodeVideoFrame, parseRealtimeServerEvent, realtimeHello, realtimeCanc
 import {
   classifyLivePhase, createAdaptiveSender, createInFlightLedger, LIVE_PHASE_LABELS,
   appendCaptionTurn, closeUserTranscript, describeLiveCapabilities, shouldDispatchVoiceTurn,
-  sameVisualFocus,
+  sameVisualFocus, isDismissedVisualAlert, pruneDismissedVisualAlerts,
 } from '../liveStreamControl'
 import type { LivePhase, LiveCaptionTurn } from '../liveStreamControl'
 import {
@@ -156,6 +156,9 @@ const liveVisionAlert = ref<(VisionAnomaly & { detectedAt: string; atMs: number 
 // 看到的问题，用户过一会儿才点「交给 AI 排查」，那时画面可能已经变了——拿当前帧去核实
 // 等于核实错了对象。
 const liveRealtimeAlert = ref<{ text: string; detectedAt: string; frame: Blob | null; atMs: number } | null>(null)
+// 用户忽略过的实时提醒（10 分钟窗口、最多 20 条）：后端的相似度去重只有 45s，过了窗口
+// 同一处会再弹，用户会以为「忽略」没生效。
+let dismissedRealtimeAlerts: { text: string; at: number }[] = []
 // 跨来源合并（在**渲染时**算，不动状态，避免两条链抢着改同一个 ref）：
 // 抽帧视觉模型与实时模型是两条独立观测链，同一个问题会被两边各报一次。近 20 秒内且判为
 // 同一处时，只渲染一条合并横幅，并保留两边的原文——合并是为了少一条重复横幅，
@@ -855,6 +858,18 @@ function reviewVisionAlert() {
     },
   })
 }
+/**
+ * 忽略一条实时提醒：清掉横幅，并**记住这一处**（忽略期内不再弹同一处）。
+ *
+ * 后端相似度去重只有 45 秒窗口，过了窗口同一处会再弹一次 —— 用户刚点完「忽略」又看到
+ * 同一条，会以为按钮没生效。窗口 10 分钟（见 isDismissedVisualAlert 的说明）。
+ */
+function dismissRealtimeAlert() {
+  const alert = liveRealtimeAlert.value
+  if (alert) dismissedRealtimeAlerts = pruneDismissedVisualAlerts([...dismissedRealtimeAlerts,
+    { text: alert.text, at: Date.now() }], Date.now())
+  liveRealtimeAlert.value = null
+}
 function reviewRealtimeAlert() {
   const alert = liveRealtimeAlert.value
   if (!alert) return
@@ -866,7 +881,9 @@ function reviewRealtimeAlert() {
     target: 'cockpit', projectId,
     prompt: `实时模型在画面中给出一条未核实提醒：「${alert.text}」。${frameNote}。请结合当前项目文件、运行日志和画面核实是否确有问题；先提出修改方案与验收条件，修改前等待用户确认。`,
     images: frame ? [frame] : [],
-    uiContext: 'app_interface_inspect',
+    // 专用上下文：不能复用 app_interface_inspect —— 那段提示是「本轮意图就是浏览当前界面，
+    // 请直接执行」，与"核实这一条提醒"互相矛盾，会把 Agent 带成泛泛扫一眼。
+    uiContext: 'verify_realtime_alert',
     onStatus: (status, detail) => {
       if (projectId !== getProjectId() || !liveRealtimeAlert.value) return
       liveVisionAlertStatus.value = status === 'processing' ? 'AI 正在核实实时提醒…'
@@ -1317,8 +1334,11 @@ function receiveLiveStreamObservation(raw: string, ticket: number, projectId: st
   }
   if (event.type === 'model.observation') {
     if (event.source === 'realtime-model' && event.verified === false && typeof event.text === 'string') {
+      const text = event.text.slice(0, 300)
+      // 用户刚忽略过这一处就别再弹了（后端 45s 去重窗过后同一处还会再来）。
+      if (isDismissedVisualAlert(text, dismissedRealtimeAlerts)) return
       liveRealtimeAlert.value = {
-        text: event.text.slice(0, 300),
+        text,
         atMs: Date.now(),
         detectedAt: new Date(typeof event.captured_at === 'number' ? event.captured_at : event.sent_at)
           .toLocaleTimeString('zh-CN', { hour12: false }),
@@ -2216,7 +2236,7 @@ onBeforeUnmount(() => {
     <p v-if="error" class="acp-error acp-error-banner" role="alert">{{ error }}</p>
     <section v-if="mergedVisualAlert" class="acp-vision-alert-banner" role="alert">
       <div><b>两个来源都报了这一处 · {{ mergedVisualAlert.vision.detectedAt }}</b><p>抽帧观察：{{ mergedVisualAlert.vision.target }}：{{ mergedVisualAlert.vision.evidence }}</p><p>实时模型：{{ mergedVisualAlert.realtime.text }}</p><small>两条独立观测链指向同一处；实时模型那句属自述、尚未核实。</small></div>
-      <button @click="reviewRealtimeAlert()">交给 AI 排查</button><button @click="dismissVisionAlert(); liveRealtimeAlert = null">忽略</button>
+      <button @click="reviewRealtimeAlert()">交给 AI 排查</button><button @click="dismissVisionAlert(); dismissRealtimeAlert()">忽略</button>
     </section>
     <section v-else-if="liveVisionAlert" class="acp-vision-alert-banner" role="alert">
       <img v-if="liveVisionAlertImageUrl" :src="liveVisionAlertImageUrl" alt="疑似异常出现时的画面快照">
@@ -2225,7 +2245,7 @@ onBeforeUnmount(() => {
     </section>
     <section v-else-if="liveRealtimeAlert" class="acp-realtime-alert-banner" role="alert">
       <div><b>实时模型提醒 · {{ liveRealtimeAlert.detectedAt }}</b><p>{{ liveRealtimeAlert.text }}</p><small>{{ liveVisionAlertStatus || '实时模型自述，尚未核实。' }}</small></div>
-      <button @click="reviewRealtimeAlert()">交给 AI 排查</button><button @click="liveRealtimeAlert = null">忽略</button>
+      <button @click="reviewRealtimeAlert()">交给 AI 排查</button><button @click="dismissRealtimeAlert()">忽略</button>
     </section>
     <nav class="acp-flow-rail" aria-label="自主开发流程">
       <div

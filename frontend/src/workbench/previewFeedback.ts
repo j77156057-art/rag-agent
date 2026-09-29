@@ -7,7 +7,7 @@ export type FeedbackDeliveryStatus = 'processing' | 'awaiting_review' | 'pending
  *    不作为用户消息展示，由后端转入 system_context；
  *  - desktop_visual_review：用户确认桌面点击后的视觉复验反馈，携带 workflowId/feedbackId 供后端对账。 */
 export type ChatUiContext = 'web_preview_feedback' | 'app_interface_inspect' | 'cockpit_live_vision'
-  | 'desktop_visual_review' | 'cockpit_voice_turn'
+  | 'desktop_visual_review' | 'cockpit_voice_turn' | 'verify_realtime_alert'
 
 export interface PreviewFeedbackRequest {
   prompt: string

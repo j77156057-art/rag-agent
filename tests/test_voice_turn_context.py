@@ -91,3 +91,19 @@ def test_other_contexts_do_not_get_the_voice_hint():
     context = "\n".join(captured["context"])
     assert "最多两三句" not in context
     assert "不要罗列能力清单" not in context
+
+
+def test_verify_realtime_alert_narrows_the_task_instead_of_browsing_the_ui():
+    """点「交给 AI 排查」时不能复用 app_interface_inspect 的提示。
+
+    那段提示写的是「本轮用户意图就是触发『浏览当前界面』，请直接执行」，与"核实这一条提醒"
+    互相矛盾，会把 Agent 带成泛泛扫一眼界面 —— 而这是 C 唯一的用户主动入口，每次都受影响。
+    """
+    response, captured = _chat_voice("实时模型提醒了一条未核实异常。",
+                                     ui_context="verify_realtime_alert")
+    assert response.status_code == 200, response.text
+    context = "\n".join(captured["context"])
+    assert "未核实" in context and "可能幻觉" in context, "必须点明提醒本身不可信"
+    assert "不要为了交差而编造问题" in context, "要允许『没找到证据』这个结论"
+    assert "本轮用户意图就是触发" not in context, "不得继承『就是浏览界面』那段提示"
+    assert "最多两三句" not in context, "这不是语音轮次，别套语音的长度约束"

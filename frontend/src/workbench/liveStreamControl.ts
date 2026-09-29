@@ -266,6 +266,33 @@ export function sameVisualFocus(left: string, right: string, threshold = 0.5): b
   return shared / smaller >= threshold
 }
 
+/** 忽略记录的裁剪：只留时间窗内的、且不超过条数上限（避免无界增长）。 */
+export function pruneDismissedVisualAlerts(
+  dismissed: { text: string; at: number }[],
+  now = Date.now(),
+  windowMs = 600_000,
+  limit = 20,
+): { text: string; at: number }[] {
+  return dismissed.filter(item => now - item.at <= windowMs).slice(-limit)
+}
+
+/**
+ * 这条提醒是不是用户**刚忽略过**的那一处（忽略期内不再弹）。
+ *
+ * 为什么需要：后端的相似度去重只有 45 秒窗口，过了窗口同一处会再弹一次 —— 用户刚点完
+ * 「忽略」，几秒后又看到同一条，会以为按钮没生效。判据复用 `sameVisualFocus()`（同一处、
+ * 换说法也算同一处）；并带时间窗：忽略只在一段时间内有效，之后同一个位置真的又出问题
+ * 仍应能提醒。
+ */
+export function isDismissedVisualAlert(
+  text: string,
+  dismissed: { text: string; at: number }[],
+  now = Date.now(),
+  windowMs = 600_000,
+): boolean {
+  return pruneDismissedVisualAlerts(dismissed, now, windowMs).some(item => sameVisualFocus(text, item.text))
+}
+
 export function appendCaptionTurn(
   captions: LiveCaptionTurn[],
   wire: { type: string; text?: unknown; final?: unknown },

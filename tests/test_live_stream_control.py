@@ -33,7 +33,8 @@ _HARNESS = r"""
 import assert from 'node:assert';
 import { createAdaptiveSender, classifyLivePhase, LIVE_PHASE_LABELS, createInFlightLedger,
   appendCaptionTurn, closeUserTranscript, describeLiveCapabilities,
-  shouldDispatchVoiceTurn, sameVisualFocus } from './liveStreamControl.js';
+  shouldDispatchVoiceTurn, sameVisualFocus,
+  isDismissedVisualAlert, pruneDismissedVisualAlerts } from './liveStreamControl.js';
 
 const now = () => Date.now();
 
@@ -208,6 +209,22 @@ assert.strictEqual(sameVisualFocus('报错', '报错弹窗'), false,
   '字数太少不判（避免两个字随便撞上就合并）');
 assert.strictEqual(sameVisualFocus('', '右上角报错'), false, '空文本不判');
 
+// ---- 忽略期内不再弹（后端相似度去重只有 45s 窗口，过了窗口同一处会再弹） ---------
+const T2 = 5_000_000;
+const ignored = [{ text: '右上角有报错弹窗', at: T2 - 1000 }];
+assert.strictEqual(isDismissedVisualAlert('右上角有报错弹窗，遮住了保存按钮', ignored, T2), true,
+  '同处换说法也要认（否则用户会觉得忽略按钮没生效）');
+assert.strictEqual(isDismissedVisualAlert('左下角按钮点不动', ignored, T2), false, '不同处不得抑制');
+assert.strictEqual(isDismissedVisualAlert('右上角有报错弹窗', ignored, T2 + 11 * 60_000), false,
+  '超过 10 分钟窗口后不再抑制（那时同一位置又出问题仍应提醒）');
+
+let pruned = [];
+for (let i = 0; i < 25; i++) pruned = pruneDismissedVisualAlerts([...pruned, { text: 'x' + i, at: T2 }], T2);
+assert.strictEqual(pruned.length, 20, '忽略记录必须有界');
+assert.strictEqual(pruned[pruned.length - 1].text, 'x24');
+assert.strictEqual(pruneDismissedVisualAlerts([{ text: 'old', at: T2 - 11 * 60_000 }], T2).length, 0,
+  '超窗记录要被裁掉');
+
 assert.match(describeLiveCapabilities(['audio.in', 'text.out']), /麦克风音频输入.*文字回复/);
 assert.strictEqual(describeLiveCapabilities(undefined), '', '抽帧模式没有能力表，返回空串而不是报错');
 assert.strictEqual(describeLiveCapabilities([]), '');
@@ -280,6 +297,8 @@ def test_cockpit_wiring_uses_the_control_module():
         "语音转写必须转交主 Agent，且先过噪音门控：实时模型没有工具通道，改文件只能由主 Agent 执行"
     assert "cockpit_voice_turn" in source, \
         "语音轮次要带自己的 uiContext（框架说明走系统上下文，不作为用户消息展示）"
+    assert "verify_realtime_alert" in source and "dismissRealtimeAlert" in source, \
+        "「交给 AI 排查」要用专用上下文，忽略要记住这一处（否则 45s 后同一处又弹）"
     assert "closeUserTranscript" in source and "if (!next) return" in source, \
         "转交必须与字幕记账走同一条判定：重放（null）时既不上字幕也不转交"
     assert "1280 / video.videoWidth, 720" not in source, "固定 1280/720 采集应已被自适应档位取代"
