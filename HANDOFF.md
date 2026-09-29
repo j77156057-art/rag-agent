@@ -1,5 +1,17 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-30 Vibecoding 能力补全 Wave4：`dev_diagnostics` 结构化诊断（本会话，不占 R 槽位）
+
+- **补什么**：`self_verify` 只回「过 / 不过」+ 尾部日志，Agent 拿到一坨文本要么瞎猜要么重跑。本波把 ruff（Python）与 `npm run typecheck`（vue-tsc，前端）的输出归一成 **文件:行:列 + 规则号 + 严重度**。
+- **产物**：新模块 `agent_runtime/diagnostics.py`；`tools.py` 的 `dev_diagnostics` + TOOLS 注册；`agent.py` 工具目录一行；`requirements.txt` 加 `ruff>=0.16,<1`；`tests/test_dev_diagnostics.py` **27 项**。
+- **默认规则集是本波最重要的决定**：仓库里**没有任何 ruff 配置**，而 ruff 0.16 的默认规则会把上千条 `I001/UP035/PIE810/RUF010/FURB167` 风格提醒刷给 Agent，真错误被埋掉。所以默认 `--select=E9,F401,F811,F821,F822,F841,E722`（只查会咬人的），要全检显式 `rules: ALL` 或 `rules: E,W,F`；`rules:` 取值走白名单正则，`; rm -rf` / `--fix` 一律拒绝。
+- **绝不假干净（三条响亮失败）**：① ruff 没装 → 「ruff 未安装（python -m pip install ruff）」；② 输出被窗口截断导致 JSON 非法 → 报「退出码说明有发现但输出没能解析」并附尾部；③ 前端 typecheck 退出非零却解析不出条目 → notes 里贴原始尾部。**曾经真实踩过**：`run_bounded` 默认窗口 4000+4000 字符，把 8786 字符的 ruff JSON 拦腰截断，工具静默回报「0 条问题」——这就是最危险的一类假干净；已同时加宽窗口（140000/40000）并加退出码规则，`test_unparsable_findings_are_reported_not_clean` 钉死。
+- **真代码验证**：`dg.run(<repo>, 'agent_runtime/lanes.py', scope='py')` 报出 `10:1 I001`、`20:1 UP035`、`113:8 PIE810`、`319:45 RUF010`（默认规则集下 0 条会咬人的问题，说明本会话新增代码没有真实缺陷）；`frontend_diagnostics(<repo>)` 真跑 `npm run typecheck` → **exit 0、0 条、7.6s**，即当前前端类型是干净的，这个基线以后可直接对比。
+- **护栏**：`target/config` 复用 `code_intel._contained_path`（越界拒绝；安全逻辑只有一份实现）；目标数 ≤12、条目 ≤200 并标注截断；只读——**从不传 `--fix`**，`--select/--config` 全部由本模块拼接、用户文本永不作为独立 argv 项；npm 路径支持 `DOCMIND_NPM_BIN`（与 `self_verify` 一致）；沿用「严禁 build，并发铁律」，只跑 typecheck。
+- **严重度口径**：`E9*/F81*/F82*` → error（语法、重复定义、未定义名字），其余 E/F/W/C/B → warning，风格类 → info。`E722` 判为 warning 是有意的：它是卫生问题不是崩溃点。
+- **验证**：`tests/test_dev_diagnostics.py` **27 passed**；全量 pytest 见下方补记。
+- **未做**：eslint 没接（前端**根本没有 eslint 配置**，接入要先建 config，那是新增约定，留给用户拍板）；诊断未与 `dev_git_diff` 联动（例如「只报本轮改动文件」）；`rules: ALL` 在大仓库上会因输出过大退回 concise 逐行解析并如实标注可能不全。
+
 ## 2026-09-29 BUG 修复：共享屏幕后切页问 AI"看不到"（AI-B lane，ChatDock 帧附加放开）
 
 - **用户报告**：共享整个屏幕后切换页面，再问 AI 能不能看到，AI 答"看不到"。

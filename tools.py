@@ -5006,6 +5006,45 @@ def dev_lanes(arg):
     return lanes.render(res)
 
 
+def dev_diagnostics(arg):
+    """拿结构化诊断（文件:行:列 + 规则号），而不是「过/不过」加一坨尾部日志。
+
+    改完一段代码、跑测试之前先用它；比 self_verify 更早发现问题，也比读构建日志更准。
+
+    输入（多行 keyed，全部可选）：
+      target: agent_runtime/realtime_omni.py, frontend/src/workbench   # 文件/目录，逗号或换行分隔
+      scope: auto|py|frontend|all    # auto 按 target 的扩展名自动选引擎
+      rules: ALL                      # ruff 规则覆盖；默认只查会咬人的（E9/F401/F8xx/E722）
+      timeout: 120                    # 单引擎秒数，上限 300
+      config: ruff.toml               # 可选，项目内的 ruff 配置文件（必须在代码根目录内）
+    也可以直接把路径当输入。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    keys = ["target", "scope", "rules", "timeout", "config"]
+    fields = _parse_keyed(arg, keys)
+    bare = [ln.strip() for ln in (arg or "").splitlines()
+            if ln.strip() and not re.match(r"^\s*(" + "|".join(keys) + r")\s*[:：]", ln)]
+    raw_target = fields.get("target") or ""
+    target = _split_path_list(raw_target) if raw_target else bare
+
+    def _one(key):
+        return (fields.get(key) or "").splitlines()[0].strip() if fields.get(key) else ""
+
+    try:
+        timeout = int(_one("timeout") or "120")
+    except (TypeError, ValueError):
+        timeout = 120
+    from agent_runtime import diagnostics
+    try:
+        res = diagnostics.run(root, target, scope=_one("scope") or "auto",
+                              timeout=timeout, config=_one("config"), rules=_one("rules"))
+    except Exception as exc:  # noqa: BLE001
+        return f"dev_diagnostics 无法运行：{type(exc).__name__}: {str(exc)[:200]}"
+    return diagnostics.render(res)
+
+
 def dev_find_references(arg):
     """重构前定位符号的全部引用点（重命名/删函数/改签名前必用）。
 
@@ -6629,6 +6668,10 @@ TOOLS = {
     "dev_lanes": {
         "description": "多人同仓协作的【认领登记表】（带 TTL 的租约）：谁在动哪些文件，冲突当场发现，过期自动可被接手。开工前先 `action: status` 看别的 lane 在动哪块，避免重复造轮子；动某个文件前 `action: check` + `path: <相对路径>` 问一句归属；领到任务 `action: claim` + `lane: AI-A` + `paths: frontend/src/workbench/**, tests/test_live_*.py`（+ 可选 `owner:`、`ttl_minutes:` 默认 120、`note:` 给别人看的说明）；做完 `action: release`，长任务定期 `action: heartbeat` 续租。需要物理隔离（别人收口提交不会把你的半成品卷进 HEAD）时 `action: open`（开通独立 worktree 并把路径回给你，之后的读写与 run_command 都用它），收回用 `action: close`（默认拒绝删除有未提交改动的 worktree，确认丢弃才加 `discard: true`）。排他按目录前缀保守判定：`*.vue` 这种无目录前缀的模式等于占下全仓，会与其他 lane 冲突，请用 `frontend/src/**/*.vue` 收窄。明知无重复但要共管时加 `force: true`，并在 HANDOFF 说明。所有写入只落在项目状态目录，不碰 git 历史。",
         "func": dev_lanes,
+    },
+    "dev_diagnostics": {
+        "description": "拿【结构化诊断】而不是「过/不过」加一坨尾部日志：Python 走 ruff、前端走 `npm run typecheck`（vue-tsc），输出归一成 文件:行:列 + 规则号 + 说明 + 严重度。改完一段代码、跑测试之前先调用它，比 self_verify 更早发现问题；重命名/搬文件之后用它确认没留下未定义引用。输入：target: <文件或目录，逗号/换行分隔，留空=按 scope 扫整个代码根目录>、scope: auto|py|frontend|all（auto 按扩展名选引擎）、rules: <ruff 规则覆盖，默认只查会咬人的 E9,F401,F811,F821,F822,F841,E722；要风格全检写 rules: ALL 或 rules: E,W,F>、timeout: <秒，上限 300>、config: <项目内 ruff 配置文件>；直接把路径当输入也可以。只读：从不传 --fix，从不写文件。工具没装时会【明确说「未安装」并给出安装命令】，绝不把「没跑成」报成「没问题」；输出被截断导致解析不出条目时同样如实报，不会谎称干净。前端诊断需要在 frontend/ 里有 typecheck 脚本且能找到 npm（可用 DOCMIND_NPM_BIN 指定）。",
+        "func": dev_diagnostics,
     },
     "dev_find_references": {
         "description": "重构前定位符号的全部引用点（重命名/删函数/改签名/搬文件前必用）。Python 走 ast 精确匹配——注释与字符串里的同名文本【不会】被误报；TS/TSX/JS/JSX/Vue 走 tree-sitter 语法匹配，注释、字符串字面量与对象字面量的键都不算引用，Vue 会解析 <script> 块并把行号映射回文件真实行（模板里的同名文本用词边界正则补充，并在 notes 说明）；其他语言走词边界正则并跳过纯注释行。语法包缺失时自动回退正则，不会静默丢结果。输入：symbol: <符号名>（必填），可选 scope: <限定目录或文件>、kind: def|ref|all（默认 all）、limit: <条数上限，默认 80>；直接把符号名当输入也可以。返回定义处与引用处（file:行号 + 代码行，按文件聚合计数），低置信的字符串/键名单列。命中过多时请用 scope 缩小范围。",
