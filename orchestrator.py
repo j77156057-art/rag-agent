@@ -18,6 +18,7 @@ import inspect
 import json
 import re
 import time
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 
 import pricing
@@ -479,7 +480,10 @@ def run_plan(tasks, runner, synth_runner=None, max_parallel=4, on_event=None,
             return t["id"], out
 
         with ThreadPoolExecutor(max_workers=min(max_parallel, max(1, len(runnable)))) as ex:
-            futures = [ex.submit(_run_one, t) for t in runnable]
+            # A separate Context is required for each concurrent task; sharing
+            # one Context across running threads raises and loses project scope.
+            futures = [ex.submit(contextvars.copy_context().run, _run_one, t)
+                       for t in runnable]
             for f in futures:
                 tid, out = f.result()
                 results[tid] = out

@@ -254,13 +254,28 @@ def execute(project_root: str | os.PathLike[str], manifest: Mapping[str, Any], p
         temp_path = Path(temp)
         input_path = temp_path / "input.json"
         input_path.write_text(raw, encoding="utf-8")
+        from .enterprise_sandbox import execution_mode, run_project_command, stage_execution_active
+        enterprise = runner is None and execution_mode() == "enterprise"
+        containerized = enterprise and not stage_execution_active()
+        if enterprise:
+            shutil.copy2(module, temp_path / ("adapter.py" if runtime == "python" else "adapter.js"))
         if runtime == "python":
-            command = [sys.executable, "-I", "-c", _PY_RUNNER, str(module), entrypoint, str(input_path)]
+            command = (["python", "-I", "-c", _PY_RUNNER, "/workspace/adapter.py", entrypoint,
+                        "/workspace/input.json"] if enterprise else
+                       [sys.executable, "-I", "-c", _PY_RUNNER, str(module), entrypoint, str(input_path)])
+            if enterprise and not containerized:
+                command = [sys.executable, "-I", "-c", _PY_RUNNER,
+                           str(temp_path / "adapter.py"), entrypoint, str(input_path)]
         else:
-            node = shutil.which("node")
+            node = "node" if containerized else shutil.which("node")
             if not node:
                 raise GeneratedAdapterError("未找到 Node.js，无法运行 Node 适配器")
-            command = [node, "--no-warnings", "-e", _NODE_RUNNER, str(module), entrypoint, str(input_path)]
+            command = ([node, "--no-warnings", "-e", _NODE_RUNNER, "/workspace/adapter.js",
+                        entrypoint, "/workspace/input.json"] if enterprise else
+                       [node, "--no-warnings", "-e", _NODE_RUNNER, str(module), entrypoint, str(input_path)])
+            if enterprise and not containerized:
+                command = [node, "--no-warnings", "-e", _NODE_RUNNER,
+                           str(temp_path / "adapter.js"), entrypoint, str(input_path)]
         # Keep Windows process bootstrap variables (SystemRoot/TEMP/etc.) but
         # remove inherited credentials and import hooks before entering the
         # Job Object. Network proxy variables are also cleared by default.
@@ -277,9 +292,13 @@ def execute(project_root: str | os.PathLike[str], manifest: Mapping[str, Any], p
                                    text=True, timeout=max(1, min(MAX_EXECUTION_SECONDS, int(timeout))),
                                    env=environment)
             else:
-                from .windows_sandbox import run_isolated
-                completed = run_isolated(command, cwd=str(temp_path), env=environment,
-                                         timeout=max(1, min(MAX_EXECUTION_SECONDS, int(timeout))))
+                if enterprise:
+                    completed = run_project_command(command, project_root=str(temp_path),
+                                                    timeout=max(1, min(MAX_EXECUTION_SECONDS, int(timeout))))
+                else:
+                    from .windows_sandbox import run_isolated
+                    completed = run_isolated(command, cwd=str(temp_path), env=environment,
+                                             timeout=max(1, min(MAX_EXECUTION_SECONDS, int(timeout))))
         except subprocess.TimeoutExpired as exc:
             raise GeneratedAdapterError("适配器执行超时") from exc
         except (OSError, RuntimeError) as exc:

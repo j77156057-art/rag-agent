@@ -11,6 +11,7 @@ import json
 import os
 import re
 import tempfile
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
@@ -21,6 +22,15 @@ from config import CODE_ROOT, STATE_ROOT, get_runtime
 SUPPORTED_FORMATS = {"docx", "pdf", "pptx", "xlsx"}
 MAX_INPUT_CHARS = 300_000
 MAX_ITEMS = 100
+_PROJECT_INTRO_REQUEST = ContextVar("docmind_project_intro_request", default=False)
+
+
+def bind_project_intro_request(enabled: bool):
+    return _PROJECT_INTRO_REQUEST.set(bool(enabled))
+
+
+def reset_project_intro_request(token) -> None:
+    _PROJECT_INTRO_REQUEST.reset(token)
 
 
 class ArtifactError(ValueError):
@@ -81,6 +91,41 @@ def _sections(data: dict) -> list[dict]:
             raise ArtifactError("sections 的每一项必须是对象")
         normalized.append(section)
     return normalized
+
+
+def _validate_project_intro(data: dict, fmt: str) -> list[str]:
+    """Require a substantive document backed by files in the active project."""
+    if data.get("purpose") != "project_intro" and not _PROJECT_INTRO_REQUEST.get():
+        return []
+    if fmt not in {"pdf", "docx"}:
+        raise ArtifactError("项目介绍只支持 PDF 或 DOCX")
+    root_value = get_runtime("code_root")
+    if not root_value or not Path(root_value).is_dir():
+        raise ArtifactError("当前项目目录不可用，无法生成项目介绍")
+    root = Path(root_value).resolve()
+    sources = _list(data.get("source_files"), name="source_files")
+    if len(sources) < 2:
+        raise ArtifactError("项目介绍至少需要引用两个当前项目文件")
+    verified = []
+    for value in sources:
+        if not isinstance(value, str) or not value.strip():
+            raise ArtifactError("source_files 必须是项目内相对文件路径")
+        path = (root / value).resolve()
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise ArtifactError("source_files 不能引用当前项目以外的文件") from exc
+        if not path.is_file() or relative.parts[0] in {"artifacts", ".docmind"}:
+            raise ArtifactError(f"项目来源文件不存在或不可用于取证：{value}")
+        verified.append(str(relative).replace("\\", "/"))
+    sections = _sections(data)
+    body = "".join(
+        _text(value) for block in sections
+        for value in (block.get("paragraphs") or []) + (block.get("bullets") or [])
+    )
+    if len(sections) < 4 or len(body.strip()) < 700:
+        raise ArtifactError("项目介绍过短：至少四个章节、700 字正文；请先读取更多项目文件并补充内容")
+    return list(dict.fromkeys(verified))
 
 
 def _render_docx(data: dict, path: Path) -> dict:
@@ -179,30 +224,35 @@ def _render_pdf(data: dict, path: Path) -> dict:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
-    from reportlab.platypus import (ListFlowable, ListItem, Paragraph,
+    from reportlab.platypus import (HRFlowable, ListFlowable, ListItem, Paragraph,
                                     SimpleDocTemplate, Spacer, Table, TableStyle)
 
     font = _register_pdf_font()
     styles = getSampleStyleSheet()
     body = ParagraphStyle("DocMindBody", parent=styles["BodyText"], fontName=font,
-                          fontSize=10.5, leading=16, wordWrap="CJK", spaceAfter=5)
+                          fontSize=10.5, leading=17, wordWrap="CJK", spaceAfter=8,
+                          textColor=colors.HexColor("#263445"))
     title_style = ParagraphStyle("DocMindTitle", parent=body, fontSize=22,
-                                 leading=28, alignment=TA_CENTER, spaceAfter=10)
+                                 leading=30, alignment=TA_CENTER, spaceAfter=12,
+                                 textColor=colors.HexColor("#173254"))
     subtitle_style = ParagraphStyle("DocMindSubtitle", parent=body, fontSize=11,
                                     textColor=colors.HexColor("#555555"),
                                     alignment=TA_CENTER, spaceAfter=14)
     heading_styles = {
         1: ParagraphStyle("DocMindH1", parent=body, fontSize=16, leading=22,
-                          spaceBefore=12, spaceAfter=6),
+                          spaceBefore=18, spaceAfter=8,
+                          textColor=colors.HexColor("#176B8A"), keepWithNext=True),
         2: ParagraphStyle("DocMindH2", parent=body, fontSize=13, leading=19,
-                          spaceBefore=9, spaceAfter=4),
+                          spaceBefore=11, spaceAfter=5, keepWithNext=True),
         3: ParagraphStyle("DocMindH3", parent=body, fontSize=11, leading=17,
-                          spaceBefore=7, spaceAfter=3),
+                          spaceBefore=8, spaceAfter=4, keepWithNext=True),
     }
     story = []
     title = _text(data.get("title"), 500).strip()
     if title:
         story.append(Paragraph(escape(title), title_style))
+        story.append(HRFlowable(width="100%", thickness=1.2,
+                                color=colors.HexColor("#2E829C"), spaceAfter=10))
     subtitle = _text(data.get("subtitle"), 1_000).strip()
     if subtitle:
         story.append(Paragraph(escape(subtitle), subtitle_style))
@@ -233,7 +283,20 @@ def _render_pdf(data: dict, path: Path) -> dict:
     document = SimpleDocTemplate(str(path), pagesize=A4, rightMargin=18 * mm,
                                  leftMargin=18 * mm, topMargin=18 * mm,
                                  bottomMargin=18 * mm, title=title)
-    document.build(story or [Paragraph(" ", body)])
+
+    def page_furniture(canvas, doc):
+        canvas.saveState()
+        width, _height = A4
+        canvas.setStrokeColor(colors.HexColor("#D9E4EB"))
+        canvas.line(18 * mm, 15 * mm, width - 18 * mm, 15 * mm)
+        canvas.setFont(font, 8)
+        canvas.setFillColor(colors.HexColor("#66798A"))
+        canvas.drawString(18 * mm, 10 * mm, title[:50])
+        canvas.drawRightString(width - 18 * mm, 10 * mm, str(doc.page))
+        canvas.restoreState()
+
+    document.build(story or [Paragraph(" ", body)],
+                   onFirstPage=page_furniture, onLaterPages=page_furniture)
     reader = PdfReader(str(path))
     return {"pages": len(reader.pages)}
 
@@ -382,6 +445,16 @@ def create_artifact(arg: str) -> str:
         fmt = _text(data.get("format"), 10).strip().lower().lstrip(".")
         if fmt not in SUPPORTED_FORMATS:
             raise ArtifactError("format 必须是 docx、pdf、pptx 或 xlsx")
+        source_files = _validate_project_intro(data, fmt)
+        if source_files:
+            data = dict(data)
+            data["sections"] = _sections(data) + [{
+                "heading": "资料来源",
+                "paragraphs": [
+                    "本文依据当前项目内的真实文件编写；运行效果与未核实功能以实际验收为准。",
+                    "项目文件：" + "、".join(source_files),
+                ],
+            }]
         output_dir = _output_dir()
         target = _unique_path(output_dir, _filename(data.get("filename"), fmt))
         handle = tempfile.NamedTemporaryFile(prefix=".docmind-", suffix=f".{fmt}",
@@ -398,6 +471,7 @@ def create_artifact(arg: str) -> str:
             "filename": target.name,
             "bytes": target.stat().st_size,
             "validation": validation,
+            "source_files": source_files,
         }, ensure_ascii=False)
     except (ArtifactError, json.JSONDecodeError, OSError, ImportError, ValueError) as exc:
         return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)

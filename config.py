@@ -211,11 +211,11 @@ EXPERIENCE_COLLECTION_NAME = os.getenv("EXPERIENCE_COLLECTION_NAME", "docmind_ex
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "80"))
 TOP_K = int(os.getenv("TOP_K", "4"))
-MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "8"))
-# 复杂代码审查需要多次定位、分段读文件和运行验证；保持普通问答的低成本，
-# 仅在识别为代码/项目缺陷审查时使用更大的有界预算。显式环境变量优先。
-AUDIT_MAX_AGENT_STEPS = int(os.getenv("DOCMIND_AUDIT_MAX_STEPS", "16"))
-CODE_MAX_AGENT_STEPS = int(os.getenv("DOCMIND_CODE_MAX_STEPS", "12"))
+# 0 means no fixed tool-step ceiling. Repetition, failure-streak, cancellation,
+# deadline and approval guards remain active.
+MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "0"))
+AUDIT_MAX_AGENT_STEPS = int(os.getenv("DOCMIND_AUDIT_MAX_STEPS", "0"))
+CODE_MAX_AGENT_STEPS = int(os.getenv("DOCMIND_CODE_MAX_STEPS", "0"))
 # 纯目录勘察（list_dir）每轮前若干次不计入工具步数：浏览目录结构是只读导航，
 # 不应挤占 read_file/grep 的取证预算；超过免费额度后照常计步。
 # 相同参数重复调用仍由 Agent 防重复护栏拦截，防止靠它无限空转。
@@ -224,10 +224,10 @@ NAV_FREE_STEPS = int(os.getenv("DOCMIND_NAV_FREE_STEPS", "2"))
 # 多轮记忆回放的问答对【硬上限】：实际回放多少轮先按 token 窗口动态决定
 # （Agent._history_window，占 prompt 预算 COMPACT_KEEP_RATIO），此值只兜底防失控。
 AGENT_HISTORY_TURNS = int(os.getenv("AGENT_HISTORY_TURNS", "40"))
-OBS_MAX_CHARS = int(os.getenv("OBS_MAX_CHARS", "1800"))  # 单条工具观察回填给模型前的截断长度
-AUDIT_OBS_MAX_CHARS = int(os.getenv("DOCMIND_AUDIT_OBS_MAX_CHARS", "2600"))
-HISTORY_ANSWER_CHARS = int(os.getenv("HISTORY_ANSWER_CHARS", "700"))  # 回放历史回答时的单条截断长度
-TRAIL_ASSISTANT_CHARS = int(os.getenv("TRAIL_ASSISTANT_CHARS", "1000"))  # trail 中保留的模型单轮决策上限
+OBS_MAX_CHARS = int(os.getenv("OBS_MAX_CHARS", "8000"))  # 只在上下文预算不足时按 token 裁剪
+AUDIT_OBS_MAX_CHARS = int(os.getenv("DOCMIND_AUDIT_OBS_CHARS", os.getenv("DOCMIND_AUDIT_OBS_MAX_CHARS", "12000")))
+HISTORY_ANSWER_CHARS = int(os.getenv("HISTORY_ANSWER_CHARS", "12000"))  # 兼容旧调用方；历史回放不再按字符截断
+TRAIL_ASSISTANT_CHARS = int(os.getenv("TRAIL_ASSISTANT_CHARS", "8000"))  # 上下文预算不足时才丢弃更早往返
 # 每轮送模型前，整段 prompt 的 token 预算（llamacpp 走 /tokenize 精算）。
 # 仅作为 env 显式覆盖值与无画像客户端的兜底；实际默认值按模型真实窗口缩放
 # （见 prompt_token_budget）：16k 本地模型约 12k，131k 云端模型可放到 ~98k，
@@ -239,7 +239,7 @@ PROMPT_TOKEN_BUDGET = int(os.getenv("PROMPT_TOKEN_BUDGET", "11000"))
 COMPACT_KEEP_RATIO = float(os.getenv("DOCMIND_COMPACT_KEEP_RATIO", "0.35"))
 COMPACT_TRIGGER_RATIO = float(os.getenv("DOCMIND_COMPACT_TRIGGER_RATIO", "0.8"))
 # 单次补全上限（含思考型模型的 reasoning）：防止模型不按格式收尾时无限生成，
-# 到顶后 finish_reason=length，Agent 会自动 nudge 要求直接给简短 Final Answer。
+# 到顶后 finish_reason=length，Agent 会保留已有正文并接续生成。
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "3072"))
 # 是否允许思考型模型把预算花在 reasoning_content 上。ReAct 工具路由不需要长思考，
 # 实测关思考后同类请求 55 token/4s 给出 Action（开思考时偶发烧满 3072 token 不行动）。
@@ -872,6 +872,16 @@ def _apply_persisted_state():
     acp = data.get("auto_cloud_preset_id")
     if isinstance(acp, str) and acp.strip() and "auto_cloud_preset_id" not in _RUNTIME:
         _RUNTIME["auto_cloud_preset_id"] = acp.strip()
+    # 自主开发舱专用模型预设：空=跟随全局模型；非空且模式为 fixed 时工作流会话单独挂该模型
+    cpm = data.get("cockpit_preset_id")
+    if isinstance(cpm, str) and "cockpit_preset_id" not in _RUNTIME:
+        _RUNTIME["cockpit_preset_id"] = cpm.strip()
+    # 开发舱模型模式：global=跟随全局；fixed=固定使用 cockpit_preset_id；
+    # auto=Harness 按阶段/任务复杂度在全局模型与自动模式云端预设之间自选
+    cmm = data.get("cockpit_mode")
+    if isinstance(cmm, str) and cmm.strip() in ("global", "fixed", "auto") \
+            and "cockpit_mode" not in _RUNTIME:
+        _RUNTIME["cockpit_mode"] = cmm.strip()
 
     # 网络搜索 / URL 获取配置恢复
     _apply_web_search_state(data)

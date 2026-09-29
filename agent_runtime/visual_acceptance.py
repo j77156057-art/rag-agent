@@ -31,6 +31,15 @@ class _QuietHandler(SimpleHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
+    def do_GET(self):
+        # The browser always probes /favicon.ico; a 404 there would be reported
+        # as a real page failure, so answer it with an empty success instead.
+        if self.path.split("?")[0].rstrip("/").lower().endswith("/favicon.ico"):
+            self.send_response(204)
+            self.end_headers()
+            return
+        super().do_GET()
+
     def handle(self):
         try:
             super().handle()
@@ -55,11 +64,80 @@ def _edge_binary() -> str:
     )
 
 
+_MAX_CONSOLE = 30
+_MAX_REQUESTS = 30
+_IGNORED_REQUEST_SUFFIX = ("favicon.ico",)
+
+
 class _DevTools:
+    """Minimal CDP client that also records the signals a screenshot cannot show."""
+
     def __init__(self, connection, runtime_errors: list[str] | None = None):
         self.connection = connection
         self.sequence = 0
         self.runtime_errors = runtime_errors if runtime_errors is not None else []
+        self.console: list[dict[str, Any]] = []
+        self.failed_requests: list[dict[str, Any]] = []
+        self._requests: dict[str, str] = {}
+
+    def _record_console(self, level: str, text: str) -> None:
+        if "favicon.ico" in str(text).lower():
+            return
+        entry = {"level": level, "text": str(text)[:300]}
+        if entry not in self.console and len(self.console) < _MAX_CONSOLE:
+            self.console.append(entry)
+
+    def _record_failure(self, kind: str, url: str, detail: str) -> None:
+        if str(url).split("?")[0].rstrip("/").lower().endswith(_IGNORED_REQUEST_SUFFIX):
+            return
+        # Chrome reports an HTTP failure twice: once as the status and once as an
+        # aborted load. Keep the status, drop the redundant abort noise.
+        if kind == "network" and "ERR_ABORTED" in str(detail):
+            base = str(url).split("?")[0]
+            if any(item["url"].split("?")[0] == base and item["kind"].startswith("http_")
+                   for item in self.failed_requests):
+                return
+        entry = {"kind": kind, "url": str(url)[:300], "detail": str(detail)[:200]}
+        if entry not in self.failed_requests and len(self.failed_requests) < _MAX_REQUESTS:
+            self.failed_requests.append(entry)
+
+    def _handle_event(self, message: dict[str, Any]) -> None:
+        method = str(message.get("method") or "")
+        params = message.get("params") or {}
+        if method == "Runtime.exceptionThrown":
+            details = params.get("exceptionDetails") or {}
+            text = str(details.get("text") or details.get("exception", {}).get("description") or "runtime error")
+            if text not in self.runtime_errors:
+                self.runtime_errors.append(text[:500])
+        elif method == "Runtime.consoleAPICalled":
+            level = str(params.get("type") or "").lower()
+            if level in {"error", "warning"}:
+                parts = []
+                for argument in params.get("args") or []:
+                    value = argument.get("value")
+                    parts.append(str(value if value is not None
+                                     else (argument.get("description") or argument.get("type") or "")))
+                self._record_console(level, " ".join(part for part in parts if part) or str(params.get("text") or ""))
+        elif method == "Log.entryAdded":
+            entry = params.get("entry") or {}
+            level = str(entry.get("level") or "").lower()
+            if level in {"error", "warning"}:
+                self._record_console(level, f"{entry.get('source') or ''}: {entry.get('text') or ''}".strip(": ").strip())
+        elif method == "Network.requestWillBeSent":
+            request = params.get("request") or {}
+            self._requests[str(params.get("requestId"))] = str(request.get("url") or "")
+        elif method == "Network.responseReceived":
+            response = params.get("response") or {}
+            try:
+                status = int(response.get("status") or 0)
+            except (TypeError, ValueError):
+                status = 0
+            if status >= 400:
+                url = str(response.get("url") or self._requests.get(str(params.get("requestId")), ""))
+                self._record_failure(f"http_{status}", url, response.get("statusText") or "")
+        elif method == "Network.loadingFailed":
+            url = self._requests.get(str(params.get("requestId")), "")
+            self._record_failure("network", url, params.get("errorText") or "")
 
     def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         self.sequence += 1
@@ -68,15 +146,25 @@ class _DevTools:
                                          "params": params or {}}))
         while True:
             message = json.loads(self.connection.recv())
-            if message.get("method") == "Runtime.exceptionThrown":
-                details = message.get("params", {}).get("exceptionDetails", {})
-                text = str(details.get("text") or details.get("exception", {}).get("description") or "runtime error")
-                if text not in self.runtime_errors:
-                    self.runtime_errors.append(text[:500])
+            self._handle_event(message)
             if message.get("id") == ident:
                 if message.get("error"):
                     raise VisualAcceptanceError(str(message["error"]))
                 return message.get("result") or {}
+
+    def drain(self, seconds: float = 1.5) -> None:
+        """Collect late console/network events without waiting on a response."""
+        deadline = time.monotonic() + max(0.1, float(seconds))
+        try:
+            self.connection.settimeout(0.3)
+        except Exception:
+            pass
+        while time.monotonic() < deadline:
+            try:
+                message = json.loads(self.connection.recv())
+            except Exception:
+                continue
+            self._handle_event(message)
 
     def evaluate(self, expression: str) -> Any:
         result = self.call("Runtime.evaluate", {
@@ -162,6 +250,8 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
         devtools = _DevTools(connection, runtime_errors)
         devtools.call("Page.enable")
         devtools.call("Runtime.enable")
+        devtools.call("Log.enable")
+        devtools.call("Network.enable")
         devtools.call("Emulation.setDeviceMetricsOverride", {
             "width": width, "height": height, "deviceScaleFactor": 1,
             "mobile": False,
@@ -172,6 +262,7 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
             "(async()=>{for(let n=0;n<120;n++){if(document.readyState==='complete')return true;"
             "await new Promise(r=>setTimeout(r,50))}throw Error('页面加载超时')})()"
         )
+        devtools.drain(min(2.0, max(0.5, timeout * 0.1)))
         title = str(devtools.evaluate("document.title || ''") or "")[:240]
         body_text = str(devtools.evaluate("document.body?.innerText || ''") or "")[:1200]
         shot = devtools.call("Page.captureScreenshot", {"format": "png"})
@@ -182,11 +273,22 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
         path = target_dir / "preview.png"
         path.write_bytes(raw)
         rel = path.relative_to(root_path).as_posix()
-        checks = {"page_loaded": True, "runtime_errors": not runtime_errors}
+        console_errors = [item for item in devtools.console if item["level"] == "error"]
+        console_warnings = [item for item in devtools.console if item["level"] == "warning"]
+        checks = {
+            "page_loaded": True,
+            "no_runtime_errors": not runtime_errors,
+            "no_console_errors": not console_errors,
+            "no_failed_requests": not devtools.failed_requests,
+        }
         return {
             "ok": all(checks.values()), "passed": all(checks.values()),
             "checks": checks, "title": title, "body_excerpt": body_text,
-            "runtime_errors": runtime_errors, "screenshot": rel,
+            "runtime_errors": runtime_errors,
+            "console_errors": console_errors,
+            "console_warnings": console_warnings,
+            "failed_requests": devtools.failed_requests,
+            "screenshot": rel,
             "image": encoded, "width": width, "height": height,
             "artifacts": [{
                 "id": "visual-preview",
@@ -195,8 +297,13 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
                 "path": rel,
                 "label": "真实浏览器预览截图",
                 "summary": "正式开发舱 visual adapter 捕获的当前项目画面",
-                "evidence": ["browser:Page.captureScreenshot", "entry:" + entry_path.relative_to(root_path).as_posix()],
-                "metadata": {"width": str(width), "height": str(height), "title": title},
+                "evidence": ["browser:Page.captureScreenshot",
+                             "browser:Runtime.consoleAPICalled",
+                             "browser:Network.responseReceived",
+                             "entry:" + entry_path.relative_to(root_path).as_posix()],
+                "metadata": {"width": str(width), "height": str(height), "title": title,
+                             "console_errors": str(len(console_errors)),
+                             "failed_requests": str(len(devtools.failed_requests))},
             }],
         }
     except VisualAcceptanceError:

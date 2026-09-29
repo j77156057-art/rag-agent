@@ -36,7 +36,36 @@ from embeddings import EmbeddingClient
 from vectorstore import pretty_source
 from agent_runtime.retrieval import get_retriever
 from ingest import _CODE_EXT, _SKIP_DIRS
+from data_formats import DataFormatError, read_file as read_data_file, write_data_file
 from agent_runtime.tools import ToolResult, ToolSpec, coerce_tool_spec, upgrade_registry
+from agent_runtime.enterprise_sandbox import SandboxUnavailable as EnterpriseSandboxUnavailable
+from agent_runtime.enterprise_sandbox import (execution_mode, host_fallback_active, run_agent_command,
+                                               stage_execution_active, stage_backend)
+
+
+_PYTHON_EXEC_TIMEOUT = int(os.getenv("DOCMIND_PYTHON_EXEC_TIMEOUT", "60") or 60)
+
+
+def _window_output(text: str) -> str:
+    """Keep the head and tail of a command output; the tail holds the traceback."""
+    from agent_runtime.process_runner import window_text
+    return window_text(text)
+
+
+def _shell_argv(command: str) -> list[str]:
+    host_boundary = ((execution_mode() != "enterprise" and not stage_execution_active())
+                     or (stage_execution_active() and stage_backend() == "host_compat")
+                     or host_fallback_active())
+    if os.name == "nt" and host_boundary:
+        return ["cmd", "/c", command]
+    return ["/bin/sh", "-lc", command]
+
+
+def _self_verify_command(command: list[str], *, project_root: str, timeout: int):
+    """Run deterministic verification under the bounded stage runner."""
+    from agent_runtime.enterprise_sandbox import stage_execution_scope
+    with stage_execution_scope():
+        return run_agent_command(command, project_root=project_root, timeout=timeout)
 
 _emb = None
 
@@ -1324,10 +1353,10 @@ _SEARCH_SOURCE_LABELS = {
 
 _SEARCH_SOURCE_RULES = (
     ("github.com", ("github", "代码", "源码", "仓库", "开源", "软件库", "api", "sdk", "mcp", "插件", "报错", "bug", "issue", "godot", "unity", "unreal", "easyeda", "cad")),
-    ("bilibili.com", ("视频", "教程", "演示", "怎么做", "做法", "教学", "评测", "测评", "游戏", "剪辑", "编程")),
-    ("zhihu.com", ("为什么", "经验", "推荐", "评价", "口碑", "哪个好", "怎么选", "避坑", "值得", "原理", "方案")),
-    ("tieba.baidu.com", ("贴吧", "玩家", "经验", "求助", "推荐", "评价", "游戏")),
-    ("xiaohongshu.com", ("小红书", "种草", "探店", "好吃", "美食", "旅行", "穿搭", "护肤", "购物", "推荐", "避坑", "评价", "口碑")),
+    ("bilibili.com", ("视频", "教程", "演示", "怎么做", "做法", "教学", "评测", "测评", "游戏", "剪辑", "编程", "旅游", "旅行", "攻略", "景点", "路线", "美食")),
+    ("zhihu.com", ("为什么", "经验", "推荐", "评价", "口碑", "哪个好", "怎么选", "避坑", "值得", "原理", "方案", "旅游", "旅行", "攻略", "景点", "路线", "美食")),
+    ("tieba.baidu.com", ("贴吧", "玩家", "经验", "求助", "推荐", "评价", "游戏", "旅游", "旅行", "攻略", "景点", "路线", "美食")),
+    ("xiaohongshu.com", ("小红书", "种草", "探店", "好吃", "美食", "旅行", "旅游", "攻略", "景点", "路线", "穿搭", "护肤", "购物", "推荐", "避坑", "评价", "口碑")),
     ("weibo.com", ("热搜", "舆论", "事件", "明星", "品牌", "评价")),
     ("csdn.net", ("代码", "报错", "教程", "编程", "python", "java", "前端", "后端", "部署")),
     ("stackoverflow.com", ("error", "exception", "stack trace", "programming", "python", "javascript", "typescript", "sql", "api")),
@@ -1344,15 +1373,20 @@ def _infer_search_sources(query):
         if any(term.lower() in text for term in terms):
             picked.append(domain)
     # 中文推荐/比较问题通常需要社区口碑；没有明确技术语义时优先这些来源。
-    if any(term in text for term in ("推荐", "评价", "口碑", "好吃", "哪个好", "怎么选", "值得买", "避坑")):
+    if any(term in text for term in ("推荐", "评价", "口碑", "好吃", "哪个好", "怎么选", "值得买", "避坑", "旅游", "旅行", "攻略", "景点", "路线", "美食")):
         for domain in ("zhihu.com", "xiaohongshu.com", "tieba.baidu.com", "bilibili.com"):
             if domain not in picked:
                 picked.append(domain)
     try:
-        limit = max(0, min(6, int(os.getenv("WEB_SEARCH_SOURCE_FANOUT", "4"))))
+        limit = max(0, min(10, int(os.getenv("WEB_SEARCH_SOURCE_FANOUT", "8"))))
     except (TypeError, ValueError):
         limit = 4
     return picked[:limit]
+
+
+def _needs_community_sources(query):
+    """需要体验/口碑来源的问题，不接受单一 Bing 摘要直接作为答案候选。"""
+    return bool(re.search(r"推荐|评价|口碑|好吃|旅游|旅行|攻略|景点|路线|美食|避坑", str(query or ""), re.I))
 
 
 def _source_query_backend(domain):
@@ -1450,6 +1484,85 @@ def web_weather(arg):
                           ensure_ascii=False)
     except Exception as exc:
         return f"天气查询失败：{type(exc).__name__}，可改用带明确城市及日期的权威天气来源核对。"
+
+
+def _parse_transport_request(arg):
+    """解析交通票价查询参数，统一支持 JSON 和多行 key: value。"""
+    text = str(arg or "").strip()
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        value = {}
+        for line in text.splitlines():
+            match = re.match(r"^\s*(origin|from|出发地|出发)\s*[:：]\s*(.+?)\s*$", line, re.I)
+            if match:
+                value["origin"] = match.group(2).strip()
+                continue
+            match = re.match(r"^\s*(destination|to|目的地|到达地|到达)\s*[:：]\s*(.+?)\s*$", line, re.I)
+            if match:
+                value["destination"] = match.group(2).strip()
+                continue
+            match = re.match(r"^\s*(date|departure_date|出发日期|日期)\s*[:：]\s*(.+?)\s*$", line, re.I)
+            if match:
+                value["departure_date"] = match.group(2).strip()
+                continue
+            match = re.match(r"^\s*(mode|交通方式|方式)\s*[:：]\s*(.+?)\s*$", line, re.I)
+            if match:
+                value["mode"] = match.group(2).strip()
+    return value if isinstance(value, dict) else {}
+
+
+def _normalize_transport_date(value):
+    raw = str(value or "").strip()
+    match = re.search(r"(20\d{2})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})\s*日?", raw)
+    if not match:
+        return ""
+    try:
+        return datetime.date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
+    except ValueError:
+        return ""
+
+
+def web_transport(arg):
+    """查询指定日期的交通候选，并严格区分搜索摘要与实时票价。
+
+    12306/航司的余票和实时价格通常需要交互式验证或登录，公开搜索摘要不能
+    证明当前价格。因此这个工具只在参数完整后检索带日期的官方/票务来源，返回
+    可核对的候选和 ``verified_fare=false``；没有实时票证时绝不输出估算价格。
+    """
+    request = _parse_transport_request(arg)
+    origin = str(request.get("origin") or "").strip()
+    destination = str(request.get("destination") or "").strip()
+    departure_date = _normalize_transport_date(request.get("departure_date"))
+    missing = [key for key, value in (("origin", origin), ("destination", destination),
+                                      ("departure_date", departure_date)) if not value]
+    if missing:
+        return json.dumps({
+            "ok": False, "needs": missing,
+            "message": "交通票价查询必须提供出发地、目的地和出发日期（YYYY-MM-DD）；不能自行假设日期。",
+        }, ensure_ascii=False)
+    today = datetime.datetime.now().astimezone().date()
+    selected = datetime.date.fromisoformat(departure_date)
+    if selected < today:
+        return json.dumps({"ok": False, "needs": ["departure_date"],
+                           "message": f"出发日期 {departure_date} 已过去，请提供未来日期。"}, ensure_ascii=False)
+    mode = str(request.get("mode") or "高铁 飞机").strip()
+    queries = [
+        f"{origin} 到 {destination} {departure_date} 高铁 车次 票价 12306",
+        f"{origin} 到 {destination} {departure_date} 飞机 航班 票价 航空公司",
+    ]
+    if "高铁" not in mode and "火车" not in mode and "列车" not in mode:
+        queries = queries[1:]
+    if "飞机" not in mode and "航班" not in mode and len(queries) == 2:
+        queries = queries[:1]
+    evidence = web_search_batch(json.dumps({"queries": queries}, ensure_ascii=False))
+    return json.dumps({
+        "ok": True, "origin": origin, "destination": destination,
+        "departure_date": departure_date, "mode": mode,
+        "verified_fare": False,
+        "evidence": evidence,
+        "message": "搜索候选不是实时余票或最终支付价。搜索摘要不能当作当前价格；未取得官方实时票证前不得给出估算，请在 12306 或航司官方购票页核对。",
+    }, ensure_ascii=False)
 
 
 def _github_search(q):
@@ -1586,7 +1699,8 @@ def web_search(query, _allow_aux=True):
         q = f"{q} site:{site}"
     q = _search_recency_query(q)
     provider = get_web_search_provider()
-    cache_key = _web_cache_key(f"search:v3:{provider}:{_allow_aux}:{_search_result_limit()}", q)
+    # 来源扇出和排序策略变更后必须换缓存命名空间，避免旧的 Bing 单源摘要继续生效。
+    cache_key = _web_cache_key(f"search:v4:{provider}:{_allow_aux}:{_search_result_limit()}", q)
     if _search_cache_enabled():
         cached = _web_cache_read(cache_key)
         if cached:
@@ -1698,7 +1812,7 @@ def _builtin_search(provider, q, include_aux=False):
     order = [provider] if provider in backends else ["ddg", "baidu", "bing"]
     if provider not in backends:
         try:
-            fanout = max(1, min(len(order), int(os.getenv("WEB_SEARCH_FANOUT", "3"))))
+                fanout = max(1, min(len(order), int(os.getenv("WEB_SEARCH_FANOUT", "6"))))
         except (TypeError, ValueError):
             fanout = 3
         selected = order[:fanout]
@@ -1713,6 +1827,11 @@ def _builtin_search(provider, q, include_aux=False):
         # 都有结果时才输出聚合头、去重和统一可信度字段。
         meaningful = [raw for raw in (results.get(name, "") for name in selected)
                       if _formatted_search_rows(raw)]
+        meaningful_names = [name for name in selected if _formatted_search_rows(results.get(name, ""))]
+        if _needs_community_sources(q) and meaningful_names == ["bing"]:
+            return ("搜索结果相关性不足：当前只拿到 Bing 单一通用摘要，"
+                    "未获得知乎/小红书/B 站/贴吧等体验来源；已停止把它直接当作推荐依据。"
+                    "请换搜索服务商或稍后重试。")
         if len(meaningful) == 1 and len(_search_terms(q)) < 2:
             result = meaningful[0]
         else:
@@ -1805,6 +1924,14 @@ def _merge_builtin_results(query, named_results):
             # 相关性优先，域名/‘官方’标签只能小幅辅助，不能把跑题资料顶到前面。
             rank = (matched / max(1, len(terms))) * 3 + score * 0.15
             rank += sum(term in row.get("title", "").lower() for term in terms) * 0.03
+            # 中文旅行/推荐/口碑问题中，通用 Bing 摘要经常只有泛化攻略标题；
+            # 社区原站更适合承载体验和避坑信息。仅在这类意图下调整排序，
+            # 技术文档和代码查询仍按主题命中优先。
+            if re.search(r"推荐|评价|口碑|好吃|旅游|旅行|攻略|景点|路线|美食|避坑", str(query), re.I):
+                if str(backend).lower() == "bing":
+                    rank -= 0.12
+                elif str(backend) in {"知乎", "小红书", "B 站", "百度贴吧"}:
+                    rank += 0.08
             candidate = {**row, "backend": backend, "rank": rank, "reason": reason, "matched": matched}
             old = unique.get(key)
             if old is None or candidate["rank"] > old["rank"]:
@@ -2731,10 +2858,10 @@ def dev_http_request(arg):
 
 
 def python_exec(code):
-    """在受限子进程中执行 Python 代码，返回 stdout/stderr（截断到 1500 字）。
+    """执行 Python 代码，返回 stdout/stderr（截断到 1500 字）。
 
     用于数值计算、数据处理、文本变换等"让 agent 真正动手"的场景。
-    超时 12 秒；这是本地开发工具，以当前用户权限运行，请勿用于不可信代码。
+    企业模式在隔离的临时项目副本中运行；本地兼容模式以当前用户权限运行。
     """
     code = (code or "").strip()
     # 清理模型可能包裹的代码围栏 / 语言提示词，避免把 "```python" 当代码执行
@@ -2759,21 +2886,22 @@ def python_exec(code):
     # 才能按项目语义解析；未配置代码库时维持旧行为（服务端目录）。
     cwd = _get_code_root() or os.path.dirname(__file__)
     try:
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=12,
-            cwd=cwd,
-        )
+        command = ([sys.executable if stage_execution_active() and stage_backend() == "host_compat" else "python", "-c", code]
+                   if execution_mode() == "enterprise"
+                   else [sys.executable, "-c", code])
+        proc = run_agent_command(command, project_root=cwd, timeout=_PYTHON_EXEC_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return "代码执行超时（>12s），可能被死循环阻塞。"
+        return (f"代码执行超时（>{_PYTHON_EXEC_TIMEOUT}s），可能被死循环阻塞。"
+                "需要跑更久的脚本，请改用 run_command（可加 background: true 转后台任务）。")
+    except EnterpriseSandboxUnavailable as e:
+        return f"拒绝执行：{e}"
     except Exception as e:  # noqa: BLE001
         return f"执行失败: {e}"
     out = (proc.stdout or "") + (proc.stderr or "")
     if not out.strip():
         return "（代码已执行，无输出）"
-    return out[:1500] + ("…" if len(out) > 1500 else "")
+    # 保留开头与结尾：异常堆栈在末尾，单向截断会把真正的报错切掉。
+    return _window_output(out)
 
 
 # ---------------------------------------------------------------------------
@@ -3144,10 +3272,18 @@ def search_code(query):
     return "\n---\n".join(out)
 
 
+def _path_within_real_root(root, target):
+    try:
+        root_real = os.path.realpath(root)
+        return os.path.normcase(os.path.commonpath((root_real, os.path.realpath(target)))) == os.path.normcase(root_real)
+    except ValueError:
+        return False
+
+
 def read_file(path):
     """读取代码库中的文件内容（path 为相对 code_root 的路径或文件名）。
 
-    大文件默认只给前 4000 字；可在输入里附 `start: <1基行号>` 与可选 `end: <行号>`
+    大文件默认只给前 12000 字；可在输入里附 `start: <1基行号>` 与可选 `end: <行号>`
     只看某个区间（如枚举/方法所在行段），格式：路径换行后接 start:/end: 两行。
     """
     root = _get_code_root()
@@ -3179,6 +3315,22 @@ def read_file(path):
             return f"拒绝访问：{path} 不在代码根目录内。"
     if not os.path.isfile(target):
         return f"文件不存在：{path}"
+    if not _path_within_real_root(root_abs, target):
+        return f"拒绝访问：{path} 经符号链接指向代码根目录之外。"
+    # Godot 缓存和通用二进制资源不得用 errors="ignore" 当文本读取：
+    # 这会静默丢字节，并让 Agent 误以为已核对完整文件内容。
+    try:
+        with open(target, "rb") as f:
+            sample = f.read(8192)
+        controls = sum(byte < 32 and byte not in (9, 10, 13) for byte in sample)
+        is_binary = (os.path.splitext(target)[1].lower() in {".bin", ".scn"}
+                     or b"\x00" in sample or controls > max(1, len(sample) // 100))
+        if is_binary:
+            parsed = read_data_file(target)
+            return (f"=== {os.path.relpath(target, root_abs)}（只读二进制检查）===\n"
+                    + json.dumps(parsed, ensure_ascii=False, default=str)[:12000])
+    except (DataFormatError, OSError) as exc:
+        return f"读取失败：{exc}"
     try:
         with open(target, encoding="utf-8", errors="ignore") as f:
             content = f.read()
@@ -3195,9 +3347,61 @@ def read_file(path):
         picked = all_lines[start_line - 1:end_line]
         shown = "".join(f"{i}: {ln}" for i, ln in enumerate(picked, start=start_line))
         return f"=== {rel}（第 {start_line}-{end_line} 行，共 {len(all_lines)} 行）===\n{shown}"
-    if len(content) > 4000:
-        content = content[:4000] + "\n…（已截断，仅显示前 4000 字；需要后续段落请用 start:/end: 指定行号）"
+    if len(content) > 12000:
+        content = content[:12000] + "\n…（已截断，仅显示前 12000 字；需要后续段落请用 start:/end: 指定行号）"
     return f"=== {rel} ===\n{content}"
+
+
+def inspect_data_file(arg):
+    """识别并解析项目内的混乱数据文件，返回清洗后的结构化摘要。"""
+    root = _get_code_root()
+    if not root:
+        return json.dumps({"ok": False, "error": "尚未配置代码库根目录"}, ensure_ascii=False)
+    raw = str(arg or "").strip()
+    try:
+        payload = json.loads(raw) if raw.startswith("{") else {"path": raw}
+        path = str(payload.get("path") or "").strip()
+        if not path:
+            raise DataFormatError("path 不能为空")
+        root_abs = os.path.abspath(root)
+        target = os.path.abspath(path if os.path.isabs(path) else os.path.join(root_abs, path))
+        if not (target == root_abs or target.startswith(root_abs + os.sep)):
+            raise DataFormatError("路径越界")
+        if not _path_within_real_root(root_abs, target):
+            raise DataFormatError("路径经符号链接越界")
+        parsed = read_data_file(target)
+        if isinstance(parsed.get("text"), str):
+            parsed["text"] = parsed["text"][:16000]
+        if isinstance(parsed.get("value"), (dict, list)):
+            parsed["value"] = json.loads(json.dumps(parsed["value"], ensure_ascii=False, default=str))
+        if isinstance(parsed.get("rows"), list):
+            parsed["rows"] = parsed["rows"][:100]
+        if isinstance(parsed.get("records"), list):
+            parsed["records"] = parsed["records"][:100]
+        parsed["relative_path"] = os.path.relpath(target, root_abs).replace(os.sep, "/")
+        return json.dumps({"ok": True, "file": parsed}, ensure_ascii=False, default=str)[:24000]
+    except (DataFormatError, OSError, ValueError, ImportError, json.JSONDecodeError) as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False)
+
+
+def generate_data_file(arg):
+    """让 Agent 在当前项目内生成并回读校验结构化数据文件。"""
+    root = _get_code_root()
+    if not root:
+        return json.dumps({"ok": False, "error": "尚未配置代码库根目录"}, ensure_ascii=False)
+    try:
+        payload = json.loads(str(arg or "").strip())
+        if not isinstance(payload, dict):
+            raise DataFormatError("参数必须是 JSON 对象")
+        result = write_data_file(root, payload)
+        result["relative_path"] = os.path.relpath(result["path"], os.path.abspath(root)).replace(os.sep, "/")
+        return json.dumps(result, ensure_ascii=False, default=str)
+    except (DataFormatError, OSError, ValueError, ImportError, json.JSONDecodeError) as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False)
 
 
 _RE_GREP_SCOPE_LINE = re.compile(r"^\s*path\s*[:：]\s*(.+?)\s*$", re.I)
@@ -3794,6 +3998,165 @@ def apply_edit(arg):
     return f"已写入 {rel}（{nbytes} 字节，路径沙箱校验通过）。\n{summary}"
 
 
+def _split_edit_blocks(text):
+    """把多文件批量编辑输入切成若干编辑块。
+
+    约定：块之间用单独一行 `---` 分隔；块内格式与 apply_edit 完全一致
+    （path / old_text / new_text）。若某个分段不以 `path:` 开头，说明那行 `---`
+    其实是文件内容的一部分（Markdown 分隔线等），会把该段并回上一块，
+    避免误切导致写入内容损坏。
+    """
+    raw = (text or "").replace("\r\n", "\n")
+    blocks = []
+    for part in raw.split("\n---\n"):
+        if not part.strip():
+            continue
+        starts_block = re.match(r"\s*path\s*[:：]", part) is not None
+        if not starts_block:
+            if blocks:
+                blocks[-1] = blocks[-1] + "\n---\n" + part
+            continue  # 首段是说明文字时直接忽略
+        blocks.append(part)
+    return blocks
+
+
+def dev_apply_edits(arg):
+    """一次提交多个文件的局部替换（原子：要么全改，要么一个都不改）。
+
+    输入：多个编辑块，块之间用单独一行 `---` 分隔；块内格式与 apply_edit 一致：
+        path: <文件>
+        old_text: <精确旧片段>
+        new_text: <新片段>
+
+    护栏：逐块复用 apply_edit 的越界 / 分区写 / old_text 唯一匹配 / 体积 / .py 语法
+    校验；任一失败则【不写入任何文件】。全部预检通过后再统一落盘，落盘中出错会
+    回滚已写文件。批量编辑强制要求 old_text（整体重写请用 apply_edit 单文件走）。
+    """
+    blocks = _split_edit_blocks(arg)
+    if not blocks:
+        return ("未解析到任何编辑块。格式：每块 `path:` + `old_text:` + `new_text:`，"
+                "块之间用单独一行 `---` 分隔。")
+    if not _get_code_root():
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+
+    plans = []
+    errors = []
+    seen = set()
+    for i, block in enumerate(blocks, 1):
+        path, old_text, new_text = _parse_edit_input(block)
+        path = (path or "").strip().strip("'\"")
+        if not path:
+            errors.append(f"块 {i}：缺少 path。")
+            continue
+        if not old_text:
+            errors.append(f"块 {i}（{path}）：批量编辑必须提供精确 old_text（整体重写请用 apply_edit）。")
+            continue
+        if new_text is None:
+            errors.append(f"块 {i}（{path}）：缺少 new_text。")
+            continue
+        target, root_abs = _resolve_in_root(path)
+        if target is None:
+            errors.append(f"块 {i}（{path}）：拒绝写入，路径不在代码根目录内。")
+            continue
+        key = os.path.normcase(target)
+        if key in seen:
+            errors.append(f"块 {i}（{path}）：同一文件出现多次，请合并为一块。")
+            continue
+        seen.add(key)
+        if not _region_write_allowed(target):
+            errors.append(f"块 {i}（{path}）：属于已配置分区，请改用 dev_region_edit。")
+            continue
+        if not os.path.isfile(target):
+            errors.append(f"块 {i}（{path}）：文件不存在（新建请用 create_file）。")
+            continue
+        try:
+            with open(target, encoding="utf-8", errors="ignore") as fh:
+                old_content = fh.read()
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"块 {i}（{path}）：读取失败 {e}")
+            continue
+        cnt = old_content.count(old_text)
+        if cnt == 0:
+            errors.append(f"块 {i}（{path}）：未找到 old_text 匹配，内容可能已变化。")
+            continue
+        if cnt > 1:
+            errors.append(f"块 {i}（{path}）：old_text 匹配 {cnt} 处，存在歧义。")
+            continue
+        new_content = old_content.replace(old_text, new_text, 1)
+        if len(new_content.encode("utf-8", "ignore")) > _APPLY_MAX_BYTES:
+            errors.append(f"块 {i}（{path}）：新内容超过 {_APPLY_MAX_BYTES // 1024}KB 上限。")
+            continue
+        if os.path.splitext(target)[1].lower() == ".py":
+            import tempfile
+            import py_compile
+            tmp = None
+            try:
+                with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
+                                                 encoding="utf-8") as tf:
+                    tf.write(new_content)
+                    tmp = tf.name
+                py_compile.compile(tmp, doraise=True)
+            except py_compile.PyCompileError as e:
+                errors.append(f"块 {i}（{path}）：语法校验失败 {e.msg}")
+                continue
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"块 {i}（{path}）：语法校验异常 {e}")
+                continue
+            finally:
+                if tmp and os.path.exists(tmp):
+                    os.remove(tmp)
+        plans.append({"path": path, "target": target, "root_abs": root_abs,
+                      "old_text": old_text, "new_text": new_text,
+                      "old_content": old_content, "new_content": new_content})
+
+    if errors:
+        return "未写入任何文件（原子性保护），请修正后重试：\n- " + "\n- ".join(errors)
+    if not plans:
+        return "未解析到有效编辑块，未写入任何文件。"
+
+    # 「人工确认」模式：只暂存、不落盘（与 apply_edit 行为保持一致）
+    if _edit_confirm_on():
+        staged = []
+        for p in plans:
+            rel = os.path.relpath(p["target"], p["root_abs"])
+            summary = _diff_summary(p["old_content"], p["new_content"])
+            pid = stage_edit("apply_edit", p["target"], rel, p["old_content"],
+                             p["new_content"], summary)
+            staged.append(f"#{pid} {rel}")
+        return "已暂存待人工确认（未写入）：\n- " + "\n- ".join(staged)
+
+    written = []
+    try:
+        for p in plans:
+            with _file_lock(p["target"]):
+                with open(p["target"], encoding="utf-8", errors="ignore") as fh:
+                    current = fh.read()
+                if current != p["old_content"]:
+                    raise RuntimeError(f"{p['path']}：并行修改冲突，文件在预检后已变化。")
+                with open(p["target"], "w", encoding="utf-8") as fh:
+                    fh.write(p["new_content"])
+            written.append(p)
+    except Exception as e:  # noqa: BLE001
+        rolled = []
+        for p in reversed(written):
+            try:
+                with open(p["target"], "w", encoding="utf-8") as fh:
+                    fh.write(p["old_content"])
+                rolled.append(p["path"])
+            except Exception:  # noqa: BLE001
+                pass
+        msg = (f"写入失败：{e}\n已回滚 {len(rolled)}/{len(written)} 个已写文件"
+               + (f"（{'、'.join(rolled)}）" if rolled else "")
+               + f"\n其余 {len(plans) - len(written)} 个文件未写入，保持原样。")
+        return msg
+
+    out = [f"已原子写入 {len(written)} 个文件："]
+    for p in written:
+        rel = os.path.relpath(p["target"], p["root_abs"])
+        out.append(f"- {rel}（{len(p['new_content'].encode('utf-8', 'ignore'))} 字节）")
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------------------
 # 受控"新建文件"工具 create_file：让 Agent 能在 code_root 内新增模块/分区文件，
 # 但依然受沙箱、体积、语法护栏约束，且绝不覆盖已有文件（覆盖请用 apply_edit）。
@@ -3989,37 +4352,173 @@ def _cmd_is_blocked(cmd):
     return False, ""
 
 
+_TRUE_WORDS = {"1", "true", "yes", "on", "是", "后台", "background"}
+_RE_CMD_PREFIX = re.compile(r"^(?:cmd|command)\s*[:：]\s*(.*)$", re.I)
+_RE_TIMEOUT_LINE = re.compile(r"^\s*timeout\s*[:：]\s*(.+?)\s*$", re.I)
+_RE_BG_LINE = re.compile(r"^\s*background\s*[:：]\s*(.+?)\s*$", re.I)
+
+
+def _parse_command_spec(arg):
+    """Split an Action Input into (command, timeout, background).
+
+    Accepts a bare command string for backward compatibility, and also the
+    keyed form an agent naturally writes when it wants a longer budget::
+
+        cmd: npm run build
+        timeout: 180
+
+    Only continuation lines are read as options, so a command that merely
+    mentions ``timeout:`` on its first line still runs verbatim.
+    """
+    lines = str(arg or "").strip().splitlines()
+    kept = []
+    timeout = None
+    background = False
+    for index, line in enumerate(lines):
+        if index > 0:
+            matched_timeout = _RE_TIMEOUT_LINE.match(line)
+            if matched_timeout:
+                timeout = matched_timeout.group(1).strip()
+                continue
+            matched_bg = _RE_BG_LINE.match(line)
+            if matched_bg:
+                background = matched_bg.group(1).strip().strip("'\"").lower() in _TRUE_WORDS
+                continue
+        if index == 0:
+            prefix = _RE_CMD_PREFIX.match(line)
+            if prefix:
+                line = prefix.group(1).strip()
+        kept.append(line)
+    command = "\n".join(kept).strip().strip("'\"")
+    return command, timeout, background
+
+
+def _render_command_result(result):
+    """Render a bounded run report for the model, keeping the failure visible."""
+    parts = [f"[exit code {result.get('exit_code')}]"]
+    if result.get("elapsed") is not None:
+        parts[0] += f" · {result['elapsed']}s"
+    parts[0] += "\n"
+    output = (result.get("output") or "").strip()
+    if not output:
+        parts.append("（命令已执行，无输出）")
+    else:
+        parts.append(output)
+    if result.get("timed_out"):
+        parts.append(f"\n注意：命令超过 {result.get('timeout_hint', '规定')} 被终止。"
+                     "若它本来就更慢，请加一行 background: true 转后台任务，再用 dev_job_logs 取日志。")
+    if result.get("error"):
+        parts.append(f"\n错误：{result['error']}")
+    return "\n".join(parts)
+
+
 def run_command(cmd):
-    """在代码库根目录内执行 shell 命令（如 pytest / npm run build），返回合并输出（截断 1500 字，超时 12s）。
+    """在项目根目录内执行命令（如 pytest / npm run build），返回合并输出。
 
     用于跑构建、跑测试、执行项目内命令来验证改动或查看结果。命令在 code_root 内执行。
     护栏：结构化黑名单（破坏性命令 / 网络外联 / 脚本解释器）+ 可选白名单（RUN_COMMAND_ALLOW）。
-    说明：这是启发式防护，非 OS 级沙箱；真正的隔离需外部容器/沙箱。
+
+    输入形式：
+      · 整条命令（向后兼容），如 `pytest -q`
+      · 需要更长预算时换行追加 `timeout: <秒>`（上限 300s）
+      · 预计更久则追加 `background: true`，转后台任务后用 dev_job_logs 取增量日志
+
+    输出策略：合并 stdout/stderr，只保留开头与结尾窗口（中间省略会明确标注），
+    保证编译器与测试的错误尾部不会被截断掉。
     """
-    cmd = (cmd or "").strip().strip("'\"")
-    if not cmd:
+    from agent_runtime import process_runner
+    from agent_runtime.enterprise_sandbox import container_available
+
+    command, timeout_raw, background = _parse_command_spec(cmd)
+    if not command:
         return "未提供命令。"
     root = _get_code_root()
     if not root:
         return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
-    blocked, why = _cmd_is_blocked(cmd)
+    blocked, why = _cmd_is_blocked(command)
     if blocked:
         return f"拒绝执行：命令被安全策略拦截（命中「{why}」）。"
+    argv = _shell_argv(command)
+    root = os.path.normpath(root)
+
+    if background:
+        seconds = process_runner.clamp_timeout(timeout_raw, process_runner.MAX_BACKGROUND_TIMEOUT, 300)
+        started = process_runner.start_job(argv, cwd=root, timeout=seconds, command_text=command)
+        if not started.get("ok"):
+            return f"后台任务启动失败：{started.get('error') or '未知原因'}"
+        return json.dumps({
+            "ok": True,
+            "job_id": started["job_id"],
+            "state": started.get("state"),
+            "timeout": started.get("timeout"),
+            "command": started.get("command"),
+            "how_to_read": f"用 dev_job_logs 输入 job_id: {started['job_id']}（可带 offset 续读增量）；"
+                           f"用 dev_job_cancel 输入 job_id: {started['job_id']} 终止。",
+        }, ensure_ascii=False)
+
+    seconds = process_runner.clamp_timeout(timeout_raw, process_runner.MAX_TIMEOUT, 30)
+    if container_available() and not host_fallback_active():
+        try:
+            proc = run_agent_command(argv, project_root=root, timeout=seconds)
+        except subprocess.TimeoutExpired:
+            return (f"命令执行超时（>{seconds}s）。若它本来就更慢，请加一行 background: true "
+                    "转后台任务，再用 dev_job_logs 取日志。")
+        except EnterpriseSandboxUnavailable as exc:
+            return f"拒绝执行：{exc}"
+        except Exception as exc:  # noqa: BLE001
+            return f"执行失败: {exc}"
+        result = process_runner.run_bounded_report(proc, seconds)
+        return _render_command_result(result)
+
+    result = process_runner.run_bounded(argv, cwd=root, timeout=seconds, command_text=command)
+    result["timeout_hint"] = f"{seconds}s"
+    return _render_command_result(result)
+
+
+def dev_job_logs(arg=""):
+    """读取后台命令任务的状态与增量输出。
+
+    输入 job_id: <id>（可附加 offset: <字符偏移> 续读）；省略 job_id 则列出最近的后台任务。
+    用于跑长构建、测试套件或本地服务时持续观察，而不是让前台调用一直阻塞。
+    """
+    from agent_runtime import process_runner
+
+    fields = _parse_keyed(arg or "", ["job_id", "id", "offset"])
+    job_id = str(fields.get("job_id") or fields.get("id") or "").strip()
+    # 模型经常直接把 id 当整串输入（"dev_job_logs(abc123)"），此时首行就是 id。
+    if not job_id and str(arg or "").strip():
+        job_id = str(arg).strip().splitlines()[0].strip().strip("'\"")
+    raw_offset = str(fields.get("offset") or "0").strip()
     try:
-        proc = subprocess.run(
-            cmd, shell=True, cwd=os.path.normpath(root),
-            timeout=12, capture_output=True, text=True,
-        )
-    except subprocess.TimeoutExpired:
-        return "命令执行超时（>12s），可能被死循环或长构建阻塞；如需更长超时请分步执行。"
-    except Exception as e:  # noqa: BLE001
-        return f"执行失败: {e}"
-    out = (proc.stdout or "") + (proc.stderr or "")
-    head = f"[exit code {proc.returncode}]\n"
-    if not out.strip():
-        return head + "（命令已执行，无输出）"
-    combined = head + out
-    return combined[:1500] + ("…" if len(combined) > 1500 else "")
+        offset = int(float(raw_offset))
+    except (TypeError, ValueError):
+        offset = 0
+    if not job_id:
+        listing = process_runner.job_logs("")
+        jobs = listing.get("jobs") or []
+        if not jobs:
+            return "当前没有后台任务。需要跑长命令时用 run_command 加一行 background: true。"
+        return json.dumps({"ok": True, "jobs": jobs}, ensure_ascii=False)
+    report = process_runner.job_logs(job_id, offset=offset)
+    if not report.get("ok"):
+        return f"后台任务读取失败：{report.get('error')}"
+    return json.dumps(report, ensure_ascii=False)
+
+
+def dev_job_cancel(arg=""):
+    """终止一个后台命令任务（保留已采集的输出供查看）。输入 job_id: <id>。"""
+    from agent_runtime import process_runner
+
+    fields = _parse_keyed(arg or "", ["job_id", "id"])
+    job_id = str(fields.get("job_id") or fields.get("id") or "").strip()
+    if not job_id and str(arg or "").strip():
+        job_id = str(arg).strip().splitlines()[0].strip().strip("'\"")
+    if not job_id:
+        return "参数缺失：请提供 job_id: <后台任务 id>（可用 dev_job_logs 不带参数列出）。"
+    report = process_runner.job_cancel(job_id)
+    if not report.get("ok"):
+        return f"后台任务终止失败：{report.get('error')}"
+    return json.dumps({k: v for k, v in report.items() if k != "logs"}, ensure_ascii=False)
 
 
 def init_regions_tool(arg):
@@ -4180,15 +4679,17 @@ def _run_region_cmd(region_dir_abs, cmd):
     if blocked:
         return f"拒绝执行：校验命令被安全策略拦截（命中「{why}」）。"
     try:
-        proc = subprocess.run(cmd, shell=True, cwd=region_dir_abs, timeout=30,
-                              capture_output=True, text=True)
+        command = _shell_argv(cmd)
+        proc = run_agent_command(command, project_root=region_dir_abs, timeout=30)
     except subprocess.TimeoutExpired:
         return "校验命令执行超时（>30s）。"
+    except EnterpriseSandboxUnavailable as e:
+        return f"拒绝执行：{e}"
     except Exception as e:  # noqa: BLE001
         return f"执行失败: {e}"
     out = (proc.stdout or "") + (proc.stderr or "")
     head = f"[exit code {proc.returncode}]\n"
-    return head + (out[:1500] + ("…" if len(out) > 1500 else ""))
+    return head + _window_output(out)
 
 
 def dev_region_verify(arg):
@@ -4209,6 +4710,8 @@ def dev_region_verify(arg):
     region_abs = os.path.normpath(os.path.join(root, meta["dir"]))
     verify_cmd = (meta.get("verify") or "").strip()
     if verify_cmd:
+        if execution_mode() == "enterprise":
+            return _run_region_cmd(region_abs, verify_cmd)
         from regions import run_verify
         ok, output = run_verify(region_abs, verify_cmd)
         if ok is not None or output is not None:
@@ -4292,6 +4795,101 @@ def dev_refactor(arg):
         except Exception as e:  # noqa: BLE001
             return f"目标已创建，但删除源文件失败：{e}（请手动清理 {src_target}）"
     return f"已安全搬移 {sr}/{sp} → {dr}/{dp}（目标已创建，源文件从 {sr} 移除）。\n{create_res}"
+
+
+def _split_path_list(raw):
+    """把 `paths:` 的值切成路径列表（支持逗号、分号、换行分隔）。"""
+    text = (raw or "").replace("\r\n", "\n")
+    out = []
+    for chunk in re.split(r"[,;\n]", text):
+        p = chunk.strip().strip("'\"").strip()
+        if p:
+            out.append(p)
+    return out
+
+
+def dev_git_diff(arg):
+    """只读预览「我刚改了什么」——工作树/暂存区相对 HEAD 的差异，绝不写入或提交。
+
+    输入（多行 keyed，全部可选）：
+      paths: tools.py, agent.py        # 限定文件/目录，逗号或换行分隔；省略=整个代码根目录
+      staged: true                     # 看「已 git add 的改动」，默认 false=看工作树未暂存改动
+      stat: true                       # 只要文件级统计，不要差异正文
+      context: 3                       # 差异上下文行数，默认 3
+      timeout: 20                      # 秒，上限 60
+    也可以直接把路径当输入（如 `tools.py`）。
+
+    返回：变更清单（区分已暂存/未暂存/未跟踪）、统计、差异正文（过长会窗口化，
+    保留开头与结尾）。未跟踪的新文件不会出现在 diff 中，工具会单独列出提示。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    keys = ["paths", "staged", "stat", "context", "timeout"]
+    fields = _parse_keyed(arg, keys)
+    bare = [ln.strip() for ln in (arg or "").splitlines()
+            if ln.strip() and not re.match(r"^\s*(" + "|".join(keys) + r")\s*[:：]", ln)]
+    raw_paths = fields.get("paths") or ""
+    paths = _split_path_list(raw_paths) if raw_paths else bare
+
+    def _truthy(v):
+        return str(v or "").strip().lower() in ("1", "true", "yes", "y", "on", "是")
+
+    try:
+        ctx = int(str(fields.get("context") or "3").strip())
+    except (TypeError, ValueError):
+        ctx = 3
+    try:
+        timeout = int(str(fields.get("timeout") or "20").strip())
+    except (TypeError, ValueError):
+        timeout = 20
+
+    from agent_runtime import code_intel
+    res = code_intel.git_diff_preview(
+        root, paths=paths, staged=_truthy(fields.get("staged")),
+        stat_only=_truthy(fields.get("stat")), context=ctx, timeout=timeout,
+    )
+    return code_intel.render_git_diff(res)
+
+
+def dev_find_references(arg):
+    """重构前定位符号的全部引用点（重命名/删函数/改签名前必用）。
+
+    Python 走 ast 精确匹配——注释与字符串里的同名文本【不会被】误报；
+    其他语言走词边界正则，并跳过纯注释行。
+    输入（多行 keyed）：
+      symbol: foo                      # 必填，函数名/类名/变量名
+      scope: frontend/src              # 可选，限定目录或文件（相对代码根目录）
+      kind: def|ref|all                # 可选，默认 all（只看定义 / 只看引用）
+      limit: 50                        # 可选，返回条数上限，默认 80
+    也可以直接把符号名当输入（如 `foo`）。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    keys = ["symbol", "scope", "kind", "limit"]
+    fields = _parse_keyed(arg, keys)
+    symbol = (fields.get("symbol") or "").strip()
+    if not symbol:
+        bare = [ln.strip() for ln in (arg or "").splitlines()
+                if ln.strip() and not re.match(r"^\s*(" + "|".join(keys) + r")\s*[:：]", ln)]
+        symbol = bare[0] if bare else ""
+    if not symbol:
+        return "参数缺失：请提供 symbol: <符号名>。"
+    symbol = _clean_symbol(symbol)  # 弱模型常写「foo 的调用点」，只取首個标识符
+    scope_raw = (fields.get("scope") or "").strip()
+    scope = _split_path_list(scope_raw) if scope_raw else None
+    try:
+        limit = int(str(fields.get("limit") or "80").strip())
+    except (TypeError, ValueError):
+        limit = 80
+
+    from agent_runtime import code_intel
+    res = code_intel.find_references(
+        root, symbol, scope=scope,
+        kind=(fields.get("kind") or "all").strip().lower(), limit=limit,
+    )
+    return code_intel.render_references(res)
 
 
 def dev_commit(arg):
@@ -5129,8 +5727,13 @@ def preview_project(arg=""):
         return ToolResult(False, f"真实预览失败：{type(exc).__name__}：{str(exc)[:300]}",
                           error_kind="visual_capture")
     screenshot = report.get("screenshot") or ""
-    text = json.dumps({key: value for key, value in report.items() if key != "image"},
-                      ensure_ascii=False)
+    console_errors = list(report.get("console_errors") or [])
+    failed_requests = list(report.get("failed_requests") or [])
+    runtime_errors = list(report.get("runtime_errors") or [])
+    signals = (f"运行时异常 {len(runtime_errors)} 条 / console 错误 {len(console_errors)} 条 / "
+               f"失败请求 {len(failed_requests)} 个")
+    text = signals + "\n" + json.dumps({key: value for key, value in report.items() if key != "image"},
+                                       ensure_ascii=False)
     # A failed or domain-specific adapter may return a bounded report without
     # an image. Keep the tool failure observable instead of raising a secondary
     # KeyError while constructing the result, and never claim that a screenshot
@@ -5342,9 +5945,11 @@ def _sv_verify_backend(py_files, root, result):
         if not os.path.isfile(test_path):
             continue
         try:
-            r = subprocess.run(
-                [sys.executable, "-B", "-m", "unittest", "tests.test_" + base, "-v"],
-                capture_output=True, text=True, timeout=120, cwd=root or os.getcwd(),
+            interpreter = (sys.executable if stage_execution_active() else "python") \
+                if execution_mode() == "enterprise" else sys.executable
+            r = _self_verify_command(
+                [interpreter, "-B", "-m", "unittest", "tests.test_" + base, "-v"],
+                project_root=root or os.getcwd(), timeout=120,
             )
             if r.returncode != 0:
                 tail = (r.stdout or "")[-1200:] + (r.stderr or "")[-1200:]
@@ -5359,8 +5964,9 @@ def _sv_verify_backend(py_files, root, result):
                 "scope": "backend", "file": f,
                 "error": "单测 tests.test_%s 超时（>120s）未结束。" % base,
             })
-        except Exception as e:  # noqa: BLE001 —— 测试运行器自身故障：降级为跳过该模块
-            result["ran"].append("unittest:skip:tests.test_%s（%s）" % (base, type(e).__name__))
+        except Exception as e:  # noqa: BLE001
+            result["failures"].append({"scope": "backend", "file": f,
+                                       "error": "单测无法运行：" + str(e)[:200]})
 
 
 def _sv_verify_frontend(fe_files, root, result):
@@ -5387,12 +5993,13 @@ def _sv_verify_frontend(fe_files, root, result):
         result["ran"].append("frontend:skip（无 typecheck 脚本）")
         return
     npm = os.getenv("DOCMIND_NPM_BIN") or shutil.which("npm")
-    if not npm:
+    if not npm and execution_mode() != "enterprise":
         result["ran"].append("frontend:skip（未找到 npm）")
         return
     try:
-        r = subprocess.run([npm, "run", "typecheck"], capture_output=True, text=True,
-                           timeout=180, cwd=fe_dir)
+        executable = "npm" if execution_mode() == "enterprise" else npm
+        r = _self_verify_command([executable, "run", "typecheck"],
+                                 project_root=fe_dir, timeout=180)
         if r.returncode != 0:
             tail = (r.stdout or "")[-1200:] + (r.stderr or "")[-1200:]
             result["failures"].append({
@@ -5405,7 +6012,8 @@ def _sv_verify_frontend(fe_files, root, result):
         result["failures"].append({"scope": "frontend", "file": fe_dir,
                                    "error": "typecheck 超时（>180s）。"})
     except Exception as e:  # noqa: BLE001
-        result["ran"].append("frontend:skip（%s）" % type(e).__name__)
+        result["failures"].append({"scope": "frontend", "file": fe_dir,
+                                   "error": "typecheck 无法运行：" + str(e)[:200]})
 
 
 def _sv_verify_script(script_name, kind, root, result):
@@ -5418,8 +6026,9 @@ def _sv_verify_script(script_name, kind, root, result):
         result["ran"].append(kind + ":skip（无 " + script_name + "）")
         return
     try:
-        r = subprocess.run([sys.executable, script], capture_output=True, text=True,
-                          timeout=180, cwd=root)
+        interpreter = (sys.executable if stage_execution_active() else "python") \
+            if execution_mode() == "enterprise" else sys.executable
+        r = _self_verify_command([interpreter, script_name], project_root=root, timeout=180)
         if r.returncode != 0:
             tail = (r.stdout or "")[-1000:] + (r.stderr or "")[-1000:]
             result["failures"].append({
@@ -5628,6 +6237,7 @@ def recall_experience(arg=""):
 
 TOOLS = {
     "web_weather": {"description": "查询今日结构化天气。先确认用户城市，禁止用搜索结果或 IP 猜位置。输入城市名或 JSON {\"city\":\"城市名\",\"country_code\":\"CN\"}；同名地点会要求澄清，返回有效日期、地点、天气字段、单位及来源 URL。失败可改用带城市和当前日期的权威来源，不得编造实时数据。", "func": web_weather},
+    "web_transport": {"description": "查询指定日期的高铁/飞机交通候选。输入 JSON 或多行 origin/destination/departure_date/mode；缺出发地、目的地或日期会返回 needs 并要求补充。必须使用未来的具体日期，返回 verified_fare=false；搜索摘要不是实时余票或支付价，禁止据此估算或编造价格。", "func": web_transport},
     "web_research": {"description": "联网研究：先搜索，再读取多个公开网页正文（默认最多 5 个，可配置），返回来源和证据。适合教程、GitHub、引擎文档和需要最新资料的问题。推荐采用多轮策略：第一轮发现候选；看到候选后用 web_search_batch 并行查评价、口碑、教程或做法；若评价一般或证据不足，排除已见 URL/标题后提交下一批候选，最后再对关键来源调用 web_fetch。输入研究主题。", "func": web_research},
     "web_fetch": {"description": "读取公开网页正文并返回来源、标题和清理后的文本。输入完整 http/https URL。联网研究时先 web_search，再对关键来源调用。", "func": web_fetch},
     "web_subtitles": {"description": "读取公开 B 站视频字幕。输入包含 BV 号或 av 号的完整视频 URL；没有公开字幕、需要登录或被风控时返回明确原因。", "func": web_subtitles},
@@ -5675,12 +6285,26 @@ TOOLS = {
         "func": dev_http_request,
     },
     "python_exec": {
-        "description": "在受限子进程中执行 Python 代码并返回输出（超时 12s）。适合数值计算、数据处理、文本变换、小规模绘图数据生成等'让 agent 真正动手'的任务。输入为完整 Python 代码。",
+        "description": "在受限子进程中执行 Python 代码并返回输出（超时 60s）。适合数值计算、数据处理、文本变换、小规模绘图数据生成等'让 agent 真正动手'的任务。输入为完整 Python 代码（不要加代码围栏）。输出保留开头与结尾，异常堆栈不会被截断；需要跑更久的脚本请改用 run_command 并加 background: true。",
         "func": python_exec,
     },
     "create_artifact": {
-        "description": "创建并校验 Word、PDF、PowerPoint 或 Excel 文件，源码和桌面分发版都可用。输入必须是 JSON 对象：format 为 docx/pdf/pptx/xlsx，filename 为文件名，title/subtitle 为标题；docx/pdf 使用 sections（每项可含 heading/level/paragraphs/bullets/table）；pptx 使用 slides（title/bullets）；xlsx 使用 sheets（name/headers/rows）。文件写入当前项目 artifacts 目录，返回实际路径和校验结果。调用前先用 dev_use_skill 读取对应技能。",
+        "description": "创建并校验 Word、PDF、PowerPoint 或 Excel 文件。输入 JSON：format 为 docx/pdf/pptx/xlsx，filename、title/subtitle；docx/pdf 使用 sections（heading/level/paragraphs/bullets/table）；pptx 使用 slides；xlsx 使用 sheets。介绍当前项目时必须设置 purpose=project_intro，提供至少两个已读取的当前项目相对路径 source_files，正文至少四章、700 字；工具核验项目文件并自动附来源，缺失或跨项目会拒绝。文件写入当前项目 artifacts 目录，返回路径和校验结果。调用前先用 dev_use_skill 读取对应技能。",
         "func": create_artifact,
+    },
+    "inspect_data_file": {
+        "description": "识别并解析当前项目内的数据文件。输入路径或 JSON {\"path\":\"data/items.csv\"}。支持文本、无扩展名配置、脏 CSV/JSON、Office/PDF；.bin/.scn 等二进制返回格式、大小、SHA-256、文件头、十六进制和可见字符串预览。无法安全解析时明确报告原因，不把乱码当正常文本。",
+        "func": inspect_data_file,
+        "capability": "read_local",
+        "group": "code",
+    },
+    "generate_data_file": {
+        "description": "在当前项目内生成并回读校验结构化文件。输入 JSON，含 path/format/data 等字段；支持 csv/tsv/json/jsonl/yaml/toml/xml/txt/md，.gitignore 用 format=txt，.bin 用 format=binary 与唯一的 base64 或 hex 字节内容。仅当提供真实 Godot 资源字节且文件头有效时允许 .scn；场景开发优先生成 .tscn 源文件并交给引擎。默认不覆盖，原子写入并回读校验。",
+        "func": generate_data_file,
+        "capability": "write_local",
+        "side_effect": "mutating",
+        "parallel_safe": False,
+        "group": "developer",
     },
     "gen_video_prompt": {
         "description": "按 MiniMax H3 的三段结构（integrated_multimodal_description / overall_soundscape / non_diegetic_music）把一段创意描述生成为结构化视频提示词，可直接粘贴进 ComfyUI 的 MiniMaxH3ImageToVideo 节点。输入为自然语言创意（主体/场景/动作/氛围）。",
@@ -5691,7 +6315,7 @@ TOOLS = {
         "func": search_code,
     },
     "read_file": {
-        "description": "读取代码库中的某个文件内容（path 为相对代码根目录的路径或文件名）。需要看完整文件、或某文件细节时用。返回文件内容（截断到 4000 字）。",
+        "description": "读取代码库中的某个文件内容（path 为相对代码根目录的路径或文件名）。需要看完整文件、或某文件细节时用。默认返回前 12000 字，也可用 start/end 读取指定行。",
         "func": read_file,
     },
     "read_external_file": {
@@ -5718,6 +6342,10 @@ TOOLS = {
         "description": "受控修改代码库中【已存在】的文件（不能新建、不能越界写）。两种用法：① 局部安全替换——提供 path、old_text（要被替换的【精确】旧片段）、new_text（替换后内容），工具在文件中唯一匹配处替换；② 整体重写——只提供 path 与 new_text（省略 old_text），但前提是你已用 read_file 读取过该文件。修改前请先 read_file 确认当前内容；.py 写入后会做语法校验，不通过自动回滚。Action Input 按多行格式写：第一行 path: <路径>，可选 old_text: <精确旧片段>，最后 new_text: <新内容（可多行）>。",
         "func": apply_edit,
     },
+    "dev_apply_edits": {
+        "description": "一次提交【多个文件】的局部替换（原子：要么全改，要么一个都不改）。改一个 API 要动多处调用点时用它，避免逐个 apply_edit 改到一半失败留下半成品。Action Input：多个编辑块，块之间用单独一行 `---` 分隔；每块格式与 apply_edit 相同（path: <文件> / old_text: <精确旧片段> / new_text: <新片段>），批量编辑强制要求 old_text。任一文件的 old_text 匹配不到/不唯一/越界/落在分区里/.py 语法错，都会【整体不写入】并返回逐块原因；全部预检通过后才统一落盘，落盘中出错会回滚已写文件。",
+        "func": dev_apply_edits,
+    },
     "create_file": {
         "description": "在代码库内【新建】一个文件（不能覆盖已有文件，修改已有文件请用 apply_edit）。用于新增模块/分区（如新建 combat/crit.py）。受路径沙箱、单文件 200KB 上限、.py 语法校验约束；父目录不存在会自动创建（仍在 code_root 内）。新建前建议先用 search_code/grep 确认不会与已有实现重复（防堆叠）。Action Input 格式：第一行 path: <相对或绝对路径>，最后 new_text: <文件内容（可多行）>。",
         "func": create_file,
@@ -5734,8 +6362,25 @@ TOOLS = {
     "memory_search": {"description": "检索当前项目的历史结果、失败教训、用户偏好和流程。输入关键词，空串列出最近记忆；历史内容仅供参考，model_report 不是已验证事实。", "func": memory_search, "parallel_safe": False, "group": "general"},
     "memory_forget": {"description": "删除当前项目的一条长期记忆，输入 id 或 id: <值>。用户纠正偏好或要求忘记时使用；删除记忆不会删除原始会话和任务日志。", "func": memory_forget, "capability": "write_local", "side_effect": "idempotent_write", "parallel_safe": False, "group": "general"},
     "run_command": {
-        "description": "在代码库根目录内执行 shell 命令（如 pytest / npm run build / gradle test），返回合并后的标准输出与错误（截断 1500 字，超时 12s）。用于跑构建、跑测试、执行项目内命令来验证改动或查看结果。命令在 code_root 内执行，危险操作（rm -rf /、format、shutdown 等）会被拦截。输入为完整命令字符串。",
+        "description": (
+            "在代码库根目录内执行 shell 命令（如 pytest / npm run build / gradle test），返回合并后的"
+            "标准输出与错误。用于跑构建、跑测试、执行项目内命令来验证改动或查看结果。命令在 code_root 内执行，"
+            "危险操作（rm -rf /、format、shutdown、pip install 等）会被拦截。\n"
+            "输入：默认整条命令（如 `pytest -q`）。需要更长预算时换行追加 `timeout: <秒>`（上限 300 秒）；"
+            "预计超过 300 秒或需要持续观察（本地服务、长构建）时追加 `background: true`，任务转后台后"
+            "用 dev_job_logs 取增量日志、dev_job_cancel 终止。\n"
+            "输出：只保留开头与结尾窗口，中间省略会明确标注行数，因此报错尾部不会被截掉；"
+            "超时会明确报告并提示转后台，不要靠猜。"
+        ),
         "func": run_command,
+    },
+    "dev_job_logs": {
+        "description": "读取后台命令任务的运行状态与增量输出。输入 `job_id: <id>` 查看该任务（可附加 `offset: <字符偏移>` 只取新增部分）；省略 job_id 则列出最近后台任务。用于跑长构建、测试套件或本地服务时持续观察，避免前台命令一直阻塞。任务结束或失败都会保留已采集的输出供排查。",
+        "func": dev_job_logs,
+    },
+    "dev_job_cancel": {
+        "description": "终止一个后台命令任务（保留已采集输出）。输入 `job_id: <id>`；id 可用 dev_job_logs 不带参数列出。用于停掉跑飞的长构建、卡死的服务或启动参数写错的本地服务。",
+        "func": dev_job_cancel,
     },
     "dev_asset_get": {
         "description": "通过素材区接口取得素材引用。输入 asset_id 或 path，可选 consumer_region；只允许读取 assets 分区内的文件，不复制或内联素材。",
@@ -5766,7 +6411,17 @@ TOOLS = {
     "game_screenshot": {"description": "截取当前引擎运行画面作为视觉观察：可选输入 target: embedded|foreground（默认 embedded，嵌入窗口不可用时自动改抓前台窗口）。优先使用已启用引擎连接器的截图能力，其次抓取工作台内嵌窗口；JPEG 保存到项目 .docmind/screenshots/ 并回传图片。截图只是某一瞬间的观察，不是代码事实；无窗口/无头环境会明确失败，那时改用运行日志或受控 playtest 证据，不要臆测画面。", "func": game_screenshot},
     "dev_desktop_capture": {"description": "桌面自动化视觉技能的安全观察入口：截取当前项目嵌入窗口或前台窗口，输入 target: embedded|foreground。只返回真实画面和 native 预览 artifact，不直接点击、输入或修改软件状态；状态修改必须调用已批准的应用 MCP、插件或其他明确工具。", "func": dev_desktop_capture},
     "dev_desktop_action": {"description": "执行一个经过项目审批的桌面动作：action=click|type|drag|key|save，target=embedded|foreground。click/drag 使用窗口客户区 x/y（drag 另给 to_x/to_y），type 使用 text，key 使用安全键名或 Control_L+s。首次调用会返回 desktop_action 审批请求；用户确认后必须用完全相同参数重试。禁止终端、Win 键、任意 HWND 和窗口枚举。", "func": dev_desktop_action},
-    "preview_project": {"description": "正式开发舱真实视觉验收：在当前项目内启动安全的本地网页预览，用真实 Edge/Chromium 截取当前画面并把截图送给视觉模型，同时登记工作流预览证据。输入可选 entry/index.html、width、height、timeout。修改网页后必须再次调用，截图失败或项目不是网页时如实报告并改用领域专用工具。", "func": preview_project},
+    "preview_project": {
+        "description": (
+            "正式开发舱真实视觉验收：在当前项目内启动安全的本地网页预览，用真实 Edge/Chromium 截取当前画面并把截图"
+            "送给视觉模型，同时登记工作流预览证据。输入可选 entry/index.html、width、height、timeout。\n"
+            "除截图外还会返回运行时异常、console 错误（含报错文本）与失败请求（4xx/5xx/网络失败，含 URL），"
+            "这些信号与截图同权：只要存在 console 错误或失败请求，验收判定为未通过。"
+            "看到报错就按报错修，不要因为截图「看起来正常」就判定通过。"
+            "修改网页后必须再次调用；截图失败或项目不是网页时如实报告并改用领域专用工具。"
+        ),
+        "func": preview_project,
+    },
     "start_workflow": {"description": (
         "当目标是【长链路开发流程】时升级为跨窗口持久开发工作流：满足多阶段/多角色协作、"
         "含写码或命令等副作用阶段、需要人工方案门与审批门、或可能跨窗口中断恢复之一即应使用"
@@ -5802,6 +6457,14 @@ TOOLS = {
     "dev_refactor": {
         "description": "跨分区安全搬移：把某分区内的文件移动到另一分区（受依赖方向约束，不破坏 git 跟踪）。输入：src_region: <源key>、src_path: <源相对路径>、dst_region: <目标key>、dst_path: <目标相对路径>。目标不能已存在（不覆盖）；搬移后从源分区 git 移除源文件。禁止把代码挪进「已依赖源分区」的分区（避免循环耦合/倒置分层）。",
         "func": dev_refactor,
+    },
+    "dev_git_diff": {
+        "description": "【只读】预览你刚改了什么：工作树或暂存区相对 HEAD 的差异，绝不写入/暂存/提交。改完代码、提交前、以及想确认「自己到底动了哪些文件」时用它。输入可留空（=整个代码根目录），也可限定：paths: <文件或目录，逗号/换行分隔>、staged: true（看已 git add 的，默认看未暂存）、stat: true（只要文件级统计，不要正文）、context: <上下文行数，默认 3>、timeout: <秒，上限 60>；直接把路径当输入也可以。返回变更清单（区分已暂存/未暂存/未跟踪）+ 统计 + 差异正文；正文过长会窗口化并标注，此时加 paths: 限定到单文件再看。注意：未跟踪的新文件不会出现在 diff 正文里，工具会单独列出提示。",
+        "func": dev_git_diff,
+    },
+    "dev_find_references": {
+        "description": "重构前定位符号的全部引用点（重命名/删函数/改签名/搬文件前必用）。Python 走 ast 精确匹配——注释与字符串里的同名文本【不会】被误报；其它语言走词边界正则并跳过纯注释行。输入：symbol: <符号名>（必填），可选 scope: <限定目录或文件>、kind: def|ref|all（默认 all）、limit: <条数上限，默认 80>；直接把符号名当输入也可以。返回定义处与引用处（file:行号 + 代码行，按文件聚合计数）。命中过多时请用 scope 缩小范围。",
+        "func": dev_find_references,
     },
     "dev_commit": {
         "description": "提交单个分区的改动（该分区独立 git 仓库内 commit）。输入：region: <分区key> 换行 message: <提交说明>。",

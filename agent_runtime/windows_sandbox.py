@@ -129,4 +129,51 @@ def run_isolated(command: list[str], *, cwd: str, env: Mapping[str, str], timeou
         kernel32.CloseHandle(job)
 
 
-__all__ = ["SandboxUnavailable", "run_isolated"]
+def spawn_isolated(command: list[str], *, cwd: str, env: Mapping[str, str],
+                   memory_bytes: int = 1024 * 1024 * 1024):
+    """Start a command under a bounded Job Object for background supervision.
+
+    Returns ``(popen, kernel32, job_handle)`` so the caller can terminate the
+    whole process tree later. Non-Windows callers get a session-led subprocess
+    with ``(popen, None, None)`` so the same supervision code stays testable.
+    """
+    if os.name != "nt":
+        popen = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=False, env=dict(env), start_new_session=True)
+        return popen, None, None
+    kernel32, job = _create_job(memory_bytes)
+    popen = None
+    try:
+        popen = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=False, env=dict(env),
+                                 creationflags=CREATE_NO_WINDOW)
+        process_handle = ctypes.c_void_p(int(getattr(popen, "_handle", 0)))
+        if not process_handle.value or not kernel32.AssignProcessToJobObject(job, process_handle):
+            raise _win32_error("无法将进程加入 Job Object")
+        return popen, kernel32, job
+    except BaseException:
+        if popen is not None and popen.poll() is None:
+            try:
+                popen.kill()
+            except Exception:
+                pass
+        kernel32.CloseHandle(job)
+        raise
+
+
+def terminate_isolated(kernel32, job_handle, *, exit_code: int = 124) -> None:
+    """Kill every process still attached to a Job Object."""
+    if kernel32 is None or job_handle is None:
+        return
+    try:
+        kernel32.TerminateJobObject(job_handle, int(exit_code))
+    finally:
+        try:
+            kernel32.CloseHandle(job_handle)
+        except Exception:
+            pass
+
+
+__all__ = ["SandboxUnavailable", "run_isolated", "spawn_isolated", "terminate_isolated"]

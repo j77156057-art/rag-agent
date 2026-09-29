@@ -150,7 +150,7 @@ def capture_window(hwnd, *, frame_grabber=None):
                 user32.ReleaseDC(hwnd, hwnd_dc)
 
 
-def _embedded_target(project_id=None):
+def _embedded_target(project_id=None, *, strict_project=False):
     """从嵌入登记表选当前项目的子窗口 HWND；不接受外部传入任意 HWND。
 
     多候选时选 placed 面积最大者（引擎主视口通常大于 splash/工具窗）；
@@ -164,9 +164,18 @@ def _embedded_target(project_id=None):
                 if c.get("alive") and (c.get("placed") or {}).get("width")]
     if not children:
         return None
-    host = desktop_bridge.host_hwnd(project_id) if project_id else None
+    if strict_project:
+        # Desktop bridge keeps a legacy default-host fallback. An approved
+        # project action must never silently inherit another project's host.
+        host = desktop_bridge.hosts_snapshot().get(project_id) if project_id else None
+        if not host:
+            return None
+    else:
+        host = desktop_bridge.host_hwnd(project_id) if project_id else None
     if host is not None:
         matched = [c for c in children if c.get("host") == host]
+        if strict_project and not matched:
+            return None
         if matched:
             children = matched
 
@@ -177,9 +186,9 @@ def _embedded_target(project_id=None):
     return int(max(children, key=_area)["hwnd"])
 
 
-def grab_embedded(project_id=None, *, frame_grabber=None):
+def grab_embedded(project_id=None, *, frame_grabber=None, strict_project=False):
     """抓取当前项目嵌入的引擎窗口，返回 (bgra, w, h, hwnd) 或 None。"""
-    hwnd = _embedded_target(project_id)
+    hwnd = _embedded_target(project_id, strict_project=strict_project)
     if not hwnd:
         return None
     frame = capture_window(hwnd, frame_grabber=frame_grabber)
@@ -253,5 +262,20 @@ def encode_and_save(raw, width, height, out_dir):
         import base64
         data_url = "data:image/jpeg;base64," + base64.b64encode(payload).decode("ascii")
         return data_url, path, img.size
+    except Exception:
+        return None
+
+
+def encode_frame(raw, width, height):
+    """把持续观察帧编码到内存，不在项目里反复生成截图文件。"""
+    try:
+        import base64
+        from PIL import Image
+        img = Image.frombytes("RGB", (int(width), int(height)), bytes(raw), "raw", "BGRX")
+        if max(img.size) > CAPTURE_MAX_EDGE:
+            img.thumbnail((CAPTURE_MAX_EDGE, CAPTURE_MAX_EDGE), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
     except Exception:
         return None

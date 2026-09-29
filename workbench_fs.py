@@ -30,6 +30,7 @@ from config import get_runtime, CODE_ROOT
 from ingest import _CODE_EXT, _SKIP_DIRS, _MAX_CODE_FILE
 import symbols as symlib
 from regions import load_region_config, _git, _git_missing_hint
+from data_formats import DataFormatError, read_file as inspect_project_file
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -61,6 +62,11 @@ WB_LANG = {
     ".kt": "kotlin", ".swift": "swift", ".scala": "scala",
 }
 WB_EDIT_EXTS = set(WB_LANG) | set(_CODE_EXT)
+WB_TEXT_NAMES = {".gitignore", ".gitattributes", ".editorconfig", ".npmrc", ".prettierrc"}
+
+
+def _editable_text_name(target: str) -> bool:
+    return os.path.splitext(target)[1].lower() in WB_EDIT_EXTS or os.path.basename(target).lower() in WB_TEXT_NAMES
 
 
 class FsError(Exception):
@@ -263,7 +269,7 @@ def build_tree(root, depth: int = 4) -> dict:
             "region": rmeta["key"] if rmeta else None,
             "region_name": rmeta["name"] if rmeta else None,
             "lang": None if is_dir else _lang_of(name),
-            "writable": is_dir or os.path.splitext(name)[1].lower() in WB_EDIT_EXTS,
+            "writable": is_dir or _editable_text_name(name),
             "children": [],
         }
         if not is_dir:
@@ -322,19 +328,63 @@ def read_full(root, rel) -> dict:
     if os.path.isdir(target):
         raise FsError(400, f"{rel_n} 是目录，不是文件。")
     size = os.path.getsize(target)
+    editable = _editable_text_name(target)
     if size > WB_MAX_FILE_BYTES:
-        raise FsError(413, f"文件过大（{size // 1024}KB），工作台编辑上限 {WB_MAX_FILE_BYTES // 1024}KB。")
-    ext = os.path.splitext(target)[1].lower()
-    if ext not in WB_EDIT_EXTS:
-        raise FsError(415, f"暂不支持在工作台编辑 {ext or '无扩展名'} 文件。")
+        editable = False
     with open(target, "rb") as fh:
-        raw = fh.read()
-    if b"\x00" in raw[:8192]:
-        raise FsError(415, "二进制文件不可在工作台编辑。")
-    try:
-        content = raw.decode("utf-8-sig")  # 容忍带 BOM 的 UTF-8（Windows 编辑器常见）
-    except UnicodeDecodeError:
-        raise FsError(415, "文件不是 UTF-8 编码，请在外部编辑器转码后再打开。")
+        raw = fh.read() if editable else fh.read(min(size, 64 * 1024))
+    preview_kind = None
+    preview_note = None
+    if editable and b"\x00" not in raw[:8192]:
+        try:
+            content = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            editable = False
+    else:
+        editable = False
+    if not editable:
+        text_preview = None
+        if (os.path.splitext(target)[1].lower() not in {".bin", ".scn"}
+                and b"\x00" not in raw[:8192]):
+            try:
+                candidate = raw.decode("utf-8-sig")
+                if sum(ord(char) < 32 and char not in "\r\n\t" for char in candidate[:8192]) <= 1:
+                    text_preview = candidate
+            except UnicodeDecodeError:
+                pass
+        if text_preview is not None:
+            content = text_preview
+            preview_kind = "text"
+            preview_note = ("文件较大，仅显示前 64KB；此预览不可保存。" if size > WB_MAX_FILE_BYTES
+                            else "此文件类型仅供查看；保存请使用对应格式工具。")
+        elif size <= 32 * 1024 * 1024:
+            try:
+                inspected = inspect_project_file(target)
+            except (DataFormatError, OSError, ValueError) as exc:
+                inspected = {"format": "binary", "warning": str(exc), "hex_preview": raw[:256].hex(" ")}
+            if (inspected.get("binary") is False and inspected.get("encoding") not in (None, "binary")
+                    and b"\x00" not in raw[:8192]):
+                preview_kind = "text"
+                preview_note = ("文件较大，仅显示前 64KB；此预览不可保存。" if size > WB_MAX_FILE_BYTES
+                                else "此文件类型仅供查看；保存请使用对应格式工具。")
+                content = raw.decode(str(inspected["encoding"]), errors="replace")
+            else:
+                preview_kind = "binary"
+                preview_note = str(inspected.get("warning") or "二进制文件只读预览；不会修改原文件。")
+                content = "\n".join([
+                    f"文件：{rel_n}", f"类型：{inspected.get('format', 'binary')}",
+                    f"大小：{size} 字节", f"SHA-256：{inspected.get('sha256', '未计算')}",
+                    f"文件头：{inspected.get('header_hex', raw[:16].hex())}",
+                    f"说明：{preview_note}", "", "前 256 字节（十六进制 / ASCII）：",
+                    str(inspected.get("hex_preview") or raw[:256].hex(" ")),
+                    "", "可见字符串（前 64KB 中提取）：",
+                    *[str(item) for item in inspected.get("strings_preview", [])],
+                ])
+        else:
+            preview_kind = "binary"
+            preview_note = "文件超过 32MB，仅显示文件头；不会载入或修改完整文件。"
+            content = (f"文件：{rel_n}\n大小：{size} 字节\n说明：{preview_note}\n"
+                       f"文件头（前 256 字节）：\n{raw[:256].hex(' ')}")
     root_abs = os.path.abspath(str(root))
     rdirs = _region_dirs(root_abs)
     rmeta = _region_of(rel_n, rdirs)
@@ -349,12 +399,14 @@ def read_full(root, rel) -> dict:
         "ok": True,
         "path": rel_n,
         "content": content,
-        "lang": _lang_of(rel_n),
+        "lang": _lang_of(rel_n) if editable else "text",
         "size": size,
         "mtime": os.path.getmtime(target),
         "region": rmeta["key"] if rmeta else None,
         "region_name": rmeta["name"] if rmeta else None,
-        "writable": True,
+        "writable": editable,
+        "preview_kind": preview_kind,
+        "preview_note": preview_note,
         "tracked": tracked,
         "dirty": dirty,
     }
@@ -394,7 +446,7 @@ def save_file(root, rel, content, if_mtime=None, reindex: bool = False) -> dict:
     if os.path.isdir(target):
         raise FsError(409, f"{rel_n} 已存在且是目录。")
     ext = os.path.splitext(target)[1].lower()
-    if ext not in WB_EDIT_EXTS:
+    if not _editable_text_name(target):
         raise FsError(403, f"不允许写入 {ext or '无扩展名'} 文件（不在可编辑白名单内）。")
     data = content.encode("utf-8")
     if len(data) > WB_MAX_FILE_BYTES:
@@ -467,7 +519,7 @@ def create_path(root, rel, kind: str, content: str = "") -> dict:
         os.makedirs(target, exist_ok=False)
         return {"ok": True, "path": rel_n, "node": {"path": rel_n, "name": os.path.basename(target), "type": "dir", "children": []}}
     ext = os.path.splitext(target)[1].lower()
-    if ext not in WB_EDIT_EXTS:
+    if not _editable_text_name(target):
         raise FsError(403, f"不允许创建 {ext or '无扩展名'} 文件（不在可编辑白名单内）。")
     if content and not isinstance(content, str):
         raise FsError(400, "content 必须是字符串。")
@@ -765,8 +817,7 @@ def git_show_at(root, rel, ref) -> dict:
     ref = str(ref or "").strip().lower()
     if not _GIT_REF_RE.match(ref):
         raise FsError(400, "ref 只能是 git 提交哈希（4-40 位十六进制）。")
-    ext = os.path.splitext(target)[1].lower()
-    if ext not in WB_EDIT_EXTS:
+    if not _editable_text_name(target):
         raise FsError(403, "历史版本仅支持可编辑的文本文件。")
     out = _git_show_blob(repo, f"{ref}:{in_repo}")
     if len(out.encode("utf-8")) > WB_MAX_FILE_BYTES:

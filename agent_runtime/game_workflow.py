@@ -34,6 +34,9 @@ from .preview_adapters import build_preview_bundle
 from .project_profile import load_profile, merge_profile
 from .workflow_reflection import build_self_review
 from .project_checkpoint import create_checkpoint, restore_checkpoint
+from .independent_review import review_project
+from .project_stage import ProjectStageError, apply_stage, cleanup_stage, create_stage
+from .enterprise_sandbox import stage_execution_scope
 from .tools import Capability
 from .context_router import (CONTEXT_LAYERS, ContextPlan, ContextRouter,
                              allocate_layer_budgets, compress_context,
@@ -146,16 +149,15 @@ class TaskFanoutState(TypedDict, total=False):
     task_results: Annotated[dict[str, Any], _merge_result_maps]
 
 
-# 工作流级步数预算（多个子代理在波次内并行，工具调用总量随任务数放大）：
-# 未显式调高时按任务规模自动推算，但始终夹在 [下限, 硬顶]。
-# 内置默认 [24, 200]，可由部署侧环境变量覆盖：
-#   DOCMIND_WORKFLOW_STEPS_MIN  自动预算下限（也是「未显式指定」的基准值）
-#   DOCMIND_WORKFLOW_STEPS_MAX  硬顶（显式值与自动值都不得超过）
-WORKFLOW_STEPS_MIN = 24
-WORKFLOW_STEPS_MAX = 200
+# 工作流级步数预算。0 表示不设置固定工具步数上限；取消、失败、重复调用、
+# 审批、费用和 deadline 仍然是独立的停止条件。部署侧可用正数恢复预算护栏：
+#   DOCMIND_WORKFLOW_STEPS_MIN  自动预算下限
+#   DOCMIND_WORKFLOW_STEPS_MAX  硬顶
+WORKFLOW_STEPS_MIN = 0
+WORKFLOW_STEPS_MAX = 0
 # 单子代理默认步数——与 agent.SUBAGENT_MAX_STEPS 的默认值保持一致；
 # 仅在无法 import agent（极端裁剪安装）时作为回退。
-WORKFLOW_CHILD_DEFAULT_STEPS = 6
+WORKFLOW_CHILD_DEFAULT_STEPS = 24
 
 
 def _env_int(name: str, default: int) -> int:
@@ -172,10 +174,14 @@ def _env_int(name: str, default: int) -> int:
 def workflow_step_limits() -> tuple[int, int]:
     """返回当前生效的步数预算 (下限, 硬顶)，每次调用实时读取环境变量。
 
-    下限至少 1；硬顶不小于下限（配置颠倒时抬到下限），保证区间恒有效。
+    两项都为 0 时代表无限；配置为正数时，硬顶不小于下限。
     """
-    lo = max(1, _env_int("DOCMIND_WORKFLOW_STEPS_MIN", WORKFLOW_STEPS_MIN))
-    hi = max(lo, _env_int("DOCMIND_WORKFLOW_STEPS_MAX", WORKFLOW_STEPS_MAX))
+    lo = max(0, _env_int("DOCMIND_WORKFLOW_STEPS_MIN", WORKFLOW_STEPS_MIN))
+    hi = max(0, _env_int("DOCMIND_WORKFLOW_STEPS_MAX", WORKFLOW_STEPS_MAX))
+    if hi == 0:
+        return 0, 0
+    if lo > hi:
+        hi = lo
     return lo, hi
 
 
@@ -183,22 +189,24 @@ def effective_workflow_max_steps(task_count: int, *, child_default: int = 0,
                                  explicit: int = 0) -> int:
     """推算工作流生效步数预算（可解释、有界）。
 
-    - ``explicit`` 为策略里显式调高的值（>当前下限）时原样保留（夹到硬顶）；
-    - 否则 ``max(下限, 任务数 * 子代理默认步数 + 4)``——并行波次越多、链路越长，
-      需要的工具步数越大，但永远不会超过硬顶。
+    - 工作流上下限均为 0 时返回 0，表示无限；
+    - ``explicit`` 为策略里显式设置的正数时保留（配置了硬顶时夹到硬顶）；
+    - 否则按任务规模自动推算，并夹在配置区间内。
     """
     lo, hi = workflow_step_limits()
     try:
         explicit_value = int(explicit or 0)
     except (TypeError, ValueError):
         explicit_value = 0
-    if explicit_value > lo:
-        return max(lo, min(hi, explicit_value))
+    if explicit_value > 0:
+        return min(hi, explicit_value) if hi > 0 else explicit_value
+    if hi == 0:
+        return 0
     if not child_default:
         try:
             import agent as agent_mod
             child_default = int(getattr(agent_mod, "SUBAGENT_MAX_STEPS",
-                                        WORKFLOW_CHILD_DEFAULT_STEPS))
+                                        WORKFLOW_CHILD_DEFAULT_STEPS)) or WORKFLOW_CHILD_DEFAULT_STEPS
         except Exception:  # noqa: BLE001
             child_default = WORKFLOW_CHILD_DEFAULT_STEPS
     try:
@@ -211,8 +219,7 @@ def effective_workflow_max_steps(task_count: int, *, child_default: int = 0,
 
 @dataclass(frozen=True)
 class WorkflowPolicy:
-    # 默认值跟随配置下限（DOCMIND_WORKFLOW_STEPS_MIN，内置 24）：不传策略时
-    # 「默认预算」与「自动预算基准」必须是同一个值，显式标记才不会误判。
+    # 默认值跟随配置下限；0 表示无限。
     max_steps: int = field(default_factory=lambda: workflow_step_limits()[0])
     max_replans: int = 2
     max_subagent_retries: int = 2
@@ -230,12 +237,13 @@ class WorkflowPolicy:
         return cls(**{k: v for k, v in (policy_dict or {}).items() if k in keys}).normalized()
 
     def normalized(self) -> "WorkflowPolicy":
-        # 下限保持 1：显式低预算（m-4）必须能存活，只夹硬顶。
+        # 0 表示无限；正数策略才按部署硬顶裁剪。
         _lo, hi = workflow_step_limits()
         mode = self.approval_mode if self.approval_mode in {"safe", "high"} else "safe"
         hook_failure = self.hook_failure if self.hook_failure in {"continue", "block"} else "continue"
         return WorkflowPolicy(
-            max_steps=max(1, min(hi, int(self.max_steps))),
+            max_steps=(0 if int(self.max_steps) <= 0 else
+                       (min(hi, int(self.max_steps)) if hi > 0 else int(self.max_steps))),
             max_replans=max(0, min(10, int(self.max_replans))),
             max_subagent_retries=max(0, min(5, int(self.max_subagent_retries))),
             max_subagents=max(1, min(16, int(self.max_subagents))),
@@ -288,6 +296,8 @@ class WorkflowState:
     # Project files captured before the first side-effecting execution wave.
     # The orchestration checkpoint above is insufficient to restore files.
     project_checkpoint: dict[str, Any] = field(default_factory=dict)
+    stage_enabled: bool = False
+    project_stage: dict[str, Any] = field(default_factory=dict)
     # Temporary capability boundary for the current execution wave.
     capability_lease: dict[str, Any] = field(default_factory=dict)
     visual_feedback: list[dict[str, Any]] = field(default_factory=list)
@@ -1530,7 +1540,8 @@ class GameWorkflowManager:
               option_generator: Callable[[str, ContextPlan], Any] | None = None,
               research_runner: Callable[[str], Any] | None = None,
               task_generator: Callable[[str, Mapping[str, Any], ContextPlan], Any] | None = None,
-              defer_option_generation: bool = False) -> dict[str, Any]:
+              defer_option_generation: bool = False,
+              stage_enabled: bool = False) -> dict[str, Any]:
         request = _clean_text(request, 12000)
         if not request:
             raise WorkflowError("开发目标不能为空")
@@ -1548,7 +1559,7 @@ class GameWorkflowManager:
         # 规划时显式低值也必须尊重，不能被自动预算覆盖。
         steps_lo, _steps_hi = workflow_step_limits()
         steps_explicit = (policy is not None
-                          and int(getattr(policy, "max_steps", steps_lo) or steps_lo)
+                          and int(getattr(policy, "max_steps", steps_lo) or 0)
                           != steps_lo)
         policy = (policy or WorkflowPolicy()).normalized()
         kind = normalize_kind(kind)
@@ -1575,6 +1586,7 @@ class GameWorkflowManager:
         wid = "wf-" + uuid.uuid4().hex[:12]
         state = WorkflowState(
             workflow_id=wid, project_id=project_id, project_root=project_root,
+            stage_enabled=bool(stage_enabled and project_root),
             kind=kind,
             request=request, sources=list(plan.sources), route_messages=list(plan.messages),
             options=[asdict(item) for item in options], policy=asdict(policy),
@@ -2078,8 +2090,9 @@ class GameWorkflowManager:
         # 调用方显式给过 max_steps（含低于自动下限的低值）时尊重显式值；
         # 否则按 n*子代理默认+4 自动推算并夹在配置区间内。
         _plan_lo, plan_hi = workflow_step_limits()
-        base_max_steps = max(1, min(plan_hi,
-                                    int((state.policy or {}).get("max_steps", _plan_lo))))
+        requested_max_steps = max(0, int((state.policy or {}).get("max_steps", _plan_lo) or 0))
+        base_max_steps = (0 if requested_max_steps == 0 else
+                          (min(plan_hi, requested_max_steps) if plan_hi > 0 else requested_max_steps))
         if (state.policy or {}).get("step_budget_explicit"):
             effective_steps, budget_source = base_max_steps, "explicit"
         else:
@@ -2473,16 +2486,24 @@ class GameWorkflowManager:
                         pass
 
             def scoped_runner(retry_task: dict[str, Any], context: dict[str, str]):
-                from .tools import tool_idempotency_scope
+                from .tools import project_stage_scope, tool_idempotency_scope
+                from config import reset_context_code_root, set_context_code_root
                 with tool_idempotency_scope(
                         "%s:%s:retry%s" % (workflow_id, task_id, attempt),
                         self.state_root):
-                    return runner(retry_task, context)
+                    if not state.project_stage:
+                        return runner(retry_task, context)
+                    token = set_context_code_root(state.project_stage["workspace_root"])
+                    try:
+                        with project_stage_scope():
+                            return runner(retry_task, context)
+                    finally:
+                        reset_context_code_root(token)
 
             if StateGraph is not None:
                 report = self._run_task_dag_langgraph(
                     [task], scoped_runner, prior_results=result_map,
-                    max_steps=max(1, policy.max_steps - state.steps),
+                    max_steps=(0 if policy.max_steps <= 0 else max(0, policy.max_steps - state.steps)),
                     max_parallel=1, max_context_chars=policy.max_context_chars,
                     on_event=emit, thread_id="%s:retry%s" % (workflow_id, attempt),
                     trace_parent_id=str((state.langsmith_trace or {}).get("root_run_id") or ""))
@@ -2499,7 +2520,8 @@ class GameWorkflowManager:
                         context[str(dep)] = summary
                 report = run_plan([task_copy],
                                   lambda _task, _ctx: scoped_runner(task, context),
-                                  max_parallel=1, max_steps=max(1, policy.max_steps - state.steps),
+                                  max_parallel=1,
+                                  max_steps=(0 if policy.max_steps <= 0 else max(0, policy.max_steps - state.steps)),
                                   on_event=emit)
 
             retried = dict((report.get("results") or {}).get(task_id) or {})
@@ -2540,6 +2562,10 @@ class GameWorkflowManager:
                                          for item in result_map.values()) else "failed"},
                 max_tool_failures=policy.max_tool_failures,
                 question=state.request, code_root=state.project_root)
+            if state.project_root:
+                state.review["agent_ok"] = bool(state.review.get("ok"))
+                state.review["project"] = self._review_project(state)
+                state.review["ok"] = bool(state.review.get("ok")) and bool(state.review["project"]["ok"])
             all_ok = all((item or {}).get("status") in {"ok", "deduped"}
                          or bool((item or {}).get("optional"))
                          for item in result_map.values())
@@ -2563,6 +2589,15 @@ class GameWorkflowManager:
         if state.status != "planned":
             raise WorkflowError("当前工作流不能执行：%s" % state.status)
         policy = WorkflowPolicy.from_state(state.policy)
+        if state.stage_enabled and not state.project_stage:
+            try:
+                state.project_stage = create_stage(
+                    state.project_root, str(self.state_root.parent), workflow_id)
+            except (OSError, ValueError, ProjectStageError) as exc:
+                raise WorkflowError("创建隔离试做区失败：%s" % str(exc)[:180]) from exc
+            self._event(state, "project_stage_created",
+                        file_count=state.project_stage.get("file_count", 0))
+            self._save(state)
         # Capture the project before entering the approval gate.  Planning is
         # side-effect free, so this baseline remains valid while the user
         # reviews the plan and survives a later process restart.
@@ -2656,7 +2691,8 @@ class GameWorkflowManager:
             # dies after a mutating tool returns but before the graph writes its
             # node checkpoint, recovery will replay the recorded result rather
             # than perform the side effect a second time.
-            from .tools import tool_idempotency_scope
+            from .tools import project_stage_scope, tool_idempotency_scope
+            from config import reset_context_code_root, set_context_code_root
             prepared = task.get("_prepared_context") if isinstance(task, Mapping) else None
             if isinstance(prepared, Mapping):
                 bounded_context = {str(key): str(value) for key, value in prepared.items()}
@@ -2670,7 +2706,14 @@ class GameWorkflowManager:
             with tool_idempotency_scope(
                     "%s:%s" % (workflow_id, str(task.get("id") or "task")),
                     self.state_root):
-                return runner(task, bounded_context)
+                if not state.project_stage:
+                    return runner(task, bounded_context)
+                token = set_context_code_root(state.project_stage["workspace_root"])
+                try:
+                    with project_stage_scope():
+                        return runner(task, bounded_context)
+                finally:
+                    reset_context_code_root(token)
         if StateGraph is not None:
             # LangGraph owns the bounded review → replan → execute loop.
             # The nested task graph uses ``Send`` for each parallel subagent;
@@ -2679,7 +2722,9 @@ class GameWorkflowManager:
             def execute_wave(tasks, prior_results, remaining_steps):
                 nonlocal graph_wave_index
                 self._refresh_workflow_lease(workflow_id)
-                if remaining_steps <= 0:
+                # remaining_steps == 0 means unlimited when policy.max_steps == 0;
+                # it means exhausted only for a positive configured budget.
+                if policy.max_steps > 0 and remaining_steps <= 0:
                     return {"ok": False, "results": {}, "steps_used": 0,
                             "blocked": [str(task.get("id")) for task in tasks],
                             "error": "达到工作流步数上限"}
@@ -2784,6 +2829,10 @@ class GameWorkflowManager:
                                       "trace": {"steps": sum((r.get("trace", {}).get("steps", []) for r in report.get("results", {}).values()), [])}},
                                      max_tool_failures=policy.max_tool_failures,
                                      question=state.request, code_root=state.project_root)
+        if state.project_root:
+            state.review["agent_ok"] = bool(state.review.get("ok"))
+            state.review["project"] = self._review_project(state)
+            state.review["ok"] = bool(state.review.get("ok")) and bool(state.review["project"]["ok"])
         state.context_layers["subagent"] = {
             "count": len(report.get("results") or {}),
             "statuses": {key: (value or {}).get("status")
@@ -3175,6 +3224,25 @@ class GameWorkflowManager:
         self._save(state)
         return {"backend": "langgraph", "state": snapshot}
 
+    def _review_project(self, state: WorkflowState) -> dict[str, Any]:
+        profile = dict(state.project_profile or load_profile(state.project_root))
+        stage = state.project_stage or {}
+        if not stage:
+            return {"ok": True, "status": "legacy", "independent": False,
+                    "message": "未启用隔离试做区，沿用兼容模式复核"}
+        review_root = str(stage.get("workspace_root") or state.project_root)
+        baseline = stage or state.project_checkpoint
+        if stage:
+            with stage_execution_scope():
+                return review_project(
+                    review_root, baseline, str(self.state_root.parent),
+                    list(profile.get("acceptance_scripts") or []),
+                )
+        return review_project(
+            review_root, baseline, str(self.state_root.parent),
+            list(profile.get("acceptance_scripts") or []),
+        )
+
     def create_project_checkpoint(self, workflow_id: str) -> dict[str, Any]:
         """Capture a bounded project baseline for this workflow once."""
         state = self._load(workflow_id)
@@ -3227,6 +3295,65 @@ class GameWorkflowManager:
                     selected=len(list(paths or [])))
         self._save(state)
         result["workflow_id"] = workflow_id
+        return result
+
+    def apply_project_stage(self, workflow_id: str, *, approved: bool = False) -> dict[str, Any]:
+        """Merge reviewed staged changes into the original project after approval."""
+        state = self._load(workflow_id)
+        if not approved:
+            raise WorkflowError("应用试做区改动需要用户明确批准")
+        if not state.project_stage:
+            raise WorkflowError("当前工作流没有隔离试做区")
+        review = dict(state.review or {}).get("project") or {}
+        if not state.review.get("ok") or review.get("status") != "passed" or not review.get("independent"):
+            raise WorkflowError("独立终审未通过，不能把试做区改动应用到项目")
+        try:
+            result = apply_stage(state.project_stage, list(review.get("changes") or []))
+        except (OSError, ValueError, ProjectStageError) as exc:
+            raise WorkflowError("应用试做区改动失败：%s" % str(exc)[:180]) from exc
+        state.project_stage["status"] = "applied"
+        self._event(state, "project_stage_applied", changed=len(result.get("paths") or []))
+        self._save(state)
+        result["workflow_id"] = workflow_id
+        return result
+
+    def rerun_project_review(self, workflow_id: str) -> dict[str, Any]:
+        """Recheck the same staged bytes after a failed or incomplete review."""
+        state = self._load(workflow_id)
+        if state.status not in self._TERMINAL_STATUSES or (state.project_stage or {}).get("status") != "draft":
+            raise WorkflowError("只能对已停止且尚未应用的试做区重新复核")
+        if not state.results:
+            raise WorkflowError("工作流尚无执行结果")
+        project_review = self._review_project(state)
+        state.review["project"] = project_review
+        agent_ok = state.review.get("agent_ok")
+        if agent_ok is None:
+            agent_ok = bool(state.results.get("ok")) and not state.review.get("failures")
+        state.review["ok"] = bool(agent_ok) and bool(project_review.get("ok"))
+        if state.review["ok"] and state.results.get("ok"):
+            state.status = "completed"
+            state.recovery = {}
+        else:
+            state.status = "failed"
+            state.recovery = build_recovery_plan(state, error="重新复核未通过")
+        self._event(state, "project_stage_reviewed", status=project_review.get("status"),
+                    tests=len(project_review.get("tests") or []))
+        self._save(state)
+        return project_review
+
+    def cleanup_project_stage(self, workflow_id: str) -> dict[str, Any]:
+        state = self._load(workflow_id)
+        if state.status not in self._TERMINAL_STATUSES or not state.project_stage:
+            raise WorkflowError("只能清理已停止的工作流试做区")
+        if state.project_stage.get("status") == "discarded":
+            return {"ok": True, "status": "discarded", "workflow_id": workflow_id}
+        try:
+            result = cleanup_stage(state.project_stage, str(self.state_root.parent))
+        except (OSError, ValueError, ProjectStageError) as exc:
+            raise WorkflowError("清理试做区失败：%s" % str(exc)[:180]) from exc
+        state.project_stage["status"] = "discarded"
+        self._event(state, "project_stage_discarded")
+        self._save(state)
         return result
 
     def build_langgraph(self, *, checkpointer=None, workflow_id: str | None = None,
@@ -3568,7 +3695,9 @@ class GameWorkflowManager:
                 steps = int(state.get("step_count", 0)) + 1
                 return {"phase": "review", "status": "reviewing", "event": "execute_wave",
                         "step_count": steps}
-            remaining = max(0, int(state.get("max_steps", workflow_step_limits()[0])) - int(state.get("step_count", 0)))
+            configured_max = int(state.get("max_steps", workflow_step_limits()[0]) or 0)
+            remaining = (0 if configured_max <= 0 else
+                         max(0, configured_max - int(state.get("step_count", 0))))
             report = dict(provider_call(
                 state, "execute.wave", lambda: execute_wave(
                     list(state.get("tasks") or []),
@@ -3597,7 +3726,8 @@ class GameWorkflowManager:
                             "review": {"ok": True}}
                 failed = list(state.get("failed_tasks") or [])
                 if replan is not None and failed and int(state.get("replan_count", 0)) < int(state.get("max_replans", 2)) \
-                        and int(state.get("step_count", 0)) < int(state.get("max_steps", workflow_step_limits()[0])):
+                        and (int(state.get("max_steps", workflow_step_limits()[0]) or 0) <= 0 or
+                             int(state.get("step_count", 0)) < int(state.get("max_steps", workflow_step_limits()[0]))):
                     return {"phase": "review", "status": "replanning", "event": "review_replan",
                             "review": {"ok": False}}
                 return {"phase": "review", "status": "failed", "event": "review_failed",
@@ -3609,7 +3739,7 @@ class GameWorkflowManager:
                 max_replans = int(state.get("max_replans", 2))
                 max_steps = int(state.get("max_steps", workflow_step_limits()[0]))
                 if failed and int(state.get("replan_count", 0)) < max_replans \
-                        and int(state.get("step_count", 0)) < max_steps:
+                        and (max_steps <= 0 or int(state.get("step_count", 0)) < max_steps):
                     return {"phase": "review", "status": "replanning", "event": "review_replan"}
                 return {"phase": "review", "status": "failed", "event": "review_failed"}
             # A checkpoint-only invocation has no execution result yet.  Keep

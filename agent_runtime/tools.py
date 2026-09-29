@@ -116,7 +116,7 @@ class ToolSpec(Mapping[str, Any]):
 
 
 _NETWORK_TOOLS = {
-    "web_search", "web_search_batch", "web_fetch", "web_research", "web_subtitles",
+    "web_search", "web_search_batch", "web_transport", "web_fetch", "web_research", "web_subtitles",
     "dev_http_request", "dev_mcp_call", "dev_list_connector_tools",
     "dev_mcp_probe", "dev_mcp_discover",
     "dev_mcp_search",
@@ -138,7 +138,6 @@ _WRITE_TOOLS = {
     "dev_preview_adapter_create",
     "dev_preview_adapter_refresh",
     "dev_preview_adapter_rollback",
-    "dev_desktop_capture",
     "dev_desktop_action",
 }
 _IRREVERSIBLE_TOOLS = {"run_command", "game_playtest", "dev_mcp_call"}
@@ -274,7 +273,29 @@ class ToolResult:
 
 _IDEMPOTENCY_SCOPE: ContextVar[tuple[str, str] | None] = ContextVar(
     "tool_idempotency_scope", default=None)
+_PROJECT_STAGE_SCOPE: ContextVar[bool] = ContextVar("project_stage_scope", default=False)
 _IDEMPOTENCY_LOCK = threading.RLock()
+
+_STAGE_ALLOWED_TOOLS = frozenset({
+    "read_file", "search_code", "grep", "list_dir", "search_knowledge",
+    "calculate", "apply_edit", "create_file", "python_exec", "run_command",
+    "self_verify", "dev_list_regions", "dev_region_read", "dev_region_edit",
+    "dev_region_verify", "web_search", "web_search_batch", "web_fetch",
+    "web_research", "tool_search", "inspect_data_file", "generate_data_file",
+    "preview_project", "game_screenshot", "dev_desktop_capture",
+})
+
+
+@contextmanager
+def project_stage_scope():
+    """Allow only project-scoped and read-only tools during a staged workflow."""
+    token = _PROJECT_STAGE_SCOPE.set(True)
+    try:
+        from .enterprise_sandbox import stage_execution_scope
+        with stage_execution_scope():
+            yield
+    finally:
+        _PROJECT_STAGE_SCOPE.reset(token)
 
 
 @contextmanager
@@ -355,6 +376,9 @@ def _idempotency_complete(db_path: str, key: str, result: ToolResult) -> None:
 
 def execute_tool(function: Callable, argument: str, legacy_failure: Callable, *,
                  tool_name: str = "", side_effect: SideEffect = SideEffect.PURE) -> ToolResult:
+    if _PROJECT_STAGE_SCOPE.get() and tool_name not in _STAGE_ALLOWED_TOOLS:
+        return ToolResult(False, "试做区禁止调用会修改外部环境的工具；请在验收后单独执行。",
+                          error_kind="project_stage_blocked")
     key = db_path = ""
     if side_effect != SideEffect.PURE:
         try:

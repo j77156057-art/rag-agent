@@ -172,7 +172,7 @@ def _inside(point: tuple[int, int], rect: dict[str, Any]) -> bool:
 def perform(action: str, *, target: str = "embedded", project_id: str | None = None,
             x: int | None = None, y: int | None = None,
             to_x: int | None = None, to_y: int | None = None,
-            text: str = "", key: str = "") -> dict[str, Any]:
+            text: str = "", key: str = "", expected_hwnd: int | None = None) -> dict[str, Any]:
     action = str(action or "").strip().lower()
     if action == "save":
         key = "Control_L+s"
@@ -182,9 +182,16 @@ def perform(action: str, *, target: str = "embedded", project_id: str | None = N
     hwnd, info, error = _resolve_target(target, project_id)
     if error:
         return {"ok": False, "error": error}
+    if expected_hwnd is not None and hwnd != expected_hwnd:
+        return {"ok": False, "error": "目标窗口在操作前已切换。"}
     focused, focus_error = _focus(hwnd, target, project_id)
     if not focused:
         return {"ok": False, "error": focus_error or "目标窗口未能获得焦点。"}
+    if expected_hwnd is not None:
+        current_hwnd, current_info, current_error = _resolve_target(target, project_id)
+        if current_error or current_hwnd != expected_hwnd or current_info["rect"] != info["rect"]:
+            return {"ok": False, "error": "目标窗口或尺寸在激活后已变化。"}
+        info = current_info
     origin, rect = info["origin"], info["rect"]
     ox, oy = int(origin.get("x", 0)), int(origin.get("y", 0))
     if action == "click":

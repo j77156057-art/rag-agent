@@ -198,6 +198,10 @@ class ToolInstallManager:
 
             def run(command):
                 if runner is None:
+                    from .enterprise_sandbox import execution_mode
+                    if execution_mode() == "enterprise":
+                        raise ToolInstallError(
+                            "企业沙箱模式禁止在宿主机安装工具；需使用隔离安装后审查并导入产物")
                     return subprocess.run(command, cwd=str(self.root), capture_output=True,
                                           text=True, timeout=run_timeout)
                 return runner(command, str(self.root), run_timeout)

@@ -7,24 +7,59 @@ import ast
 import os
 import re
 import uuid
+import json
 
 from config import CHUNK_SIZE, CHUNK_OVERLAP, CODE_COLLECTION_NAME, CODE_CHUNK
 from embeddings import EmbeddingClient
 from vectorstore import add_documents
+from data_formats import FORMAT_EXTENSIONS, DataFormatError, read_file
 
 
 def load_text(path):
-    """按扩展名加载为纯文本。"""
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".pdf":
-        from pypdf import PdfReader
+    """读取文档/表格/结构化文件并转成稳定的可检索文本。"""
+    parsed = read_file(path)
+    kind = parsed.get("kind")
+    if kind == "text":
+        return str(parsed.get("text") or "")
+    if kind == "table":
+        lines = ["\t".join(str(value if value is not None else "") for value in parsed.get("headers", []))]
+        lines.extend("\t".join(str(value if value is not None else "") for value in row)
+                     for row in parsed.get("rows", []))
+        return "\n".join(lines)
+    if kind == "workbook":
+        blocks = []
+        for name, table in (parsed.get("sheets") or {}).items():
+            blocks.append(f"# Sheet: {name}")
+            blocks.append(load_text_from_table(table))
+        return "\n\n".join(blocks)
+    if kind == "slides":
+        return "\n\n".join(f"# Slide {index}\n{text}" for index, text in enumerate(parsed.get("slides") or [], 1))
+    if kind in {"json", "yaml", "toml", "xml", "records"}:
+        if parsed.get("table") or parsed.get("headers"):
+            return load_text_from_table(parsed)
+        # 解析失败的脏结构化文件仍保留原文和错误位置，避免把坏 JSON
+        # 退化成单独的 ``null`` 后丢失可检索线索。
+        if parsed.get("errors") and parsed.get("text"):
+            errors = "\n".join(
+                f"- {item.get('error', '解析失败')}"
+                + (f"（第 {item['line']} 行，第 {item['column']} 列）"
+                   if item.get("line") else "")
+                for item in parsed.get("errors", [])[:20]
+                if isinstance(item, dict)
+            )
+            return f"{parsed.get('text', '')}\n\n[解析错误]\n{errors}".strip()
+        value = parsed.get("value", parsed.get("records", parsed.get("root", "")))
+        return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    if parsed.get("preview"):
+        return str(parsed["preview"])
+    raise DataFormatError(f"文件没有可提取的文本：{path}")
 
-        reader = PdfReader(path)
-        return "\n".join((p.extract_text() or "") for p in reader.pages)
-    if ext in (".md", ".markdown", ".txt"):
-        with open(path, encoding="utf-8") as f:
-            return f.read()
-    raise ValueError(f"不支持的格式: {ext}")
+
+def load_text_from_table(table):
+    lines = ["\t".join(str(value if value is not None else "") for value in table.get("headers", []))]
+    lines.extend("\t".join(str(value if value is not None else "") for value in row)
+                 for row in table.get("rows", []))
+    return "\n".join(lines)
 
 
 def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
@@ -71,7 +106,9 @@ def ingest_directory(directory):
     total = 0
     for name in sorted(os.listdir(directory)):
         p = os.path.join(directory, name)
-        if os.path.isfile(p) and name.lower().endswith((".pdf", ".md", ".markdown", ".txt")):
+        if os.path.isfile(p) and os.path.splitext(name)[1].lower() in {
+                ext for ext, fmt in FORMAT_EXTENSIONS.items()
+                if fmt in {"pdf", "text", "markdown", "csv", "tsv", "json", "jsonl", "yaml", "toml", "xml", "html", "docx", "xlsx", "pptx"}}:
             try:
                 total += ingest_file(p)
             except Exception as e:  # 单个文件失败不影响其他
@@ -93,7 +130,8 @@ def ingest_directory(directory):
 _CODE_EXT = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".cs", ".java", ".cpp", ".cc", ".c",
     ".h", ".hpp", ".go", ".rs", ".lua", ".rb", ".php", ".swift", ".kt", ".scala",
-    ".sh", ".json", ".yaml", ".yml", ".toml",
+    ".sh", ".json", ".jsonl", ".ndjson", ".yaml", ".yml", ".toml",
+    ".csv", ".tsv", ".xml", ".html", ".htm", ".md", ".markdown",
     # Godot：GDScript 脚本、着色器、文本场景/资源与工程配置（二进制 .scn/.res 天然排除）
     ".gd", ".gdshader", ".tscn", ".tres", ".godot",
 }
@@ -113,8 +151,10 @@ _LANG_BY_EXT = {
     ".tsx": "typescript", ".cs": "csharp", ".java": "java", ".cpp": "cpp",
     ".cc": "cpp", ".c": "c", ".h": "c", ".hpp": "cpp", ".go": "go", ".rs": "rust",
     ".lua": "lua", ".rb": "ruby", ".php": "php", ".swift": "swift", ".kt": "kotlin",
-    ".scala": "scala", ".sh": "shell", ".json": "json", ".yaml": "yaml",
-    ".yml": "yaml", ".toml": "toml",
+    ".scala": "scala", ".sh": "shell", ".json": "json", ".jsonl": "jsonl",
+    ".ndjson": "jsonl", ".yaml": "yaml", ".yml": "yaml", ".toml": "toml",
+    ".csv": "csv", ".tsv": "tsv", ".xml": "xml", ".html": "html",
+    ".htm": "html", ".md": "markdown", ".markdown": "markdown",
     ".gd": "gdscript", ".gdshader": "gdshader", ".tscn": "godot-scene",
     ".tres": "godot-resource", ".godot": "ini",
 }
@@ -331,8 +371,8 @@ def chunk_code(text, path):
 
 
 def load_code_file(path):
-    with open(path, encoding="utf-8", errors="ignore") as f:
-        text = f.read()
+    parsed = read_file(path)
+    text = str(parsed.get("text") or "")
     if text.startswith("\ufeff"):
         text = text[1:]  # Godot 默认 UTF-8 BOM，剥掉避免污染首块
     return text

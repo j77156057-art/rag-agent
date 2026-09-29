@@ -22,7 +22,8 @@ from agent_runtime.adapter_catalog import (approve_generated as approve_generate
                                             catalog as adapter_catalog,
                                             configure as configure_adapters)
 from agent_runtime.local_runtime import effective_subagent_limit, resource_profile
-from config import COLLECTION_NAME, LLM_MODEL, LLM_PROVIDER, PROVIDERS, get_runtime
+from config import (COLLECTION_NAME, LLM_MODEL, LLM_PROVIDER, PROVIDERS, get_runtime,
+                    set_context_code_root, reset_context_code_root)
 from game_workbench import approval as record_user_approval
 from game_workbench import list_approval_records, require_approval
 from agent_runtime.cockpit_policy import QUEUE_APPROVABLE, pending_gate_requests
@@ -47,6 +48,7 @@ class WorkflowStartReq(BaseModel):
     policy: dict = {}
     # 领域画像：generic（默认）/ game；未知值由管理器归一为 generic，不报错。
     kind: str = "generic"
+    stage_enabled: bool = True
 
 
 class WorkflowChoiceReq(BaseModel):
@@ -115,6 +117,10 @@ class WorkflowProjectRollbackReq(BaseModel):
     paths: list[str] = []
 
 
+class WorkflowStageApplyReq(BaseModel):
+    approved: bool = False
+
+
 class PreviewAdapterConfigReq(BaseModel):
     adapters: list[str] = []
 
@@ -169,9 +175,25 @@ class CockpitApprovalDecisionReq(BaseModel):
 def build_router(ctx) -> APIRouter:
     router = APIRouter(prefix="/api/agent", tags=["agent"])
 
+    def project_bound(callback, project_root: str, project_id: str = ""):
+        """Run durable workflow callbacks in their stored project, not the UI's current one."""
+        def scoped(*args, **kwargs):
+            root_token = set_context_code_root(project_root) if project_root else None
+            pid_token = ctx._CTX_PROJECT_ID.set(project_id) if project_id else None
+            try:
+                return callback(*args, **kwargs)
+            finally:
+                if pid_token is not None:
+                    ctx._CTX_PROJECT_ID.reset(pid_token)
+                if root_token is not None:
+                    reset_context_code_root(root_token)
+        return scoped
+
     def workflow_evidence(prompt: str, project_id: str = "", project_root: str = "") -> str:
         """Build bounded local evidence for planning prompts only."""
-        collections = {"knowledge": COLLECTION_NAME}
+        # Planning a concrete project must not substitute the global knowledge
+        # base (which may describe DocMind) for that project's own files.
+        collections = {} if project_root else {"knowledge": COLLECTION_NAME}
         if project_root:
             pid = project_id or projects.project_id(project_root)
             collections["code"] = projects.code_collection(pid)
@@ -184,6 +206,8 @@ def build_router(ctx) -> APIRouter:
         """Rebuild execution callbacks from durable workflow/session IDs."""
         sid = session_id or state.get("execution_session_id") or "workflow"
         agent = ctx._agent_for(sid, state.get("project_id") or None)
+        workflow_root = str(state.get("project_root") or "")
+        workflow_pid = str(state.get("project_id") or "")
 
         wid = str((state or {}).get("workflow_id") or "")
 
@@ -202,6 +226,23 @@ def build_router(ctx) -> APIRouter:
             except Exception:
                 # A failed state read must not silently remove the boundary.
                 agent.capability_lease = {"status": "invalid"}
+            # 开发舱 auto 模式：Harness 按子任务复杂度自行选模，升级时在轨迹里留痕
+            routed_llm, routed_preset, route = (None, None, None)
+            try:
+                routed_llm, routed_preset, route = ctx.cockpit_route_llm(
+                    prompt, state.get("project_id") or "")
+            except Exception:
+                routed_llm, routed_preset, route = None, None, None
+            sink = _step_sink(str(task.get("id") or ""), str(task.get("role") or "coder"))
+            if routed_llm is not None and routed_preset and callable(sink):
+                try:
+                    sink({"type": "thought",
+                          "text": "🧠 自动选模：复杂度 %s（%s）→ 使用 %s / %s"
+                                  % (route.get("complexity"), route.get("reason"),
+                                     routed_preset.get("provider"),
+                                     routed_preset.get("model") or "默认模型")})
+                except Exception:
+                    pass
             out = agent._run_child(
                 task.get("role", "coder"), prompt, context=context,
                 persona=task.get("persona", ""),
@@ -209,8 +250,8 @@ def build_router(ctx) -> APIRouter:
                 mcp_policy=task.get("mcp", "auto"),
                 reflect=bool(task.get("reflection", True)),
                 max_steps=task.get("max_steps"),
-                step_sink=_step_sink(str(task.get("id") or ""),
-                                     str(task.get("role") or "coder")))
+                step_sink=sink,
+                llm=routed_llm)
             check = review_output(out, max_tool_failures=int(
                 (state.get("policy") or {}).get("max_tool_failures", 3)))
             out = dict(out or {})
@@ -220,11 +261,22 @@ def build_router(ctx) -> APIRouter:
                 out["error"] = out.get("error") or "子代理输出未通过 Harness 复核"
             return out
 
+        def _replanner_llm():
+            """auto 模式下失败重规划一律升级强模型；其他模式/不可用 → None（会话模型）。"""
+            try:
+                strong, _preset = ctx.cockpit_strong_llm(state.get("project_id") or "")
+                return strong
+            except Exception:
+                return None
+
         return {
-            "runner": runner,
-            "synth_runner": lambda tasks, results: agent._synth(tasks, results),
-            "replanner": lambda failed, results, attempt: agent._replanner(
-                failed, results, attempt),
+            "runner": project_bound(runner, workflow_root, workflow_pid),
+            "synth_runner": project_bound(
+                lambda tasks, results: agent._synth(tasks, results), workflow_root, workflow_pid),
+            "replanner": project_bound(
+                lambda failed, results, attempt: agent._replanner(
+                    failed, results, attempt, llm=_replanner_llm()),
+                workflow_root, workflow_pid),
         }
 
     # Approval may arrive after a process restart.  The manager persists only
@@ -232,7 +284,7 @@ def build_router(ctx) -> APIRouter:
     WORKFLOWS.set_execution_resolver(lambda state: workflow_callbacks(state))
 
     def launch_workflow(*, prompt, kind, web_enabled, use_llm, experience_enabled,
-                        project_id, policy, schedule_options):
+                        project_id, policy, schedule_options, stage_enabled=True):
         """HTTP 端点与对话内 start_workflow 工具共用的工作流组装入口。
 
         schedule_options(wid) 决定方案生成在何处异步跑（端点用 BackgroundTasks，
@@ -292,21 +344,31 @@ def build_router(ctx) -> APIRouter:
                 )
                 if evidence:
                     instruction += "\n本地检索证据：\n" + evidence
-                return llm_agent.llm.chat([{"role": "user", "content": instruction}],
-                                          stream=False, temperature=0.1, timeout=25)
+                # 开发舱 auto 模式：规划是高价值回合，按目标复杂度升级强模型
+                planner_llm = llm_agent.llm
+                try:
+                    routed, _preset, _route = ctx.cockpit_route_llm(prompt, project_id or "")
+                    if routed is not None:
+                        planner_llm = routed
+                except Exception:
+                    pass
+                return planner_llm.chat([{"role": "user", "content": instruction}],
+                                        stream=False, temperature=0.1, timeout=25)
 
         workflow = WORKFLOWS.start(
             prompt, project_id=project_id, project_root=root,
             web_enabled=web_enabled, experience_enabled=experience_enabled,
             llm_enabled=use_llm, kind=kind, policy=policy,
-            option_generator=option_generator,
-            task_generator=task_generator,
+            option_generator=(project_bound(option_generator, root, project_id)
+                              if option_generator else None),
+            task_generator=(project_bound(task_generator, root, project_id)
+                            if task_generator else None),
             # The research provider is invoked by the LangGraph research
             # node after the user selects the web-research option.  It is
             # kept as a callback so credentials/cache policy remain in the
             # audited tool implementation and never enter a checkpoint.
             research_runner=(web_research if web_enabled else None),
-            defer_option_generation=True)
+            defer_option_generation=True, stage_enabled=bool(stage_enabled))
         if workflow.get("status") == "generating_options":
             schedule_options(workflow["workflow_id"])
         return workflow
@@ -321,7 +383,7 @@ def build_router(ctx) -> APIRouter:
         return launch_workflow(
             prompt=goal, kind=normalize_kind(kind), web_enabled=bool(web_enabled),
             use_llm=True, experience_enabled=True, project_id="", policy=None,
-            schedule_options=_spawn_options)
+            schedule_options=_spawn_options, stage_enabled=True)
 
     tools.set_workflow_launcher(_workflow_launcher)
 
@@ -417,6 +479,7 @@ def build_router(ctx) -> APIRouter:
                 experience_enabled=req.experience_enabled,
                 project_id=req.project_id,
                 policy=WorkflowPolicy(**(req.policy or {})),
+                stage_enabled=req.stage_enabled,
                 schedule_options=lambda wid:
                     background_tasks.add_task(WORKFLOWS.generate_options, wid))
             return {"ok": True, "workflow": workflow}
@@ -572,17 +635,15 @@ def build_router(ctx) -> APIRouter:
     @router.post("/workflow/{workflow_id}/choice")
     async def workflow_choice(workflow_id: str, req: WorkflowChoiceReq):
         try:
-            # The choice request only records the decision: it returns the
-            # planning state immediately and lets a worker thread run the
-            # planner LLM, pass the execution gate and start the DAG. A slow
-            # model or a minutes-long run must never pin the card in
-            # "submitting" — progress arrives through SSE/polling instead.
+            # Choosing a proposal must never approve project changes. The UI
+            # requests planning separately and shows the resulting plan and
+            # acceptance contract before the user starts execution.
             workflow = await run_in_threadpool(
                 WORKFLOWS.choose,
                 workflow_id,
                 req.choice,
                 custom_request=req.custom_request,
-                auto_execute=True,
+                auto_execute=False,
             )
             return {"ok": True, "workflow": workflow}
         except WorkflowError as exc:
@@ -849,6 +910,30 @@ def build_router(ctx) -> APIRouter:
         except (OSError, ValueError, TypeError) as exc:
             return {"ok": False, "error": str(exc)}
 
+    @router.post("/workflow/{workflow_id}/stage/apply")
+    async def workflow_stage_apply(workflow_id: str, req: WorkflowStageApplyReq):
+        try:
+            return {"ok": True, "result": await run_in_threadpool(
+                WORKFLOWS.apply_project_stage, workflow_id, approved=req.approved)}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @router.post("/workflow/{workflow_id}/stage/review")
+    async def workflow_stage_review(workflow_id: str):
+        try:
+            return {"ok": True, "review": await run_in_threadpool(
+                WORKFLOWS.rerun_project_review, workflow_id)}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @router.post("/workflow/{workflow_id}/stage/cleanup")
+    async def workflow_stage_cleanup(workflow_id: str):
+        try:
+            return {"ok": True, "result": await run_in_threadpool(
+                WORKFLOWS.cleanup_project_stage, workflow_id)}
+        except WorkflowError as exc:
+            return {"ok": False, "error": str(exc)}
+
     @router.post("/preview-adapters/{adapter_id}/decision")
     async def preview_adapter_decision(adapter_id: str, req: PreviewAdapterDecisionReq):
         try:
@@ -880,6 +965,7 @@ def build_router(ctx) -> APIRouter:
                 "request": state.get("request"),
                 "acceptance": state.get("acceptance_contract") or {},
                 "evaluation": evaluation,
+                "review": state.get("review") or {},
                 "preview": state.get("preview") or {},
                 "self_review": state.get("self_review") or {},
                 "recovery": state.get("recovery") or {},

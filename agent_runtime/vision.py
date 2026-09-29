@@ -54,7 +54,7 @@ def configured() -> bool:
     return bool((os.getenv("DOCMIND_VISION_MODEL") or "").strip())
 
 
-def analyze_images(images, *, current_capability=None):
+def analyze_images(images, *, current_capability=None, observation_prompt=None, raw_observation=False):
     """返回 ``(images_for_main_model, context_messages, audit)``。
 
     ``images`` 是 base64 字符串列表。原生视觉模型拿到原图；其它模型只有在
@@ -93,7 +93,7 @@ def analyze_images(images, *, current_capability=None):
             "材质、摄像机、错误提示和明显异常。不要猜测图片外信息，控制在 1600 字以内。"
         )
         result = client.chat(
-            [{"role": "user", "content": prompt, "images": images}],
+            [{"role": "user", "content": observation_prompt or prompt, "images": images}],
             stream=False,
             enable_thinking=False,
         )
@@ -101,7 +101,7 @@ def analyze_images(images, *, current_capability=None):
         if not text:
             raise RuntimeError("视觉模型返回空描述")
         elapsed = int((time.monotonic() - started) * 1000)
-        context = (
+        context = text if raw_observation else (
             f"【Harness 图片观察（{provider}/{model}，耗时 {elapsed}ms）】\n{text}\n"
             "以上是视觉模型对当前图片的观察，不是代码事实；请结合项目文件和工具复核后再提出修改。"
         )
