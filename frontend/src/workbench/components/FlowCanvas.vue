@@ -260,8 +260,8 @@ function providerLabel(p: string) {
 </script>
 
 <template>
-  <div v-if="flowOpen" class="fl-overlay" @mousedown.self="closeFlow">
-    <div class="fl-panel" role="dialog" aria-label="AI 工作流">
+  <div v-if="flowOpen" class="fl-overlay wb-modal-backdrop" @mousedown.self="closeFlow">
+    <div class="fl-panel wb-modal-shell" role="dialog" aria-modal="true" aria-label="AI 工作流">
       <!-- 头部 -->
       <div class="fl-head">
         <div class="fl-title">
@@ -465,6 +465,7 @@ function providerLabel(p: string) {
   backdrop-filter: blur(2px);
   display: flex; align-items: center; justify-content: center;
   padding: 22px;
+  animation: fl-fade .18s ease-out both;
 }
 .fl-panel {
   width: min(1340px, 98vw);
@@ -473,7 +474,7 @@ function providerLabel(p: string) {
   border: 1px solid #d3dcea;
   border-radius: 14px;
   box-shadow: 0 22px 60px rgba(31, 45, 72, .28);
-  display: flex; flex-direction: column; overflow: hidden;
+  display: flex; flex-direction: column; overflow: hidden; animation: fl-rise .22s cubic-bezier(.2,.8,.2,1) both;
 }
 .fl-head {
   flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
@@ -486,9 +487,9 @@ function providerLabel(p: string) {
 .fl-iconbtn {
   width: 28px; height: 28px; border: 1px solid #d3dcea; background: #fff; border-radius: 7px;
   color: #5a6778; cursor: pointer; font-size: 16px; line-height: 1;
-  display: inline-flex; align-items: center; justify-content: center;
+  display: inline-flex; align-items: center; justify-content: center; transition: color .15s ease, border-color .15s ease, background .15s ease, transform .15s ease;
 }
-.fl-iconbtn:hover { border-color: #9fb0c6; background: #f5f8fc; color: #23304a; }
+.fl-iconbtn:hover { border-color: #9fb0c6; background: #f5f8fc; color: #23304a; transform: translateY(-1px); }.fl-iconbtn:focus-visible { outline: 2px solid #2f6fed; outline-offset: 1px; }
 .fl-demo {
   flex: 0 0 auto; margin: 10px 16px 0; padding: 7px 11px; border-radius: 8px;
   font-size: 11.5px; line-height: 1.6; color: #8a5a16; background: #fdf2e0; border: 1px solid #f0d29a;
@@ -518,9 +519,9 @@ function providerLabel(p: string) {
 .fl-hint { padding: 22px 14px; font-size: 11.5px; line-height: 1.8; color: #93a0b5; text-align: center; }
 .fl-turn {
   text-align: left; border: 1px solid #e2e8f1; background: #fafbfd; border-radius: 10px;
-  padding: 8px 10px; cursor: pointer; font: inherit; display: flex; flex-direction: column; gap: 3px;
+  padding: 8px 10px; cursor: pointer; font: inherit; display: flex; flex-direction: column; gap: 3px; transition: border-color .15s ease, background .15s ease, transform .15s ease, box-shadow .15s ease;
 }
-.fl-turn:hover { border-color: #b9c9e2; background: #f6f9ff; }
+.fl-turn:hover { border-color: #b9c9e2; background: #f6f9ff; transform: translateX(2px); box-shadow: 0 3px 9px rgba(35,52,84,.08); }.fl-turn:focus-visible { outline: 2px solid #2f6fed; outline-offset: 1px; }
 .fl-turn.on { border-color: #8fb2f2; background: #f0f6ff; box-shadow: 0 0 0 2px rgba(47,111,237,.10); }
 .fl-turn-row { display: flex; align-items: center; justify-content: space-between; }
 .fl-turn-time { font-size: 10.5px; color: #7a869a; font-variant-numeric: tabular-nums; }
@@ -541,7 +542,7 @@ function providerLabel(p: string) {
 }
 .fl-chip {
   font-size: 10.5px; color: #46536a; background: #fff; border: 1px solid #dbe2ee;
-  border-radius: 999px; padding: 2px 9px; font-variant-numeric: tabular-nums; white-space: nowrap;
+  border-radius: 999px; padding: 2px 9px; font-variant-numeric: tabular-nums; white-space: nowrap; transition: border-color .15s ease, background .15s ease;
 }
 .fl-chip.model { color: #7a4fd1; border-color: #d9c9f5; background: #f8f4ff; font-weight: 600; }
 .fl-chip.cache { color: var(--green); border-color: #bfe6d2; background: #eefaf3; font-weight: 600; }
@@ -551,8 +552,9 @@ function providerLabel(p: string) {
 /* Vue Flow 自定义节点 */
 .fl-node {
   background: #fff; border: 1.5px solid #d3dcea; border-radius: 12px;
-  padding: 10px 12px; box-shadow: 0 3px 10px rgba(31, 45, 72, .08);
+  padding: 10px 12px; box-shadow: 0 3px 10px rgba(31, 45, 72, .08); transition: box-shadow .16s ease, transform .16s ease, border-color .16s ease;
 }
+.fl-node:hover { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(31,45,72,.14); }
 .fl-n-head { display: flex; align-items: center; gap: 8px; }
 .fl-n-head b { font-size: 12.5px; color: #1b2433; }
 .fl-n-glyph {
@@ -612,6 +614,8 @@ function providerLabel(p: string) {
 .fl-bad { color: #d23b42; }
 .fl-detail-empty { color: #93a0b5; font-size: 11.5px; line-height: 1.9; text-align: center; margin-top: 80px; }
 .mono { font-family: var(--font-mono, ui-monospace, Consolas, monospace); }
+@keyframes fl-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes fl-rise { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
 
 @media (max-width: 1080px) {
   .fl-turns { flex-basis: 208px; }
@@ -624,4 +628,6 @@ function providerLabel(p: string) {
   .fl-turns { flex-basis: 176px; }
   .fl-title span { display: none; }
 }
+@media (max-width: 560px) { .fl-head { padding: 10px 11px; }.fl-turns { flex-basis: 154px; }.fl-turn-list { padding: 6px; }.fl-canvas-head { max-height: 90px; overflow: auto; padding: 7px 9px; }.fl-n-sub.faint { display: none; } }
+@media (prefers-reduced-motion: reduce) { .fl-overlay, .fl-panel, .fl-iconbtn, .fl-turn, .fl-chip, .fl-node { animation: none; transition: none; } }
 </style>

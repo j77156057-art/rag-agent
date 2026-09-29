@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { agentApi, mcpApi } from '../api'
-import type { AgentApproval, CockpitApprovalRequest, McpCapabilityCandidate, WorkflowState } from '../api'
+import type { AgentApproval, AgentGateRequest, McpCapabilityCandidate, WorkflowState } from '../api'
 
-const props = defineProps<{ workflow: WorkflowState | null }>()
+const props = defineProps<{ workflow: WorkflowState | null; externalOnly?: boolean }>()
 const emit = defineEmits<{
   (e: 'approve-plan'): void
   (e: 'final-decision', approved: boolean, note: string): void
@@ -12,9 +12,9 @@ const emit = defineEmits<{
 type QueueItem = {
   id: string; source: 'plan' | 'final' | 'gate' | 'external' | 'mcp'
   title: string; summary: string; risk: 'L2' | 'L3' | 'review'
-  gate?: CockpitApprovalRequest; external?: AgentApproval; mcp?: McpCapabilityCandidate
+  gate?: AgentGateRequest; external?: AgentApproval; mcp?: McpCapabilityCandidate
 }
-const gates = ref<CockpitApprovalRequest[]>([])
+const gates = ref<AgentGateRequest[]>([])
 const external = ref<AgentApproval[]>([])
 const mcpPending = ref<Record<string, McpCapabilityCandidate>>({})
 const selected = ref<QueueItem | null>(null)
@@ -34,11 +34,12 @@ const actionLabels: Record<string, string> = {
 const items = computed<QueueItem[]>(() => {
   const rows: QueueItem[] = []
   const wf = props.workflow
-  if (wf && ['planned', 'awaiting_approval'].includes(wf.status))
+  if (!props.externalOnly && wf && ['planned', 'awaiting_approval'].includes(wf.status))
     rows.push({ id: `plan:${wf.workflow_id}`, source: 'plan', title: '审核执行计划',
       summary: `${wf.tasks?.length || 0} 项任务 · ${wf.acceptance_contract?.items?.length || 0} 条验收条件`, risk: 'review' })
   for (const gate of gates.value) rows.push({ id: gate.id, source: 'gate',
-    title: actionLabels[gate.action] || gate.action, summary: gate.target, risk: gate.risk, gate })
+    title: actionLabels[gate.action] || gate.action, summary: gate.target,
+    risk: gate.risk === 'L3' ? 'L3' : 'L2', gate })
   for (const row of external.value.filter(x => x.status === 'pending'))
     rows.push({ id: row.id, source: 'external', title: '修改项目外文件',
       summary: row.summary || row.paths?.join('、') || row.id, risk: 'L3', external: row })
@@ -46,7 +47,7 @@ const items = computed<QueueItem[]>(() => {
     if (!gates.value.some(g => g.action === 'mcp_capability' && g.target === key))
       rows.push({ id: `mcp:${key}`, source: 'mcp', title: `启用 ${candidate.domain || key} MCP 能力`,
         summary: `${candidate.tool_count || 0} 个工具 · ${candidate.best_for || key}`, risk: 'L2', mcp: candidate })
-  if (wf?.status === 'completed' && wf.acceptance_contract?.final_decision === 'pending')
+  if (!props.externalOnly && wf?.status === 'completed' && wf.acceptance_contract?.final_decision === 'pending')
     rows.push({ id: `final:${wf.workflow_id}`, source: 'final', title: '最终验收',
       summary: '检查实际效果、任务结果和验收条件', risk: 'review' })
   return rows.sort((a, b) => Number(b.risk === 'L3') - Number(a.risk === 'L3'))
@@ -113,8 +114,8 @@ watch(() => props.workflow?.status, () => { void refresh() })
       <span><b>{{ item.title }}</b><small>{{ item.summary }}</small></span>
       <span class="caq-arrow">›</span>
     </button>
-    <Teleport to="body"><div v-if="selected" class="caq-mask" @click.self="close">
-      <div class="caq-dialog" role="dialog" aria-modal="true" :aria-label="selected.title">
+    <Teleport to="body"><div v-if="selected" class="caq-mask wb-modal-backdrop" @click.self="close">
+      <div class="caq-dialog wb-modal-shell" role="dialog" aria-modal="true" :aria-label="selected.title">
         <header><h3>{{ selected.title }}</h3><button :disabled="busy" @click="close">×</button></header>
         <p class="caq-detail">{{ selected.summary }}</p>
         <template v-if="selected.source === 'plan'">
@@ -138,6 +139,10 @@ watch(() => props.workflow?.status, () => { void refresh() })
 </template>
 
 <style scoped>
-.caq { display: grid; align-content: start; gap: 8px; }.caq header { display: flex; justify-content: space-between; align-items: center; gap: 10px; }.caq h3 { margin: 0; font-size: 13px; }.caq header span,.caq-empty { color: var(--text-faint); font-size: 11px; }.caq-empty { margin: 0; }.caq-item { width: 100%; display: flex; align-items: start; gap: 8px; text-align: left; border: 1px solid var(--border); border-radius: 8px; padding: 9px; background: var(--bg-raised); color: var(--text); cursor: pointer; }.caq-item:hover { border-color: var(--accent); }.caq-item > span:nth-child(2) { min-width: 0; flex: 1; display: grid; gap: 3px; }.caq-item b { font-size: 12px; }.caq-item small { color: var(--text-faint); overflow-wrap: anywhere; }.caq-risk { font-size: 10px; color: var(--accent); }.caq-L3 { color: var(--danger); }.caq-arrow { color: var(--text-faint); }.caq-notice { color: var(--green); margin: 0; font-size: 11px; }
-.caq-mask { position: fixed; inset: 0; z-index: 1200; display: grid; place-items: center; background: rgba(20,30,48,.4); }.caq-dialog { width: min(560px,calc(100vw - 32px)); max-height: 80vh; overflow: auto; box-sizing: border-box; display: grid; gap: 10px; padding: 18px; border-radius: 12px; background: var(--bg-raised); color: var(--text); box-shadow: var(--shadow-pop); }.caq-dialog header button { border: 0; background: transparent; font-size: 20px; cursor: pointer; color: var(--text-muted); }.caq-dialog h4 { margin: 4px 0 0; font-size: 12px; }.caq-dialog p { margin: 0; font-size: 12px; color: var(--text-muted); }.caq-line { border-top: 1px solid var(--border); padding-top: 6px; font-size: 12px; overflow-wrap: anywhere; }.caq-detail { overflow-wrap: anywhere; }.caq-dialog pre { max-height: 220px; overflow: auto; padding: 8px; border: 1px solid var(--border); font-size: 11px; }.caq-dialog textarea { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-raised); color: var(--text); }.caq-dialog footer { display: flex; justify-content: flex-end; gap: 7px; }.caq-dialog footer button { padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-raised); color: var(--text); cursor: pointer; }.caq-dialog footer button:disabled { opacity: .5; cursor: default; }.caq-error { color: var(--danger) !important; }
+.caq { display: grid; align-content: start; gap: 8px; }.caq header { display: flex; justify-content: space-between; align-items: center; gap: 10px; }.caq h3 { margin: 0; font-size: 13px; }.caq header span,.caq-empty { color: var(--text-faint); font-size: 11px; }.caq-empty { margin: 0; padding: 10px 0; }.caq-item { width: 100%; display: flex; align-items: start; gap: 8px; text-align: left; border: 1px solid var(--border); border-radius: 9px; padding: 10px; background: var(--bg-raised); color: var(--text); cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .16s ease, box-shadow .16s ease; }.caq-item:hover { border-color: var(--accent); background: var(--bg-selected); transform: translateX(2px); box-shadow: 0 4px 12px rgba(35,52,84,.08); }.caq-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }.caq-item > span:nth-child(2) { min-width: 0; flex: 1; display: grid; gap: 3px; }.caq-item b { font-size: 12px; }.caq-item small { color: var(--text-faint); overflow-wrap: anywhere; line-height: 1.45; }.caq-risk { font-size: 10px; color: var(--accent); border: 1px solid currentColor; border-radius: 99px; padding: 1px 6px; flex: 0 0 auto; }.caq-L3 { color: var(--danger); background: rgba(214,78,78,.06); }.caq-review { color: var(--amber); background: rgba(214,158,46,.06); }.caq-arrow { color: var(--text-faint); transition: transform .16s ease, color .16s ease; }.caq-item:hover .caq-arrow { color: var(--accent); transform: translateX(3px); }.caq-notice { color: var(--green); margin: 0; padding: 7px 9px; border: 1px solid rgba(52,168,112,.25); border-radius: 7px; background: rgba(52,168,112,.05); font-size: 11px; }
+.caq-mask { position: fixed; inset: 0; z-index: 1200; display: grid; place-items: center; background: rgba(20,30,48,.4); backdrop-filter: blur(2px); animation: caq-fade .18s ease-out both; }.caq-dialog { width: min(560px,calc(100vw - 32px)); max-height: 80vh; overflow: auto; box-sizing: border-box; display: grid; gap: 10px; padding: 18px; border-radius: 12px; background: var(--bg-raised); color: var(--text); box-shadow: var(--shadow-pop); animation: caq-rise .2s cubic-bezier(.2,.8,.2,1) both; }.caq-dialog header button { border: 0; background: transparent; font-size: 20px; cursor: pointer; color: var(--text-muted); border-radius: 5px; transition: color .15s ease, background .15s ease, transform .15s ease; }.caq-dialog header button:hover { color: var(--text); background: var(--bg-hover); transform: rotate(90deg); }.caq-dialog h4 { margin: 4px 0 0; font-size: 12px; }.caq-dialog p { margin: 0; font-size: 12px; color: var(--text-muted); line-height: 1.5; }.caq-line { border-top: 1px solid var(--border); padding-top: 6px; font-size: 12px; overflow-wrap: anywhere; line-height: 1.45; }.caq-detail { overflow-wrap: anywhere; }.caq-dialog pre { max-height: 220px; overflow: auto; padding: 8px; border: 1px solid var(--border); font-size: 11px; border-radius: 6px; background: var(--bg); }.caq-dialog textarea { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-raised); color: var(--text); transition: border-color .15s ease, box-shadow .15s ease; }.caq-dialog textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,96,212,.12); }.caq-dialog footer { display: flex; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }.caq-dialog footer button { padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-raised); color: var(--text); cursor: pointer; transition: color .15s ease, background .15s ease, border-color .15s ease, transform .15s ease; }.caq-dialog footer button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }.caq-dialog footer button:disabled { opacity: .5; cursor: default; }.caq-error { color: var(--danger) !important; }
+@keyframes caq-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes caq-rise { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@media (max-width: 560px) { .caq-dialog { width: calc(100vw - 20px); max-height: 88vh; padding: 14px; } .caq-dialog footer button { flex: 1 1 auto; } }
+@media (prefers-reduced-motion: reduce) { .caq-item, .caq-arrow, .caq-dialog header button, .caq-dialog textarea, .caq-dialog footer button { transition: none; } .caq-mask, .caq-dialog { animation: none; } }
 </style>

@@ -123,6 +123,7 @@ function press(_e: MouseEvent) {}
   border-radius: 6px;
   cursor: pointer;
   white-space: nowrap;
+  transition: color .16s ease, background .16s ease, border-color .16s ease, transform .16s ease;
 }
 .sel-ai-btn:hover {
   background: var(--bg-hover);
@@ -141,5 +142,16 @@ function press(_e: MouseEvent) {}
 .sel-ai-btn-ask:hover {
   background: rgba(47, 111, 237, 0.12);
   color: #2560d4;
+}
+.sel-ai-btn:focus-visible { outline: 2px solid #2f6fed88; outline-offset: 2px; }
+.sel-ai-btn:active { transform: translateY(1px); }
+@media (max-width: 520px) {
+  .sel-ai-bar { min-width: 0; max-width: calc(100vw - 16px); }
+  .sel-ai-actions { flex-wrap: wrap; }
+  .sel-ai-btn { flex: 1 1 auto; justify-content: center; }
+  .sel-ai-meta { white-space: normal; line-height: 1.4; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sel-ai-bar, .sel-ai-btn { animation: none; transition: none; }
 }
 </style>

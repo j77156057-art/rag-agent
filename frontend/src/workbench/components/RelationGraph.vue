@@ -609,8 +609,8 @@ const colorOf = regionColor
 </script>
 
 <template>
-  <div v-if="relationGraphOpen" class="rg-overlay" @mousedown.self="closeRelationGraph">
-    <section class="rg-panel" role="dialog" aria-label="关系图">
+  <div v-if="relationGraphOpen" class="rg-overlay wb-modal-backdrop" @mousedown.self="closeRelationGraph">
+    <section class="rg-panel wb-modal-shell" role="dialog" aria-modal="true" aria-label="关系图">
       <header class="rg-top">
         <div class="rg-title">
           <svg width="15" height="15" viewBox="0 0 15 15" aria-hidden="true">
@@ -841,6 +841,7 @@ const colorOf = regionColor
   align-items: center;
   justify-content: center;
   padding: 26px;
+  animation: rg-overlay-in .18s ease-out both;
 }
 .rg-panel {
   width: min(1280px, 97vw);
@@ -852,6 +853,7 @@ const colorOf = regionColor
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  animation: rg-panel-in .22s cubic-bezier(.2,.8,.2,1) both;
 }
 .rg-top {
   flex: 0 0 auto;
@@ -874,6 +876,17 @@ const colorOf = regionColor
   display: inline-flex; align-items: center; justify-content: center;
 }
 .rg-iconbtn:hover { background: var(--bg-hover); color: var(--text); }
+.rg-iconbtn:focus-visible,
+.rg-toggle:focus-visible,
+.rg-zoom button:focus-visible,
+.rg-clear:focus-visible,
+.rg-d-x:focus-visible,
+.rg-d-open:focus-visible,
+.rg-retry:focus-visible,
+.rg-d-link:focus-visible {
+  outline: 2px solid #2f6fed88;
+  outline-offset: 2px;
+}
 
 .rg-toolbar {
   flex: 0 0 auto;
@@ -931,6 +944,8 @@ const colorOf = regionColor
   cursor: pointer;
 }
 .rg-toggle:hover { border-color: var(--border-strong); color: var(--text); }
+.rg-toggle { transition: color .16s ease, border-color .16s ease, background .16s ease, opacity .16s ease; }
+.rg-toggle:not(.off) { background: #2f6fed0d; border-color: #2f6fed55; }
 .rg-toggle.off { opacity: 0.42; }
 .rg-tg-line { width: 14px; height: 0; border-top: 2px solid #4d7fc0; display: inline-block; }
 .rg-tg-line.mnt { border-top: 2px dashed #f0883e; }
@@ -953,6 +968,8 @@ const colorOf = regionColor
   padding: 0 7px;
 }
 .rg-zoom button:hover { color: var(--text); border-color: var(--border-strong); }
+.rg-zoom button { transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease; }
+.rg-zoom button:active { transform: translateY(1px); }
 
 .rg-canvas-wrap { flex: 1; position: relative; overflow: hidden; background: var(--bg); }
 .rg-svg {
@@ -981,7 +998,7 @@ const colorOf = regionColor
 .rg-elabel-tx.calls { fill: #0c6b58; }
 
 .rg-node { cursor: pointer; }
-.rg-node rect { stroke-width: 1.3; }
+.rg-node rect { stroke-width: 1.3; transition: stroke-width .14s ease, filter .14s ease, opacity .14s ease; }
 .rg-node:hover rect { stroke-width: 2; filter: brightness(1.08); }
 .rg-node.selected rect { stroke-width: 2.4; filter: drop-shadow(0 2px 6px rgba(47,111,237,.35)); }
 .rg-node.dim { opacity: 0.13; }
@@ -1045,6 +1062,8 @@ const colorOf = regionColor
   border-radius: 6px; padding: 7px 10px; font-size: 12px; cursor: pointer;
 }
 .rg-d-open:disabled { opacity: .5; cursor: not-allowed; }
+.rg-d-open:not(:disabled):hover { filter: brightness(1.06); transform: translateY(-1px); }
+.rg-d-open { transition: filter .16s ease, transform .16s ease; }
 
 .rg-state {
   position: absolute;
@@ -1082,4 +1101,32 @@ const colorOf = regionColor
 .rg-lg-scene { background: rgba(240, 136, 62, 0.25); border: 1px solid #f0883e; }
 .rg-lg-ext { background: rgba(152, 163, 180, 0.1); border: 1px dashed #98a3b4; }
 .rg-legend-tip { color: var(--text-faint); }
+
+@keyframes rg-overlay-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes rg-panel-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+
+@media (max-width: 900px) {
+  .rg-overlay { padding: 14px; }
+  .rg-panel { width: 100%; height: min(900px, 94vh); }
+  .rg-toolbar { flex-wrap: wrap; }
+  .rg-search { max-width: none; flex-basis: 100%; }
+  .rg-toggles { min-width: 0; overflow-x: auto; padding-bottom: 2px; }
+  .rg-zoom { margin-left: auto; }
+  .rg-detail { width: min(300px, calc(100% - 24px)); }
+  .rg-legend { max-width: calc(100% - 28px); overflow-x: auto; white-space: nowrap; }
+}
+@media (max-width: 560px) {
+  .rg-overlay { padding: 0; align-items: stretch; }
+  .rg-panel { height: 100%; max-height: none; border-radius: 0; border-left: 0; border-right: 0; }
+  .rg-top { padding: 10px 12px; }
+  .rg-stats { display: none; }
+  .rg-toolbar { gap: 7px; padding: 8px 10px; }
+  .rg-toggles { order: 2; flex-basis: 100%; }
+  .rg-zoom { margin-left: 0; }
+  .rg-detail { top: 8px; right: 8px; max-height: calc(100% - 16px); }
+  .rg-legend { left: 8px; bottom: 8px; padding: 5px 9px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rg-overlay, .rg-panel, .rg-toggle, .rg-zoom button, .rg-node rect, .rg-d-open { animation: none; transition: none; }
+}
 </style>

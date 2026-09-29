@@ -8,6 +8,10 @@ import type { PreviewFeedbackRequest } from './previewFeedback'
 /** 聚焦对话台时可携带的意图：预置问题或强制按当前项目重建会话上下文 */
 export interface FocusChatDetail {
   q?: string
+  /** 仅在草稿为空时预填，不覆盖用户已输入内容 */
+  qIfEmpty?: string
+  /** 聚焦哪个对话台：普通工作台（default）或自主开发舱（cockpit） */
+  target?: 'default' | 'cockpit'
   reload?: boolean
 }
 
@@ -24,10 +28,23 @@ export interface AppEventMap {
   'docmind:send-chat': PreviewFeedbackRequest
   /** 各入口（概览/分区图/预览/工具菜单）请求聚焦底部对话台 */
   'docmind:focus-chat': FocusChatDetail
+  /** 自主开发舱「管理预设」→ 切回概览并打开对话台模型设置弹窗 */
+  'docmind:open-model-settings': void
   /** api 层检测到当前项目 id 变化 → ChatDock 重建会话上下文 */
   'docmind:project-context-changed': void
   /** ChatDock 团队抽屉 → 指定 WorkflowCard 滚动定位成员任务 */
   'docmind:wf-focus-member': WfFocusMemberDetail
+  /** 开发舱持续视觉：最近一帧及当前观察会话的变化记录。 */
+  'docmind:live-vision-frame': {
+    projectId: string
+    image: Blob | null
+    /** 帧采集时间（epoch ms），语音发言时段匹配依赖它。 */
+    capturedAt?: number
+    /** 用户圈选区域的裁剪帧；未圈选时为 null。 */
+    focusImage?: Blob | null
+    observation?: string
+    timeline?: { at: string; observation: string }[]
+  }
 }
 
 export type AppEventName = keyof AppEventMap

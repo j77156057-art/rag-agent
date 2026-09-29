@@ -43,8 +43,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 </script>
 
 <template>
-  <div v-if="rewriteDiff && diff" class="rd-overlay" @mousedown.self="closeRewriteDiff">
-    <section class="rd-panel" role="dialog" aria-label="改写差异预览">
+  <div v-if="rewriteDiff && diff" class="rd-overlay wb-modal-backdrop" @mousedown.self="closeRewriteDiff">
+    <section class="rd-panel wb-modal-shell" role="dialog" aria-modal="true" aria-label="改写差异预览">
       <header class="rd-top">
         <div class="rd-title">
           <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
@@ -109,6 +109,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   align-items: center;
   justify-content: center;
   padding: 34px;
+  animation: rd-overlay-in .18s ease-out both;
 }
 .rd-panel {
   width: min(900px, 95vw);
@@ -120,6 +121,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  animation: rd-panel-in .22s cubic-bezier(.2,.8,.2,1) both;
 }
 .rd-top {
   flex: 0 0 auto;
@@ -150,6 +152,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   flex: 0 0 auto;
 }
 .rd-iconbtn:hover { background: var(--bg-hover); color: var(--text); }
+.rd-iconbtn:focus-visible, .rd-cancel:focus-visible, .rd-accept:focus-visible { outline: 2px solid #2f6fed88; outline-offset: 2px; }
 
 .rd-instr {
   flex: 0 0 auto;
@@ -241,4 +244,25 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 }
 .rd-accept:hover:not(:disabled) { background: #1c9e66; }
 .rd-accept:disabled { opacity: 0.45; cursor: default; }
+.rd-cancel, .rd-accept { transition: background .16s ease, border-color .16s ease, color .16s ease, transform .16s ease, filter .16s ease; }
+.rd-cancel:active, .rd-accept:active:not(:disabled) { transform: translateY(1px); }
+@keyframes rd-overlay-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes rd-panel-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@media (max-width: 700px) {
+  .rd-overlay { padding: 14px; }
+  .rd-panel { width: 100%; height: min(900px, 94vh); }
+  .rd-statbar { flex-wrap: wrap; gap: 6px 10px; }
+  .rd-stat-hint { flex-basis: 100%; margin-left: 0; }
+}
+@media (max-width: 520px) {
+  .rd-overlay { padding: 0; align-items: stretch; }
+  .rd-panel { height: 100%; border-radius: 0; border-left: 0; border-right: 0; }
+  .rd-top { padding: 10px 12px; }
+  .rd-path { display: none; }
+  .rd-foot { padding: 10px 12px; }
+  .rd-cancel, .rd-accept { flex: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rd-overlay, .rd-panel, .rd-iconbtn, .rd-cancel, .rd-accept { animation: none; transition: none; }
+}
 </style>

@@ -7,6 +7,7 @@ import { formatMtime } from '../theme'
 const { dialog, resolveDialog } = useWorkbench()
 const inputVal = ref('')
 const inputEl = ref<HTMLInputElement | null>(null)
+const initialEl = ref<HTMLElement | null>(null)
 
 watch(dialog, async (d) => {
   if (d?.kind === 'prompt') {
@@ -17,6 +18,9 @@ watch(dialog, async (d) => {
     const dot = d.defaultValue.lastIndexOf('.')
     if (dot > 0) inputEl.value?.setSelectionRange(0, dot)
     else inputEl.value?.select()
+  } else if (d) {
+    await nextTick()
+    initialEl.value?.focus()
   }
 })
 
@@ -35,12 +39,12 @@ function onKey(e: KeyboardEvent) {
 <template>
   <div
     v-if="dialog"
-    class="dg-mask"
+    class="dg-mask wb-modal-backdrop"
     @mousedown.self="resolveDialog(dialog.kind === 'alert')"
     @keydown="onKey"
     tabindex="-1"
   >
-    <div class="dg-box" role="dialog" aria-modal="true">
+    <div class="dg-box wb-modal-shell" role="dialog" aria-modal="true">
       <!-- confirm -->
       <template v-if="dialog.kind === 'confirm'">
         <h3 class="dg-title">{{ dialog.title }}</h3>
@@ -49,6 +53,7 @@ function onKey(e: KeyboardEvent) {
         <div class="dg-actions">
           <button class="dg-btn" @click="resolveDialog(false)">取消</button>
           <button
+            ref="initialEl"
             class="dg-btn dg-primary"
             :class="{ 'dg-danger': dialog.danger }"
             @click="resolveDialog(true)"
@@ -83,7 +88,7 @@ function onKey(e: KeyboardEvent) {
         <p class="dg-msg">{{ dialog.message }}</p>
         <pre v-if="dialog.detail" class="dg-detail">{{ dialog.detail }}</pre>
         <div class="dg-actions">
-          <button class="dg-btn dg-primary" @click="resolveDialog(true)">知道了</button>
+          <button ref="initialEl" class="dg-btn dg-primary" @click="resolveDialog(true)">知道了</button>
         </div>
       </template>
 
@@ -96,7 +101,7 @@ function onKey(e: KeyboardEvent) {
         </p>
         <p class="dg-msg dg-sub">继续保存会用当前编辑器内容覆盖外部改动，且无法自动合并。</p>
         <div class="dg-actions">
-          <button class="dg-btn" @click="resolveDialog(false)">取消（我先对比）</button>
+          <button ref="initialEl" class="dg-btn" @click="resolveDialog(false)">取消（我先对比）</button>
           <button class="dg-btn dg-danger" @click="resolveDialog(true)">强制覆盖保存</button>
         </div>
       </template>

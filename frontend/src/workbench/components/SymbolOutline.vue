@@ -154,6 +154,8 @@ function go(s: SymbolInfo) {
 }
 .so-expand { margin: 0 auto; }
 .so-collapse:hover, .so-expand:hover { color: var(--text); background: var(--bg-hover); }
+.so-collapse:focus-visible, .so-expand:focus-visible, .so-item:focus-visible { outline: 2px solid #2f6fed88; outline-offset: -2px; }
+.so-collapse, .so-expand, .so-item { transition: color .16s ease, background .16s ease, transform .16s ease; }
 .so-body { flex: 1; overflow-y: auto; padding: 6px 0 12px; }
 .so-hint {
   padding: 12px 10px;
@@ -212,6 +214,7 @@ function go(s: SymbolInfo) {
 }
 .so-item:hover { background: var(--bg-hover); }
 .so-item:hover .so-ln { color: var(--text-muted); }
+.so-item:active { transform: translateX(1px); }
 .so-mark {
   font-style: normal;
   font-family: var(--font-mono);
@@ -235,5 +238,12 @@ function go(s: SymbolInfo) {
   font-size: 10px;
   color: var(--text-faint);
   flex: 0 0 auto;
+}
+@media (max-width: 760px) {
+  .so-panel { flex-basis: 180px; width: 180px; }
+  .so-panel.is-collapsed { flex-basis: 28px; width: 28px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .so-collapse, .so-expand, .so-item { transition: none; }
 }
 </style>

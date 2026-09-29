@@ -2,6 +2,9 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent } from 'vue'
 import { runtimeApi, engineApi, playApi, sceneApi, regionsApi, bugsApi, changesetApi, aiApi, getProjectId } from '../api'
 import { createPoller } from '../composables/polling'
+import { appEvents } from '../eventBus'
+import { blobDataUrl } from '../previewFeedback'
+import { capturePreviewFrame } from '../workflowPreviewCapture'
 import type { WebTemplates, WebExportResult, DesktopHost, EmbedRect, BugItem, RegionInfo } from '../api'
 import { useWorkbench } from '../composables/workbench'
 import { demoMode, demoBugs, demoChangesets, demoRegionCards, demoBugFixAnswer } from '../composables/demo'
@@ -12,7 +15,8 @@ const RuntimeTimeline = defineAsyncComponent(() => import('./RuntimeTimeline.vue
 
 // 阶段 4：popup（默认，传统固定遮罩弹窗，行为逐字不变）/ docked（常驻主区，内联填充父容器）。
 // 同一个组件实例通过 prop 切换形态，绝不重建（否则丢 iframe / 引擎嵌入状态）。
-const props = withDefaults(defineProps<{ mode?: 'popup' | 'docked' }>(), { mode: 'popup' })
+const props = withDefaults(defineProps<{ mode?: 'popup' | 'docked'; host?: string }>(), { mode: 'popup', host: '#wb-playpane-slot' })
+const emit = defineEmits<{ close: [] }>()
 const docked = computed(() => props.mode === 'docked')
 
 const { jumpToLine, openPath, activeTab, runtimeOpen, runtimeTab, closeRuntimeResident } = useWorkbench()
@@ -30,6 +34,104 @@ const iframeEl = ref<HTMLIFrameElement | null>(null)
 const iframeUrl = ref('')
 const iframeNonce = ref(0)
 const exporting = ref(false)
+const visualNote = ref('')
+const visualImage = ref('')
+const visualBlob = ref<Blob | null>(null)
+const visualProject = ref('')
+const visualBusy = ref(false)
+const visualSending = ref(false)
+const visualStatus = ref('')
+const visualOpen = ref(false)
+const visualPanel = ref<HTMLElement | null>(null)
+let visualGeneration = 0
+
+async function openVisualFeedback() {
+  if (visualBusy.value || visualSending.value) return
+  const frame = iframeEl.value
+  if (!frame) { visualStatus.value = '请先加载 Web 试玩画面；原生桌面窗口暂需通过聊天上传截图。'; return }
+  const projectId = getProjectId(), ticket = ++visualGeneration
+  visualBusy.value = true
+  visualStatus.value = ''
+  try {
+    const blob = await capturePreviewFrame(frame)
+    const image = await blobDataUrl(blob)
+    if (projectId !== getProjectId() || ticket !== visualGeneration) return
+    visualBlob.value = blob; visualImage.value = image; visualProject.value = projectId
+    visualOpen.value = true
+    visualStatus.value = '已截取此刻画面。请确认截图包含你要反馈的内容。'
+    await nextTick()
+    visualPanel.value?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  } catch (e) { visualStatus.value = (e as Error).message || '截图失败，请通过聊天上传截图。' }
+  finally { visualBusy.value = false }
+}
+/** 只观察当前画面并交给 AI，不要求用户先填写修改意见。 */
+async function inspectCurrentView() {
+  if (visualBusy.value || visualSending.value) return
+  const projectId = getProjectId()
+  if (!projectId) { visualStatus.value = '请先选择当前项目。'; return }
+  const ticket = ++visualGeneration
+  visualBusy.value = true
+  visualStatus.value = '正在读取当前界面…'
+  try {
+    let blob: Blob | null = null
+    let captureError = ''
+    if (iframeEl.value) {
+      try {
+        blob = await capturePreviewFrame(iframeEl.value)
+        visualBlob.value = blob
+        visualImage.value = await blobDataUrl(blob)
+        visualProject.value = projectId
+      } catch (cause) {
+        captureError = (cause as Error).message || '网页画面暂时无法截图'
+      }
+    }
+    if (ticket !== visualGeneration || projectId !== getProjectId()) return
+    visualSending.value = true
+    visualStatus.value = '正在交给 AI 观察…'
+    const target = props.host === '#wb-cockpit-runtime-slot' ? 'cockpit' : 'default'
+    appEvents.emit('docmind:send-chat', {
+      target, projectId, images: blob ? [blob] : [],
+      uiContext: 'app_interface_inspect',
+      prompt: [
+        '请浏览并分析当前项目的运行界面。',
+        blob
+          ? '我附上了刚刚截取的真实画面，请描述可观察事实，并结合运行日志和项目文件复核。'
+          : `当前没有可附加的网页截图${captureError ? `（${captureError}）` : ''}，请调用 dev_desktop_capture 获取当前项目嵌入窗口或前台窗口；无法捕获时要明确说明，不要猜测。`,
+        '先给出界面状态、明显问题和下一步建议，不要把视觉观察当作源码或功能验收。',
+      ].join('\n'),
+      onStatus(status, detail) {
+        if (ticket !== visualGeneration) return
+        if (status === 'processing') visualStatus.value = detail || 'AI 正在查看当前界面，回复会显示在聊天区。'
+        else if (status === 'awaiting_review') { visualSending.value = false; visualStatus.value = 'AI 已完成界面观察，请查看聊天区。' }
+        else if (status === 'pending') { visualSending.value = false; visualStatus.value = detail || '当前对话正忙，请稍后重试。' }
+        else if (status === 'failed') { visualSending.value = false; visualStatus.value = detail || '界面观察未完成，请重试。' }
+      },
+    })
+  } catch (e) {
+    visualSending.value = false
+    visualStatus.value = (e as Error).message || '当前界面读取失败，请重试。'
+  } finally {
+    visualBusy.value = false
+  }
+}
+function sendVisualFeedback() {
+  if (!visualNote.value.trim() || !visualBlob.value || visualSending.value) return
+  if (visualProject.value !== getProjectId()) { visualStatus.value = '项目已切换，请重新截取当前项目画面。'; return }
+  const ticket = visualGeneration
+  visualSending.value = true
+  visualStatus.value = '正在交给 AI…'
+  appEvents.emit('docmind:send-chat', {
+    target: props.host === '#wb-cockpit-runtime-slot' ? 'cockpit' : 'default',
+    projectId: visualProject.value, images: [visualBlob.value],
+    prompt: visualNote.value.trim(),
+    uiContext: 'web_preview_feedback',
+    onStatus(status, detail) {
+      if (ticket !== visualGeneration) return
+      visualSending.value = status === 'processing'
+      visualStatus.value = detail || (status === 'processing' ? 'AI 正在分析，回复显示在聊天区。' : '请查看聊天区的分析和方案。')
+    },
+  })
+}
 const exportMsg = ref('')
 const lastExport = ref<WebExportResult | null>(null)
 const tpl = ref<WebTemplates | null>(null)
@@ -748,11 +850,15 @@ watch(tab, v => {
 
 /** 关闭面板：docked 关常驻态，popup 关弹窗（互斥，行为与既有入口一致）。 */
 function closePane() {
-  if (docked.value) closeRuntimeResident()
+  if (docked.value && props.host === '#wb-cockpit-runtime-slot') emit('close')
+  else if (docked.value) closeRuntimeResident()
   else open.value = false
 }
 
 function resetProject() {
+  visualGeneration++
+  visualOpen.value = false; visualBlob.value = null; visualImage.value = ''
+  visualNote.value = ''; visualStatus.value = ''; visualSending.value = false
   stopTimers()
   events.value = []
   seen.clear()
@@ -797,14 +903,14 @@ onUnmounted(() => {
       <button v-if="!docked" class="sr-trigger" title="一键导出并在工作台里运行游戏，边玩边看日志和场景" @click="open = true"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 2.2 L9.6 6 L3 9.8 Z" fill="currentColor"/></svg><span class="sr-label">运行游戏</span></button>
     </Teleport>
     <!-- 遮罩：仅弹窗模式 -->
-    <div v-if="!docked && open" class="pb-mask" @click.self="open = false" />
+    <div v-if="!docked && open" class="pb-mask wb-modal-backdrop" @click.self="open = false" />
     <!--
       面板主体：弹窗模式在此就地渲染（固定弹层）；常驻模式 teleport 到主区 host 内联填充。
       同一份内容、同一个组件实例，仅切换承载方式，绝不重建。
       defer 同上：主区槽位 #wb-playpane-slot 与本实例同根，需等根节点插入后再解析 target。
     -->
-    <Teleport defer to="#wb-playpane-slot" :disabled="!docked">
-      <div v-if="docked || open" class="pb-pop" :class="{ 'pb-pop-inline': docked }">
+    <Teleport defer :to="props.host" :disabled="!docked">
+      <div v-if="docked || open" class="pb-pop" :class="[{ 'pb-pop-inline': docked }, { 'wb-modal-shell': !docked }]">
         <div class="pb-head">
           <div class="pb-tabs">
             <button :class="{ on: tab === 'play' }" @click="tab = 'play'">🎮 Web 试玩</button>
@@ -824,6 +930,8 @@ onUnmounted(() => {
               <button class="pb-btn" :disabled="!iframeUrl" @click="cmdReload" title="热重载游戏场景（不刷新页面）">↻ 重载场景</button>
               <button class="pb-btn" :disabled="!iframeUrl" @click="reloadFrame">刷新框架</button>
               <button class="pb-btn" :disabled="!iframeUrl" @click="openExternal">新标签打开</button>
+              <button class="pb-btn primary" :disabled="visualBusy || visualSending" @click="inspectCurrentView">{{ visualBusy ? '读取画面…' : visualSending ? 'AI 观察中…' : '让 AI 观察当前画面' }}</button>
+              <button class="pb-btn" :disabled="!iframeUrl || visualBusy || visualSending" @click="openVisualFeedback">截图并反馈给 AI</button>
               <span class="pb-sep" />
               <label
                 class="pb-check"
@@ -878,6 +986,8 @@ onUnmounted(() => {
             </div>
 
             <!-- 原生引擎嵌入时，Window 子窗口会盖在这一块矩形上（ref 用于算它的坐标） -->
+            <small class="pb-interaction-hint">点击游戏画面后使用项目原有按键；「让 AI 观察当前画面」会把网页截图交给视觉模型，原生窗口会调用桌面视觉工具。</small>
+            <div v-if="visualStatus && !visualOpen" class="pb-visual-status" role="status">{{ visualStatus }}</div>
             <div ref="engineViewport" class="pb-framewrap" @mousedown="onViewportFocus">
               <iframe
                 v-if="iframeUrl"
@@ -891,6 +1001,14 @@ onUnmounted(() => {
                 <small>Godot 工程将导出为 WebAssembly 并在此画布内运行，支持边玩边让 AI 修改代码</small>
               </div>
             </div>
+            <section v-if="visualOpen" ref="visualPanel" class="pb-visual-feedback" aria-label="画面反馈">
+              <header><b>这张画面要怎么改？</b><button class="pb-btn" @click="visualOpen = false">收起反馈</button></header>
+              <img :src="visualImage" alt="发送给 AI 的当前试玩截图，请检查画面是否完整" />
+              <textarea v-model="visualNote" aria-label="画面修改意见" rows="3" placeholder="例如：优化血条和地面效果；先给我方案，审核后再修改。" :disabled="visualSending" />
+              <div><button class="pb-btn" :disabled="visualBusy || visualSending" @click="openVisualFeedback">重新截取</button><button class="pb-btn primary" :disabled="!visualNote.trim() || visualSending" @click="sendVisualFeedback">{{ visualSending ? 'AI 分析中…' : '发送截图与意见' }}</button></div>
+              <p role="status">{{ visualStatus }}</p>
+              <small>截图和意见发送到当前聊天使用的模型；分析回复不代表文件已修改。审核并完成修改后，再重新导出试玩检查效果。</small>
+            </section>
           </div>
 
           <div class="pb-side">
@@ -991,19 +1109,21 @@ onUnmounted(() => {
 
 <style scoped>
 .sr-panel { position: relative; }
-.sr-trigger { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border-strong); background: transparent; color: var(--text-muted); border-radius: 5px; padding: 5px 9px; cursor: pointer; white-space: nowrap; }
-.sr-trigger:hover { color: var(--text); border-color: #b9d0f5; }
+.sr-trigger { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border-strong); background: transparent; color: var(--text-muted); border-radius: 5px; padding: 5px 9px; cursor: pointer; white-space: nowrap; transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease; }
+.sr-trigger:hover { color: var(--text); border-color: #b9d0f5; background: var(--bg-hover); transform: translateY(-1px); }
 
-.pb-mask { position: fixed; inset: 0; background: rgba(38, 52, 77, 0.38); z-index: 65; }
-.pb-pop { position: fixed; z-index: 66; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 1360px; max-width: 96vw; height: 840px; max-height: 92vh; background: var(--bg-raised); border: 1px solid var(--border-strong); border-radius: 10px; box-shadow: 0 24px 70px rgba(35, 52, 84, 0.16); display: flex; flex-direction: column; overflow: hidden; }
-.pb-head { display: flex; align-items: center; justify-content: space-between; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+.pb-mask { position: fixed; inset: 0; background: rgba(38, 52, 77, 0.38); z-index: 65; animation: pb-mask-in .2s ease-out both; }
+.pb-pop { position: fixed; z-index: 66; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 1360px; max-width: 96vw; height: 840px; max-height: 92vh; background: var(--bg-raised); border: 1px solid var(--border-strong); border-radius: 10px; box-shadow: 0 24px 70px rgba(35, 52, 84, 0.16); display: flex; flex-direction: column; overflow: hidden; animation: pb-pop-in .24s cubic-bezier(.2,.8,.2,1) both; }
+.pb-head { display: flex; align-items: center; justify-content: space-between; padding: 9px 12px; border-bottom: 1px solid var(--border); background: linear-gradient(180deg, var(--bg-raised), var(--bg-hover)); }
 .pb-tabs { display: flex; gap: 6px; }
-.pb-tabs button { background: transparent; border: 1px solid transparent; color: var(--text-muted); padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+.pb-tabs button { background: transparent; border: 1px solid transparent; color: var(--text-muted); padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; transition: color .16s ease, background .16s ease, border-color .16s ease, transform .16s ease; }
+.pb-tabs button:hover:not(.on) { color: var(--text); background: var(--bg-selected); transform: translateY(-1px); }
 .pb-tabs button.on { background: linear-gradient(180deg, #3b7ef2, #2f6fed); border-color: #2560d4; color: #fff; }
-.pb-x { background: none; border: 0; color: var(--text-muted); font-size: 18px; cursor: pointer; }
+.pb-x { background: none; border: 0; color: var(--text-muted); font-size: 18px; cursor: pointer; border-radius: 5px; padding: 2px 6px; transition: color .16s ease, background .16s ease, transform .16s ease; }
+.pb-x:hover { color: var(--text); background: var(--bg-selected); transform: rotate(90deg); }
 .pb-body { flex: 1; display: flex; min-height: 0; }
-.pb-main { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 10px 12px; gap: 8px; }
-.pb-side { width: 320px; border-left: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+.pb-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: auto; padding: 10px 12px; gap: 8px; background: linear-gradient(180deg, rgba(246,249,255,.45), transparent 35%); }
+.pb-side { width: 320px; border-left: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; background: linear-gradient(180deg, var(--bg-hover), var(--bg-raised)); }
 .pb-side-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 12px; }
 .pb-side-head > div { display: flex; align-items: center; gap: 8px; }
 .pb-live { color: #c23a40; font-size: 10px; letter-spacing: 1px; }
@@ -1012,8 +1132,8 @@ onUnmounted(() => {
 
 .pb-toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .pb-sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
-.pb-btn { border: 1px solid var(--border-strong); background: transparent; color: var(--text-muted); border-radius: 5px; padding: 5px 10px; font-size: 12px; cursor: pointer; }
-.pb-btn:hover:not(:disabled) { color: var(--text); border-color: #b9d0f5; }
+.pb-btn { border: 1px solid var(--border-strong); background: transparent; color: var(--text-muted); border-radius: 5px; padding: 5px 10px; font-size: 12px; cursor: pointer; transition: color .16s ease, background .16s ease, border-color .16s ease, transform .16s ease, box-shadow .16s ease; }
+.pb-btn:hover:not(:disabled) { color: var(--text); border-color: #b9d0f5; transform: translateY(-1px); box-shadow: 0 3px 8px rgba(35,52,84,.08); }
 .pb-btn:disabled { opacity: .4; cursor: default; }
 .pb-btn.primary { background: linear-gradient(180deg, #3b7ef2, #2f6fed); border-color: #2560d4; color: #fff; }
 .pb-btn.warn { border-color: rgba(224, 72, 79, 0.5); color: #c23a40; }
@@ -1029,14 +1149,16 @@ onUnmounted(() => {
 .pb-dl-bar { height: 7px; border-radius: 4px; background: rgba(35, 52, 84, 0.12); overflow: hidden; }
 .pb-dl-bar i { display: block; height: 100%; background: linear-gradient(90deg, #2f6fed, #6f9cf5); transition: width .3s; }
 
-.pb-framewrap { flex: 0 1 auto; width: min(100%, 860px); height: 480px; min-height: 260px; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; background: #fcfdff; position: relative; }
+.pb-framewrap { flex: 0 1 auto; width: min(100%, 860px); height: 480px; min-height: 260px; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; background: #fcfdff; position: relative; box-shadow: 0 8px 22px rgba(35,52,84,.06); transition: border-color .18s ease, box-shadow .18s ease; }
+.pb-framewrap:hover { border-color: var(--border-strong); box-shadow: 0 10px 26px rgba(35,52,84,.1); }
 .pb-frame { width: 100%; height: 100%; border: 0; display: block; background: #fcfdff; }
 .pb-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--text-faint); font-size: 14px; text-align: center; padding: 30px; line-height: 1.8; }
 .pb-empty small { font-size: 11px; max-width: 380px; }
 
-.pb-tl { flex: 1; overflow: auto; padding: 4px 0; font: 11px var(--font-mono); }
+.pb-tl { flex: 1 1 45%; min-height: 150px; overflow: auto; padding: 4px 0; font: 11px var(--font-mono); }
 .pb-tl-empty { padding: 18px 12px; color: var(--text-faint); font-family: var(--font-base, inherit); line-height: 1.7; }
-.pb-ev { display: flex; align-items: baseline; gap: 7px; padding: 4px 10px; border-bottom: 1px solid rgba(35, 52, 84, 0.08); }
+.pb-ev { display: flex; align-items: baseline; gap: 7px; padding: 5px 10px; border-bottom: 1px solid rgba(35, 52, 84, 0.08); transition: background .15s ease, transform .15s ease; }
+.pb-ev:hover { background: var(--bg-selected); transform: translateX(2px); }
 .pb-ev-time { color: var(--text-faint); flex: 0 0 62px; }
 .pb-ev-type { font-weight: 700; }
 .pb-ev-src { color: var(--text-faint); font-size: 9px; border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; }
@@ -1064,13 +1186,14 @@ onUnmounted(() => {
 .pb-pop-inline .pb-side { width: clamp(260px, 26vw, 380px); }
 
 /* ===== 阶段 4：Bug 反馈闭环 ===== */
-.pb-bugwrap { flex: 1 1 48%; min-height: 0; display: flex; flex-direction: column; border-top: 1px solid var(--border); }
+.pb-bugwrap { flex: 1 1 52%; min-height: 0; display: flex; flex-direction: column; border-top: 1px solid var(--border); }
 .pb-bug-loading { color: var(--text-faint); font-size: 10px; }
 .pb-bugtool { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid rgba(35, 52, 84, 0.08); }
 .pb-bugtitle { flex: 1 1 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 5px 7px; border-radius: 5px; font-size: 11.5px; }
 .pb-bugsel { flex: 0 1 auto; max-width: 46%; background: var(--bg); border: 1px solid var(--border); color: var(--text-muted); padding: 4px 6px; border-radius: 5px; font-size: 11px; }
 .pb-bugs { flex: 1; overflow: auto; padding: 4px 0; }
-.pb-bug { padding: 7px 10px; border-bottom: 1px solid rgba(35, 52, 84, 0.08); display: flex; flex-direction: column; gap: 3px; }
+.pb-bug { padding: 8px 10px; border-bottom: 1px solid rgba(35, 52, 84, 0.08); display: flex; flex-direction: column; gap: 3px; transition: background .15s ease, border-color .15s ease, transform .15s ease; }
+.pb-bug:hover { background: var(--bg-selected); transform: translateX(2px); }
 .pb-bug.st-fixed { opacity: .62; }
 .pb-bug.st-ignored { opacity: .45; }
 .pb-bug-top { display: flex; align-items: baseline; gap: 6px; }
@@ -1086,4 +1209,41 @@ onUnmounted(() => {
 .pb-fix-shot { font-size: 10px; color: #0e8a8f; }
 .pb-fix-out { margin: 0; max-height: 200px; overflow: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font: 11px/1.6 var(--font-mono); color: var(--text); white-space: pre-wrap; word-break: break-word; }
 .pb-fix-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.pb-interaction-hint, .pb-visual-status { font-size: 12px; color: var(--text-muted); }
+.pb-visual-feedback { flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg-raised); padding: 12px; box-shadow: 0 8px 20px rgba(35,52,84,.08); animation: pb-section-in .2s ease-out both; }
+.pb-visual-feedback header, .pb-visual-feedback > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.pb-visual-feedback img { max-width: 100%; max-height: 180px; object-fit: contain; background: var(--bg); }
+.pb-visual-feedback textarea { box-sizing: border-box; width: 100%; resize: vertical; padding: 8px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--bg); font: inherit; }
+.pb-visual-feedback p { margin: 0; font-size: 12px; }
+.pb-visual-feedback small { color: var(--text-muted); }
+
+@keyframes pb-mask-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes pb-pop-in { from { opacity: 0; transform: translate(-50%, -48%) scale(.985); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+@keyframes pb-section-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+
+@media (max-width: 900px) {
+  .pb-pop { max-width: 98vw; height: 94vh; }
+  .pb-body { flex-direction: column; overflow: auto; }
+  .pb-main { flex: 0 0 auto; min-height: 0; }
+  .pb-side { width: auto; min-height: 300px; border-left: 0; border-top: 1px solid var(--border); }
+  .pb-framewrap, .pb-pop-inline .pb-framewrap { width: 100%; height: min(54vw, 480px); min-height: 220px; }
+}
+
+@media (max-width: 560px) {
+  .pb-head { padding: 7px 8px; }
+  .pb-tabs { gap: 3px; overflow-x: auto; }
+  .pb-tabs button { padding: 5px 8px; white-space: nowrap; }
+  .pb-main { padding: 8px; }
+  .pb-toolbar { align-items: stretch; }
+  .pb-toolbar .pb-btn { flex: 1 1 auto; }
+  .pb-toolbar .pb-sep, .pb-toolbar .pb-check { display: none; }
+  .pb-framewrap, .pb-pop-inline .pb-framewrap { height: 58vw; min-height: 190px; }
+  .pb-side-head { align-items: flex-start; gap: 6px; flex-direction: column; }
+  .pb-side-head > div { width: 100%; justify-content: flex-start; flex-wrap: wrap; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sr-trigger, .pb-tabs button, .pb-x, .pb-btn, .pb-framewrap, .pb-ev, .pb-bug { transition: none; }
+  .pb-mask, .pb-pop, .pb-visual-feedback { animation: none; }
+}
 </style>

@@ -9,6 +9,8 @@ export interface EditorTab {
   regionName: string | null
   mtime: number
   writable: boolean
+  previewKind?: 'text' | 'binary' | null
+  previewNote?: string | null
   /** 只读快照：建编辑器时作为初始 doc，保存成功后更新 */
   savedContent: string
   draftContent?: string

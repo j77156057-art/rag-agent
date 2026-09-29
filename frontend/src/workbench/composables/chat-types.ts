@@ -22,9 +22,13 @@ export interface ChatWorkflowRef {
   seed?: Partial<WorkflowState>
 }
 
+/** 应用自身发起的活动（如「AI 浏览当前界面」）：渲染为居中小字条，
+ *  不是用户气泡——其完整指令只作为系统上下文发给模型 */
+export type ChatActivityKind = 'inspect'
+
 export interface ChatMsg {
   id: number
-  role: 'user' | 'assistant'
+  role: 'user' | 'assistant' | 'activity'
   text: string
   status: ChatMsgStatus
   /** ReAct 工具轨迹（问答页展示精简步骤，工作台展示完整时间线） */
@@ -47,4 +51,6 @@ export interface ChatMsg {
   recoverable?: boolean
   /** 工作台：图片消息只显示数量（File 随请求发送，不留 URL） */
   imageCount?: number
+  /** role==='activity' 时的活动类型 */
+  activityKind?: ChatActivityKind
 }

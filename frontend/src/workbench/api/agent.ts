@@ -26,6 +26,13 @@ export interface ProjectProfile {
   preview_adapters?: string[]; sources?: string[]; updated_at?: string
 }
 export interface ProjectProfileResp { ok?: boolean; profile?: ProjectProfile; error?: string }
+export interface UserProfile {
+  user_id?: string; display_name: string; language: string; timezone: string;
+  location: string; preferences: Record<string, unknown>; goals: string[]; notes: string; updated?: string
+}
+export interface UserProfileResp { ok?: boolean; profile?: UserProfile; error?: string }
+export interface MemoryItem { id: string; kind: string; title: string; content: string; evidence?: string; source?: string; repeats?: number; updated?: string }
+export interface MemoryListResp { ok?: boolean; items?: MemoryItem[]; error?: string }
 export interface PreviewAdapterInfo {
   id: string; label?: string; kind?: string; evidence?: string
   capture_adapter?: string; available?: boolean; requires_connector?: boolean
@@ -42,6 +49,7 @@ export interface PreviewAdapterConfigResp { ok?: boolean; profile?: ProjectProfi
 export interface WorkflowAcceptanceReport {
   workflow_id?: string; status?: string; kind?: string; request?: string
   acceptance?: AcceptanceContract; evaluation?: WorkflowEvaluation
+  review?: WorkflowState['review']
   preview?: WorkflowPreview; self_review?: WorkflowSelfReview; recovery?: WorkflowState['recovery']
   generated_at?: string
 }
@@ -153,6 +161,13 @@ export interface VisualFeedbackRecord {
   screenshot: boolean; sent_at: string; status?: string; detail?: string
   snapshots?: Partial<Record<'before' | 'after', { width: number; height: number; bytes: number; captured_at: string }>>
 }
+export interface WorkflowProjectReview {
+  ok: boolean; status: string; independent: boolean; message: string
+  change_count?: number; changes?: Array<{ path: string; status: string }>
+  diff?: string; diff_truncated?: boolean
+  checkpoint_skipped?: Array<{ path?: string; reason?: string }>
+  tests?: Array<{ command: string; ok: boolean; exit_code?: number; output?: string; error?: string }>
+}
 export interface WorkflowState {
   workflow_id: string; status: string; phase: string; request?: string
   kind?: 'generic' | 'game' | 'eda' | string
@@ -170,7 +185,7 @@ export interface WorkflowState {
   }>
   results?: Record<string, Record<string, unknown>>; events?: WorkflowEvent[]; timeline?: WorkflowEvent[]
   dispatches?: Array<{ planner?: string; added?: string[]; kind?: string }>
-  review?: Record<string, unknown>; interrupt_reason?: string
+  review?: { ok?: boolean; project?: WorkflowProjectReview; [key: string]: unknown }; interrupt_reason?: string
   recovery?: {
     status?: string; generated_at?: string; summary?: string
     evidence?: { failed_task_ids?: string[]; uncertain_task_ids?: string[] }
@@ -183,6 +198,7 @@ export interface WorkflowState {
     id?: string; created_at?: string; file_count?: number; bytes?: number
     skipped?: Array<{ path?: string; reason?: string }>
   }
+  project_stage?: { status?: string; workspace_root?: string; file_count?: number; process_backend?: string }
   capability_lease?: {
     id?: string; capabilities?: string[]; status?: string
     created_at?: string; expires_at?: string; expires_at_epoch?: number
@@ -305,6 +321,21 @@ export const agentApi = {
   projectProfile(): Promise<ProjectProfileResp> {
     return rawJson('/api/agent/project-profile')
   },
+  userProfile(): Promise<UserProfileResp> {
+    return rawJson('/api/agent/profile')
+  },
+  updateUserProfile(patch: Partial<UserProfile>): Promise<UserProfileResp> {
+    return request('/api/agent/profile', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
+    })
+  },
+  memories(query = '', limit = 20): Promise<MemoryListResp> {
+    const params = new URLSearchParams({ query, limit: String(limit) })
+    return rawJson(`/api/agent/memory?${params.toString()}`)
+  },
+  deleteMemory(id: string): Promise<{ ok?: boolean; error?: string }> {
+    return request(`/api/agent/memory/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  },
   workflowStart(
     prompt: string,
     options: { use_llm?: boolean; web_enabled?: boolean; kind?: 'generic' | 'game' | 'eda' } = {},
@@ -382,6 +413,15 @@ export const agentApi = {
   },
   workflowProjectRollback(id: string, approved = false, paths: string[] = []): Promise<{ ok?: boolean; rollback?: Record<string, unknown>; error?: string }> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/project-rollback`, { approved, paths })
+  },
+  workflowStageApply(id: string, approved = false): Promise<{ ok?: boolean; result?: Record<string, unknown>; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/stage/apply`, { approved })
+  },
+  workflowStageReview(id: string): Promise<{ ok?: boolean; review?: WorkflowProjectReview; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/stage/review`, {})
+  },
+  workflowStageCleanup(id: string): Promise<{ ok?: boolean; result?: Record<string, unknown>; error?: string }> {
+    return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/stage/cleanup`, {})
   },
   workflowInterrupt(id: string, reason = '用户请求中断'): Promise<WorkflowResp> {
     return rawJson(`/api/agent/workflow/${encodeURIComponent(id)}/interrupt`, { reason })

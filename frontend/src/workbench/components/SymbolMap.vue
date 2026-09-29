@@ -111,8 +111,8 @@ function kindOf(kind: string) {
 </script>
 
 <template>
-  <div v-if="symbolMapOpen" class="sm-overlay" @mousedown.self="closeSymbolMap">
-    <section class="sm-panel" role="dialog" aria-label="符号语义地图">
+  <div v-if="symbolMapOpen" class="sm-overlay wb-modal-backdrop" @mousedown.self="closeSymbolMap">
+    <section class="sm-panel wb-modal-shell" role="dialog" aria-modal="true" aria-label="符号语义地图">
       <header class="sm-top">
         <div class="sm-title">
           <svg width="15" height="15" viewBox="0 0 15 15" aria-hidden="true">
@@ -222,6 +222,7 @@ function kindOf(kind: string) {
   align-items: center;
   justify-content: center;
   padding: 34px;
+  animation: sm-overlay-in .18s ease-out both;
 }
 .sm-panel {
   width: min(1040px, 96vw);
@@ -233,6 +234,7 @@ function kindOf(kind: string) {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  animation: sm-panel-in .22s cubic-bezier(.2,.8,.2,1) both;
 }
 .sm-top {
   flex: 0 0 auto;
@@ -255,6 +257,8 @@ function kindOf(kind: string) {
   display: inline-flex; align-items: center; justify-content: center;
 }
 .sm-iconbtn:hover { background: var(--bg-hover); color: var(--text); }
+.sm-iconbtn:focus-visible, .sm-chip:focus-visible, .sm-clear:focus-visible, .sm-retry:focus-visible, .sm-file-head:focus-visible, .sm-sym:focus-visible { outline: 2px solid #2f6fed88; outline-offset: 2px; }
+.sm-iconbtn, .sm-chip, .sm-file-head, .sm-sym, .sm-retry { transition: color .16s ease, background .16s ease, border-color .16s ease, transform .16s ease; }
 .sm-toolbar {
   flex: 0 0 auto;
   padding: 10px 16px 8px;
@@ -384,6 +388,7 @@ function kindOf(kind: string) {
   border-radius: 4px;
 }
 .sm-sym:hover { background: var(--bg-selected); }
+.sm-sym:active, .sm-file-head:active { transform: translateX(1px); }
 .sm-sym-mark {
   font-style: normal;
   font-family: var(--font-mono);
@@ -416,4 +421,23 @@ function kindOf(kind: string) {
 .sm-sym-ln { font-family: var(--font-mono); font-size: 10px; color: var(--text-faint); margin-left: auto; flex: 0 0 auto; align-self: center; }
 .sm-sym:hover .sm-sym-ln { color: var(--accent); }
 .sm-sym-empty { font-size: 11px; color: var(--text-faint); padding: 2px 8px 4px; list-style: none; }
+@keyframes sm-overlay-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes sm-panel-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@media (max-width: 700px) {
+  .sm-overlay { padding: 14px; }
+  .sm-panel { width: 100%; height: min(900px, 94vh); }
+  .sm-top { padding: 10px 12px; }
+  .sm-stats { display: none; }
+  .sm-toolbar { padding: 8px 12px; }
+  .sm-chips { overflow-x: auto; flex-wrap: nowrap; padding-bottom: 2px; }
+}
+@media (max-width: 520px) {
+  .sm-overlay { padding: 0; align-items: stretch; }
+  .sm-panel { height: 100%; border-radius: 0; border-left: 0; border-right: 0; }
+  .sm-content { padding-inline: 6px; }
+  .sm-file-doc { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sm-overlay, .sm-panel, .sm-iconbtn, .sm-chip, .sm-file-head, .sm-sym, .sm-retry, .sm-caret { animation: none; transition: none; }
+}
 </style>

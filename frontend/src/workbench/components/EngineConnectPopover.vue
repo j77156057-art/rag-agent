@@ -161,8 +161,8 @@ function connectorGuide(s: McpServer) {
 
 <template>
   <Teleport to="body">
-    <div v-if="open" class="cd-pop-mask" @click="open = false" />
-    <div v-if="open" class="cd-pop" @click.stop>
+    <div v-if="open" class="cd-pop-mask wb-modal-backdrop" @click="open = false" />
+    <div v-if="open" class="cd-pop wb-modal-shell" role="dialog" aria-modal="true" aria-label="连接游戏引擎" @click.stop>
       <div class="cd-pop-title">连接游戏引擎</div>
       <div class="cd-pop-subtitle">连接后，AI 才能读取引擎中的场景、脚本和运行日志。</div>
       <div v-if="addon && addon.is_godot_project" class="cd-addon">
@@ -249,6 +249,9 @@ function connectorGuide(s: McpServer) {
   position: fixed;
   inset: 0;
   z-index: 59;
+  background: rgba(35,52,84,.16);
+  backdrop-filter: blur(1px);
+  animation: cd-mask-in .16s ease-out both;
 }
 .cd-pop {
   position: fixed;
@@ -261,6 +264,7 @@ function connectorGuide(s: McpServer) {
   box-shadow: 0 14px 38px rgba(35,52,84,.2);
   padding: 10px 12px;
   z-index: 60;
+  animation: cd-pop-in .2s cubic-bezier(.2,.8,.2,1) both;
 }
 .cd-pop-title { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
 .cd-spacer { flex: 1; }
@@ -272,6 +276,14 @@ function connectorGuide(s: McpServer) {
 .cd-mini:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
 .cd-mini:disabled { opacity: .45; cursor: default; }
 .cd-mini-danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
+.cd-mini { transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease; }
+.cd-mini:active:not(:disabled) { transform: translateY(1px); }
+.cd-mini:focus-visible,
+.cd-input-sm:focus-visible,
+.cd-add-chk input:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  outline-offset: 2px;
+}
 
 .cd-pop-subtitle { font-size: 11px; color: var(--text-dim); line-height: 1.5; margin-bottom: 8px; }
 
@@ -327,7 +339,8 @@ function connectorGuide(s: McpServer) {
 .cd-add-actions { display: flex; gap: 6px; justify-content: flex-end; }
 
 
-.cd-server { padding: 7px 0; border-top: 1px dashed var(--border); }
+.cd-server { padding: 8px 5px; border-top: 1px dashed var(--border); border-radius: 6px; transition: background .16s ease; }
+.cd-server:hover { background: var(--bg-hover); }
 
 .cd-server-name { font-size: 12px; }
 
@@ -346,4 +359,20 @@ function connectorGuide(s: McpServer) {
 .cd-dot-idle { background: var(--amber); }
 
 .cd-dot-off { background: var(--text-faint); }
+
+@keyframes cd-mask-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes cd-pop-in { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+
+@media (max-width: 620px) {
+  .cd-pop { left: 8px; right: 8px; bottom: 8px; width: auto; max-width: none; max-height: calc(100vh - 16px); border-radius: 10px; }
+  .cd-addon-row, .cd-server-row { flex-wrap: wrap; }
+  .cd-server-meta { margin-right: auto; }
+  .cd-server-row .cd-spacer { display: none; }
+  .cd-server-row .cd-mini { margin-left: auto; }
+  .cd-add-row { flex-direction: column; align-items: stretch; }
+  .cd-add-chk { align-self: flex-start; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cd-pop-mask, .cd-pop, .cd-mini, .cd-server { animation: none; transition: none; }
+}
 </style>

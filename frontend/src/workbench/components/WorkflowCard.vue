@@ -7,6 +7,7 @@ import type { WorkflowState } from '../api'
 import WorkflowGateDialog from './WorkflowGateDialog.vue'
 import WorkflowPreview from './WorkflowPreview.vue'
 import AdapterManagerPanel from './AdapterManagerPanel.vue'
+import { agentApi } from '../api/agent'
 
 const props = defineProps<{
   workflowId: string
@@ -33,6 +34,56 @@ const {
   onChoose, onResearchSubmit, onResearchRun, onApprove, onReject,
   onRevise, onReviseApprove, onAcceptanceSave,
 } = useWorkflowCard(props, emit)
+
+async function applyReviewedStage() {
+  if (!state.value?.workflow_id || busy.value) return
+  busy.value = true
+  try {
+    const result = await agentApi.workflowStageApply(state.value.workflow_id, true)
+    if (result.ok) {
+      emit('activity')
+      window.setTimeout(() => window.location.reload(), 180)
+    } else {
+      loadError.value = result.error || '应用试做区改动失败'
+    }
+  } catch (error) {
+    loadError.value = error instanceof Error ? error.message : '应用试做区改动失败'
+  } finally {
+    busy.value = false
+  }
+}
+
+async function reviewStageAgain() {
+  if (!state.value?.workflow_id || busy.value) return
+  busy.value = true
+  try {
+    const result = await agentApi.workflowStageReview(state.value.workflow_id)
+    if (!result.ok) throw new Error(result.error || '重新复核失败')
+    const refreshed = await agentApi.workflow(state.value.workflow_id)
+    if (refreshed.workflow) state.value = refreshed.workflow
+    emit('activity')
+  } catch (error) {
+    loadError.value = error instanceof Error ? error.message : '重新复核失败'
+  } finally {
+    busy.value = false
+  }
+}
+
+async function discardStage() {
+  if (!state.value?.workflow_id || busy.value || !window.confirm('丢弃这个任务的试做区文件？原项目不会改变，丢弃后不能再应用这些改动。')) return
+  busy.value = true
+  try {
+    const result = await agentApi.workflowStageCleanup(state.value.workflow_id)
+    if (!result.ok) throw new Error(result.error || '丢弃试做区失败')
+    const refreshed = await agentApi.workflow(state.value.workflow_id)
+    if (refreshed.workflow) state.value = refreshed.workflow
+    emit('activity')
+  } catch (error) {
+    loadError.value = error instanceof Error ? error.message : '丢弃试做区失败'
+  } finally {
+    busy.value = false
+  }
+}
 </script>
 
 <template>
@@ -62,7 +113,7 @@ const {
         <div v-for="(stage, i) in stages" :key="stage.key" class="wf-stage" :class="`wf-stage-${stageClass(i)}`">
           <span class="wf-stage-dot">{{ stageClass(i) === 'done' ? '✓' : i + 1 }}</span>
           <span class="wf-stage-label">{{ stage.label }}</span>
-          <span v-if="i < stages.length - 1" class="wf-stage-line" />
+          <span v-if="i < stages.length - 1" class="wf-stage-line" :class="{ 'wf-stage-line-done': stageClass(i) === 'done' }" />
         </div>
       </div>
 
@@ -70,6 +121,17 @@ const {
 
       <!-- 目标 -->
       <p v-if="state?.request" class="wf-goal">{{ state.request }}</p>
+      <p v-if="state?.project_stage?.status === 'draft'" class="wf-stage-note">项目改动位于临时试做区 · {{ state.project_stage.process_backend === 'container' ? '容器隔离' : state.project_stage.process_backend === 'host_compat' ? '宿主兼容执行，未隔离文件与网络' : '命令执行待配置容器' }}</p>
+      <p v-else-if="state?.project_stage?.status === 'applied'" class="wf-stage-note">已审核的改动已应用到项目</p>
+      <p v-else-if="state?.project_stage?.status === 'discarded'" class="wf-stage-note">试做区已丢弃，原项目未应用这轮改动</p>
+
+      <section v-if="status === 'awaiting_choice' && state?.options?.length" class="wf-inline-options">
+        <div><b>请审核推进方案</b><small>选择方案只会生成执行计划；修改项目仍需你批准。</small></div>
+        <div v-for="option in state.options" :key="option.id" class="wf-inline-option">
+          <div><b>{{ option.title }}</b><small>{{ option.summary }}</small></div>
+          <button class="wf-mini-btn" :disabled="busy" @click="option.id === 'custom' || option.id === 'web_research' ? gateDismissed = false : onChoose(option.id)">{{ option.id === 'custom' ? '补充目标' : option.id === 'web_research' ? '查看联网选项' : '选择并生成计划' }}</button>
+        </div>
+      </section>
 
       <!-- 进度/控制条 -->
       <div class="wf-meta">
@@ -80,6 +142,9 @@ const {
         <span class="wf-spacer" />
         <button v-if="status === 'executing'" class="wf-mini-btn wf-mini-danger" :disabled="busy" @click="interrupt">中断</button>
         <button v-if="status === 'interrupted'" class="wf-mini-btn wf-mini-primary" :disabled="busy" @click="resume">恢复执行</button>
+      </div>
+      <div v-if="state?.tasks?.length" class="wf-progress" role="progressbar" :aria-valuenow="completedCount" aria-valuemin="0" :aria-valuemax="state.tasks.length">
+        <span :style="{ width: `${Math.round((completedCount / state.tasks.length) * 100)}%` }" />
       </div>
 
       <div v-if="state?.interrupt_reason" class="wf-alert">{{ state.interrupt_reason }}</div>
@@ -169,14 +234,27 @@ const {
           </div>
         </template>
       </section>
-      <div v-if="state?.review" class="wf-review">
+      <div v-if="typeof state?.review?.ok === 'boolean'" class="wf-review">
         <b :class="state.review.ok ? 'wf-ok' : 'wf-bad'">{{ state.review.ok ? '✓ 复核通过' : '! 复核未通过' }}</b>
         <div v-for="(f, i) in reviewFailures" :key="i" class="wf-review-fail">
           <span>{{ f.message }}</span><small v-if="f.recovery">建议：{{ f.recovery }}</small>
         </div>
+        <details v-if="state.review.project" class="wf-project-review">
+          <summary>独立项目复核：{{ state.review.project.status }} · {{ state.review.project.change_count || 0 }} 个文件变化</summary>
+          <p>{{ state.review.project.message }}</p>
+          <button v-if="state.review.project.status === 'passed' && state.project_stage?.status === 'draft'" class="wf-mini-btn wf-mini-primary" :disabled="busy" @click="applyReviewedStage">将已验证改动应用到项目</button>
+          <button v-if="state.project_stage?.status === 'draft' && (status === 'completed' || status === 'failed' || status === 'interrupted')" class="wf-mini-btn" :disabled="busy" @click="reviewStageAgain">重新测试与复核</button>
+          <button v-if="state.project_stage?.status === 'draft' && (status === 'completed' || status === 'failed' || status === 'interrupted')" class="wf-mini-btn wf-mini-danger" :disabled="busy" @click="discardStage">丢弃试做区</button>
+          <small v-if="state.review.project.checkpoint_skipped?.length">快照遗漏 {{ state.review.project.checkpoint_skipped.length }} 个文件，结果尚未完整验证。</small>
+          <div v-for="(item, i) in state.review.project.tests || []" :key="i" class="wf-review-fail">
+            <span>{{ item.ok ? '✓' : '✕' }} {{ item.command }} · {{ item.exit_code ?? item.error ?? '未运行' }}</span>
+            <pre v-if="item.output || item.error">{{ item.output || item.error }}</pre>
+          </div>
+          <details v-if="state.review.project.diff"><summary>查看文件差异{{ state.review.project.diff_truncated ? '（部分）' : '' }}</summary><pre>{{ state.review.project.diff }}</pre></details>
+        </details>
       </div>
       <WorkflowPreview v-if="state && (state.preview || state.visual_feedback?.length)" :key="state.workflow_id" :workflow="state" @activity="emit('activity')" />
-      <AdapterManagerPanel v-if="state && (state.preview || state.status === 'completed' || state.status === 'failed' || state.status === 'interrupted')" :workflow="state" @activity="emit('activity')" />
+      <details v-if="state && (state.preview || state.status === 'completed' || state.status === 'failed' || state.status === 'interrupted')" class="wf-adapter-drawer"><summary>项目预览适配器与回滚设置</summary><AdapterManagerPanel :workflow="state" @activity="emit('activity')" /></details>
       <section v-if="state?.recovery?.status === 'required' && (status === 'failed' || status === 'interrupted')" class="wf-recovery">
         <div class="wf-recovery-head"><b>失败后的下一步</b><span>需要用户审核</span></div>
         <p>{{ state.recovery.summary || '执行未通过复核，请选择下一步。' }}</p>
@@ -319,10 +397,11 @@ const {
   border-radius: 12px;
   background: var(--bg-raised);
   overflow: hidden;
+  transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease;
 }
-.wf-card.wf-executing { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(37,96,212,.08); }
-.wf-card.wf-failed { border-color: rgba(214,78,78,.5); }
-.wf-card.wf-completed { border-color: rgba(52,168,112,.45); }
+.wf-card.wf-executing { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(37,96,212,.08), 0 10px 24px rgba(37,96,212,.06); }
+.wf-card.wf-failed { border-color: rgba(214,78,78,.5); box-shadow: 0 8px 20px rgba(214,78,78,.06); }
+.wf-card.wf-completed { border-color: rgba(52,168,112,.45); box-shadow: 0 8px 20px rgba(52,168,112,.06); }
 .wf-head {
   display: flex; align-items: center; gap: 8px;
   padding: 9px 12px; user-select: none;
@@ -336,6 +415,7 @@ const {
 .wf-status-completed { color: var(--green); }
 .wf-status-failed { color: var(--danger); }
 .wf-status-awaiting_choice, .wf-status-awaiting_approval { color: var(--amber); }
+.wf-status-executing::before { content: ''; display: inline-block; width: 6px; height: 6px; margin: 0 5px 1px 0; border-radius: 50%; background: currentColor; animation: wf-pulse 1.4s ease-in-out infinite; }
 .wf-sep { color: var(--text-faint); font-size: 10px; }
 .wf-event { font-size: 11px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 0 1 auto; }
 .wf-count {
@@ -349,8 +429,17 @@ const {
   font-size: 11px; font-weight: 600; padding: 2px 10px; cursor: pointer;
 }
 .wf-gate-btn:hover { background: rgba(214,158,46,.16); }
+.wf-gate-btn { transition: background .16s ease, transform .16s ease, box-shadow .16s ease; }
+.wf-gate-btn:hover { transform: translateY(-1px); box-shadow: 0 3px 8px rgba(214,158,46,.15); }
 .wf-body { padding: 11px 13px 12px; display: grid; gap: 10px; }
+.wf-inline-options { display: grid; gap: 8px; padding: 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-hover); }
+.wf-inline-options > div:first-child { display: grid; gap: 3px; }
+.wf-inline-options > div:first-child small,.wf-inline-option small { color: var(--text-muted); line-height: 1.45; }
+.wf-inline-option { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-raised); }
+.wf-inline-option > div { display: grid; gap: 3px; min-width: 0; }
+.wf-inline-option button { flex: 0 0 auto; }
 .wf-stages { display: flex; align-items: center; }
+.wf-stage-note { margin: 8px 0; padding: 7px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-hover); color: var(--text-muted); font-size: 11px; }
 .wf-stage { position: relative; display: flex; align-items: center; gap: 5px; flex: 1; }
 .wf-stage-dot {
   width: 18px; height: 18px; border-radius: 50%;
@@ -360,6 +449,7 @@ const {
 }
 .wf-stage-label { font-size: 10.5px; color: var(--text-faint); white-space: nowrap; }
 .wf-stage-line { flex: 1; height: 1px; background: var(--border); margin: 0 4px; min-width: 8px; }
+.wf-stage-line-done { background: linear-gradient(90deg, var(--green), rgba(52,168,112,.35)); }
 .wf-stage-active .wf-stage-dot { border-color: var(--accent); color: #fff; background: var(--accent); }
 .wf-stage-active .wf-stage-label { color: var(--accent); font-weight: 600; }
 .wf-stage-done .wf-stage-dot { border-color: var(--green); background: var(--green); color: #fff; }
@@ -380,6 +470,8 @@ const {
 .wf-acceptance-final textarea { width: 100%; box-sizing: border-box; padding: 7px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-raised); color: var(--text); resize: vertical; }
 .wf-acceptance-final > div { display: flex; gap: 7px; }
 .wf-meta { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.wf-progress { height: 4px; border-radius: 99px; background: var(--bg-selected); overflow: hidden; }
+.wf-progress > span { display: block; height: 100%; min-width: 0; border-radius: inherit; background: linear-gradient(90deg, var(--accent), #6f9cf5); transition: width .35s ease; }
 .wf-error { margin: 0; color: var(--danger); font-size: 11.5px; }
 .wf-alert {
   margin: 0; padding: 6px 9px; font-size: 11.5px;
@@ -388,8 +480,9 @@ const {
 .wf-mini-btn {
   border: 1px solid var(--border); border-radius: 6px; background: var(--bg-raised);
   color: var(--text-muted); font-size: 11px; padding: 2px 9px; cursor: pointer;
+  transition: color .16s ease, background .16s ease, border-color .16s ease, transform .16s ease;
 }
-.wf-mini-btn:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
+.wf-mini-btn:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); transform: translateY(-1px); }
 .wf-mini-btn:disabled { opacity: .5; cursor: default; }
 .wf-mini-danger { color: var(--danger); border-color: var(--danger); }
 .wf-mini-danger:hover:not(:disabled) { background: var(--danger); color: #fff; }
@@ -399,9 +492,11 @@ const {
   display: flex; align-items: baseline; gap: 8px;
   padding: 6px 9px; border: 1px solid var(--border); border-radius: 8px;
   background: var(--bg-surface, var(--bg-hover)); font-size: 12px;
+  transition: background .16s ease, border-color .16s ease, transform .16s ease;
 }
+.wf-task:hover { background: var(--bg-hover); border-color: var(--border-strong); transform: translateX(2px); }
 .wf-task-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); flex: 0 0 auto; align-self: center; }
-.wf-task-running .wf-task-dot { background: var(--accent); box-shadow: 0 0 0 3px rgba(37,96,212,.15); }
+.wf-task-running .wf-task-dot { background: var(--accent); box-shadow: 0 0 0 3px rgba(37,96,212,.15); animation: wf-pulse 1.4s ease-in-out infinite; }
 .wf-task-ok .wf-task-dot { background: var(--green); }
 .wf-task-failed .wf-task-dot, .wf-task-blocked .wf-task-dot { background: var(--danger); }
 .wf-task-id { font-family: ui-monospace, monospace; font-size: 10.5px; color: var(--accent); }
@@ -415,8 +510,9 @@ const {
 .wf-members-head { display: flex; align-items: baseline; gap: 8px; }
 .wf-members-head b { font-size: 12px; color: var(--text); }
 .wf-members-head small { font-size: 10.5px; color: var(--text-faint); }
-.wf-member { border: 1px solid var(--border); border-radius: 9px; background: var(--bg-surface, var(--bg-hover)); }
-.wf-member-running { border-color: rgba(37,96,212,.45); }
+.wf-member { border: 1px solid var(--border); border-radius: 9px; background: var(--bg-surface, var(--bg-hover)); transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease; }
+.wf-member:hover { border-color: var(--border-strong); }
+.wf-member-running { border-color: rgba(37,96,212,.45); box-shadow: inset 3px 0 0 var(--accent); }
 .wf-member-row {
   width: 100%; display: flex; align-items: center; gap: 9px;
   padding: 8px 10px; border: 0; background: transparent; cursor: pointer; text-align: left;
@@ -477,12 +573,18 @@ const {
 .wf-member-error .wf-mini-btn { justify-self: start; margin-top: 3px; }
 .wf-review {
   display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
-  font-size: 11.5px; padding: 7px 9px; border-radius: 8px; background: var(--bg-hover);
+  font-size: 11.5px; padding: 9px 10px; border-radius: 8px; background: var(--bg-hover); border: 1px solid var(--border);
 }
+.wf-review:has(.wf-ok) { border-color: rgba(52,168,112,.3); background: rgba(52,168,112,.05); }
+.wf-review:has(.wf-bad) { border-color: rgba(214,78,78,.3); background: rgba(214,78,78,.04); }
 .wf-ok { color: var(--green); }
 .wf-bad { color: var(--danger); }
 .wf-review-fail { display: grid; gap: 1px; width: 100%; font-size: 11px; color: var(--text-muted); }
 .wf-review-fail small { color: var(--text-faint); }
+.wf-project-review { width: 100%; border-top: 1px solid var(--border); padding-top: 5px; color: var(--text-muted); }
+.wf-project-review summary { cursor: pointer; }
+.wf-project-review p { margin: 5px 0; }
+.wf-project-review pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
 .wf-recovery { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--danger); border-radius: 9px; background: var(--bg-hover); font-size: 11px; }
 .wf-recovery-head { display: flex; justify-content: space-between; gap: 8px; }
 .wf-recovery-head span { color: var(--danger); font-size: 10px; }
@@ -537,4 +639,23 @@ const {
 .wf-timeline-more { margin-top: 7px; }
 .wf-dots { animation: wf-blink 1.1s infinite; }
 @keyframes wf-blink { 50% { opacity: .25; } }
+@keyframes wf-pulse { 0%, 100% { opacity: .55; transform: scale(.86); } 50% { opacity: 1; transform: scale(1); } }
+
+@media (max-width: 640px) {
+  .wf-head { flex-wrap: wrap; gap: 6px; }
+  .wf-event { order: 8; flex-basis: 100%; }
+  .wf-stages { overflow-x: auto; padding-bottom: 2px; }
+  .wf-stage { min-width: 78px; }
+  .wf-stage-label { overflow: hidden; text-overflow: ellipsis; }
+  .wf-task { align-items: flex-start; flex-wrap: wrap; }
+  .wf-task-text { flex-basis: calc(100% - 24px); }
+  .wf-task-state { margin-left: 15px; }
+  .wf-member-side small { display: none; }
+  .wf-recovery-option { align-items: flex-start; flex-direction: column; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wf-card, .wf-gate-btn, .wf-mini-btn, .wf-task, .wf-member, .wf-progress > span { transition: none; }
+  .wf-status-executing::before, .wf-task-running .wf-task-dot, .wf-dots { animation: none; }
+}
 </style>

@@ -1,5 +1,6 @@
 // 模型配置 / 能力画像 / 视觉理解（由原 workbench/api.ts 按域切分；调用方继续从 barrel ../api 引入）。
 import { projectRequest, rawJson, request, withProject } from './_base'
+import type { VisionAnomaly } from '../liveVisionAlerts'
 
 // ---------------------------------------------------------------- 模型设置（/api/config）
 export interface ProviderMeta {
@@ -22,11 +23,66 @@ export interface ModelCapability {
 }
 
 export const visionApi = {
+  realtimeStatus(): Promise<{
+    ok: boolean; mode?: 'sampled-frames' | 'native' | 'unavailable'; mode_label?: string
+    mode_reason?: string; native_provider?: string | null; native_available?: boolean
+    native_reason?: string; limitations?: string[]; error?: string
+  }> {
+    return fetch('/api/vision/realtime-status', withProject()).then(async (res) => (await res.json()) as {
+      ok: boolean; mode?: 'sampled-frames' | 'native' | 'unavailable'; mode_label?: string
+      mode_reason?: string; native_provider?: string | null; native_available?: boolean
+      native_reason?: string; limitations?: string[]; error?: string
+    })
+  },
+  locateClick(description: string, goal = ''): Promise<{
+    ok: boolean; error?: string; proposal_id?: string; image?: string; bbox?: number[]
+    point?: { x: number; y: number }; label?: string; evidence?: string; expires_in?: number
+  }> {
+    return fetch('/api/vision/locate-click', withProject({
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description, goal }),
+    })).then(res => res.json())
+  },
+  executeClick(proposalId: string): Promise<{
+    ok: boolean; executed?: boolean; before?: string | null; after?: string | null; label?: string; error?: string
+    verification?: { status: 'met' | 'unmet' | 'uncertain' | 'unavailable'; evidence: string; confidence?: number; next_target?: string }
+  }> {
+    return fetch('/api/vision/execute-click', withProject({
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proposal_id: proposalId, confirmed: true }),
+    })).then(res => res.json())
+  },
   analyzeVideo(file: File): Promise<{ ok: boolean; context?: string[]; info?: { frame_count?: number }; error?: string }> {
     const fd = new FormData()
     fd.append('file', file, file.name || 'clip.mp4')
     return fetch('/api/vision/video', withProject({ method: 'POST', body: fd }))
       .then(async (res) => (await res.json()) as { ok: boolean; context?: string[]; info?: { frame_count?: number }; error?: string })
+  },
+  analyzeLiveFrame(blob: Blob, previousObservation = '', signal?: AbortSignal, focused = false): Promise<{
+    ok: boolean; accepted?: boolean; throttled?: boolean; retry_after?: number
+    observations?: string[]; anomalies?: VisionAnomaly[]; audit?: { mode?: string; elapsed_ms?: number; error?: string }
+    error?: string
+  }> {
+    const fd = new FormData()
+    fd.append('file', blob, `live-frame-${Date.now()}.${blob.type === 'image/jpeg' ? 'jpg' : 'png'}`)
+    if (previousObservation) fd.append('previous_observation', previousObservation.slice(-900))
+    if (focused) fd.append('focused_region', '1')
+    return fetch('/api/vision/frame', withProject({ method: 'POST', body: fd, signal }))
+      .then(async (res) => (await res.json()) as {
+        ok: boolean; accepted?: boolean; throttled?: boolean; retry_after?: number
+        observations?: string[]; anomalies?: VisionAnomaly[]; audit?: { mode?: string; elapsed_ms?: number; error?: string }
+        error?: string
+      })
+  },
+  captureDesktopFrame(target: 'embedded' | 'foreground' = 'embedded', strictProject = false): Promise<{
+    ok: boolean; image?: string; target?: string; captured_at?: string; error?: string
+  }> {
+    return fetch('/api/vision/desktop-frame', withProject({
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target, strict_project: strictProject }),
+    })).then(async (res) => (await res.json()) as {
+      ok: boolean; image?: string; target?: string; captured_at?: string; error?: string
+    })
   },
 }
 
@@ -116,6 +172,32 @@ export interface SavePresetReq {
   api_key?: string
 }
 
+/** 开发舱模型模式：global=跟随全局；fixed=固定预设；auto=Harness 按复杂度自选 */
+export type CockpitMode = 'global' | 'fixed' | 'auto'
+
+/** auto 模式的强模型层（自动模式云端预设）可用性 */
+export interface CockpitAutoInfo {
+  available: boolean
+  reason: string
+  preset: { id: string; label: string; provider: string; model: string } | null
+}
+
+/** 自主开发舱模型选择状态 */
+export interface CockpitModelInfo {
+  ok?: boolean
+  mode: CockpitMode
+  /** 已保存的固定预设（global/auto 下仅用于切回 fixed 时回显） */
+  preset_id: string
+  presets: ModelPreset[]
+  /** 当前全局对话模型（未指定专用预设时工作流也用它） */
+  current: { provider: string; model: string }
+  /** fixed 模式实际生效的预设；global/auto 时为 null */
+  effective: { id: string; label: string; provider: string; model: string } | null
+  /** auto 模式强模型层信息 */
+  auto: CockpitAutoInfo
+  error?: string
+}
+
 /** 联网识别出的候选窗口（附带出处片段，由用户判断后采用） */
 export interface ContextCandidate {
   tokens: number
@@ -169,5 +251,13 @@ export const modelApi = {
   /** 一键激活预设（等同在弹窗里填好整套参数后点保存并切换） */
   activatePreset(id: string): Promise<ModelConfigInfo & { error?: string }> {
     return rawJson(`/api/model_presets/${encodeURIComponent(id)}/activate`, {})
+  },
+  /** 开发舱模型：读取模式、固定预设与自动模式强模型层状态 */
+  cockpitGet(): Promise<CockpitModelInfo> {
+    return rawJson<CockpitModelInfo>('/api/agent/cockpit-model')
+  },
+  /** 开发舱模型：设置模式（global/fixed/auto）；fixed 需带预设 id */
+  cockpitSet(mode: CockpitMode, presetId = ''): Promise<CockpitModelInfo> {
+    return rawJson<CockpitModelInfo>('/api/agent/cockpit-model', { mode, preset_id: presetId })
   },
 }

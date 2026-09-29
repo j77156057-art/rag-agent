@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // DocMind 开发工作台 · P0 任务 4：多标签编辑 + 保存 + 新建/改名/删除。
-import { onMounted, onBeforeUnmount, computed, defineAsyncComponent, reactive, ref, watch } from 'vue'
+import { onMounted, onBeforeUnmount, computed, defineAsyncComponent, nextTick, reactive, ref, watch } from 'vue'
 import FileTree from './components/FileTree.vue'
 import CodeView from './components/CodeView.vue'
 import EditorTabs from './components/EditorTabs.vue'
@@ -33,6 +33,8 @@ const FlowCanvas = defineAsyncComponent(() => import('./components/FlowCanvas.vu
 const RegionMapDialog = defineAsyncComponent(() => import('./components/RegionMapDialog.vue'))
 const SettingsView = defineAsyncComponent(() => import('./components/SettingsView.vue'))
 const AssetCenterView = defineAsyncComponent(() => import('./components/AssetCenterView.vue'))
+// 自主开发舱：重型工作流面板独立分包，切到该工作区才加载
+const AutonomousCockpit = defineAsyncComponent(() => import('./components/AutonomousCockpit.vue'))
 
 // 演示侧栏的文件 → 业务标签（key 取文件名，与静态示例树对齐）
 const demoBadgeOf = (name: string) => {
@@ -56,22 +58,37 @@ const {
 } = useWorkbench()
 
 const dirtyCount = computed(() => tabs.value.filter((t) => t.dirty).length)
+const cockpitReady = ref(false)
+const cockpitRuntime = ref(false)
+const cockpitFiles = ref(false)
+const cockpitRef = ref<{ showOutputs: () => void } | null>(null)
 /** 统一设置页（用量费用 / 网络搜索 / MCP / 智能体）显隐 */
 const settingsVisible = ref(false)
-const settingsSection = ref<'usage' | 'search' | 'mcp' | 'agent'>('usage')
-function openSettings(tab: 'usage' | 'search' | 'mcp' | 'agent' = 'usage') {
+const settingsSection = ref<'usage' | 'search' | 'mcp' | 'agent' | 'model'>('usage')
+function openSettings(tab: 'usage' | 'search' | 'mcp' | 'agent' | 'model' = 'usage') {
   settingsSection.value = tab
   settingsVisible.value = true
 }
 function onOpenSettings(ev: Event) {
   const tab = (ev as CustomEvent<{ tab?: string }>).detail?.tab
-  openSettings(tab === 'mcp' ? 'mcp' : 'usage')
+  openSettings(tab === 'mcp' ? 'mcp' : tab === 'model' ? 'model' : 'usage')
 }
 /**
  * 重型弹层首次打开才挂载（异步 chunk 届时才下载）；挂载后常驻、关闭不销毁，
  * 保留已加载数据与缩放状态——与原先"始终挂载 + 根 v-if 隐藏"的体验一致。
  */
-const everMounted = reactive({ relation: false, unity: false, flow: false, region: false, settings: false })
+const everMounted = reactive({ relation: false, unity: false, flow: false, region: false, settings: false, cockpit: false })
+watch(workspace, v => {
+  if (v !== 'cockpit') return
+  everMounted.cockpit = true
+  // 复位开发舱内部滚动：输入框 focus 的浏览器默认 scrollIntoView 会把整页
+  // .acp 标题顶出视口、目标区/预览区也会停在中段，切回开发舱时统一回到顶部
+  nextTick(() => {
+    document.querySelector<HTMLElement>('.acp')?.scrollTo({ top: 0 })
+    document.querySelector<HTMLElement>('.acp-stage-content')?.scrollTo({ top: 0 })
+    document.querySelector<HTMLElement>('.acp-controls')?.scrollTo({ top: 0 })
+  })
+}, { immediate: true })
 watch(relationGraphOpen, (v) => { if (v) everMounted.relation = true })
 watch(unityGraphOpen, (v) => { if (v) everMounted.unity = true })
 watch(flowOpen, (v) => { if (v) everMounted.flow = true })
@@ -85,15 +102,13 @@ const canRevertActive = computed(() => {
 const canHistoryActive = computed(() => activeTab.value?.tracked === true)
 
 // ---------------------------------------------------------------- 顶栏收纳菜单
-// 低频入口统一收进两个下拉：「代码图」（4 张关系图）与「工具」
-// （任务与生成 / GPU / AI 运行台 / AI 运行设置 / 运行游戏 / 游戏引擎连接）。
-// 面板组件自带触发按钮已隐藏，仅保留 teleport 到 body 的弹层，经 ref 唤起。
-const mapMenuOpen = ref(false)
-const toolsMenuOpen = ref(false)
+// 低频入口统一收进「更多」下拉：代码分析、任务与生成、GPU、AI 运行台、
+// AI 运行设置、运行游戏和游戏引擎连接。面板组件自带触发按钮已隐藏，
+// 仅保留 teleport 到 body 的弹层，经 ref 唤起。
+const moreMenuOpen = ref(false)
 // 菜单 position:fixed（逃离 .wb-topbar overflow-y:hidden 的裁剪），
 // 打开时按触发按钮实时量取坐标，左缘夹取避免溢出视口。
-const mapMenuStyle = ref<Record<string, string>>({})
-const toolsMenuStyle = ref<Record<string, string>>({})
+const moreMenuStyle = ref<Record<string, string>>({})
 const MENU_WIDTH = 244
 function menuStyleFor(btn: HTMLElement): Record<string, string> {
   const r = btn.getBoundingClientRect()
@@ -101,19 +116,13 @@ function menuStyleFor(btn: HTMLElement): Record<string, string> {
   left = Math.max(8, Math.min(left, window.innerWidth - MENU_WIDTH - 8))
   return { top: `${Math.round(r.bottom + 6)}px`, left: `${left}px` }
 }
-function toggleMapMenu(e: MouseEvent) {
-  const willOpen = !mapMenuOpen.value
-  if (willOpen) mapMenuStyle.value = menuStyleFor(e.currentTarget as HTMLElement)
-  mapMenuOpen.value = willOpen
-}
-function toggleToolsMenu(e: MouseEvent) {
-  const willOpen = !toolsMenuOpen.value
-  if (willOpen) toolsMenuStyle.value = menuStyleFor(e.currentTarget as HTMLElement)
-  toolsMenuOpen.value = willOpen
+function toggleMoreMenu(e: MouseEvent) {
+  const willOpen = !moreMenuOpen.value
+  if (willOpen) moreMenuStyle.value = menuStyleFor(e.currentTarget as HTMLElement)
+  moreMenuOpen.value = willOpen
 }
 function closeTopMenus() {
-  mapMenuOpen.value = false
-  toolsMenuOpen.value = false
+  moreMenuOpen.value = false
 }
 const teRef = ref<InstanceType<typeof TaskEnginePanel> | null>(null)
 const gpRef = ref<InstanceType<typeof GpuPanel> | null>(null)
@@ -322,6 +331,7 @@ function onWorkspaceHotkey(e: KeyboardEvent) {
   if (e.key === '1') { e.preventDefault(); setWorkspace('overview') }
   else if (e.key === '2' && tabs.value.length) { e.preventDefault(); setWorkspace('code') }
   else if (e.key === '3') { e.preventDefault(); setWorkspace('assets') }
+  else if (e.key === '4') { e.preventDefault(); setWorkspace('cockpit') }
 }
 
 onMounted(() => {
@@ -427,7 +437,8 @@ onBeforeUnmount(() => {
       </div>
       <SemanticLocateBar v-if="tree || demoMode" class="wb-locate-slot" />
       <div class="wb-topbar-right">
-        <a class="wb-question-link" href="/" title="回到 AI 问答首页：用大白话提问，让 AI 在代码库里找答案">AI 问答</a>
+        <a class="wb-question-link" href="/" title="返回 RAG 问答页">问答页</a>
+        <button class="wb-question-link" type="button" title="展开底部 AI 对话并开始提问" @click="appEvents.emit('docmind:focus-chat', {})">AI 对话</button>
         <button
           class="wb-save-btn wb-settings-btn"
           title="设置：Token 用量与费用、网络搜索、MCP 连接器、智能体预设"
@@ -439,20 +450,21 @@ onBeforeUnmount(() => {
           </svg>
           设置
         </button>
-        <!-- 低频分析视图收进「代码图」下拉 -->
-        <span v-if="tree || demoMode" class="wb-menu-wrap">
+        <!-- 低频分析视图与高级工具统一收进「更多」下拉 -->
+        <span class="wb-menu-wrap">
           <button
             type="button"
             class="wb-save-btn wb-menu-trigger"
-            :class="{ 'wb-menu-on': mapMenuOpen }"
-            title="代码可视化：定义调用 / 继承挂载 / Unity 引用 / AI 问答流"
-            @click="toggleMapMenu($event)"
+            :class="{ 'wb-menu-on': moreMenuOpen }"
+            title="更多：代码分析、任务工具、GPU、运行台、引擎连接"
+            @click="toggleMoreMenu($event)"
           >
-            代码图
+            更多
             <svg class="wb-menu-caret" width="9" height="9" viewBox="0 0 9 9" aria-hidden="true"><path d="M1.5 3.2 L4.5 6.2 L7.5 3.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
-          <div v-show="mapMenuOpen" class="wb-menu-backdrop" @click="mapMenuOpen = false" />
-          <div v-show="mapMenuOpen" class="wb-menu" :style="mapMenuStyle" @click="mapMenuOpen = false">
+          <div v-show="moreMenuOpen" class="wb-menu-backdrop" @click="moreMenuOpen = false" />
+          <div v-show="moreMenuOpen" class="wb-menu" :style="moreMenuStyle" @click="moreMenuOpen = false">
+            <div class="wb-menu-label">代码分析</div>
             <button v-if="tree" type="button" class="wb-menu-item" @click="openSymbolMap">
               <span class="wb-menu-item-name">代码地图</span>
               <small>函数/变量在哪定义、被谁调用</small>
@@ -469,23 +481,8 @@ onBeforeUnmount(() => {
               <span class="wb-menu-item-name">流程图</span>
               <small>每轮问答「提问→思考→调工具→回答」</small>
             </button>
-          </div>
-        </span>
-        <!-- 高级工具/引擎类面板收进「工具」下拉 -->
-        <span class="wb-menu-wrap">
-          <button
-            type="button"
-            class="wb-save-btn wb-menu-trigger"
-            :class="{ 'wb-menu-on': toolsMenuOpen }"
-            title="高级工具：任务生成、GPU、AI 运行台、运行游戏、引擎连接"
-            @click="toggleToolsMenu($event)"
-          >
-            工具
-            <svg class="wb-menu-caret" width="9" height="9" viewBox="0 0 9 9" aria-hidden="true"><path d="M1.5 3.2 L4.5 6.2 L7.5 3.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </button>
-          <!-- 菜单用 v-show 常驻 DOM：#wb-sr-slot 须始终可被运行游戏按钮 teleport 挂载 -->
-          <div v-show="toolsMenuOpen" class="wb-menu-backdrop" @click="toolsMenuOpen = false" />
-          <div v-show="toolsMenuOpen" class="wb-menu" :style="toolsMenuStyle" @click="toolsMenuOpen = false">
+            <div class="wb-menu-sep" />
+            <div class="wb-menu-label">工具与运行</div>
             <button type="button" class="wb-menu-item" @click="teRef?.show()">
               <span class="wb-menu-item-name">任务与生成</span>
               <small>任务分支、Godot 控制、ComfyUI 画图、Unreal</small>
@@ -570,6 +567,7 @@ onBeforeUnmount(() => {
 
       <FileTree
         v-else-if="tree"
+        v-show="workspace !== 'cockpit' || cockpitFiles"
         :tree="tree"
         :selected-path="selectedPath"
         :loading="treeLoading"
@@ -615,7 +613,10 @@ onBeforeUnmount(() => {
         <div id="wb-playpane-slot" class="wb-playpane-slot" v-show="runtimeResident" />
         <!-- 页面切换只隐藏编辑区，不卸载 ChatDock。否则 ChatDock 的卸载钩子会
              把正在进行的 SSE 当成用户主动停止，导致切到运行面板时回答被中断。 -->
-        <div class="wb-editor-shell" :style="{ display: runtimeResident ? 'none' : 'contents' }">
+        <!-- 自主开发舱：独立工作区，描述目标后由模型规划/执行/验证，用户审核计划与结果 -->
+        <AutonomousCockpit ref="cockpitRef" v-if="everMounted.cockpit" v-show="workspace === 'cockpit' && !runtimeResident"
+          @ready="cockpitReady = true" @runtime-preview="cockpitRuntime = $event" @toggle-files="cockpitFiles = !cockpitFiles" />
+        <div v-if="workspace !== 'cockpit'" class="wb-editor-shell" :style="{ display: runtimeResident ? 'none' : 'contents' }">
           <AssetCenterView v-if="workspace === 'assets'" />
           <template v-else-if="tree">
             <EditorTabs v-if="workspace === 'code'" />
@@ -624,7 +625,6 @@ onBeforeUnmount(() => {
               <SelectionAiPanel v-if="aiPanelOpen && workspace === 'code'" />
               <SymbolOutline v-if="workspace === 'code'" />
             </div>
-            <ChatDock />
             <footer class="wb-statusbar">
               <span v-if="selectedPath" class="wb-status-path">{{ selectedPath }}</span>
               <span v-else class="wb-status-faint">未选择文件</span>
@@ -642,12 +642,12 @@ onBeforeUnmount(() => {
             <div class="wb-editor-row">
               <CodeView :tab="null" />
             </div>
-            <ChatDock />
             <footer class="wb-statusbar">
               <span class="wb-status-faint">示例演示模式 · 未连接本地项目</span>
             </footer>
           </template>
         </div>
+        <div id="wb-chat-slot" class="wb-chat-host" v-show="workspace !== 'cockpit' && !runtimeResident" />
       </main>
 
       <div v-if="!treeError && !tree && !demoMode" class="wb-booting">
@@ -659,7 +659,11 @@ onBeforeUnmount(() => {
     <!-- 唯一实例：popup（默认，固定弹层，行为不变）/ docked（常驻主区）由 runtimeResident 切换。
          docked 主体 teleport 进主区 #wb-playpane-slot；同实例仅切 mode，不重建，
          故 iframe 与引擎嵌入状态得以保留。触发按钮由该实例 teleport 回顶栏 #wb-sr-slot。 -->
-    <SceneRuntimePanel :mode="runtimeResident ? 'docked' : 'popup'" />
+    <Teleport defer to="#wb-chat-slot"><ChatDock scope="default" /></Teleport>
+    <Teleport v-if="cockpitReady" defer to="#wb-cockpit-chat-slot"><ChatDock scope="cockpit" /></Teleport>
+    <SceneRuntimePanel :mode="runtimeResident || (workspace === 'cockpit' && cockpitReady && cockpitRuntime) ? 'docked' : 'popup'"
+      :host="workspace === 'cockpit' && cockpitReady && cockpitRuntime ? '#wb-cockpit-runtime-slot' : '#wb-playpane-slot'"
+      @close="cockpitRuntime = false; cockpitRef?.showOutputs()" />
 
     <!-- 高级工具面板宿主：自带触发按钮隐藏（入口已收进顶栏「工具」菜单），
          弹层 teleport 到 body，经模板 ref 调 show() 唤起。 -->

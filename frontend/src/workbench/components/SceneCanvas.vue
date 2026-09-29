@@ -1012,15 +1012,15 @@ defineExpose({ reload, undo, redo, addChildNew })
 <style scoped>
 .sc-wrap { display: flex; flex-direction: column; min-height: 0; flex: 1; outline: none; }
 .sc-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding-bottom: 8px; }
-.sc-path { flex: 1; min-width: 160px; max-width: 320px; background: var(--bg); border: 1px solid var(--border); color: var(--text-muted); padding: 5px 8px; border-radius: 5px; font-size: 11px; font-family: var(--font-mono); }
+.sc-path { flex: 1; min-width: 160px; max-width: 320px; background: var(--bg); border: 1px solid var(--border); color: var(--text-muted); padding: 5px 8px; border-radius: 5px; font-size: 11px; font-family: var(--font-mono); transition: border-color .15s ease, box-shadow .15s ease; }.sc-path:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(47,111,237,.1); }
 .sc-sep { width: 1px; height: 18px; background: var(--border); margin: 0 3px; }
 .sc-spacer { flex: 1; }
-.sc-btn { border: 1px solid var(--border-strong); background: transparent; color: var(--text-muted); border-radius: 5px; padding: 5px 9px; font-size: 11px; cursor: pointer; white-space: nowrap; }
-.sc-btn:hover:not(:disabled) { color: var(--text); border-color: #b9d0f5; }
+.sc-btn { border: 1px solid var(--border-strong); background: transparent; color: var(--text-muted); border-radius: 5px; padding: 5px 9px; font-size: 11px; cursor: pointer; white-space: nowrap; transition: color .15s ease, border-color .15s ease, background .15s ease, transform .15s ease, box-shadow .15s ease; }
+.sc-btn:hover:not(:disabled) { color: var(--text); border-color: #b9d0f5; background: var(--bg-selected); transform: translateY(-1px); box-shadow: 0 3px 8px rgba(35,52,84,.08); }.sc-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .sc-btn:disabled { opacity: .38; cursor: default; }
 .sc-btn.danger { border-color: rgba(224, 72, 79, 0.5); color: #c23a40; }
 .sc-seg { display: flex; border: 1px solid var(--border-strong); border-radius: 5px; overflow: hidden; }
-.sc-seg button { background: transparent; border: 0; color: var(--text-muted); padding: 5px 10px; font-size: 11px; cursor: pointer; }
+.sc-seg button { background: transparent; border: 0; color: var(--text-muted); padding: 5px 10px; font-size: 11px; cursor: pointer; transition: color .15s ease, background .15s ease; }
 .sc-seg button.on { background: linear-gradient(180deg, #3b7ef2, #2f6fed); color: #fff; }
 .sc-check { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-muted); cursor: pointer; }
 .sc-guard { font-size: 11px; color: var(--text-faint); }
@@ -1034,7 +1034,7 @@ defineExpose({ reload, undo, redo, addChildNew })
 .sc-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--text-faint); border: 1px dashed var(--border); border-radius: 8px; }
 .sc-empty small { max-width: 380px; text-align: center; line-height: 1.7; }
 .sc-body { flex: 1; display: flex; min-height: 0; gap: 10px; }
-.sc-canvas { flex: 1; min-width: 0; position: relative; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: linear-gradient(180deg, #f7f9fd, #eef2f8); }
+.sc-canvas { flex: 1; min-width: 0; position: relative; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: linear-gradient(180deg, #f7f9fd, #eef2f8); box-shadow: 0 7px 20px rgba(35,52,84,.06); transition: border-color .18s ease, box-shadow .18s ease; }.sc-canvas:focus-within { border-color: #b9d0f5; box-shadow: 0 0 0 3px rgba(47,111,237,.08), 0 7px 20px rgba(35,52,84,.08); }
 .sc-canvas-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; color: var(--text-muted); background: rgba(247, 249, 253, .92); pointer-events: none; text-align: center; }
 .sc-canvas-empty b { font-size: 12px; font-weight: 600; }
 .sc-canvas-empty small { max-width: 330px; color: var(--text-faint); font-size: 11px; line-height: 1.6; }
@@ -1053,7 +1053,7 @@ defineExpose({ reload, undo, redo, addChildNew })
 .sc-leg-bar { width: 16px; height: 0; border-top: 2px solid; flex: none; }
 .sc-leg-bar.dash { border-top-style: dashed; }
 .sc-leg-bar.dot { border-top-style: dotted; }
-.sc-side { width: 306px; flex: 0 0 306px; border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; min-height: 0; overflow: auto; padding: 9px 10px; gap: 8px; }
+.sc-side { width: 306px; flex: 0 0 306px; border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; min-height: 0; overflow: auto; padding: 9px 10px; gap: 8px; background: linear-gradient(180deg, var(--bg-hover), var(--bg-raised)); box-shadow: 0 5px 16px rgba(35,52,84,.04); }
 .sc-side-head { display: flex; align-items: baseline; gap: 7px; }
 .sc-side-head b { font-size: 13px; }
 .sc-side-path { font-size: 10px; color: var(--text-faint); font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1066,7 +1066,7 @@ defineExpose({ reload, undo, redo, addChildNew })
 .sc-sec h4 small { color: var(--text-faint); font-weight: 400; }
 .sc-sec h4.err { color: #c23a40; }
 .sc-row { display: flex; gap: 5px; align-items: center; }
-.sc-row input, .sc-row select { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--border); color: var(--text); font-size: 11px; padding: 4px 6px; border-radius: 4px; }
+.sc-row input, .sc-row select { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--border); color: var(--text); font-size: 11px; padding: 4px 6px; border-radius: 4px; transition: border-color .15s ease, box-shadow .15s ease; }.sc-row input:focus, .sc-row select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(47,111,237,.1); }
 .sc-row input.sc-w2 { flex: 1 1 40%; }
 .sc-props { display: flex; flex-direction: column; gap: 3px; max-height: 320px; overflow: auto; }
 .sc-prop { display: flex; gap: 5px; align-items: center; }
@@ -1081,7 +1081,8 @@ defineExpose({ reload, undo, redo, addChildNew })
 .sc-stats div { display: flex; justify-content: space-between; gap: 8px; color: var(--text-muted); }
 .sc-stats b { color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sc-ref { display: flex; align-items: center; gap: 6px; font-size: 10.5px; padding: 3px 4px; border-radius: 4px; cursor: pointer; }
-.sc-ref:hover { background: var(--bg-hover); }
+.sc-ref:hover { background: var(--bg-hover); transform: translateX(2px); }.sc-ref { transition: background .15s ease, transform .15s ease; }
+.sc-ref:focus-visible, .sc-crumb:focus-visible, .sc-search-x:focus-visible, .sc-x:focus-visible { outline: 2px solid #2f6fed88; outline-offset: 2px; }
 .sc-ref.ghost { opacity: .55; }
 .sc-ref-name { flex: 1; font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sc-ref small { color: var(--text-faint); }
@@ -1098,6 +1099,9 @@ defineExpose({ reload, undo, redo, addChildNew })
 .sc-crumb:hover { background: var(--bg-hover); }
 .sc-crumb.cur { color: var(--text); font-weight: 600; cursor: default; }
 .sc-crumb:not(:last-child)::after { content: '›'; color: var(--text-faint); margin-left: 3px; }
+@media (max-width: 900px) { .sc-body { flex-direction: column; overflow: auto; }.sc-canvas { flex: 1 1 440px; min-height: 360px; }.sc-side { width: auto; flex: 0 0 auto; max-height: 46vh; }.sc-search-input { width: 120px; } }
+@media (max-width: 560px) { .sc-bar { align-items: stretch; }.sc-path { max-width: none; flex-basis: 100%; }.sc-check, .sc-sep { display: none; }.sc-btn { flex: 1 1 auto; }.sc-seg { flex: 1 1 auto; }.sc-seg button { flex: 1 1 50%; }.sc-search { flex: 1 1 100%; }.sc-search-input { width: 100%; }.sc-canvas { min-height: 280px; }.sc-side { max-height: none; } }
+@media (prefers-reduced-motion: reduce) { .sc-path, .sc-btn, .sc-seg button, .sc-canvas, .sc-row input, .sc-row select, .sc-ref, .sc-node, .sc-file, .sc-collapse { transition: none; animation: none; } }
 </style>
 
 <style>
@@ -1162,8 +1166,9 @@ defineExpose({ reload, undo, redo, addChildNew })
 .sc-file-sub { font-size: 9.5px; color: var(--text-faint); }
 .sc-file-warn { color: #b5791f; }
 /* 折叠按钮（节点卡内，仅层级布局显示） */
-.sc-collapse { flex: none; width: 16px; height: 16px; margin-right: 2px; border: 1px solid var(--border-strong); background: var(--bg); border-radius: 4px; font-size: 9px; line-height: 1; color: var(--text-muted); cursor: pointer; padding: 0; }
-.sc-collapse:hover { border-color: var(--accent); color: var(--accent); }
+.sc-collapse { flex: none; width: 16px; height: 16px; margin-right: 2px; border: 1px solid var(--border-strong); background: var(--bg); border-radius: 4px; font-size: 9px; line-height: 1; color: var(--text-muted); cursor: pointer; padding: 0; transition: color .14s ease, border-color .14s ease, background .14s ease, transform .14s ease; }
+.sc-collapse:hover { border-color: var(--accent); color: var(--accent); background: var(--bg-hover); }
+.sc-collapse:active { transform: translateY(1px); }
 /* 搜索命中 / 关系高亮装饰态 */
 .sc-node.hit { box-shadow: 0 0 0 2px var(--accent), 0 8px 18px rgba(22, 33, 54, .12); border-color: var(--accent); }
 .sc-node.faded { opacity: .2; filter: saturate(.55); }
@@ -1171,6 +1176,7 @@ defineExpose({ reload, undo, redo, addChildNew })
 .sc-file.hit { box-shadow: 0 0 0 2px var(--accent), 0 8px 18px rgba(22, 33, 54, .12); border-color: var(--accent); }
 .sc-file.faded { opacity: .2; }
 .sc-file.rel { box-shadow: 0 0 0 2px color-mix(in srgb, var(--fc) 42%, transparent), 0 8px 18px rgba(22, 33, 54, .12); }
+.sc-canvas .vue-flow__controls-button:focus-visible { outline: 2px solid #2f6fed88; outline-offset: -2px; }
 .sc-canvas .vue-flow__edge.sc-edge-rel .vue-flow__edge-path { stroke: #2f6fed !important; stroke-width: 2 !important; }
 .sc-canvas .vue-flow__edge.sc-edge-dim { opacity: .12; }
 </style>

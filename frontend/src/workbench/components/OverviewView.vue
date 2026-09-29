@@ -197,12 +197,13 @@ const ASK_CHIPS = [
   to { opacity: 1; }
 }
 .ov-inner {
-  max-width: 1080px;
+  width: min(100%, 1480px);
+  max-width: none;
   margin: 0 auto;
-  padding: 18px 26px 28px;
+  padding: 22px 32px 34px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 20px;
 }
 
 /* ---------- 项目状态条：平面、一根分隔线 ---------- */
@@ -210,14 +211,17 @@ const ASK_CHIPS = [
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 4px 2px 14px;
-  border-bottom: 1px solid var(--border);
+  padding: 14px 16px;
+  border: 1px solid #dbe4f1;
+  border-radius: 13px;
+  background: linear-gradient(135deg, #ffffff 0%, #f7faff 100%);
+  box-shadow: 0 5px 18px rgba(35,52,84,.055);
 }
-.ov-folder { color: var(--accent); display: inline-flex; }
+.ov-folder { color: var(--accent); display: inline-flex; padding: 7px; border-radius: 9px; background: #eaf2ff; }
 .ov-strip-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .ov-root {
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--text);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   max-width: 560px;
@@ -232,21 +236,23 @@ const ASK_CHIPS = [
   padding: 4px 8px; border-radius: 6px;
 }
 .ov-restore:hover { color: var(--accent); background: var(--bg-hover); }
+.ov-restore:focus-visible, .ov-x:focus-visible, .ov-step:focus-visible, .ov-recent-item:focus-visible, .ov-chip:focus-visible, .ov-empty-btn:focus-visible { outline: 2px solid #2f6fed88; outline-offset: 2px; }
+.ov-restore, .ov-x, .ov-step, .ov-recent-item, .ov-chip, .ov-empty-btn { transition: color .16s ease, background .16s ease, border-color .16s ease, transform .16s ease; }
 
 /* ---------- 两栏 ---------- */
 .ov-columns {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 280px;
-  gap: 26px;
+  grid-template-columns: minmax(0, 1fr) 312px;
+  gap: 30px;
   align-items: start;
 }
 .ov-main { min-width: 0; }
-.ov-rail { display: flex; flex-direction: column; gap: 20px; }
+.ov-rail { display: flex; flex-direction: column; gap: 12px; position: sticky; top: 14px; max-height: calc(100vh - 112px); overflow: auto; padding-right: 2px; }
 
 /* ---------- 右栏：朴素分组，无卡片边框 ---------- */
 .ov-group-head {
   display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 9px;
+  margin-bottom: 10px;
 }
 .ov-group-head h4 {
   margin: 0; font-size: 11px; font-weight: 700;
@@ -290,6 +296,15 @@ button.ov-step:hover, a.ov-step:hover { background: var(--bg-hover); }
   display: flex; gap: 12px; flex-wrap: wrap;
   font-size: 10.5px; color: var(--text-faint);
 }
+
+.ov-group {
+  padding: 13px 14px;
+  border: 1px solid #e0e7f1;
+  border-radius: 12px;
+  background: rgba(255,255,255,.78);
+  box-shadow: 0 4px 16px rgba(35,52,84,.045);
+}
+.ov-guide { border-color: #d5e2f5; background: linear-gradient(180deg, #fafdff, #f5f8fd); }
 
 /* 最近打开 */
 .ov-recent { list-style: none; margin: 0; padding: 0; }
@@ -344,14 +359,27 @@ button.ov-step:hover, a.ov-step:hover { background: var(--bg-hover); }
   transition: background .12s;
 }
 .ov-empty-btn:hover { background: rgba(47,111,237,.12); }
+.ov-empty-btn:active, .ov-step:active, .ov-recent-item:active, .ov-chip:active { transform: translateY(1px); }
 
 /* ---------- 窄屏：右栏落到底部 ---------- */
 @media (max-width: 1080px) {
+  .ov-inner { width: 100%; }
   .ov-columns { grid-template-columns: minmax(0, 1fr); gap: 18px; }
   .ov-rail {
+    position: static; max-height: none; overflow: visible; padding-right: 0;
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
     gap: 12px 24px;
   }
+}
+@media (max-width: 620px) {
+  .ov-inner { padding: 14px 14px 22px; gap: 14px; }
+  .ov-strip { align-items: flex-start; padding: 12px; }
+  .ov-root { max-width: calc(100vw - 90px); }
+  .ov-rail { grid-template-columns: 1fr; }
+  .ov-empty { padding: 32px 18px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ov, .ov-restore, .ov-x, .ov-step, .ov-recent-item, .ov-chip, .ov-empty-btn { animation: none; transition: none; }
 }
 </style>

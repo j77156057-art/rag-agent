@@ -64,6 +64,7 @@ onBeforeUnmount(() => { disposed = true })
     repeating-linear-gradient(90deg, rgba(35,52,84,.05) 0 1px, transparent 1px 16px);
   border-radius: 6px;
   overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(35,52,84,.04);
 }
 .m3d-viewer {
   display: block;
@@ -83,8 +84,10 @@ onBeforeUnmount(() => { disposed = true })
   gap: 8px;
   color: var(--text-faint);
   font-size: 11px;
+  background: rgba(238,242,248,.72);
+  animation: m3d-fallback-in .18s ease-out both;
 }
-.m3d-error { color: #b06a2b; }
+.m3d-error { color: #b06a2b; background: rgba(253,243,223,.82); }
 .m3d-spinner {
   width: 18px;
   height: 18px;
@@ -94,4 +97,8 @@ onBeforeUnmount(() => { disposed = true })
   animation: m3d-spin .8s linear infinite;
 }
 @keyframes m3d-spin { to { transform: rotate(360deg); } }
+@keyframes m3d-fallback-in { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .m3d-fallback, .m3d-spinner { animation: none; }
+}
 </style>

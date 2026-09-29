@@ -604,8 +604,8 @@ const externalIds = computed<Set<string>>(
 </script>
 
 <template>
-  <div v-if="unityGraphOpen" class="ug-overlay" @mousedown.self="closeUnityGraph">
-    <section class="ug-panel" role="dialog" aria-label="Unity GUID 引用图">
+  <div v-if="unityGraphOpen" class="ug-overlay wb-modal-backdrop" @mousedown.self="closeUnityGraph">
+    <section class="ug-panel wb-modal-shell" role="dialog" aria-modal="true" aria-label="Unity GUID 引用图">
       <header class="ug-top">
         <div class="ug-title">
           <svg width="15" height="15" viewBox="0 0 15 15" aria-hidden="true">
@@ -809,6 +809,7 @@ const externalIds = computed<Set<string>>(
   align-items: center;
   justify-content: center;
   padding: 26px;
+  animation: ug-overlay-in .18s ease-out both;
 }
 .ug-panel {
   width: min(1320px, 97vw);
@@ -820,6 +821,7 @@ const externalIds = computed<Set<string>>(
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  animation: ug-panel-in .22s cubic-bezier(.2,.8,.2,1) both;
 }
 .ug-top {
   flex: 0 0 auto;
@@ -844,6 +846,16 @@ const externalIds = computed<Set<string>>(
   display: inline-flex; align-items: center; justify-content: center;
 }
 .ug-iconbtn:hover { background: var(--bg-hover); color: var(--text); }
+.ug-iconbtn:focus-visible,
+.ug-chip:focus-visible,
+.ug-zoom button:focus-visible,
+.ug-clear:focus-visible,
+.ug-d-mini:focus-visible,
+.ug-d-open:focus-visible,
+.ug-retry:focus-visible {
+  outline: 2px solid #2f6fed88;
+  outline-offset: 2px;
+}
 
 .ug-toolbar {
   flex: 0 0 auto;
@@ -899,6 +911,8 @@ const externalIds = computed<Set<string>>(
 }
 .ug-chip:hover { filter: brightness(1.25); }
 .ug-chip.off { opacity: 0.3; }
+.ug-chip { transition: opacity .16s ease, filter .16s ease, background .16s ease, border-color .16s ease; }
+.ug-chip:not(.off) { background: #2f6fed0d; }
 .ug-chip-missing { color: #c23a40 !important; border-color: #c23a4066 !important; }
 .ug-zoom { display: flex; gap: 4px; }
 .ug-zoom button {
@@ -912,6 +926,8 @@ const externalIds = computed<Set<string>>(
   padding: 0 7px;
 }
 .ug-zoom button:hover { color: var(--text); border-color: var(--border-strong); }
+.ug-zoom button { transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease; }
+.ug-zoom button:active { transform: translateY(1px); }
 
 .ug-body { flex: 1; display: flex; min-height: 0; }
 .ug-canvas-wrap { flex: 1; position: relative; overflow: hidden; background: var(--bg); min-width: 0; }
@@ -935,7 +951,7 @@ const externalIds = computed<Set<string>>(
 .ug-line.dim { opacity: 0.08; }
 
 .ug-node { cursor: pointer; }
-.ug-node rect { stroke-width: 1.3; }
+.ug-node rect { stroke-width: 1.3; transition: stroke-width .14s ease, filter .14s ease, opacity .14s ease; }
 .ug-node:hover rect { stroke-width: 2; filter: brightness(1.25); }
 .ug-node.sel rect { stroke-width: 2.4; }
 .ug-node.dim { opacity: 0.12; }
@@ -1028,6 +1044,7 @@ const externalIds = computed<Set<string>>(
   flex: 0 0 auto;
 }
 .ug-d-mini:hover { color: var(--text); border-color: var(--border-strong); }
+.ug-d-mini { transition: color .16s ease, border-color .16s ease, background .16s ease; }
 .ug-d-open {
   width: 100%;
   border: 1px solid var(--border-strong);
@@ -1040,6 +1057,8 @@ const externalIds = computed<Set<string>>(
   margin-bottom: 14px;
 }
 .ug-d-open:hover { background: var(--bg-hover); }
+.ug-d-open { transition: background .16s ease, border-color .16s ease, transform .16s ease; }
+.ug-d-open:active { transform: translateY(1px); }
 .ug-d-section h4 {
   margin: 12px 0 6px;
   font-size: 11px;
@@ -1072,4 +1091,33 @@ const externalIds = computed<Set<string>>(
 }
 .ug-d-empty { color: var(--text-faint) !important; cursor: default !important; font-size: 10.5px; }
 .ug-d-empty:hover { background: transparent !important; }
+
+@keyframes ug-overlay-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ug-panel-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+
+@media (max-width: 900px) {
+  .ug-overlay { padding: 14px; }
+  .ug-panel { width: 100%; height: min(900px, 94vh); }
+  .ug-toolbar { flex-wrap: wrap; }
+  .ug-search { max-width: none; flex-basis: 100%; }
+  .ug-chips { order: 2; min-width: 0; overflow-x: auto; flex-wrap: nowrap; padding-bottom: 2px; }
+  .ug-zoom { margin-left: auto; }
+  .ug-detail { flex-basis: 250px; }
+}
+@media (max-width: 620px) {
+  .ug-overlay { padding: 0; align-items: stretch; }
+  .ug-panel { height: 100%; border-radius: 0; border-left: 0; border-right: 0; }
+  .ug-top { padding: 10px 12px; }
+  .ug-stats { display: none; }
+  .ug-toolbar { gap: 7px; padding: 8px 10px; }
+  .ug-zoom { margin-left: 0; }
+  .ug-body { flex-direction: column; }
+  .ug-canvas-wrap { min-height: 44vh; }
+  .ug-detail { flex: 0 0 auto; max-height: 40vh; border-left: 0; border-top: 1px solid var(--border); padding: 10px 12px; }
+  .ug-d-open { margin-bottom: 8px; }
+  .ug-legend { left: 8px; bottom: 8px; max-width: calc(100% - 16px); overflow-x: auto; white-space: nowrap; padding: 5px 9px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ug-overlay, .ug-panel, .ug-chip, .ug-zoom button, .ug-node rect, .ug-d-mini, .ug-d-open { animation: none; transition: none; }
+}
 </style>

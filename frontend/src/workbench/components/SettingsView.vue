@@ -5,24 +5,66 @@
 import { ref, watch, computed, onUnmounted } from 'vue'
 import {
   settingsApi, mcpApi, harnessApi,
+  agentApi,
   WEB_SEARCH_PROVIDERS, WEB_FETCH_PROVIDERS,
   type SettingsConfigInfo, type ModelConfigInfo, type ProviderOption, type McpServer,
   type McpCapabilityCandidate,
   type BudgetStatus, type TraceSummary,
   type McpAutoConnectCandidate, type McpAutoConnectConfig, type McpProbeRes, type McpDirectoryResult,
   type McpRegisterStatusRes, type McpRegisterTier, type McpRegisterState,
+  type UserProfile, type MemoryItem,
 } from '../api'
 import Icon from './Icon.vue'
+import { appEvents } from '../eventBus'
 
-const props = defineProps<{ visible: boolean; initialTab?: 'usage' | 'search' | 'mcp' | 'agent' }>()
+const props = defineProps<{ visible: boolean; initialTab?: 'usage' | 'search' | 'mcp' | 'agent' | 'model' }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
 
-type Tab = 'usage' | 'search' | 'mcp' | 'agent'
+type Tab = 'usage' | 'search' | 'mcp' | 'agent' | 'model'
 const tab = ref<Tab>('usage')
 
 const loading = ref(false)
 const errorMsg = ref('')
 const savedMsg = ref('')
+
+// ---------------- 长期记忆与用户画像 ----------------
+const profileLoading = ref(false)
+const profileSaving = ref(false)
+const profileError = ref('')
+const profileSaved = ref('')
+const profile = ref<UserProfile>({ display_name: '', language: '', timezone: '', location: '', preferences: {}, goals: [], notes: '' })
+const memoryItems = ref<MemoryItem[]>([])
+const memoryLoading = ref(false)
+async function loadMemoryProfile() {
+  profileLoading.value = true; memoryLoading.value = true; profileError.value = ''
+  try {
+    const [p, m] = await Promise.all([agentApi.userProfile(), agentApi.memories('', 30)])
+    if (p.profile) profile.value = { ...profile.value, ...p.profile }
+    memoryItems.value = m.items || []
+  } catch (e) { profileError.value = (e as { message?: string }).message || '读取长期记忆失败' }
+  finally { profileLoading.value = false; memoryLoading.value = false }
+}
+async function saveMemoryProfile() {
+  profileSaving.value = true; profileError.value = ''; profileSaved.value = ''
+  try {
+    const r = await agentApi.updateUserProfile({
+      display_name: profile.value.display_name, language: profile.value.language,
+      timezone: profile.value.timezone, location: profile.value.location,
+      preferences: profile.value.preferences, goals: profile.value.goals, notes: profile.value.notes,
+    })
+    if (r.profile) profile.value = { ...profile.value, ...r.profile }
+    profileSaved.value = '用户画像已保存'
+  } catch (e) { profileError.value = (e as { message?: string }).message || '保存用户画像失败' }
+  finally { profileSaving.value = false }
+}
+async function deleteMemory(id: string) {
+  try { const r = await agentApi.deleteMemory(id); if (r.ok) memoryItems.value = memoryItems.value.filter(item => item.id !== id) }
+  catch (e) { profileError.value = (e as { message?: string }).message || '删除记忆失败' }
+}
+function updateGoals(event: Event) {
+  const value = (event.target as HTMLTextAreaElement | null)?.value || ''
+  profile.value.goals = value.split('\n').map(v => v.trim()).filter(Boolean)
+}
 
 // ---------------- Token 用量 / 费用控制 ----------------
 const usageLoading = ref(false)
@@ -845,7 +887,7 @@ async function removeMcp(key: string) {
 // immediate：组件在首次打开设置时才由 App 异步挂载，挂载即 visible=true，需立即加载
 watch(() => props.visible, async (v) => {
   if (!v) { stopRegPoll(); return } // 关掉设置即停轮询，绝不让定时器泄漏
-  await Promise.all([loadConfig(), loadMcp(), loadUsage()])
+  await Promise.all([loadConfig(), loadMcp(), loadUsage(), loadMemoryProfile()])
   loadAgents()
   tab.value = props.initialTab || 'usage'
   savedMsg.value = ''
@@ -864,12 +906,17 @@ onUnmounted(() => {
 })
 
 function close() { emit('close') }
+function openModelSettings() {
+  // 先关闭统一设置壳，再打开对话台里的完整模型参数弹窗，避免两个遮罩叠加。
+  emit('close')
+  appEvents.emit('docmind:open-model-settings')
+}
 </script>
 
 <template>
-  <div v-if="visible" class="sv-mask" @mousedown.self="close">
-    <div class="sv-box" role="dialog" aria-modal="true">
-      <div class="sv-head">
+  <div v-if="visible" class="sv-mask wb-modal-backdrop" @mousedown.self="close">
+    <div class="sv-box wb-modal-shell" role="dialog" aria-modal="true">
+      <div class="sv-head wb-modal-head">
         <h3 class="sv-title">设置</h3>
         <button class="sv-x" @click="close" title="关闭">×</button>
       </div>
@@ -880,6 +927,7 @@ function close() { emit('close') }
           <button class="sv-nav-item" :class="{ on: tab === 'search' }" @click="tab = 'search'">网络搜索</button>
           <button class="sv-nav-item" :class="{ on: tab === 'mcp' }" @click="tab = 'mcp'">MCP</button>
           <button class="sv-nav-item" :class="{ on: tab === 'agent' }" @click="tab = 'agent'">智能体</button>
+          <button class="sv-nav-item" :class="{ on: tab === 'model' }" @click="tab = 'model'">模型</button>
         </nav>
 
         <!-- 右侧内容 -->
@@ -1153,9 +1201,9 @@ function close() { emit('close') }
             </div>
 
             <!-- C3：写盘确认卡（最重要） -->
-            <div v-if="acConfirmOpen" class="sv-mask" data-dialog="mcp-confirm" @click.self="closeConfirm">
-              <div class="sv-dialog" style="width: 460px">
-                <div class="sv-dialog-head">
+            <div v-if="acConfirmOpen" class="sv-mask wb-modal-backdrop" data-dialog="mcp-confirm" @click.self="closeConfirm">
+              <div class="sv-dialog wb-modal-shell" style="width: 460px">
+                <div class="sv-dialog-head wb-modal-head">
                   <Icon name="shield-check" :size="24" />
                   <div><h3 class="sv-title">确认添加这个连接器？</h3>
                   <p class="sv-hint">DocMind 会把下面这条配置写入本机并立即启用，之后你可以在对话里调用它的工具。</p></div>
@@ -1198,9 +1246,9 @@ function close() { emit('close') }
             </div>
 
             <!-- C4：注册代管弹窗（L0 自动填充 / L1 停-继续 / L2 人工回填兜底） -->
-            <div v-if="regOpen" class="sv-mask" data-dialog="mcp-register" :data-tier="regTier" :data-status="regStatus" @click.self="closeRegister">
-              <div class="sv-dialog" style="width: 440px">
-                <div class="sv-dialog-head">
+            <div v-if="regOpen" class="sv-mask wb-modal-backdrop" data-dialog="mcp-register" :data-tier="regTier" :data-status="regStatus" @click.self="closeRegister">
+              <div class="sv-dialog wb-modal-shell" style="width: 440px">
+                <div class="sv-dialog-head wb-modal-head">
                   <Icon :name="regView === 'running' ? 'zap' : regView === 'waiting' ? 'user-check' : 'lock'" :size="24" />
                   <h3 class="sv-title">{{ regView === 'running' ? '自动填充注册信息' : regView === 'waiting' ? '需要你确认一步' : '这一步需要你手动完成' }}</h3>
                 </div>
@@ -1280,7 +1328,7 @@ function close() { emit('close') }
             </div>
 
             <ul class="sv-list" v-if="mcpServers.length">
-              <li v-for="s in mcpServers" :key="s.key" class="sv-list-item">
+              <li v-for="s in mcpServers" :key="s.key" class="sv-list-item wb-card">
                 <div class="sv-list-main">
                   <span class="sv-list-name">{{ s.label || s.key }}</span>
                   <span class="sv-list-sub">{{ s.transport }}{{ s.enabled ? ' · 已启用' : ' · 未启用' }} · {{ (mcpCapabilities.active[s.key]?.domain || s.engine || '未发现能力') }}</span>
@@ -1332,7 +1380,7 @@ function close() { emit('close') }
             <h4 class="sv-h4">智能体（本地预设）</h4>
             <p class="sv-hint">保存常用 Agent 预设（名称 / 模型 / 提示词），便于在对话前快速切换。当前存于本机浏览器。</p>
             <ul class="sv-list" v-if="agents.length">
-              <li v-for="a in agents" :key="a.id" class="sv-list-item">
+              <li v-for="a in agents" :key="a.id" class="sv-list-item wb-card">
                 <div class="sv-list-main">
                   <span class="sv-list-name">{{ a.name }}</span>
                   <span class="sv-list-sub">{{ a.model || '默认模型' }} · {{ (a.system || '').slice(0, 24) }}{{ (a.system || '').length > 24 ? '…' : '' }}</span>
@@ -1353,6 +1401,49 @@ function close() { emit('close') }
             <div class="sv-actions">
               <button class="sv-btn sv-primary" :disabled="!agentForm.name.trim()" @click="addAgent">添加</button>
             </div>
+
+            <div class="sv-sep"></div>
+            <div class="sv-section-head">
+              <div>
+                <h4 class="sv-h4">长期记忆与用户画像</h4>
+                <p class="sv-hint">记忆按当前项目保存；画像只使用你明确填写或声明的内容，模型不会从项目文件推断个人信息。</p>
+              </div>
+              <button class="sv-mini" :disabled="profileLoading" @click="loadMemoryProfile">刷新</button>
+            </div>
+            <div v-if="profileLoading" class="sv-hint">读取中…</div>
+            <div class="sv-form-grid">
+              <label class="sv-field"><span>称呼</span><input v-model="profile.display_name" class="sv-input" placeholder="例如：小林" /></label>
+              <label class="sv-field"><span>语言</span><input v-model="profile.language" class="sv-input" placeholder="例如：中文" /></label>
+              <label class="sv-field"><span>时区</span><input v-model="profile.timezone" class="sv-input" placeholder="例如：Asia/Shanghai" /></label>
+              <label class="sv-field"><span>所在地</span><input v-model="profile.location" class="sv-input" placeholder="例如：南宁" /></label>
+            </div>
+            <label class="sv-label">长期目标（每行一项）</label>
+            <textarea :value="profile.goals.join('\n')" class="sv-input sv-textarea" rows="3" placeholder="例如：完成 DocMind 游戏项目\n建立可复用的工作流" @input="updateGoals" />
+            <label class="sv-label">补充偏好与备注</label>
+            <textarea v-model="profile.notes" class="sv-input sv-textarea" rows="3" placeholder="只填写你希望 Agent 长期记住的内容" />
+            <p v-if="profileError" class="sv-err">{{ profileError }}</p>
+            <p v-if="profileSaved" class="sv-ok">{{ profileSaved }}</p>
+            <div class="sv-actions"><button class="sv-btn sv-primary" :disabled="profileSaving" @click="saveMemoryProfile">{{ profileSaving ? '保存中…' : '保存画像' }}</button></div>
+            <div v-if="memoryItems.length" class="sv-memory-list">
+              <div class="sv-memory-head"><span>项目长期记忆</span><span>{{ memoryItems.length }} 条</span></div>
+              <div v-for="item in memoryItems" :key="item.id" class="sv-memory-row">
+                <div class="sv-list-main"><b>{{ item.title || item.kind }}</b><span class="sv-list-sub">{{ item.content }}</span></div>
+                <button class="sv-mini" title="删除这条记忆" @click="deleteMemory(item.id)">删除</button>
+              </div>
+            </div>
+            <p v-else-if="!memoryLoading" class="sv-hint">当前项目还没有长期记忆。</p>
+          </section>
+
+          <!-- 模型参数统一入口；模型芯片只负责快速切换已保存预设。 -->
+          <section v-show="tab === 'model'" class="sv-panel">
+            <h4 class="sv-h4">模型与预设</h4>
+            <p class="sv-hint">在这里添加模型、修改接口地址、API Key、上下文窗口和能力参数。保存后会立即切换，并在下次启动时自动恢复。</p>
+            <div v-if="cfg" class="sv-model-current wb-card">
+              <span class="sv-list-sub">当前模型</span>
+              <b>{{ cfg.provider_meta?.[cfg.llm_provider]?.label || cfg.llm_provider }} · {{ cfg.llm_model || '默认模型' }}</b>
+              <span class="sv-list-sub">已保存预设 {{ cfg.model_presets?.length || 0 }} 个 · {{ cfg.llm_mode === 'auto' ? '自动模式' : '固定模式' }}</span>
+            </div>
+            <button class="sv-btn sv-primary sv-model-open" :disabled="loading || !cfg" @click="openModelSettings">打开模型参数设置</button>
           </section>
         </div>
       </div>
@@ -1396,6 +1487,9 @@ function close() { emit('close') }
 .sv-nav-item.on { background: var(--bg-input); border-color: var(--accent); color: var(--accent); font-weight: 600; }
 .sv-content { flex: 1; min-width: 0; overflow-y: auto; padding: 16px 20px; }
 .sv-panel { display: flex; flex-direction: column; gap: 4px; }
+.sv-model-current { display: flex; flex-direction: column; gap: 5px; padding: 13px; margin-top: 8px; background: var(--bg); }
+.sv-model-current b { font-size: 14px; color: var(--text); overflow-wrap: anywhere; }
+.sv-model-open { align-self: flex-start; margin-top: 10px; }
 .sv-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .sv-section-head .sv-hint { margin-bottom: 0; }
 .sv-h4 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
@@ -1470,6 +1564,10 @@ function close() { emit('close') }
 .sv-list-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .sv-list-name { font-size: 13px; font-weight: 600; }
 .sv-list-sub { font-size: 11px; color: var(--text-faint); }
+.sv-memory-list { margin-top: 12px; border-top: 1px solid var(--border); }
+.sv-memory-head { display: flex; justify-content: space-between; padding: 9px 0 5px; color: var(--text-faint); font-size: 11px; }
+.sv-memory-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+.sv-memory-row .sv-list-sub { line-height: 1.45; overflow-wrap: anywhere; }
 .sv-mini {
   flex: none; font-size: 12px; padding: 4px 12px; border-radius: 6px;
   border: 1px solid var(--border); background: var(--bg); color: var(--text); cursor: pointer;

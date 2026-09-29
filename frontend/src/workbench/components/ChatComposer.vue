@@ -23,6 +23,8 @@ const props = defineProps<{
   webTitle: string
   usage: ContextUsage | null
   usageTitle: string
+  voiceActive: boolean
+  voiceSupported: boolean
 }>()
 
 const emit = defineEmits<{
@@ -34,7 +36,8 @@ const emit = defineEmits<{
   (e: 'remove-image', index: number): void
   (e: 'update:webOn', v: boolean): void
   (e: 'toggle-thinking'): void
-  (e: 'open-settings'): void
+  (e: 'open-model-switcher'): void
+  (e: 'toggle-voice'): void
 }>()
 
 const inputEl = ref<HTMLTextAreaElement | null>(null)
@@ -84,6 +87,9 @@ function onVideoPick(ev: Event) {
       <button class="cd-chip cd-attach" :disabled="demoMode || sending || videoBusy" title="视频会由 Harness 抽帧并生成时间轴观察" @click="videoInput?.click()">
         <span aria-hidden="true">▹</span><span>{{ videoBusy ? '分析视频…' : '视频' }}</span>
       </button>
+      <button v-if="voiceSupported" class="cd-chip cd-attach" :class="{ 'cd-chip-on': voiceActive }" :aria-pressed="voiceActive" title="语音协作：发言时段会匹配当前项目画面；无同步画面时明确说明" @click="emit('toggle-voice')">
+        <span aria-hidden="true">{{ voiceActive ? '◼' : '◉' }}</span><span>{{ voiceActive ? '听取中' : '语音' }}</span>
+      </button>
       <span v-if="pendingImages.length" class="cd-attachments">
         <span v-for="(img, i) in pendingImages" :key="img.name + i" class="cd-attachment">
           {{ img.name || '图片' }}
@@ -94,8 +100,8 @@ function onVideoPick(ev: Event) {
       <button
         class="cd-chip cd-chip-model"
         :disabled="demoMode"
-        :title="demoMode ? '离线演示模式无需配置模型' : '模型设置：切换云端 / 本地 / 任意 OpenAI 兼容接口'"
-        @click="emit('open-settings')"
+        :title="demoMode ? '离线演示模式无需配置模型' : '切换已保存模型；添加模型和修改参数请到设置'"
+        @click="emit('open-model-switcher')"
       >
         <svg width="12" height="12" viewBox="0 0 12 12">
           <rect x="2.6" y="2.6" width="6.8" height="6.8" rx="1" fill="none" stroke="currentColor" stroke-width="1"/>
@@ -108,6 +114,7 @@ function onVideoPick(ev: Event) {
       <button
         class="cd-chip"
         :class="{ 'cd-chip-on': webOn }"
+        :aria-pressed="webOn"
         :title="webTitle"
         @click="emit('update:webOn', !webOn)"
       >
@@ -124,6 +131,7 @@ function onVideoPick(ev: Event) {
         v-if="thinkingSupported"
         class="cd-chip"
         :class="{ 'cd-chip-on': thinkingEffective, 'cd-chip-native': thinkingNative }"
+        :aria-pressed="thinkingEffective"
         :disabled="thinkingNative"
         :title="thinkingTitle"
         @click="emit('toggle-thinking')"
@@ -172,8 +180,8 @@ function onVideoPick(ev: Event) {
         @drop="onDrop"
         @dragover="onDragover"
       />
-      <button v-if="sending" class="cd-send cd-stop" @click="emit('stop')">停止</button>
-      <button v-else class="cd-send" :disabled="!modelValue.trim() && !pendingImages.length" @click="emit('submit')">发送</button>
+      <button v-if="sending" class="cd-send cd-stop" title="停止当前请求" aria-label="停止当前请求" @click="emit('stop')">停止</button>
+      <button v-else class="cd-send" :disabled="!modelValue.trim() && !pendingImages.length" title="发送消息（Ctrl+Enter）" @click="emit('submit')">发送</button>
     </div>
   </footer>
 </template>
@@ -269,4 +277,25 @@ function onVideoPick(ev: Event) {
 .cd-attachment { display: inline-flex; align-items: center; gap: 3px; max-width: 150px; padding: 2px 5px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-muted); font-size: 10px; }
 .cd-attachment button { border: 0; background: transparent; color: var(--text-faint); cursor: pointer; padding: 0 1px; }
 .cd-attachment-error { color: var(--danger); font-size: 10px; }
+
+/* 输入工具行的层次与微动效 */
+.cd-tools { padding: 1px 2px 0; }
+.cd-inputbar { border-top: 1px solid color-mix(in srgb, var(--border) 84%, white); }
+.cd-attachments { animation: cd-attachment-in .2s var(--ease-spring) both; }
+.cd-attachment { background: rgba(255,255,255,.66); transition: border-color .16s, background .16s, transform .16s var(--ease-spring); }
+.cd-attachment:hover { border-color: var(--accent); background: #fff; transform: translateY(-1px); }
+.cd-send:active:not(:disabled) { transform: translateY(0); }
+@keyframes cd-attachment-in {
+  from { opacity: 0; transform: translateY(3px) scale(.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@media (max-width: 560px) {
+  .cd-inputbar { padding: 6px 8px 8px; }
+  .cd-tools { gap: 5px; }
+  .cd-chip { max-width: calc(100vw - 24px); }
+  .cd-chip-model { max-width: min(62vw, 240px); }
+  .cd-input-row { gap: 6px; }
+  .cd-input { min-width: 0; font-size: 12px; }
+  .cd-send { padding-inline: 12px; }
+}
 </style>

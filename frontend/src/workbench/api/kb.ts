@@ -43,9 +43,9 @@ export const promptApi = {
 /** 上下文窗口用量查询（页面刷新后恢复指示用）。session_id 为 query 参数，
  *  与 /api/chat 的 form 字段对应，保证读到的是当前标签页会话的用量。 */
 export const contextApi = {
-  async get(): Promise<ContextUsage | null> {
+  async get(sessionId = getSessionId()): Promise<ContextUsage | null> {
     const r = await request<{ ok: boolean; active?: boolean } & Partial<ContextUsage>>(
-      `/api/context?session_id=${encodeURIComponent(getSessionId())}`,
+      `/api/context?session_id=${encodeURIComponent(sessionId)}`,
     )
     if (!r.active) return null
     return {

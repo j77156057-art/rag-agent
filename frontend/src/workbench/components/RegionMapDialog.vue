@@ -157,8 +157,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 </script>
 
 <template>
-  <div v-if="regionMapOpen" class="rm-overlay" @mousedown.self="closeRegionMap">
-    <section class="rm-panel" role="dialog" aria-label="分区可视化">
+  <div v-if="regionMapOpen" class="rm-overlay wb-modal-backdrop" @mousedown.self="closeRegionMap">
+    <section class="rm-panel wb-modal-shell" role="dialog" aria-modal="true" aria-label="分区可视化">
       <header class="rm-top">
         <div class="rm-title">
           <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
@@ -361,6 +361,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   align-items: center;
   justify-content: center;
   padding: 30px;
+  animation: rm-overlay-in .18s ease-out both;
 }
 .rm-panel {
   width: min(1020px, 96vw);
@@ -372,6 +373,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  animation: rm-panel-in .22s cubic-bezier(.2,.8,.2,1) both;
 }
 .rm-top {
   flex: 0 0 auto;
@@ -399,6 +401,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 }
 .rm-refresh:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
 .rm-refresh:disabled { opacity: 0.5; cursor: default; }
+.rm-refresh { transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease; }
+.rm-refresh:active:not(:disabled) { transform: translateY(1px); }
 .rm-iconbtn {
   border: 1px solid transparent;
   background: transparent;
@@ -409,6 +413,14 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   display: inline-flex; align-items: center; justify-content: center;
 }
 .rm-iconbtn:hover { background: var(--bg-hover); color: var(--text); }
+.rm-iconbtn:focus-visible,
+.rm-refresh:focus-visible,
+.rm-add input:focus-visible,
+.rm-create-btn:focus-visible,
+.rm-fill-btn:focus-visible {
+  outline: 2px solid #2f6fed88;
+  outline-offset: 2px;
+}
 .spinning { animation: rm-spin 1s linear infinite; }
 @keyframes rm-spin { to { transform: rotate(360deg); } }
 
@@ -423,8 +435,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   font-size: 12px;
   margin-bottom: 16px;
 }
-.rm-contract.ok { background: rgba(28,158,102,.1); border: 1px solid #8fd4b3; color: #146c48; }
-.rm-contract.bad { background: rgba(224,72,79,.08); border: 1px solid #eeb7ba; color: #c23a40; }
+.rm-contract.ok { background: rgba(28,158,102,.1); border: 1px solid #8fd4b3; color: #146c48; box-shadow: inset 3px 0 #1c9e66; }
+.rm-contract.bad { background: rgba(224,72,79,.08); border: 1px solid #eeb7ba; color: #c23a40; box-shadow: inset 3px 0 #e0484f; }
 .rm-contract svg { flex: 0 0 auto; margin-top: 1px; }
 .rm-contract-text { min-width: 0; }
 .rm-contract-text strong { font-size: 12.5px; }
@@ -456,8 +468,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 /* 画布按实际列宽收缩并居中；列数多到溢出时 margin:auto 退化为 0，可横向滚动 */
 .rm-dag { display: block; margin: 0 auto; }
 .rm-node { cursor: pointer; }
-.rm-node rect { transition: stroke-width 0.12s; }
+.rm-node rect { transition: stroke-width .14s ease, filter .14s ease, opacity .14s ease; }
 .rm-node:hover rect, .rm-node.selected rect { stroke-width: 2; }
+.rm-node:hover rect { filter: brightness(1.04); }
 .rm-node.missing rect { stroke-dasharray: 4 3; fill-opacity: 0.35; }
 .rm-node-name {
   fill: #222b38;
@@ -485,8 +498,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   background: #fff;
   overflow: hidden;
   cursor: pointer;
+  transition: border-color .16s ease, background .16s ease, box-shadow .16s ease, transform .16s ease;
 }
-.rm-card:hover { border-color: var(--border-strong); background: var(--bg-hover); }
+.rm-card:hover { border-color: var(--border-strong); background: var(--bg-hover); transform: translateY(-1px); box-shadow: 0 5px 14px rgba(35,52,84,.08); }
 .rm-card.selected { border-color: #2f6fed77; box-shadow: 0 0 0 1px #2f6fed44 inset; }
 .rm-card.missing { cursor: default; opacity: 0.72; }
 .rm-card-bar { flex: 0 0 3px; }
@@ -571,6 +585,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 }
 .rm-create-btn:hover:not(:disabled) { background: #2f6fed22; border-color: #2560d4; }
 .rm-create-btn:disabled { opacity: 0.55; cursor: default; }
+.rm-create-btn, .rm-fill-btn { transition: background .16s ease, border-color .16s ease, transform .16s ease; }
+.rm-create-btn:active:not(:disabled), .rm-fill-btn:active:not(:disabled) { transform: translateY(1px); }
 .rm-fill-btn {
   display: inline-flex;
   align-items: center;
@@ -614,4 +630,32 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   color: var(--text-faint);
 }
 .rm-error { color: #c23a40; }
+
+@keyframes rm-overlay-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes rm-panel-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+
+@media (max-width: 760px) {
+  .rm-overlay { padding: 14px; }
+  .rm-panel { width: 100%; height: min(900px, 94vh); }
+  .rm-top { align-items: flex-start; }
+  .rm-top-actions { flex-wrap: wrap; justify-content: flex-end; }
+  .rm-body { padding: 12px 12px 18px; }
+  .rm-cards { grid-template-columns: 1fr; }
+  .rm-add { align-items: stretch; }
+  .rm-add label { flex: 1 1 160px; }
+}
+@media (max-width: 520px) {
+  .rm-overlay { padding: 0; align-items: stretch; }
+  .rm-panel { height: 100%; border-radius: 0; border-left: 0; border-right: 0; }
+  .rm-top { padding: 10px 12px; }
+  .rm-title { min-width: 0; }
+  .rm-root { display: none; }
+  .rm-top-actions { gap: 4px; }
+  .rm-top-actions .rm-refresh { padding: 4px 7px; font-size: 10.5px; }
+  .rm-contract { font-size: 11.5px; }
+  .rm-card-main { padding: 8px 9px 9px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rm-overlay, .rm-panel, .rm-refresh, .rm-node rect, .rm-card, .rm-create-btn, .rm-fill-btn { animation: none; transition: none; }
+}
 </style>

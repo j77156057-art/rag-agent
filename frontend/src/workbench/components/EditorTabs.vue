@@ -8,6 +8,13 @@ const { tabs, activeId, activateTab, closeTab } = useWorkbench()
 function chipOf(name: string) {
   return fileChip(name)
 }
+
+function closeByKeyboard(event: KeyboardEvent, id: number) {
+  if (event.key !== 'Enter' && event.key !== ' ') return
+  event.preventDefault()
+  event.stopPropagation()
+  closeTab(id)
+}
 </script>
 
 <template>
@@ -32,8 +39,10 @@ function chipOf(name: string) {
       <span
         class="et-x"
         role="button"
+        tabindex="0"
         aria-label="关闭标签"
         @click.stop="closeTab(tab.id)"
+        @keydown="closeByKeyboard($event, tab.id)"
       >
         <svg width="9" height="9" viewBox="0 0 9 9"><path d="M1 1 L8 8 M8 1 L1 8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
       </span>

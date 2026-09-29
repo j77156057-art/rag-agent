@@ -4,7 +4,7 @@
 import { Handle, Position } from '@vue-flow/core'
 import type { SceneFile } from '../api'
 
-defineProps<{
+const props = defineProps<{
   data: {
     file: SceneFile
     color: string
@@ -20,6 +20,14 @@ defineProps<{
 }>()
 
 const emit = defineEmits<{ (e: 'open', file: SceneFile): void }>()
+
+function openByKeyboard(event: KeyboardEvent) {
+  if (!props.data.file.resolved) return
+  if (event.key !== 'Enter' && event.key !== ' ') return
+  event.preventDefault()
+  event.stopPropagation()
+  emit('open', props.data.file)
+}
 </script>
 
 <template>
@@ -28,10 +36,12 @@ const emit = defineEmits<{ (e: 'open', file: SceneFile): void }>()
     class="sc-file"
     :class="{ sel: selected, ghost: !data.file.resolved, hit: !!data.match && !!data.searchActive, faded: !!data.dim, rel: !!data.rel }"
     :style="{ '--fc': data.color }"
+    :tabindex="data.file.resolved ? 0 : -1"
     :title="data.file.raw || data.file.rel"
     @mouseenter="data.onHover && data.onHover(data.id ?? null)"
     @mouseleave="data.onHover && data.onHover(null)"
     @dblclick.stop="data.file.resolved && emit('open', data.file)"
+    @keydown="openByKeyboard"
   >
     <span class="sc-file-chip">{{ data.file.chip }}</span>
     <div class="sc-file-meta">

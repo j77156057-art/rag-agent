@@ -123,6 +123,9 @@ async function restoreWorkspace() {
         tab.savedContent = file.content
         tab.draftContent = file.content
         tab.mtime = file.mtime
+        tab.writable = tab.writable && file.writable
+        tab.previewKind = file.preview_kind ?? null
+        tab.previewNote = file.preview_note ?? null
         docReplacers.get(tab.id)?.(file.content)
       } catch (e) {
         if (project === getProjectId() && root === restoredRoot && tabs.value.includes(tab) && !tab.dirty) tab.error = (e as Error).message
@@ -259,9 +262,9 @@ async function openPath(path: string, preferWritable?: boolean) {
     live.mtime = f.mtime
     live.tracked = f.tracked
     live.gitDirty = f.dirty
-    // 树节点 writable 优先（file 接口对契约文件恒返 writable:true）
-    if (node) live.writable = node.writable
-    if (contractLocked) live.writable = false
+    live.previewKind = f.preview_kind ?? null
+    live.previewNote = f.preview_note ?? null
+    live.writable = (node?.writable ?? true) && f.writable && !contractLocked
     live.savedContent = f.content
     live.loading = false
   } catch (e) {

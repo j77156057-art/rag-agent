@@ -351,8 +351,8 @@
     </div>
 
     <!-- 素材库选首帧 -->
-    <div v-if="pickerOpen" class="ag-modal-mask" @click.self="pickerOpen = false">
-      <div class="ag-modal">
+    <div v-if="pickerOpen" class="ag-modal-mask wb-modal-backdrop" @click.self="pickerOpen = false">
+      <div class="ag-modal wb-modal-shell">
         <header><b>从素材库选首帧（{{ pickerTarget === 'cloud' ? '云端帧动画' : '本地 H3' }}）</b><button type="button" class="ag-x" @click="pickerOpen = false">×</button></header>
         <p v-if="pickerLoading" class="ag-loading">加载中…</p>
         <div v-else class="ag-picker-grid">

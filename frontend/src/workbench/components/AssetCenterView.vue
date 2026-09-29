@@ -549,8 +549,8 @@ onMounted(() => {
     </div>
 
     <!-- ============================ Poly 详情抽屉 ============================ -->
-    <div v-if="detail" class="ac-drawer-mask" @click.self="closeDetail">
-      <aside class="ac-drawer">
+    <div v-if="detail" class="ac-drawer-mask wb-modal-backdrop" @click.self="closeDetail">
+      <aside class="ac-drawer wb-modal-shell">
         <header class="ac-drawer-head">
           <p class="ac-drawer-title">{{ detail.item.name }}</p>
           <button type="button" class="ac-x" @click="closeDetail" aria-label="关闭">×</button>
@@ -613,8 +613,8 @@ onMounted(() => {
     </div>
 
     <!-- ============================ Kenney 包勾选对话框 ============================ -->
-    <div v-if="peek" class="ac-modal-mask" @click.self="closePeek">
-      <div class="ac-modal">
+    <div v-if="peek" class="ac-modal-mask wb-modal-backdrop" @click.self="closePeek">
+      <div class="ac-modal wb-modal-shell">
         <header class="ac-drawer-head">
           <div>
             <p class="ac-drawer-title">{{ peek.pack.name }}</p>
@@ -689,8 +689,8 @@ onMounted(() => {
     </div>
 
     <!-- ============================ 素材库模型/音效预览 ============================ -->
-    <div v-if="libPreview" class="ac-drawer-mask" @click.self="libPreview = null">
-      <aside class="ac-drawer">
+    <div v-if="libPreview" class="ac-drawer-mask wb-modal-backdrop" @click.self="libPreview = null">
+      <aside class="ac-drawer wb-modal-shell">
         <header class="ac-drawer-head">
           <p class="ac-drawer-title">{{ libPreview.name }}</p>
           <button type="button" class="ac-x" @click="libPreview = null" aria-label="关闭">×</button>
@@ -770,6 +770,14 @@ onMounted(() => {
 .ac-seg:hover { background: rgba(47,111,237,.08); color: var(--text); }
 .ac-seg.on { background: #fff; border-color: var(--border); color: var(--accent); box-shadow: 0 1px 2px rgba(35,52,84,.07); }
 .ac-sub.on { background: #fff; color: var(--accent); box-shadow: 0 1px 2px rgba(35,52,84,.08); }
+.ac-seg:focus-visible, .ac-sub:focus-visible, .ac-kind:focus-visible,
+.ac-search-btn:focus-visible, .ac-more-item:focus-visible, .ac-pack-open:focus-visible,
+.ac-card:focus-visible, .ac-refresh:focus-visible, .ac-mini-btn:focus-visible,
+.ac-primary:focus-visible, .ac-x:focus-visible, .ac-file-name:focus-visible,
+.ac-dest-root select:focus-visible, .ac-field select:focus-visible {
+  outline: 2px solid rgba(47,111,237,.6);
+  outline-offset: 2px;
+}
 .ac-sub-count {
   display: inline-block; margin-left: 4px; min-width: 17px; padding: 0 4px;
   border-radius: 9px; background: rgba(47,111,237,.12); color: var(--accent);
@@ -780,6 +788,7 @@ onMounted(() => {
   position: absolute; top: calc(100% + 4px); left: 0; z-index: 30;
   min-width: 220px; background: #fff; border: 1px solid var(--border);
   border-radius: 9px; box-shadow: 0 8px 28px rgba(35,52,84,.16); padding: 6px;
+  animation: ac-pop-in .16s ease-out both;
 }
 .ac-more-title { margin: 2px 6px 6px; font-size: 11px; color: var(--text-faint); }
 .ac-more-item {
@@ -933,6 +942,7 @@ button.ac-card { font: inherit; color: inherit; }
   background: #fff; border-left: 1px solid var(--border);
   display: flex; flex-direction: column;
   box-shadow: -8px 0 30px rgba(35,52,84,.14);
+  animation: ac-drawer-in .2s cubic-bezier(.2,.8,.2,1) both;
 }
 .ac-drawer-head {
   flex: 0 0 auto;
@@ -1005,6 +1015,7 @@ button.ac-card { font: inherit; color: inherit; }
   background: #fff; border-radius: 12px; border: 1px solid var(--border);
   display: flex; flex-direction: column; overflow: hidden;
   box-shadow: 0 18px 60px rgba(35,52,84,.25);
+  animation: ac-modal-in .2s cubic-bezier(.2,.8,.2,1) both;
 }
 .ac-modal-sub { margin: 3px 0 0; font-size: 11px; color: var(--text-faint); }
 .ac-peek-loading { flex: 1 1 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 30px; text-align: center; }
@@ -1069,6 +1080,10 @@ button.ac-card { font: inherit; color: inherit; }
 .ac-toast-enter-active, .ac-toast-leave-active { transition: opacity .18s, transform .18s; }
 .ac-toast-enter-from, .ac-toast-leave-to { opacity: 0; transform: translate(-50%, 8px); }
 
+@keyframes ac-pop-in { from { opacity: 0; transform: translateY(-4px) scale(.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@keyframes ac-drawer-in { from { opacity: 0; transform: translateX(18px); } to { opacity: 1; transform: translateX(0); } }
+@keyframes ac-modal-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+
 /* 窄屏：过滤栏换行、详情抽屉拉宽占比 */
 @media (max-width: 1024px) {
   .ac-license-hint { margin-left: 0; flex-basis: 100%; order: 3; }
@@ -1081,5 +1096,12 @@ button.ac-card { font: inherit; color: inherit; }
   .ac-drawer { width: 100%; max-width: 100%; }
   .ac-modal-mask { padding: 0; }
   .ac-modal { width: 100%; height: 100%; border-radius: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ac-seg, .ac-sub, .ac-kind, .ac-card, .ac-more-menu, .ac-drawer, .ac-modal,
+  .ac-spinner, .ac-toast-enter-active, .ac-toast-leave-active {
+    animation: none !important;
+    transition: none !important;
+  }
 }
 </style>

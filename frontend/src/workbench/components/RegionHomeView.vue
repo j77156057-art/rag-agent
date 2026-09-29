@@ -121,9 +121,9 @@ function contractText(c: RegionCard): string {
 .rh-loading { font-size: 12px; color: var(--text-faint); margin: 8px 0; }
 .rh-head {
   display: flex; align-items: flex-end; justify-content: space-between;
-  gap: 12px; margin-bottom: 10px;
+  gap: 12px; margin-bottom: 14px;
 }
-.rh-head h3 { margin: 0; font-size: 14px; color: var(--text); font-weight: 700; }
+.rh-head h3 { margin: 0; font-size: 16px; color: var(--text); font-weight: 750; letter-spacing: -.01em; }
 .rh-head p { margin: 3px 0 0; font-size: 11.5px; color: var(--text-faint); }
 .rh-refresh {
   flex: 0 0 auto; border: 1px solid var(--border); background: var(--bg-raised);
@@ -131,11 +131,13 @@ function contractText(c: RegionCard): string {
   padding: 4px 11px; cursor: pointer; font-family: var(--font-ui);
 }
 .rh-refresh:hover:not(:disabled) { border-color: #b9d0f5; color: var(--accent); }
+.rh-refresh:focus-visible, .rh-card:focus-visible, .rh-missing-toggle:focus-visible, .rh-missing-go:focus-visible { outline: 2px solid #2f6fed88; outline-offset: 2px; }
+.rh-refresh, .rh-card, .rh-missing-toggle, .rh-missing-go { transition: border-color .16s ease, box-shadow .16s ease, background .16s ease, transform .16s ease, color .16s ease; }
 
 .rh-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
 }
 .rh-card {
   position: relative; display: flex; align-items: stretch;
@@ -143,7 +145,8 @@ function contractText(c: RegionCard): string {
   border-radius: 10px; background: var(--bg-raised);
   padding: 0; cursor: pointer; overflow: hidden;
   font-family: var(--font-ui);
-  transition: border-color .15s, box-shadow .15s;
+  min-height: 142px;
+  transition: border-color .15s, box-shadow .15s, transform .16s var(--ease-spring), background .16s ease;
   /* 进入时轻微淡入（分区多时按位置错峰，封顶前 8 个） */
   animation: rh-in .22s ease both;
 }
@@ -159,17 +162,17 @@ function contractText(c: RegionCard): string {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: none; }
 }
-.rh-card:hover:not(:disabled) { border-color: #b9d0f5; box-shadow: 0 2px 10px rgba(35,52,84,.07); }
+.rh-card:hover:not(:disabled) { border-color: #a9c5ef; background: #fcfdff; box-shadow: 0 8px 22px rgba(35,52,84,.11); transform: translateY(-2px); }
 .rh-card:disabled { cursor: default; }
 .rh-card:disabled .rh-locator { display: none; }
 .rh-rail { width: 3px; flex: 0 0 3px; }
 .rh-body {
   flex: 1; min-width: 0;
   display: flex; flex-direction: column; gap: 5px;
-  padding: 10px 12px 9px;
+  padding: 14px 15px 12px;
 }
 .rh-title { display: flex; align-items: center; gap: 7px; min-width: 0; }
-.rh-name { font-size: 13px; font-weight: 700; color: var(--text); }
+.rh-name { font-size: 14px; font-weight: 750; color: var(--text); }
 .rh-dir { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); }
 .rh-branch {
   margin-left: auto; flex: 0 0 auto;
@@ -184,7 +187,7 @@ function contractText(c: RegionCard): string {
 }
 .rh-card:hover .rh-locator { opacity: 1; transform: none; color: var(--accent); }
 .rh-desc {
-  font-size: 11.5px; color: var(--text-muted); line-height: 1.55;
+  font-size: 12px; color: var(--text-muted); line-height: 1.6;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
   overflow: hidden;
 }
@@ -221,7 +224,7 @@ function contractText(c: RegionCard): string {
   padding: 8px 11px;
   border: 1px dashed var(--border);
   border-radius: 9px;
-  background: transparent;
+  background: rgba(255,255,255,.6);
 }
 .rh-missing-toggle {
   display: inline-flex; align-items: center; gap: 6px;
@@ -257,7 +260,11 @@ function contractText(c: RegionCard): string {
 .rh-dot { width: 7px; height: 7px; border-radius: 2px; flex: 0 0 7px; }
 
 @media (max-width: 620px) {
-  .rh-grid { grid-template-columns: minmax(0, 1fr); }
+  .rh-grid { grid-template-columns: minmax(0, 1fr); gap: 9px; }
+  .rh-card { min-height: 0; }
   .rh-missing-list .rh-line-faint { margin-left: 0; flex-basis: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rh-card, .rh-refresh, .rh-missing-toggle, .rh-missing-go, .rh-locator, .rh-caret { animation: none; transition: none; }
 }
 </style>

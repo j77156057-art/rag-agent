@@ -39,8 +39,8 @@ function sessionTime(value: string): string {
 
 <template>
   <Teleport to="body">
-    <div v-if="open" class="cd-pop-mask" @click="emit('close')" />
-    <div v-if="open" class="cd-session-pop" @click.stop>
+    <div v-if="open" class="cd-pop-mask wb-modal-backdrop" @click="emit('close')" />
+    <div v-if="open" class="cd-session-pop wb-modal-shell" role="dialog" aria-modal="true" aria-label="会话历史" @click.stop>
       <div class="cd-session-head">
         <div>
           <div class="cd-pop-title">会话历史</div>
@@ -84,6 +84,9 @@ function sessionTime(value: string): string {
   position: fixed;
   inset: 0;
   z-index: 59;
+  background: rgba(35,52,84,.14);
+  backdrop-filter: blur(1px);
+  animation: sh-fade-in .16s ease-out both;
 }
 .cd-pop-title { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
 .cd-mini {
@@ -93,6 +96,12 @@ function sessionTime(value: string): string {
 }
 .cd-mini:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
 .cd-mini:disabled { opacity: .45; cursor: default; }
+.cd-mini:focus-visible,
+.cd-session-new:focus-visible,
+.cd-session-main:focus-visible,
+.cd-session-delete:focus-visible,
+.cd-session-clear:focus-visible { outline: 2px solid #2f6fed88; outline-offset: 2px; }
+.cd-mini, .cd-session-new, .cd-session-main, .cd-session-delete, .cd-session-clear { transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease, opacity .16s ease; }
 .cd-session-pop {
   position: fixed;
   right: 10px; bottom: 64px;
@@ -101,6 +110,7 @@ function sessionTime(value: string): string {
   background: var(--bg-raised); border: 1px solid var(--border-strong);
   border-radius: 8px; box-shadow: 0 14px 38px rgba(35,52,84,.2);
   padding: 10px; z-index: 60;
+  animation: sh-pop-in .2s cubic-bezier(.2,.8,.2,1) both;
 }
 .cd-session-head { display: flex; align-items: flex-start; gap: 8px; justify-content: space-between; }
 .cd-session-subtitle { color: var(--text-faint); font-size: 10.5px; line-height: 1.45; margin-top: -4px; }
@@ -145,4 +155,12 @@ function sessionTime(value: string): string {
 .cd-session-delete { align-self: center; margin-right: 5px; width: 22px; height: 22px; border: 0; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 16px; }
 .cd-session-delete:hover { color: var(--danger); }
 .cd-session-delete:disabled { cursor: default; opacity: .5; }
+@keyframes sh-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes sh-pop-in { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@media (max-width: 560px) {
+  .cd-session-pop { left: 8px; right: 8px; bottom: 8px; width: auto; max-width: none; max-height: calc(100vh - 16px); border-radius: 10px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cd-pop-mask, .cd-session-pop, .cd-mini, .cd-session-new, .cd-session-main, .cd-session-delete, .cd-session-clear { animation: none; transition: none; }
+}
 </style>

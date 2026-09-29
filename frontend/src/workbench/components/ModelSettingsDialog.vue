@@ -42,6 +42,9 @@ const presetBusy = ref(false)
 const llmMode = ref<'fixed' | 'auto'>('fixed')
 const autoCloudPresetId = ref('')
 const presetError = ref('')
+// 弹窗由 v-if 按需创建，首次创建时 visible 已经是 true；回填期间禁止
+// provider 监听把服务端保存的具体模型名改回厂商默认模型。
+let hydratingConfig = false
 
 const cloudPresets = computed<ModelPreset[]>(() =>
   presets.value.filter((p) => {
@@ -93,36 +96,44 @@ function normalizedContextWindow(): string {
   return String(value).trim()
 }
 
-// 弹窗每次打开时用服务端最新配置回填表单
-watch(
-  () => props.visible,
-  (v) => {
-    if (!v || !props.config) return
+function hydrateConfig(config: ModelConfigInfo) {
+    hydratingConfig = true
     errorMsg.value = ''
     warnings.value = []
-    provider.value = props.config.llm_provider || 'mock'
-    model.value = props.config.llm_model || ''
+    provider.value = config.llm_provider || 'mock'
+    model.value = config.llm_model || ''
     apiKey.value = ''
-    baseUrl.value = props.config.custom_base_url || ''
-    ctxWindow.value = props.config.context_window_override ? String(props.config.context_window_override) : ''
-    accessMode.value = props.config.external_access_mode || 'safe'
-    thinkingCapability.value = props.config.capability?.thinking || 'unknown'
-    visionCapability.value = props.config.capability?.vision || 'unknown'
-    videoCapability.value = props.config.capability?.video || 'unknown'
-    presets.value = [...(props.config.model_presets || [])]
+    baseUrl.value = config.custom_base_url || ''
+    ctxWindow.value = config.context_window_override ? String(config.context_window_override) : ''
+    accessMode.value = config.external_access_mode || 'safe'
+    thinkingCapability.value = config.capability?.thinking || 'unknown'
+    visionCapability.value = config.capability?.vision || 'unknown'
+    videoCapability.value = config.capability?.video || 'unknown'
+    presets.value = [...(config.model_presets || [])]
     presetLabel.value = ''
     presetError.value = ''
-    llmMode.value = props.config.llm_mode === 'auto' ? 'auto' : 'fixed'
-    autoCloudPresetId.value = props.config.auto_cloud_preset_id || ''
+    llmMode.value = config.llm_mode === 'auto' ? 'auto' : 'fixed'
+    autoCloudPresetId.value = config.auto_cloud_preset_id || ''
     ctxBusy.value = ''
     ctxMsg.value = ''
     lookupResult.value = null
+    hydratingConfig = false
+}
+
+// v-if 首次挂载时 visible 已经为 true，所以必须 immediate；同时配置对象更新
+// （例如从预设切换回来）时也重新回填，避免弹窗显示上一套模型。
+watch(
+  () => [props.visible, props.config] as const,
+  ([visible, config]) => {
+    if (visible && config) hydrateConfig(config)
   },
+  { immediate: true },
 )
 
 // 切换厂商：模型名沿用该厂商默认（用户可改）；自定义端点清空 key 输入；
 // 窗口覆盖按「厂商/模型」持久化，切厂商时重置为待填状态
 watch(provider, (p) => {
+  if (hydratingConfig || (p === props.config?.llm_provider && model.value === props.config?.llm_model)) return
   errorMsg.value = ''
   ctxMsg.value = ''
   lookupResult.value = null
@@ -331,8 +342,8 @@ async function save() {
 </script>
 
 <template>
-  <div v-if="visible" class="ms-mask" @mousedown.self="onMaskDown">
-    <div class="ms-box" role="dialog" aria-modal="true">
+  <div v-if="visible" class="ms-mask wb-modal-backdrop" @mousedown.self="onMaskDown">
+    <div class="ms-box wb-modal-shell" role="dialog" aria-modal="true">
       <h3 class="ms-title">模型设置</h3>
 
       <label class="ms-label">模型选择方式</label>
@@ -580,18 +591,20 @@ async function save() {
 
 <style scoped>
 .ms-mask {
-  position: fixed; inset: 0; z-index: 2000;
+  position: fixed; inset: 0; z-index: 2000; box-sizing: border-box;
   background: rgba(20, 24, 33, .32);
-  display: flex; align-items: center; justify-content: center;
+  display: flex; align-items: center; justify-content: center; backdrop-filter: blur(2px); animation: ms-fade .18s ease-out both;
 }
 .ms-box {
-  width: 460px; max-width: calc(100vw - 32px);
+  width: 460px; max-width: min(460px, calc(100vw - 24px));
+  max-height: min(88vh, calc(100vh - 24px));
+  box-sizing: border-box;
   background: var(--bg, #fff);
   border: 1px solid var(--border);
   border-radius: 12px;
   box-shadow: 0 12px 40px rgba(15, 23, 42, .18);
   padding: 18px 20px 16px;
-  display: flex; flex-direction: column; gap: 6px;
+  display: flex; flex-direction: column; gap: 6px; animation: ms-rise .2s cubic-bezier(.2,.8,.2,1) both; scrollbar-gutter: stable;
 }
 .ms-title { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
 .ms-label {
@@ -607,7 +620,7 @@ async function save() {
   background: var(--bg-input, #fff); color: var(--text);
   outline: none;
 }
-.ms-input:focus { border-color: var(--accent); }
+.ms-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(47,111,237,.1); }
 .ms-endpoint {
   font-size: 11px; color: var(--text-faint);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -626,9 +639,9 @@ async function save() {
 .ms-mini {
   font-size: 12px; padding: 4px 12px; border-radius: 6px;
   border: 1px solid var(--border); background: var(--bg); color: var(--text);
-  cursor: pointer;
+  cursor: pointer; transition: color .15s ease, border-color .15s ease, background .15s ease, transform .15s ease, box-shadow .15s ease;
 }
-.ms-mini:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.ms-mini:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); background: var(--bg-selected); transform: translateY(-1px); box-shadow: 0 3px 8px rgba(35,52,84,.08); }
 .ms-mini:disabled { opacity: .5; cursor: default; }
 .ms-ctx-note { font-size: 11px; color: var(--text-faint); }
 .ms-lookup {
@@ -661,8 +674,9 @@ async function save() {
 .ms-cap-tag {
   font-size: 11px; color: var(--text-muted);
   border: 1px solid var(--border); border-radius: 999px;
-  padding: 2px 9px; background: var(--bg-selected);
+  padding: 2px 9px; background: var(--bg-selected); transition: border-color .15s ease, transform .15s ease;
 }
+.ms-cap-tag:hover { border-color: var(--accent); transform: translateY(-1px); }
 .ms-cap-off { opacity: .65; }
 .ms-tip { font-size: 11px; color: var(--text-faint); margin: 8px 0 0; line-height: 1.5; }
 /* 越界访问模式分段选择 */
@@ -671,9 +685,9 @@ async function save() {
 .ms-seg-opt {
   flex: 1; display: flex; flex-direction: column; gap: 2px;
   padding: 9px 12px; border: 1px solid var(--border); border-radius: 9px;
-  background: var(--bg); color: var(--text); cursor: pointer; text-align: left;
+  background: var(--bg); color: var(--text); cursor: pointer; text-align: left; transition: border-color .15s ease, background .15s ease, transform .15s ease, box-shadow .15s ease;
 }
-.ms-seg-opt:hover:not(:disabled) { border-color: var(--accent); }
+.ms-seg-opt:hover:not(:disabled) { border-color: var(--accent); transform: translateY(-1px); box-shadow: 0 3px 9px rgba(35,52,84,.07); }.ms-seg-opt:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .ms-seg-on { border-color: var(--accent); background: var(--bg-selected); }
 .ms-seg-high.ms-seg-on { border-color: #d97706; background: #fff7ed; }
 .ms-seg-name { font-size: 13px; font-weight: 600; }
@@ -692,8 +706,9 @@ async function save() {
 .ms-preset-item {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px;
-  background: var(--bg);
+  background: var(--bg); transition: border-color .15s ease, background .15s ease, transform .15s ease;
 }
+.ms-preset-item:hover { border-color: var(--border-strong); background: var(--bg-selected); transform: translateX(2px); }
 .ms-preset-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .ms-preset-name { font-size: 13px; font-weight: 600; }
 .ms-preset-meta { font-size: 11px; color: var(--text-faint); display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
@@ -708,14 +723,18 @@ async function save() {
 .ms-preset-empty { margin-top: 4px; }
 .ms-preset-save { display: flex; gap: 8px; margin-top: 8px; }
 .ms-preset-name-input { flex: 1; }
-.ms-box { max-height: 88vh; overflow-y: auto; }
+.ms-box { overflow-y: auto; overscroll-behavior: contain; }
 .ms-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .ms-btn {
   padding: 7px 16px; font-size: 13px; border-radius: 8px;
   border: 1px solid var(--border); background: var(--bg); color: var(--text);
-  cursor: pointer;
+  cursor: pointer; transition: color .15s ease, border-color .15s ease, background .15s ease, transform .15s ease, box-shadow .15s ease;
 }
-.ms-btn:hover { border-color: var(--accent); }
+.ms-btn:hover:not(:disabled) { border-color: var(--accent); transform: translateY(-1px); box-shadow: 0 3px 9px rgba(35,52,84,.08); }.ms-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .ms-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .ms-primary:disabled { opacity: .5; cursor: default; }
+@keyframes ms-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ms-rise { from { opacity: 0; transform: translateY(7px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@media (max-width: 560px) { .ms-mask { align-items: flex-end; }.ms-box { width: 100%; max-width: none; max-height: calc(100vh - 12px); border-radius: 12px 12px 0 0; padding: 15px 14px 13px; }.ms-seg { flex-direction: column; }.ms-cap-edit label { align-items: stretch; flex-direction: column; gap: 4px; }.ms-select { min-width: 0; width: 100%; }.ms-actions { position: sticky; bottom: -13px; padding-top: 10px; padding-bottom: 2px; background: linear-gradient(180deg, transparent, var(--bg) 26%); } }
+@media (prefers-reduced-motion: reduce) { .ms-mask, .ms-box, .ms-mini, .ms-cap-tag, .ms-seg-opt, .ms-preset-item, .ms-btn { animation: none; transition: none; } }
 </style>

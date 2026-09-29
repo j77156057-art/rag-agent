@@ -229,11 +229,16 @@ function savedLabel(tab: EditorTab): string {
         <span v-if="git(tab).dot !== 'none'" class="cv-badge" :class="`cv-git-${git(tab).dot}`" :title="git(tab).title">
           {{ git(tab).dot === 'untracked' ? '未跟踪' : git(tab).dot === 'dirty' ? '已修改' : '已跟踪' }}
         </span>
-        <span v-if="!tab.writable" class="cv-badge cv-readonly" title="契约/受保护文件">只读保护</span>
+        <span v-if="!tab.writable" class="cv-badge cv-readonly">{{ tab.previewKind ? '只读预览' : '只读保护' }}</span>
         <span :class="['cv-savestate', { 'is-dirty': tab.dirty, 'is-saving': tab.saving }]">{{ savedLabel(tab) }}</span>
         <span class="cv-faint">{{ formatMtime(tab.mtime) }}</span>
       </div>
     </header>
+
+    <div v-if="tab && !tab.loading && !tab.error && tab.previewKind" class="cv-previewbar">
+      <strong>{{ tab.previewKind === 'binary' ? '二进制文件预览' : '文本文件预览' }}</strong>
+      <span>{{ tab.previewNote }}</span>
+    </div>
 
     <!-- 加载态 -->
     <div v-if="tab?.loading" class="cv-state">

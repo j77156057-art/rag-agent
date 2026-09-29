@@ -131,10 +131,10 @@ function submitRevise() {
   <!-- Teleport 到 body：卡片自身 overflow:hidden、对话台折叠态 33px 裁剪都可能
        吞掉 position:fixed 遮罩（与会话历史弹层同策略），必须脱离裁剪容器。 -->
   <Teleport to="body">
-  <div class="wg-mask">
+  <div class="wg-mask wb-modal-backdrop">
     <div
       ref="boxRef"
-      class="wg-box"
+      class="wg-box wb-modal-shell"
       :class="{ 'wg-busy-on': busy }"
       role="dialog"
       aria-modal="true"
@@ -290,7 +290,8 @@ function submitRevise() {
   border-radius: 14px;
   box-shadow: var(--shadow-pop);
   padding: 18px 20px 16px;
-  animation: wg-rise .14s ease-out;
+  animation: wg-rise .18s cubic-bezier(.2,.8,.2,1);
+  scrollbar-gutter: stable;
 }
 .wg-box:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 @keyframes wg-fade { from { opacity: 0; } to { opacity: 1; } }
@@ -314,9 +315,9 @@ function submitRevise() {
 .wg-busy-on { opacity: .85; }
 .wg-x {
   border: 0; background: transparent; color: var(--text-faint);
-  font-size: 18px; line-height: 1; cursor: pointer; padding: 2px 6px; border-radius: 6px;
+  font-size: 18px; line-height: 1; cursor: pointer; padding: 2px 6px; border-radius: 6px; transition: color .15s ease, background .15s ease, transform .15s ease;
 }
-.wg-x:hover:not(:disabled) { color: var(--text); background: var(--bg-hover); }
+.wg-x:hover:not(:disabled) { color: var(--text); background: var(--bg-hover); transform: rotate(90deg); }
 .wg-x:disabled { cursor: default; }
 .wg-goal {
   margin: 10px 0 12px; padding: 9px 11px;
@@ -338,10 +339,12 @@ function submitRevise() {
   display: block; text-align: left; width: 100%;
   border: 1px solid var(--border); border-radius: 10px;
   background: var(--bg-raised); padding: 10px 12px; cursor: pointer;
-  transition: border-color .12s, background .12s, transform .05s;
+  transition: border-color .16s ease, background .16s ease, transform .16s ease, box-shadow .16s ease;
 }
-.wg-option:hover:not(:disabled) { border-color: var(--accent); background: var(--bg-selected); }
+.wg-option:hover:not(:disabled) { border-color: var(--accent); background: var(--bg-selected); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(35,52,84,.08); }
 .wg-option:active:not(:disabled) { transform: scale(.995); }
+.wg-option:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.wg-option:has(.wg-tag) { border-color: rgba(47,111,237,.4); background: color-mix(in srgb, var(--accent) 4%, var(--bg-raised)); }
 .wg-option:disabled { opacity: .6; cursor: default; }
 .wg-option b { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
 .wg-option span { display: block; margin-top: 4px; font-size: 12px; line-height: 1.55; color: var(--text-muted); }
@@ -353,7 +356,7 @@ function submitRevise() {
 .wg-tag-web { background: var(--amber); }
 .wg-custom { margin-top: 10px; display: grid; gap: 8px; }
 .wg-tasks { margin: 10px 0; display: grid; gap: 7px; max-height: 38vh; overflow-y: auto; }
-.wg-task { display: flex; gap: 10px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-surface, var(--bg-hover)); }
+.wg-task { display: flex; gap: 10px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-surface, var(--bg-hover)); transition: border-color .15s ease, background .15s ease, transform .15s ease; }.wg-task:hover { border-color: var(--border-strong); background: var(--bg-selected); transform: translateX(2px); }
 .wg-task b { flex: 0 0 auto; font-size: 11px; color: var(--accent); font-family: ui-monospace, monospace; padding-top: 1px; }
 .wg-task-main { min-width: 0; display: grid; gap: 2px; font-size: 12.5px; line-height: 1.5; }
 .wg-task-role { font-size: 11px; color: var(--text-faint); font-weight: 600; }
@@ -370,14 +373,15 @@ textarea, input, select {
 }
 textarea:focus, input:focus, select:focus { outline: none; border-color: var(--accent); }
 .wg-row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
-.wg-foot { margin-top: 10px; }
+.wg-foot { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); background: linear-gradient(180deg, transparent, var(--bg-raised) 28%); position: sticky; bottom: -16px; padding-bottom: 2px; }
 .wg-spacer { flex: 1; }
 .wg-btn {
   height: 30px; padding: 0 14px; border-radius: 7px;
   border: 1px solid var(--border-strong); background: var(--bg-raised);
-  color: var(--text); font-size: 12.5px; cursor: pointer;
+  color: var(--text); font-size: 12.5px; cursor: pointer; transition: color .15s ease, border-color .15s ease, background .15s ease, transform .15s ease, box-shadow .15s ease;
 }
-.wg-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.wg-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); box-shadow: 0 3px 8px rgba(35,52,84,.08); }
+.wg-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .wg-btn:disabled { opacity: .55; cursor: default; }
 .wg-primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
 .wg-primary:hover:not(:disabled) { background: var(--accent-strong, var(--accent)); color: #fff; }
@@ -393,4 +397,15 @@ textarea:focus, input:focus, select:focus { outline: none; border-color: var(--a
 .wg-criterion label { display: grid; gap: 4px; }
 .wg-criterion .wg-check { display: flex; align-items: center; }
 .wg-check input { width: auto; }
+@media (max-width: 620px) {
+  .wg-mask { align-items: flex-end; }
+  .wg-box { width: 100%; max-width: none; max-height: 88vh; border-radius: 14px 14px 0 0; padding: 15px 14px 12px; }
+  .wg-row { flex-wrap: wrap; }
+  .wg-row .wg-btn { flex: 1 1 auto; }
+  .wg-foot { bottom: -12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wg-box, .wg-mask, .wg-option, .wg-task, .wg-x, .wg-btn { transition: none; animation: none; }
+  .wg-busy-dot, .wg-hint-dot { animation: none; }
+}
 </style>

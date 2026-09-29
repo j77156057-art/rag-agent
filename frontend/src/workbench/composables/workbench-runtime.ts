@@ -3,7 +3,7 @@
 import { ref, type Ref } from 'vue'
 import type { EditorTab } from './workbench-types'
 
-export type WorkspaceView = 'overview' | 'code' | 'assets'
+export type WorkspaceView = 'overview' | 'code' | 'assets' | 'cockpit'
 export type RuntimePanelTab = 'play' | 'scene' | 'timeline'
 
 interface RuntimeDeps {

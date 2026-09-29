@@ -69,9 +69,9 @@ function focus(id: string) {
   height: 28px; padding: 0 11px;
   border: 1px solid var(--border-strong); border-radius: 99px;
   background: var(--bg-raised); box-shadow: 0 4px 14px rgba(35,52,84,.16);
-  color: var(--text); font-size: 11.5px; cursor: pointer;
+  color: var(--text); font-size: 11.5px; cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .16s ease, box-shadow .16s ease;
 }
-.wmd-strip:hover { border-color: var(--accent); }
+.wmd-strip:hover { border-color: var(--accent); background: var(--bg-selected); transform: translateY(-1px); box-shadow: 0 6px 16px rgba(35,52,84,.18); }.wmd-strip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .wmd-strip b { font-weight: 600; }
 .wmd-strip em { font-style: normal; color: var(--text-faint); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .wmd-arrow {
@@ -109,9 +109,9 @@ function focus(id: string) {
 .wmd-item {
   display: flex; align-items: center; gap: 8px;
   width: 100%; text-align: left; padding: 6px 7px;
-  border: 0; border-radius: 7px; background: transparent; cursor: pointer;
+  border: 0; border-radius: 7px; background: transparent; cursor: pointer; transition: background .15s ease, transform .15s ease;
 }
-.wmd-item:hover { background: var(--bg-hover); }
+.wmd-item:hover { background: var(--bg-hover); transform: translateX(2px); }.wmd-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .wmd-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; background: var(--text-faint); }
 .wmd-item.is-running .wmd-dot { background: var(--accent); }
 .wmd-item.is-ok .wmd-dot { background: var(--green); }
@@ -120,8 +120,9 @@ function focus(id: string) {
 .wmd-main b { font-size: 11.5px; color: var(--text); font-weight: 600; }
 .wmd-main small { color: var(--text-faint); font-weight: 400; font-family: ui-monospace, monospace; font-size: 9.5px; }
 .wmd-task { font-size: 10.5px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.wmd-state { font-style: normal; font-size: 10px; color: var(--text-faint); flex: 0 0 auto; }
+.wmd-state { font-style: normal; font-size: 10px; color: var(--text-faint); flex: 0 0 auto; border: 1px solid currentColor; border-radius: 99px; padding: 1px 5px; }
 .wmd-item.is-running .wmd-state { color: var(--accent); }
 .wmd-item.is-ok .wmd-state { color: var(--green); }
 .wmd-item.is-bad .wmd-state { color: var(--danger); }
+@media (prefers-reduced-motion: reduce) { .wmd-strip, .wmd-item { transition: none; } }
 </style>

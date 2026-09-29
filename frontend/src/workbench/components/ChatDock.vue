@@ -6,21 +6,23 @@
 import { nextTick, ref, watch, onMounted, onBeforeUnmount, computed, defineAsyncComponent } from 'vue'
 // 直接依赖对话框域，避免经 workbench 聚合桶拖入编辑器链
 import { askConfirm, askAlert } from '../composables/dialogs'
-import { aiApi, agentApi, visionApi, contextApi, harnessApi, getSessionId, getProjectId, setSessionId, startNewSession, startTabProbe } from '../api'
+import { aiApi, voiceApi, agentApi, visionApi, contextApi, harnessApi, modelApi, getSessionId, getProjectId, setSessionId, startNewSession, startTabProbe } from '../api'
 import type { ContextUsage, SessionInfo } from '../api'
 import type { SseEvent } from '../api'
 import { appEvents } from '../eventBus'
+import type { ChatUiContext } from '../previewFeedback'
 import type { FocusChatDetail } from '../eventBus'
 import { demoMode } from '../composables/demo'
 import { useModelConfig } from '../composables/useModelConfig'
 import { useWorkflowGate } from '../composables/useWorkflowGate'
 import { useOrphanWorkflow } from '../composables/useOrphanWorkflow'
 import { useChatStream } from '../composables/useChatStream'
-import type { ChatMsg } from '../composables/chat-types'
+import type { ChatActivityKind, ChatMsg } from '../composables/chat-types'
 import { useAutoScroll } from '../composables/useAutoScroll'
 import { useMessageRender } from '../composables/useMessageRender'
 // 设置弹窗低频且体积大（117KB）：异步组件 + v-if，打开时才拉取
 const ModelSettingsDialog = defineAsyncComponent(() => import('./ModelSettingsDialog.vue'))
+const ModelSwitcherPopover = defineAsyncComponent(() => import('./ModelSwitcherPopover.vue'))
 import EngineConnectPopover from './EngineConnectPopover.vue'
 import SessionHistoryPopover from './SessionHistoryPopover.vue'
 import WorkflowHistoryPopover from './WorkflowHistoryPopover.vue'
@@ -30,6 +32,144 @@ import WorkflowMembersDock from './WorkflowMembersDock.vue'
 import ChatComposer from './ChatComposer.vue'
 import type { WorkflowSummary } from '../api'
 import type { PreviewFeedbackRequest } from '../previewFeedback'
+
+const props = withDefaults(defineProps<{ scope?: 'default' | 'cockpit' }>(), { scope: 'default' })
+const voiceActive = ref(false)
+// 语音是自主开发舱的协作通道；普通项目对话台不显示也不启动语音资源。
+const voiceSupported = ref(props.scope === 'cockpit' && typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window))
+const voiceTtsConfigured = ref(false)
+const voiceForwardQueue = ref<string[]>([])
+const voiceCompanionBusy = ref(false)
+const voiceMainResult = ref('')
+let liveVisionFrame: Blob | null = null
+let liveVisionTimeline: { at: string; observation: string }[] = []
+let voiceRecognition: any = null
+let voiceRecorder: MediaRecorder | null = null
+let voiceAudio: HTMLAudioElement | null = null
+const voiceAudioQueue: string[] = []
+const spokenChars = new Map<number, number>()
+function shouldForwardVoice(text: string): boolean {
+  return /这里不对|不对|有问题|改一下|修改一下|继续|重做|不符合|错了|不正确/.test(text)
+}
+async function speakVoiceText(text: string) {
+  const chunk = String(text || '').trim()
+  if (!chunk) return
+  if (voiceTtsConfigured.value) {
+    try {
+      const blob = await voiceApi.speech(chunk)
+      voiceAudioQueue.push(URL.createObjectURL(blob))
+      if (!voiceAudio) {
+        voiceAudio = new Audio()
+        voiceAudio.onended = () => { if (voiceAudioQueue.length) { voiceAudio!.src = voiceAudioQueue.shift()!; void voiceAudio!.play() } else { voiceAudio = null } }
+        voiceAudio.onerror = () => voiceAudio?.onended?.(new Event('ended'))
+        voiceAudio.src = voiceAudioQueue.shift()!
+        void voiceAudio.play()
+      }
+      return
+    } catch { /* 服务端 TTS 失败时回退浏览器语音 */ }
+  }
+  if (typeof window !== 'undefined' && window.speechSynthesis) {
+    window.speechSynthesis.speak(new SpeechSynthesisUtterance(chunk))
+  }
+}
+async function companionVoice(text: string) {
+  if (voiceCompanionBusy.value) return
+  voiceCompanionBusy.value = true
+  try {
+    const visualContext = liveVisionTimeline.length
+      ? `\n最近画面观察：${liveVisionTimeline.slice(-3).map(item => `${item.at} ${item.observation.slice(-500)}`).join('；')}`
+      : ''
+    const r = await voiceApi.dialogue(text, voiceMainResult.value + visualContext, false)
+    await speakVoiceText(r.text)
+  } catch {
+    await speakVoiceText('我先记下你的问题，主 Agent 完成本轮后会继续处理。')
+  } finally { voiceCompanionBusy.value = false }
+}
+function toggleVoice() {
+  if (props.scope !== 'cockpit' || !voiceSupported.value) return
+  if (voiceRecognition) { voiceRecognition.stop(); voiceRecognition = null; voiceActive.value = false; return }
+  const Recognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+  if (!Recognition && typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
+    void navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+      const chunks: Blob[] = []
+      voiceRecorder = new MediaRecorder(stream)
+      voiceRecorder.ondataavailable = event => { if (event.data?.size) chunks.push(event.data) }
+      voiceRecorder.onstop = async () => {
+        stream.getTracks().forEach(track => track.stop())
+        voiceRecorder = null; voiceRecognition = null; voiceActive.value = false
+        try {
+          const phrase = await voiceApi.transcribe(new Blob(chunks, { type: 'audio/webm' }), 'zh')
+          if (phrase) { if (sending.value && !shouldForwardVoice(phrase)) await companionVoice(phrase); else if (sending.value) voiceForwardQueue.value.push(phrase); else void send(phrase) }
+        } catch { await speakVoiceText('语音识别失败，请重试。') }
+      }
+      voiceRecorder.start(); voiceRecognition = voiceRecorder; voiceActive.value = true
+    }).catch(() => { voiceActive.value = false })
+    return
+  }
+  const rec = new Recognition(); rec.lang = 'zh-CN'; rec.continuous = true; rec.interimResults = true
+  rec.onresult = (event: any) => {
+    let interim = ''
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const phrase = String(event.results[i][0].transcript || '').trim()
+      if (event.results[i].isFinal && phrase) {
+        if (sending.value) {
+          if (shouldForwardVoice(phrase)) {
+            voiceForwardQueue.value.push(phrase)
+            void speakVoiceText('已转交主 Agent。')
+          } else void companionVoice(phrase)
+        } else void send(phrase)
+      }
+      else interim += phrase
+    }
+    if (interim) input.value = interim
+  }
+  rec.onerror = () => { voiceActive.value = false; voiceRecognition = null }
+  rec.onend = () => { voiceActive.value = false; voiceRecognition = null }
+  rec.start(); voiceRecognition = rec; voiceActive.value = true
+}
+function speakDelta(turn: ChatMsg) {
+  voiceMainResult.value = turn.text.slice(-6000)
+  if (props.scope !== 'cockpit' || !voiceActive.value) return
+  const previous = spokenChars.get(turn.id) || 0
+  const text = turn.text.slice(previous)
+  const boundary = Math.max(text.lastIndexOf('。'), text.lastIndexOf('！'), text.lastIndexOf('？'), text.lastIndexOf('.'), text.lastIndexOf('!'), text.lastIndexOf('?'))
+  if (boundary < 0) return
+  const chunk = text.slice(0, boundary + 1).trim()
+  if (!chunk) return
+  spokenChars.set(turn.id, previous + boundary + 1)
+  void speakVoiceText(chunk)
+}
+const scopedSessionKey = () => `docmind.cockpitSession:${getProjectId()}`
+const fallbackCockpitSessions = new Map<string, string>()
+function makeCockpitSessionId(): string {
+  const id = globalThis.crypto?.randomUUID?.().replace(/-/g, '') || `${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`
+  return `dev-${id.slice(0, 32)}`
+}
+function currentSessionId(): string {
+  if (props.scope === 'default') return getSessionId()
+  try {
+    const saved = sessionStorage.getItem(scopedSessionKey())
+    if (saved?.startsWith('dev-')) return saved
+    const created = makeCockpitSessionId()
+    sessionStorage.setItem(scopedSessionKey(), created)
+    return created
+  } catch {
+    const key = scopedSessionKey()
+    if (!fallbackCockpitSessions.has(key)) fallbackCockpitSessions.set(key, makeCockpitSessionId())
+    return fallbackCockpitSessions.get(key)!
+  }
+}
+async function selectSession(id: string): Promise<boolean> {
+  if (props.scope === 'default') return setSessionId(id)
+  if (!id.startsWith('dev-')) return false
+  try { sessionStorage.setItem(scopedSessionKey(), id); return true }
+  catch { fallbackCockpitSessions.set(scopedSessionKey(), id); return true }
+}
+async function createSession(): Promise<string> {
+  if (props.scope === 'default') return startNewSession()
+  const id = makeCockpitSessionId()
+  return await selectSession(id) ? id : ''
+}
 
 // ---------------------------------------------------------------- 对话状态
 // ChatMsg 契约在 composables/chat-types.ts，与问答首页共用同一份模型
@@ -111,7 +251,7 @@ interface InterruptedRecovery {
 
 let msgSeq = 1
 const messages = ref<ChatMsg[]>([])
-let chatProject = getProjectId(), chatSession = getSessionId(), chatEpoch = 0
+let chatProject = getProjectId(), chatSession = currentSessionId(), chatEpoch = 0
 const draftKey = () => 'docmind.workbenchChatDraft:' + chatProject + ':' + chatSession
 const recoveryKey = () => 'docmind.interrupted:' + chatProject + ':' + chatSession
 const historyError = ref('')
@@ -139,12 +279,12 @@ function isContinuationRequest(value: string): boolean {
   return /^(继续|继续完成任务|继续上次任务|继续回答|继续执行|接着做|接着完成|恢复任务|恢复回答|从中断处继续)$/.test(normalized)
 }
 function continuationQuestion(request: string, recovery: InterruptedRecovery): string {
-  const trace = recovery.trace.map(item => `${item.type}: ${item.text}`).join('\n').slice(-5000)
-  const plan = recovery.plan.join('\n').slice(-1800)
+  const trace = recovery.trace.map(item => `${item.type}: ${item.text}`).join('\n')
+  const plan = recovery.plan.join('\n')
   return [
     '这是上一个被页面切换或连接中断的回合的继续请求。不要把“继续”当成新的独立问题。',
-    `原始用户请求：${recovery.user.slice(0, 3000)}`,
-    `上次已收到的助手内容：${recovery.assistant.slice(-6000)}`,
+    `原始用户请求：${recovery.user}`,
+    `上次已收到的助手内容：${recovery.assistant}`,
     trace ? `上次已记录的执行步骤：\n${trace}` : '',
     plan ? `上次执行计划：\n${plan}` : '',
     '请先依据以上上下文判断已经完成的步骤，再从中断处继续；不要重复已经确认完成的有副作用工具调用。若原始请求只是询问能力，请直接继续回答原始问题。',
@@ -156,6 +296,16 @@ function continuationQuestion(request: string, recovery: InterruptedRecovery): s
 const legacyPromptPrefix = /^\s*【系统提示】[\s\S]*?用户问题：\s*/
 function cleanLegacyPrompt(value: string): string {
   return String(value || '').replace(legacyPromptPrefix, '').trimStart()
+}
+/** 应用自发起活动（非用户消息）在会话历史里的标记 → 字条类型/文案。
+ *  标记由后端写入历史 user 字段（见 api.py app_guided_inspect）。 */
+const ACTIVITY_MARKERS: Array<{ marker: string; kind: ChatActivityKind; label: string }> = [
+  { marker: '【界面观察】', kind: 'inspect', label: 'AI 浏览当前界面' },
+]
+function activityFromHistory(text: string): { kind: ChatActivityKind; label: string } | null {
+  const raw = String(text || '').trimStart()
+  const hit = ACTIVITY_MARKERS.find(a => raw.startsWith(a.marker))
+  return hit ? { kind: hit.kind, label: hit.label } : null
 }
 const input = ref(readDraft())
 watch(input, v => { try { sessionStorage.setItem(draftKey(), v) } catch {} }, { flush: 'sync' })
@@ -172,6 +322,25 @@ function visibleTrace(msg: ChatMsg) {
   })
   return msg.trace.map((item, index) => ({ item, index })).filter(x => !hidden.has(x.index))
 }
+const traceSegmentOpen = ref<Set<number>>(new Set())
+function toggleTraceSegment(id: number) {
+  const next = new Set(traceSegmentOpen.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  traceSegmentOpen.value = next
+}
+function traceSegmentIsOpen(msg: ChatMsg) {
+  return traceSegmentOpen.value.has(msg.id) || msg.status === 'streaming'
+}
+function traceSegmentTitle(msg: ChatMsg) {
+  const stages: string[] = []
+  for (const row of visibleTrace(msg)) {
+    if (row.item.type !== 'action') continue
+    const stage = traceGroup(row.item)
+    if (stages[stages.length - 1] !== stage) stages.push(stage)
+  }
+  return stages.length ? stages.join(' → ') : '分析与复核'
+}
 function onCardActivity() {
   // 卡片内部子代理步骤频率高：按帧合批跟随，不做每事件 nextTick
   scheduleFollow()
@@ -184,10 +353,13 @@ const attachmentError = ref('')
 const videoBusy = ref(false)
 
 // ---------------------------------------------------------------- 折叠
-const collapsed = ref(window.localStorage.getItem('docmind.chatDockCollapsed') === '1')
-const expanded = ref(window.localStorage.getItem('docmind.chatDockExpanded') === '1')
-watch(collapsed, (v) => window.localStorage.setItem('docmind.chatDockCollapsed', v ? '1' : '0'))
-watch(expanded, (v) => window.localStorage.setItem('docmind.chatDockExpanded', v ? '1' : '0'))
+const dockStateKey = (part: 'collapsed' | 'expanded') => props.scope === 'default'
+  ? `docmind.chatDock${part === 'collapsed' ? 'Collapsed' : 'Expanded'}`
+  : `docmind.chatDock.cockpit.${part}`
+const collapsed = ref(window.localStorage.getItem(dockStateKey('collapsed')) === '1')
+const expanded = ref(window.localStorage.getItem(dockStateKey('expanded')) === '1')
+watch(collapsed, (v) => window.localStorage.setItem(dockStateKey('collapsed'), v ? '1' : '0'))
+watch(expanded, (v) => window.localStorage.setItem(dockStateKey('expanded'), v ? '1' : '0'))
 function toggleDock() {
   // 审批门打开时禁止折叠（pointer-events 已挡鼠标，这里挡已聚焦元素的键盘触发），
   // 否则 33px 裁剪会把居中审批模态吞掉
@@ -211,6 +383,44 @@ const {
     void loadContextUsage()
   },
 })
+
+// 模型芯片只负责切换已保存预设；完整的新增/编辑入口留在设置页。
+const modelSwitcherOpen = ref(false)
+const modelSwitchError = ref('')
+async function openModelSwitcher() {
+  if (demoMode.value) return
+  modelSwitchError.value = ''
+  try {
+    const current = await modelApi.get()
+    modelConfig.value = current
+    // 旧版本已选中的模型未自动生成预设；首次打开切换器时补录一次。
+    const exists = current.model_presets?.some(p => p.provider === current.llm_provider
+      && p.model === current.llm_model
+      && p.base_url === (current.llm_provider === 'custom' ? current.custom_base_url : ''))
+    if (!exists && current.llm_provider !== 'mock') {
+      const saved = await modelApi.savePreset({
+        label: `${current.provider_meta?.[current.llm_provider]?.label || current.llm_provider} · ${current.llm_model}`,
+        provider: current.llm_provider,
+        model: current.llm_model,
+        base_url: current.llm_provider === 'custom' ? current.custom_base_url : '',
+        context_window: current.context_window_override || 0,
+      })
+      if (saved.ok === false || !saved.presets) modelSwitchError.value = saved.error || '保存当前模型到切换列表失败'
+      else modelConfig.value = { ...current, model_presets: saved.presets }
+    }
+  } catch (e) {
+    modelSwitchError.value = (e as { message?: string }).message || '读取模型列表失败'
+  }
+  modelSwitcherOpen.value = true
+}
+function openModelSettings() {
+  modelSwitcherOpen.value = false
+  openSettings()
+}
+function openUnifiedModelSettings() {
+  modelSwitcherOpen.value = false
+  window.dispatchEvent(new CustomEvent('docmind:open-settings', { detail: { tab: 'model' } }))
+}
 
 // ---------------------------------------------------------------- 上下文窗口用量
 // 后端按当前模型真实窗口估算（含系统提示/历史摘要/历史回放/当前问题），
@@ -257,9 +467,13 @@ const usageTitle = computed(() => {
 })
 
 // ---------------------------------------------------------------- 发送 / 停止
-async function send(text?: string, attached?: File[], onAccepted?: () => void): Promise<boolean> {
+async function send(text?: string, attached?: File[], onAccepted?: () => void, uiContext?: ChatUiContext, activity?: { kind: ChatActivityKind; label: string }): Promise<boolean> {
   const q = (text ?? input.value).trim()
   const imgs = attached ? attached.slice() : pendingImages.value.slice()
+  if (props.scope === 'cockpit' && !attached && liveVisionFrame && imgs.length === 0) {
+    const extension = liveVisionFrame.type === 'image/jpeg' ? 'jpg' : 'png'
+    imgs.push(new File([liveVisionFrame], `current-view-${Date.now()}.${extension}`, { type: liveVisionFrame.type || 'image/png' }))
+  }
   if ((!q && !imgs.length) || sending.value) return false
   // 审批门打开期间禁止发起新问答（CSS 已挡鼠标，这里挡 Ctrl+Enter 键盘发送）
   if (gateBlocking.value) {
@@ -285,7 +499,13 @@ async function send(text?: string, attached?: File[], onAccepted?: () => void): 
     attachmentError.value = ''
   }
   stickToBottom.value = true  // 用户主动发送，恢复贴底自动滚动
-  messages.value.push({ id: msgSeq++, role: 'user', text: q || '请分析附件图片', status: 'done', trace: [], reasoning: '', notices: [], plan: [], imageCount: imgs.length })
+  if (activity) {
+    // 应用自发起活动（如 AI 浏览当前界面）：完整指令只作为系统上下文发给后端，
+    // 对话流里只显示一张居中小字条，不伪装成用户说的话
+    messages.value.push({ id: msgSeq++, role: 'activity', text: activity.label, status: 'done', trace: [], reasoning: '', notices: [], plan: [], activityKind: activity.kind, imageCount: imgs.length || undefined })
+  } else {
+    messages.value.push({ id: msgSeq++, role: 'user', text: q || '请分析附件图片', status: 'done', trace: [], reasoning: '', notices: [], plan: [], imageCount: imgs.length })
+  }
   const turn: ChatMsg = {
     id: msgSeq++, role: 'assistant', text: '', status: 'streaming', trace: [], reasoning: '', notices: [], plan: [],
     startedAt: Date.now(),
@@ -322,6 +542,9 @@ async function send(text?: string, attached?: File[], onAccepted?: () => void): 
       web: webOn.value,
       thinking: thinkingOpt,
       images: imgs,
+      sessionId: currentSessionId(),
+      uiContext: props.scope === 'cockpit' && liveVisionTimeline.length && !uiContext ? 'cockpit_live_vision' : uiContext,
+      visualTimeline: props.scope === 'cockpit' ? liveVisionTimeline : [],
     })
     drain()
     const t = live()
@@ -349,9 +572,11 @@ async function send(text?: string, attached?: File[], onAccepted?: () => void): 
   } finally {
     if (epoch === chatEpoch) {
       sending.value = false; abortCtl = null
+      const queuedVoice = voiceForwardQueue.value.shift()
+      if (queuedVoice) void send(queuedVoice)
       // 问答可能由主 Agent 经 start_workflow 工具触发工作流；若撞上同项目互斥，
       // 错误只体现在回答文本里，这里补一次探测，让孤儿恢复条给出可操作入口。
-      void detectOrphanWorkflow()
+      if (props.scope === 'default') void detectOrphanWorkflow()
     }
     void refreshSessionList()
     await nextTick(scrollToBottom)
@@ -422,20 +647,25 @@ function restoreInterrupted(turns: { user: string; assistant: string }[]) {
     const row = JSON.parse(sessionStorage.getItem(recoveryKey()) || 'null')
     if (!row || typeof row.user !== 'string' || typeof row.assistant !== 'string') return
     if (turns.some(t => t.user === row.user && t.assistant)) { sessionStorage.removeItem(recoveryKey()); return }
-    messages.value.push({ id: msgSeq++, role: 'user', text: cleanLegacyPrompt(row.user), status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
+    const interruptedAct = activityFromHistory(row.user)
+    messages.value.push(interruptedAct
+      ? { id: msgSeq++, role: 'activity', text: interruptedAct.label, status: 'done', trace: [], reasoning: '', notices: [], plan: [], activityKind: interruptedAct.kind }
+      : { id: msgSeq++, role: 'user', text: cleanLegacyPrompt(row.user), status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
     messages.value.push({ id: msgSeq++, role: 'assistant', text: cleanLegacyPrompt(row.assistant), status: 'stopped',
       trace: row.trace || [], reasoning: row.reasoning || '', plan: row.plan || [], recoverable: true,
       notices: ['上次回答因离开页面或切换项目中断，已保留原始问题和执行上下文；可以点击“继续上次任务”或输入“继续”。'] })
   } catch {}
 }
 function resetChatContext() {
+  liveVisionFrame = null
+  liveVisionTimeline = []
   preserveInterrupted()
   stop()
-  chatProject = getProjectId(); chatSession = getSessionId()
+  chatProject = getProjectId(); chatSession = currentSessionId()
   messages.value = []; usage.value = null; historyError.value = ''
   orphanWf.value = null
   input.value = readDraft()
-  void restoreHistory(true).then(() => detectOrphanWorkflow())
+  void restoreHistory(true).then(() => { if (props.scope === 'default') void detectOrphanWorkflow() })
 }
 function onPageHide() { preserveInterrupted(); stop() }
 function onBeforeLeave(e: BeforeUnloadEvent) { if (sending.value) { preserveInterrupted(); e.preventDefault(); e.returnValue = '' } }
@@ -445,6 +675,7 @@ function clearMessages() {
   messages.value = []
   usage.value = null
   resetRenderState()
+  traceSegmentOpen.value = new Set()
   // 卡片随消息一起卸载，不会再发 team 事件；这里同步清掉左下角成员抽屉，
   // 否则会残留指向已消失卡片的幽灵成员
   wfTeams.value = []
@@ -461,7 +692,7 @@ async function clearConversation(): Promise<boolean> {
   clearMessages()
   if (demoMode.value) return true
   try {
-    await harnessApi.deleteSession(getSessionId())
+    await harnessApi.deleteSession(currentSessionId())
   } catch {
     /* 会话文件不存在或服务不可达：忽略，本地已清空 */
   }
@@ -481,7 +712,9 @@ async function refreshSessionList() {
     const result = await harnessApi.sessions()
     // 会话按页面域隔离：问答页会话 id 为 ask- 前缀，工作台历史不展示它们
     sessionItems.value = (Array.isArray(result.items) ? result.items : [])
-      .filter(i => !String(i.session_id || '').startsWith('ask-'))
+      .filter(i => props.scope === 'cockpit'
+        ? String(i.session_id || '').startsWith('dev-')
+        : !/^(ask-|dev-)/.test(String(i.session_id || '')))
     sessionError.value = ''
   } catch (e) {
     sessionError.value = (e as Error).message || '会话历史加载失败'
@@ -507,7 +740,7 @@ async function switchSession(id: string) {
   sessionError.value = ''
   stop()
   try {
-    const claimed = await setSessionId(target)
+    const claimed = await selectSession(target)
     if (!claimed) throw new Error('这个会话正在其他标签页使用，无法在当前标签切换。')
     chatProject = getProjectId()
     chatSession = target
@@ -529,7 +762,7 @@ async function createConversation() {
   sessionError.value = ''
   stop()
   try {
-    const next = await startNewSession()
+    const next = await createSession()
     if (!next) throw new Error('无法创建新的独立会话，请刷新页面重试。')
     chatProject = getProjectId()
     chatSession = next
@@ -541,7 +774,7 @@ async function createConversation() {
     sessionOpen.value = false
     orphanWf.value = null
     await refreshSessionList()
-    void detectOrphanWorkflow()
+    if (props.scope === 'default') void detectOrphanWorkflow()
     await nextTick(focusComposer)
   } catch (e) {
     sessionError.value = (e as Error).message || '新建对话失败'
@@ -553,7 +786,7 @@ async function createConversation() {
 async function loadContextUsage() {
   if (demoMode.value) return
   try {
-    const u = await contextApi.get()
+    const u = await contextApi.get(currentSessionId())
     if (u) usage.value = u
   } catch {
     /* 未启动/无会话时不显示指示即可 */
@@ -657,7 +890,7 @@ async function interruptWfHistory(item: WorkflowSummary) {
     const r = await agentApi.workflowInterrupt(item.workflow_id, '用户在工作流历史中中断')
     if (r.ok === false) throw new Error(r.error || '中断失败')
     await refreshWfHistory()
-    void detectOrphanWorkflow()
+    if (props.scope === 'default') void detectOrphanWorkflow()
   } catch (e) {
     wfHistoryError.value = (e as Error).message || '中断失败'
   } finally {
@@ -693,7 +926,10 @@ function rebuildFromTurns(turns: { user: string; assistant: string }[]) {
   for (const t of turns) {
     if (!t) continue
     if (t.user) {
-      rebuilt.push({ id: msgSeq++, role: 'user', text: cleanLegacyPrompt(t.user), status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
+      const act = activityFromHistory(t.user)
+      rebuilt.push(act
+        ? { id: msgSeq++, role: 'activity', text: act.label, status: 'done', trace: [], reasoning: '', notices: [], plan: [], activityKind: act.kind }
+        : { id: msgSeq++, role: 'user', text: cleanLegacyPrompt(t.user), status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
     }
     if (t.assistant) {
       rebuilt.push({ id: msgSeq++, role: 'assistant', text: cleanLegacyPrompt(t.assistant), status: 'done', trace: [], reasoning: '', notices: [], plan: [] })
@@ -711,11 +947,11 @@ async function restoreHistory(force = false) {
   if (!force && messages.value.length) return
   // 记住进入时的消息数：await 期间用户可能已发送新消息（SSE 正在流），
   // 重建会整体覆盖 messages 并让 live() 匹配不到、静默丢流，故 await 后需复检。
-  const project = getProjectId(), session = getSessionId(), epoch = chatEpoch
+  const project = getProjectId(), session = currentSessionId(), epoch = chatEpoch
   const before = messages.value.length
   try {
     const detail = await harnessApi.sessionDetail(session)
-    if (project !== getProjectId() || session !== getSessionId() || epoch !== chatEpoch) return
+    if (project !== getProjectId() || session !== currentSessionId() || epoch !== chatEpoch) return
     const turns = detail.turns || []
     // Never silently load a different conversation into a fresh session.
     if (force && !turns.length && !sending.value) messages.value = []
@@ -785,6 +1021,7 @@ function demoReply(q: string): string {
 // 概览页「去问问 / 试试问 AI」：展开对话台、（可选）预填问题、定位输入框
 // 运行台「继续这段对话」：detail.reload=true 时按当前存储的会话 id 重新回灌历史
 function onFocusChat(detail: FocusChatDetail) {
+  if ((detail?.target || 'default') !== props.scope) return
   const q = detail?.q
   collapsed.value = false
   if (detail?.reload) {
@@ -794,10 +1031,12 @@ function onFocusChat(detail: FocusChatDetail) {
   }
   nextTick(() => {
     if (q) input.value = q
+    else if (detail?.qIfEmpty && !input.value.trim()) input.value = detail.qIfEmpty
     focusComposer()
   })
 }
 async function onSendChat(detail: PreviewFeedbackRequest) {
+  if ((detail?.target || 'default') !== props.scope) return
   const prompt = detail?.prompt?.trim()
   if (!prompt) { detail?.onStatus?.('failed', '反馈不能为空'); return }
   if (detail.projectId !== getProjectId()) { detail.onStatus?.('pending', '项目已切换，请回到原项目重试'); return }
@@ -815,7 +1054,11 @@ async function onSendChat(detail: PreviewFeedbackRequest) {
     return
   }
   try {
-    const finished = await send(prompt, files, () => detail.onStatus?.('processing'))
+    // 「浏览当前界面」是应用发起的活动：对话流只显示小字条，完整指令由后端转系统上下文
+    const activity = detail.uiContext === 'app_interface_inspect'
+      ? { kind: 'inspect' as const, label: 'AI 浏览当前界面' }
+      : undefined
+    const finished = await send(prompt, files, () => detail.onStatus?.('processing'), detail.uiContext, activity)
     detail.onStatus?.(finished ? 'awaiting_review' : 'failed', finished ? 'AI 回复已结束，请检查预览效果' : '本次对话未完成，已执行操作不会自动撤销，请检查后重试')
   } catch {
     detail.onStatus?.('failed', '本次对话未完成，请检查项目当前状态后重试')
@@ -824,25 +1067,45 @@ async function onSendChat(detail: PreviewFeedbackRequest) {
 let offFocusChat = () => {}
 let offSendChat = () => {}
 let offContextChanged = () => {}
+let offOpenModelSettings = () => {}
+let offLiveVisionFrame = () => {}
 onMounted(() => {
+  if (props.scope === 'cockpit') {
+    void voiceApi.status().then(status => {
+      voiceTtsConfigured.value = !!status.tts_configured
+      voiceSupported.value = voiceSupported.value || !!status.stt_configured
+    }).catch(() => { voiceTtsConfigured.value = false })
+  }
   // 全局事件统一走类型化事件总线（eventBus.ts），返回值即取消订阅
   offFocusChat = appEvents.on('docmind:focus-chat', onFocusChat)
   offSendChat = appEvents.on('docmind:send-chat', onSendChat)
   offContextChanged = appEvents.on('docmind:project-context-changed', resetChatContext)
+  offOpenModelSettings = appEvents.on('docmind:open-model-settings', () => openModelSettings())
+  if (props.scope === 'cockpit') {
+    offLiveVisionFrame = appEvents.on('docmind:live-vision-frame', detail => {
+      if (detail.projectId !== getProjectId()) return
+      liveVisionFrame = detail.image
+      liveVisionTimeline = detail.image ? detail.timeline || [] : []
+    })
+  }
   window.addEventListener('pagehide', onPageHide)
   window.addEventListener('beforeunload', onBeforeLeave)
-  startTabProbe()   // 启动跨标签存活探测（供唯一性门禁判断）
+  if (props.scope === 'default') startTabProbe()   // 普通工作台沿用跨标签探测
   void loadModelConfig()
   void loadContextUsage()
   void refreshSessionList()
   // 历史回灌完成后再探测孤儿：避免本会话卡片已随历史逻辑存在时误报
-  void restoreHistory().then(() => detectOrphanWorkflow())
+  void restoreHistory().then(() => { if (props.scope === 'default') void detectOrphanWorkflow() })
 })
 onBeforeUnmount(() => {
+  if (voiceAudio) { voiceAudio.pause(); voiceAudio = null }
+  voiceAudioQueue.splice(0)
   onPageHide()
   offFocusChat()
   offSendChat()
   offContextChanged()
+  offOpenModelSettings()
+  offLiveVisionFrame()
   window.removeEventListener('pagehide', onPageHide)
   window.removeEventListener('beforeunload', onBeforeLeave)
 })
@@ -851,8 +1114,8 @@ onBeforeUnmount(() => {
 const {
   scheduleLiveMd, finishLiveMd, streamHtmlOf,
   answerHtml, refsOf, webRefsOf, openRef, TRACE_GLYPH,
-  toggleActivity, activityIsOpen, traceTitle, traceSummary, traceState, traceStateLabel,
-  traceElapsed, elapsedLabel, slowResponseLabel, reasonOpen, toggleReason, resetRenderState,
+  toggleActivity, activityIsOpen, traceTitle, traceSummary, traceGroup, traceGroupLabel, traceGroupStart, traceState, traceStateLabel,
+  traceElapsed, elapsedLabel, reasonOpen, toggleReason, resetRenderState,
 } = useMessageRender<ChatMsg>(() =>
   sending.value
   || messages.value.some(m => m.status === 'streaming' || (m.workflow?.workflowId && !m.finishedAt))
@@ -862,7 +1125,7 @@ const {
 const { drain, appendTrace, dispatch } = useChatStream<ChatMsg>({
   onActivity: (t) => { t.lastActivityAt = Date.now() },
   // 帧内正文增量提交后挂 125ms 节流的 markdown 重渲染
-  onTextFlushed: (t) => scheduleLiveMd(t),
+  onTextFlushed: (t) => { scheduleLiveMd(t); speakDelta(t) },
   // 一次 rAF 帧提交后跟随一次（微任务里读到本帧最新布局），不逐 token 强排
   onFrame: () => queueMicrotask(followBottom),
   // 首条 reasoning 到达时自动展开该回合的思考窗口（Set 判重）
@@ -912,6 +1175,7 @@ const webTitle = computed(() => webOn.value
         class="cd-head-toggle"
         role="button"
         :aria-expanded="!collapsed"
+        :aria-controls="`docmind-chat-body-${props.scope}`"
         :title="collapsed ? '展开对话台' : '收起对话台'"
         tabindex="0"
         @click="toggleDock"
@@ -921,7 +1185,7 @@ const webTitle = computed(() => webOn.value
         <span class="cd-chevron" :class="{ rotated: !collapsed }">
           <svg width="9" height="9" viewBox="0 0 9 9"><path d="M2 1.5 L5.5 4.5 L2 7.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
         </span>
-        <span class="cd-title">AI 助手</span>
+        <span class="cd-title">{{ props.scope === 'cockpit' ? '开发舱对话' : 'AI 助手' }}</span>
         <span v-if="sending" class="cd-live">AI 正在查代码<span class="cd-dots">…</span></span>
         <!-- 折叠态也要感知后台进展：工作流执行期 sending 已释放，靠成员抽屉状态补指示 -->
         <span v-if="collapsed && activeWorkflowIds.length" class="cd-live cd-live-wf">
@@ -933,6 +1197,8 @@ const webTitle = computed(() => webOn.value
       <button
         class="cd-btn"
         :class="{ 'cd-btn-on': sessionOpen }"
+        :aria-pressed="sessionOpen"
+        aria-label="会话历史"
         title="查看会话历史或开始新对话"
         @click.stop="sessionOpen = !sessionOpen; sessionOpen && refreshSessionList()"
       >
@@ -942,9 +1208,11 @@ const webTitle = computed(() => webOn.value
         </svg>
         <span>会话</span>
       </button>
-      <button
+      <button v-if="props.scope === 'default'"
         class="cd-btn"
         :class="{ 'cd-btn-on': wfHistoryOpen }"
+        :aria-pressed="wfHistoryOpen"
+        aria-label="工作流历史"
         title="工作流历史：查看进度、中断运行中的工作流、删除已结束记录"
         @click.stop="wfHistoryOpen ? (wfHistoryOpen = false) : openWfHistory()"
       >
@@ -988,10 +1256,18 @@ const webTitle = computed(() => webOn.value
     <EngineConnectPopover />
 
     <!-- 折叠时不再卸载对话区：靠高度过渡 + 裁剪做顺滑展开/收起，状态与滚动位置保留 -->
-      <div ref="scroller" class="cd-body" @scroll="onScroll" @wheel="onWheel">
+      <div :id="`docmind-chat-body-${props.scope}`" ref="scroller" class="cd-body" @scroll="onScroll" @wheel="onWheel">
         <p v-if="historyError" role="alert">{{ historyError }}</p>
         <div v-for="m in messages" :key="m.id" class="cd-msg" :class="`cd-msg-${m.role}`">
-          <div v-if="m.role === 'user'" class="cd-user-bubble">
+          <div v-if="m.role === 'activity'" class="cd-act-note">
+            <svg v-if="m.activityKind === 'inspect'" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+              <path d="M1 5.5 C2.6 3.4 4.2 2.6 6 2.6 C7.8 2.6 9.4 3.4 11 5.5 C9.4 7.6 7.8 8.4 6 8.4 C4.2 8.4 2.6 7.6 1 5.5 Z" fill="none" stroke="currentColor" stroke-width="1"/>
+              <circle cx="6" cy="5.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1"/>
+            </svg>
+            <span>{{ m.text }}</span>
+            <small v-if="m.imageCount">· 已附当前画面</small>
+          </div>
+          <div v-else-if="m.role === 'user'" class="cd-user-bubble">
             <span v-if="m.imageCount" class="cd-msg-attachment">{{ m.imageCount }} 张图片</span>
             <span>{{ m.text }}</span>
           </div>
@@ -999,7 +1275,7 @@ const webTitle = computed(() => webOn.value
             <div v-if="m.trace.length || m.reasoning || m.status === 'streaming'" class="cd-run-head">
               <span class="cd-run-avatar">✦</span>
               <span class="cd-run-role">交付代理</span>
-              <span class="cd-run-status" :class="`cd-run-${m.status}`">
+              <span class="cd-run-status wb-status-chip" :class="`cd-run-${m.status}`">
                 {{ m.status === 'streaming' ? '正在执行' : m.status === 'done' ? '已完成' : m.status === 'error' ? '执行失败' : '已停止' }}
               </span>
               <span class="cd-run-time" v-if="elapsedLabel(m)">· {{ elapsedLabel(m) }}</span>
@@ -1038,10 +1314,23 @@ const webTitle = computed(() => webOn.value
               <div v-if="reasonOpen.has(m.id)" class="cd-reason-body">{{ m.reasoning }}</div>
             </div>
             <div v-if="visibleTrace(m).length" class="cd-activity">
+              <button class="cd-activity-segment" :aria-expanded="traceSegmentIsOpen(m)" @click="toggleTraceSegment(m.id)">
+                <span class="cd-activity-segment-copy"><b>本轮任务动作</b><span>{{ traceSegmentTitle(m) }}</span></span>
+                <span class="cd-activity-segment-count">{{ visibleTrace(m).length }} 条记录</span>
+                <span aria-hidden="true">{{ traceSegmentIsOpen(m) ? '▾' : '▸' }}</span>
+              </button>
+              <div v-if="traceSegmentIsOpen(m)" class="cd-activity-steps">
               <div v-for="row in visibleTrace(m)" :key="row.index" class="cd-activity-item" :class="`cd-activity-${traceState(m, row.item, row.index)}`">
-                <button class="cd-activity-row" @click="toggleActivity(m.id, row.index)">
+                <div v-if="traceGroupStart(m, row.index)" class="cd-activity-group-label">{{ traceGroupLabel(row.item) }}</div>
+                <button
+                  class="cd-activity-row"
+                  :aria-expanded="activityIsOpen(m.id, row.index, m)"
+                  :aria-label="`${traceTitle(row.item)}，${traceStateLabel(traceState(m, row.item, row.index))}，点击查看详情`"
+                  @click="toggleActivity(m.id, row.index)"
+                >
                   <span class="cd-activity-glyph">{{ TRACE_GLYPH[row.item.type] || '·' }}</span>
                   <span class="cd-activity-main">
+                    <span class="cd-activity-kicker">{{ row.item.type === 'action' ? '工具调用' : row.item.type === 'observation' ? '工具返回' : row.item.type === 'reflection' ? '执行提示' : '执行记录' }}</span>
                     <span class="cd-activity-title">{{ traceTitle(row.item) }}</span>
                     <span class="cd-activity-summary">{{ traceSummary(row.item) }}</span>
                   </span>
@@ -1051,14 +1340,12 @@ const webTitle = computed(() => webOn.value
                     <span class="cd-activity-chevron">{{ activityIsOpen(m.id, row.index, m) ? '▾' : '▸' }}</span>
                   </span>
                 </button>
-                <div v-if="activityIsOpen(m.id, row.index, m)" class="cd-activity-detail">{{ row.item.text }}</div>
+                <div v-if="activityIsOpen(m.id, row.index, m)" class="cd-activity-detail">
+                  <span class="cd-activity-detail-label">事件详情</span>
+                  <code>{{ row.item.text }}</code>
+                </div>
               </div>
-            </div>
-            <div v-if="m.status === 'streaming'" class="cd-thinking">
-              {{ m.reasoning ? 'AI 正在思考、处理请求' : '正在等待模型或工具返回' }}<span class="cd-dots">…</span>
-            </div>
-            <div v-if="slowResponseLabel(m)" class="cd-slow-notice" role="status">
-              {{ slowResponseLabel(m) }}
+              </div>
             </div>
             <!-- 流式中按 ~8fps 节流重渲染 markdown（格式边出边成型，又不逐 token 重建
                  DOM）；结束瞬间由 answerHtml 缓存接管成稿，视觉无跳变 -->
@@ -1096,7 +1383,7 @@ const webTitle = computed(() => webOn.value
       </button>
 
       <!-- 孤儿工作流恢复条：后端未终结但当前对话没有卡片（多为刷新后），不处理会持续拦截新请求 -->
-      <div v-if="orphanWf" class="cd-orphan" role="alert">
+      <div v-if="orphanWf && props.scope === 'default'" class="cd-orphan" role="alert">
         <span class="cd-orphan-glyph" aria-hidden="true">⚠</span>
         <div class="cd-orphan-body">
           <div class="cd-orphan-title">
@@ -1132,6 +1419,8 @@ const webTitle = computed(() => webOn.value
         :web-title="webTitle"
         :usage="usage"
         :usage-title="usageTitle"
+        :voice-active="voiceActive"
+        :voice-supported="props.scope === 'cockpit' && voiceSupported"
         @submit="send()"
         @stop="stop"
         @images-picked="onImagesPicked"
@@ -1139,7 +1428,8 @@ const webTitle = computed(() => webOn.value
         @remove-image="removeImage"
         @update:web-on="webOn = $event"
         @toggle-thinking="toggleThinking"
-        @open-settings="openSettings"
+        @open-model-switcher="openModelSwitcher"
+        @toggle-voice="toggleVoice"
       />
 
     <WorkflowMembersDock
@@ -1152,6 +1442,14 @@ const webTitle = computed(() => webOn.value
       :visible="settingsOpen"
       :config="modelConfig"
       @close="settingsOpen = false"
+      @saved="onModelSaved"
+    />
+    <ModelSwitcherPopover
+      :visible="modelSwitcherOpen"
+      :config="modelConfig"
+      :load-error="modelSwitchError"
+      @close="modelSwitcherOpen = false"
+      @manage="openUnifiedModelSettings"
       @saved="onModelSaved"
     />
   </section>
@@ -1249,6 +1547,8 @@ const webTitle = computed(() => webOn.value
   font-size: 11px; cursor: pointer;
 }
 .cd-btn:hover { color: var(--text); border-color: var(--border-strong); }
+.cd-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.cd-btn:active { transform: translateY(1px); }
 .cd-btn-on { color: var(--accent); border-color: var(--accent); }
 
 /* 弹层 */
@@ -1269,14 +1569,15 @@ const webTitle = computed(() => webOn.value
   box-shadow: 0 14px 38px rgba(35,52,84,.2);
   padding: 10px 12px;
   z-index: 60;
+  animation: cd-pop-in .18s var(--ease-spring) both;
 }
 .cd-pop-title { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
 .cd-mini {
   height: 21px; padding: 0 9px; font-size: 11px;
   border: 1px solid var(--border-strong); border-radius: 5px;
-  background: transparent; color: var(--text-muted); cursor: pointer;
+  background: transparent; color: var(--text-muted); cursor: pointer; transition: color .15s ease, border-color .15s ease, background .15s ease, transform .15s ease;
 }
-.cd-mini:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.cd-mini:hover:not(:disabled) { color: var(--text); border-color: var(--accent); transform: translateY(-1px); }
 .cd-mini:disabled { opacity: .45; cursor: default; }
 .cd-mini-danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
 
@@ -1287,7 +1588,7 @@ const webTitle = computed(() => webOn.value
   background: var(--bg-raised); color: var(--accent); font-size: 10.5px;
   box-shadow: 0 2px 8px rgba(30, 50, 90, .14); cursor: pointer;
 }
-.cd-jump-bottom:hover { background: var(--bg-selected); }
+.cd-jump-bottom:hover { background: var(--bg-selected); transform: translateY(-1px); }
 /* 孤儿工作流恢复条：贴在输入框上沿，琥珀色提示但不遮挡消息流 */
 .cd-orphan {
   display: flex; align-items: center; gap: 8px;
@@ -1311,9 +1612,9 @@ const webTitle = computed(() => webOn.value
 .cd-quick {
   text-align: left; font-size: 11.5px; padding: 5px 10px;
   border: 1px solid var(--border); border-radius: 12px;
-  background: transparent; color: var(--text-muted); cursor: pointer;
+  background: transparent; color: var(--text-muted); cursor: pointer; transition: color .15s ease, border-color .15s ease, background .15s ease, transform .15s ease;
 }
-.cd-quick:hover { color: var(--accent); border-color: var(--accent); }
+.cd-quick:hover { color: var(--accent); border-color: var(--accent); background: var(--bg-selected); transform: translateX(2px); }
 
 .cd-msg { margin-bottom: 10px; }
 .cd-user-bubble {
@@ -1324,6 +1625,15 @@ const webTitle = computed(() => webOn.value
   font-size: 12.5px; white-space: pre-wrap;
 }
 .cd-msg-user { display: flex; justify-content: flex-end; }
+/* 应用自发起活动字条：居中、弱化，不是用户气泡也不是 AI 回复 */
+.cd-msg-activity { display: flex; justify-content: center; }
+.cd-act-note {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 99px;
+  background: var(--bg-hover); color: var(--text-faint);
+  font-size: 11px; line-height: 1.5;
+}
+.cd-act-note small { color: var(--text-faint); opacity: .8; }
 .cd-answer { font-size: 12.5px; max-width: 96%; }
 /* 流式期的节流 markdown 与成稿同一样式；光标在块级内容后自然落到新行 */
 .cd-caret {
@@ -1333,9 +1643,10 @@ const webTitle = computed(() => webOn.value
 }
 @keyframes cd-caret { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .cd-caret { animation: none; } }
-.cd-thinking, .cd-error { font-size: 12px; color: var(--text-muted); padding: 4px 0; }
+.cd-thinking, .cd-error { font-size: 12px; color: var(--text-muted); padding: 6px 9px; border-radius: 7px; background: var(--bg-hover); }
+.cd-thinking { border-left: 2px solid var(--accent); }
 .cd-slow-notice { margin: 6px 0; padding: 7px 9px; border: 1px solid color-mix(in srgb, var(--amber) 45%, var(--border)); border-radius: 6px; color: var(--text-muted); background: color-mix(in srgb, var(--amber) 10%, transparent); font-size: 11px; line-height: 1.45; }
-.cd-error { color: var(--danger); }
+.cd-error { color: var(--danger); border: 1px solid rgba(214,78,78,.22); background: rgba(214,78,78,.05); }
 
 .cd-run-head {
   display: flex; align-items: center; gap: 6px;
@@ -1353,6 +1664,8 @@ const webTitle = computed(() => webOn.value
 .cd-run-done { color: var(--green); }
 .cd-run-error { color: var(--danger); }
 .cd-run-stopped { color: var(--amber); }
+.cd-run-streaming::before { content: ''; display: inline-block; width: 9px; height: 9px; margin: 0 6px 0 0; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: cd-run-spin .8s linear infinite; }
+@keyframes cd-run-spin { to { transform: rotate(360deg); } }
 .cd-run-time { color: var(--text-faint); font-variant-numeric: tabular-nums; }
 
 .cd-wf-pending {
@@ -1370,10 +1683,27 @@ const webTitle = computed(() => webOn.value
 
 /* 聊天内的纵向活动流：动作按 SSE 到达顺序实时追加，详情按行折叠。 */
 .cd-activity {
-  position: relative; margin: 4px 0 8px 8px;
-  padding-left: 16px; border-left: 1px solid var(--border);
+  position: relative; margin: 6px 0 9px;
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  background: var(--bg-raised); overflow: hidden;
 }
+.cd-activity-segment { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; border: 0; background: var(--bg-hover); padding: 8px 10px; text-align: left; color: var(--text-muted); cursor: pointer; }
+.cd-activity-segment:hover { background: var(--bg-selected); }
+.cd-activity-segment:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.cd-activity-segment-copy { display: grid; min-width: 0; flex: 1; gap: 2px; }
+.cd-activity-segment-copy b { color: var(--text); font-size: 11px; }
+.cd-activity-segment-copy span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); font-size: 11px; }
+.cd-activity-segment-count { white-space: nowrap; color: var(--text-faint); font-size: 10px; }
+.cd-activity-steps { margin: 7px 10px 9px 17px; padding-left: 16px; border-left: 1px solid var(--border); }
 .cd-activity-item { position: relative; margin: 0; }
+.cd-activity-group-label {
+  margin: 8px 0 2px -2px;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .05em;
+}
+.cd-activity-item:first-child .cd-activity-group-label { margin-top: 2px; }
 .cd-activity-item::before {
   content: ''; position: absolute; left: -20px; top: 9px;
   width: 7px; height: 7px; border-radius: 50%;
@@ -1390,6 +1720,7 @@ const webTitle = computed(() => webOn.value
   color: var(--text-muted); cursor: pointer;
 }
 .cd-activity-row:hover { color: var(--text); }
+.cd-activity-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .cd-activity-glyph {
   flex: 0 0 15px; width: 15px; text-align: center;
   color: var(--text-faint); font-size: 13px; line-height: 1;
@@ -1398,17 +1729,19 @@ const webTitle = computed(() => webOn.value
 .cd-activity-ok .cd-activity-glyph { color: var(--green); }
 .cd-activity-warn .cd-activity-glyph { color: var(--amber); }
 .cd-activity-error .cd-activity-glyph { color: var(--danger); }
-.cd-activity-main { min-width: 0; flex: 1; display: flex; align-items: baseline; gap: 7px; }
-.cd-activity-title { flex: 0 0 auto; color: var(--text); font-size: 12.5px; font-weight: 600; }
+.cd-activity-main { min-width: 0; flex: 1; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; column-gap: 7px; row-gap: 1px; }
+.cd-activity-kicker { grid-column: 1 / -1; color: var(--text-faint); font-size: 9.5px; line-height: 1.2; letter-spacing: .04em; text-transform: uppercase; }
+.cd-activity-title { min-width: 0; color: var(--text); font-size: 12.5px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cd-activity-summary {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: var(--text-muted); font-size: 12px;
 }
 .cd-activity-meta { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; }
-.cd-activity-state { color: var(--text-faint); }
-.cd-activity-running .cd-activity-state { color: var(--accent); }
-.cd-activity-warn .cd-activity-state { color: var(--amber); }
-.cd-activity-error .cd-activity-state { color: var(--danger); }
+.cd-activity-state { padding: 2px 6px; border-radius: 999px; color: var(--text-faint); background: var(--bg-hover); white-space: nowrap; }
+.cd-activity-running .cd-activity-state { color: var(--accent); background: rgba(47,111,237,.1); }
+.cd-activity-ok .cd-activity-state { color: var(--green); background: rgba(28,158,102,.09); }
+.cd-activity-warn .cd-activity-state { color: var(--amber); background: rgba(200,129,28,.11); }
+.cd-activity-error .cd-activity-state { color: var(--danger); background: rgba(224,72,79,.1); }
 .cd-activity-time { color: var(--text-faint); font-variant-numeric: tabular-nums; }
 .cd-activity-chevron { color: var(--text-faint); font-size: 10px; }
 .cd-activity-detail {
@@ -1417,6 +1750,8 @@ const webTitle = computed(() => webOn.value
   color: var(--text-dim); font: 10.5px/1.5 var(--font-mono, monospace);
   white-space: pre-wrap; overflow-wrap: anywhere; max-height: 130px; overflow: auto;
 }
+.cd-activity-detail-label { display: block; margin-bottom: 3px; color: var(--text-faint); font: 9.5px/1.2 var(--font-ui); letter-spacing: .04em; }
+.cd-activity-detail code { display: block; color: inherit; font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .cd-refs { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
 .cd-ref {
@@ -1505,5 +1840,72 @@ const webTitle = computed(() => webOn.value
 @media (prefers-reduced-motion: reduce) {
   .cd-dock { transition: none; }
   .cd-chevron { transition: none; }
+}
+
+/* ---------- 对话区视觉细化 ---------- */
+.cd-dock {
+  background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(248,250,254,.98));
+  box-shadow: 0 -8px 26px rgba(35,52,84,.06);
+}
+.cd-head {
+  background: linear-gradient(180deg, rgba(255,255,255,.96), rgba(247,249,253,.92));
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 82%, white);
+}
+.cd-body {
+  scroll-behavior: smooth;
+  background: linear-gradient(180deg, rgba(248,250,253,.5), rgba(255,255,255,.8));
+}
+.cd-msg { animation: cd-message-in .22s var(--ease-spring) both; }
+.cd-user-bubble {
+  border: 1px solid rgba(47,111,237,.1);
+  box-shadow: 0 3px 10px rgba(47,111,237,.08);
+}
+.cd-answer { line-height: 1.7; }
+.cd-activity {
+  padding-top: 3px;
+  padding-bottom: 3px;
+  border-left-color: color-mix(in srgb, var(--accent) 25%, var(--border));
+}
+.cd-activity-row { border-radius: 6px; padding: 5px 6px; transition: background .16s, color .16s, transform .16s var(--ease-spring); }
+.cd-activity-row:hover { background: rgba(47,111,237,.06); transform: translateX(2px); }
+.cd-activity-detail { animation: cd-detail-in .18s var(--ease-spring) both; border-radius: 0 5px 5px 0; }
+.cd-notice { border: 1px solid rgba(152,163,180,.22); background: rgba(244,247,251,.8); }
+.cd-inputbar { background: linear-gradient(180deg, rgba(250,252,255,.88), rgba(245,248,252,.96)); border-top: 1px solid var(--border); }
+.cd-input { box-shadow: inset 0 1px 2px rgba(35,52,84,.03); transition: border-color .16s, box-shadow .16s, background .16s; }
+.cd-input:focus { background: #fff; box-shadow: 0 0 0 3px rgba(47,111,237,.11), inset 0 1px 2px rgba(35,52,84,.03); }
+.cd-send { box-shadow: 0 4px 11px rgba(47,111,237,.18); transition: transform .16s var(--ease-spring), box-shadow .16s, filter .16s; }
+.cd-send:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 7px 15px rgba(47,111,237,.24); filter: brightness(1.03); }
+.cd-chip { transition: transform .16s var(--ease-spring), border-color .16s, background .16s, color .16s; }
+.cd-chip:hover:not(:disabled):not(.cd-chip-off) { transform: translateY(-1px); }
+
+@keyframes cd-message-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes cd-detail-in {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes cd-pop-in { from { opacity: 0; transform: translateY(5px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@keyframes cd-run-pulse { 0%, 100% { opacity: .6; transform: scale(.85); } 50% { opacity: 1; transform: scale(1); } }
+@media (max-width: 560px) {
+  .cd-head { gap: 5px; padding-inline: 7px; }
+  .cd-head-toggle { margin-left: -4px; padding-inline: 4px; }
+  .cd-title { max-width: 76px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cd-btn { height: 24px; padding-inline: 6px; }
+  .cd-body { padding-left: 9px; padding-right: 9px; }
+  .cd-user-bubble { max-width: 94%; }
+  .cd-answer { max-width: 100%; }
+  .cd-activity-main { grid-template-columns: 1fr; gap: 1px; }
+  .cd-activity-summary { grid-column: 1; }
+  .cd-activity-meta { margin-left: auto; }
+  .cd-pop { left: 6px; bottom: 52px; width: calc(100vw - 12px); }
+  .cd-orphan { align-items: flex-start; flex-wrap: wrap; margin-inline: 8px; }
+  .cd-orphan-body { flex-basis: calc(100% - 28px); }
+  .cd-orphan .cd-mini { margin-left: 22px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cd-mini, .cd-jump-bottom, .cd-quick, .cd-activity-row { transition: none; }
+  .cd-pop, .cd-run-streaming::before { animation: none; }
 }
 </style>

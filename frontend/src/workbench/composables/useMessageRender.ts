@@ -90,7 +90,7 @@ export function useMessageRender<T extends RenderMessage>(isActive: () => boolea
 
   // ------------------------------------------------- trace 步骤展示
   const TRACE_LABEL: Record<string, string> = {
-    thought: '分析摘要', action: '执行动作', observation: '返回结果', reflection: '复核与重试',
+    thought: '分析摘要', action: '执行动作', observation: '返回结果', reflection: '执行提示',
   }
   const TRACE_GLYPH: Record<string, string> = {
     thought: '◌', action: '↗', observation: '✓', reflection: '↻',
@@ -145,6 +145,31 @@ export function useMessageRender<T extends RenderMessage>(isActive: () => boolea
     }
     if (raw.length <= 92) return raw
     return raw.slice(0, 89) + '…'
+  }
+  /** 把相邻工具步骤归到用户能理解的动作阶段，供时间线做连续动作分组。 */
+  function traceGroup(item: { type: string; text: string }): string {
+    if (item.type === 'thought') return '分析'
+    if (item.type === 'observation') return '结果'
+    if (item.type === 'reflection') return '进度'
+    const tool = item.text.trim().match(/^([\w.-]+)\s*\(/)?.[1] || ''
+    if (/^(web_search|web_fetch|search_|grep|dev_mcp_search|lookup)/i.test(tool)) return '搜索'
+    if (/^(read_|list_|fetch_|dev_list_connector_tools|inspect|stat)/i.test(tool)) return '读取'
+    if (/^(apply_edit|create_file|write_|delete_|move_|rename_)/i.test(tool)) return '修改'
+    if (/^(run_|test|lint|build|game_playtest|verify|check)/i.test(tool)) return '验证'
+    return '执行'
+  }
+  function traceGroupLabel(item: { type: string; text: string }) {
+    return `${traceGroup(item)}阶段`
+  }
+  function traceGroupStart(msg: T, index: number) {
+    if (index <= 0) return true
+    // 返回结果属于紧邻的工具动作，复核记录也不另起一个动作组；
+    // 这样连续的“搜索 → 读取 → 修改 → 验证”只显示一次阶段标题。
+    if (msg.trace[index].type !== 'action') return false
+    for (let i = index - 1; i >= 0; i -= 1) {
+      if (msg.trace[i].type === 'action') return traceGroup(msg.trace[index]) !== traceGroup(msg.trace[i])
+    }
+    return true
   }
   function traceState(msg: T, item: { type: string; text: string }, index: number): 'running' | 'ok' | 'warn' | 'error' {
     const raw = item.text
@@ -220,6 +245,9 @@ export function useMessageRender<T extends RenderMessage>(isActive: () => boolea
     activityIsOpen,
     traceTitle,
     traceSummary,
+    traceGroup,
+    traceGroupLabel,
+    traceGroupStart,
     traceState,
     traceStateLabel,
     traceElapsed,

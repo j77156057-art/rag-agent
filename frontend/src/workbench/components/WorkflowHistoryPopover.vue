@@ -56,8 +56,8 @@ function sessionTime(value: string): string {
 
 <template>
   <Teleport to="body">
-    <div v-if="open" class="cd-pop-mask" @click="emit('close')" />
-    <div v-if="open" class="cd-session-pop cd-wf-pop" @click.stop>
+    <div v-if="open" class="cd-pop-mask wb-modal-backdrop" @click="emit('close')" />
+    <div v-if="open" class="cd-session-pop cd-wf-pop wb-modal-shell" role="dialog" aria-modal="true" aria-label="工作流历史" @click.stop>
       <div class="cd-session-head">
         <div>
           <div class="cd-pop-title">工作流历史</div>
@@ -122,7 +122,7 @@ function sessionTime(value: string): string {
   width: 360px; max-width: calc(100vw - 24px);
   background: var(--bg-raised); border: 1px solid var(--border-strong);
   border-radius: 8px; box-shadow: 0 14px 38px rgba(35,52,84,.2);
-  padding: 10px; z-index: 60;
+  padding: 10px; z-index: 60; animation: cd-history-in .18s cubic-bezier(.2,.8,.2,1) both;
 }
 .cd-session-head { display: flex; align-items: flex-start; gap: 8px; justify-content: space-between; }
 .cd-session-subtitle { color: var(--text-faint); font-size: 10.5px; line-height: 1.45; margin-top: -4px; }
@@ -130,14 +130,14 @@ function sessionTime(value: string): string {
 .cd-session-empty { padding: 12px 5px; color: var(--text-faint); font-size: 11px; text-align: center; }
 .cd-session-item { display: flex; align-items: stretch; border-top: 1px solid var(--border); }
 .cd-session-main { flex: 1; min-width: 0; display: flex; gap: 7px; align-items: center; padding: 8px 5px; border: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
-.cd-session-main:hover { background: var(--bg-hover); }
+.cd-session-main { border-radius: 6px; transition: background .15s ease, transform .15s ease; }.cd-session-main:hover { background: var(--bg-hover); transform: translateX(2px); }.cd-session-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .cd-session-main:disabled { opacity: .6; cursor: default; }
 .cd-session-copy { min-width: 0; display: block; }
 .cd-session-copy strong, .cd-session-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cd-session-copy strong { font-size: 11.5px; font-weight: 600; }
 .cd-session-copy small { margin-top: 2px; color: var(--text-faint); font-size: 10px; }
-.cd-session-delete { align-self: center; margin-right: 5px; width: 22px; height: 22px; border: 0; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 16px; }
-.cd-session-delete:hover { color: var(--danger); }
+.cd-session-delete { align-self: center; margin-right: 5px; width: 22px; height: 22px; border: 0; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 16px; border-radius: 5px; transition: color .15s ease, background .15s ease, transform .15s ease; }
+.cd-session-delete:hover { color: var(--danger); background: rgba(214,78,78,.07); transform: translateY(-1px); }.cd-session-delete:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .cd-session-delete:disabled { cursor: default; opacity: .5; }
 /* 工作流历史弹层 */
 .cd-wf-pop { max-height: min(70vh, 520px); }
@@ -160,4 +160,7 @@ function sessionTime(value: string): string {
 }
 .cd-wf-act:hover:not(:disabled) { color: var(--amber); border-color: var(--amber); }
 .cd-wf-act-danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
+@keyframes cd-history-in { from { opacity: 0; transform: translateY(5px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@media (max-width: 560px) { .cd-session-pop { right: 6px; bottom: 52px; width: calc(100vw - 12px); } .cd-session-subtitle { max-width: 70vw; } }
+@media (prefers-reduced-motion: reduce) { .cd-session-pop, .cd-session-main, .cd-session-delete { animation: none; transition: none; } .cd-wf-dot-run { animation: none; } }
 </style>

@@ -95,6 +95,8 @@ export interface FileResp {
   region: string | null
   region_name: string | null
   writable: boolean
+  preview_kind?: 'text' | 'binary' | null
+  preview_note?: string | null
   tracked: boolean | null
   dirty: boolean | null
 }

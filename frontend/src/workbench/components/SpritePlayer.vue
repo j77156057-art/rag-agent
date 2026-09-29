@@ -66,13 +66,15 @@ onBeforeUnmount(() => cancelAnimationFrame(raf))
 </script>
 
 <style scoped>
-.sp-wrap { display: inline-flex; flex-direction: column; align-items: center; gap: 6px; }
+.sp-wrap { display: inline-flex; flex-direction: column; align-items: center; gap: 6px; padding: 5px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-hover); }
 .sp-canvas {
   max-width: 100%;
   height: auto;
   image-rendering: pixelated;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   background: #eef1f5;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(35,52,84,.08);
 }
-.sp-err { font-size: 11px; color: var(--red, #d8563f); margin: 0; }
+.sp-err { font-size: 11px; color: var(--red, #d8563f); margin: 0; padding: 4px 7px; border-radius: 5px; background: rgba(216,86,63,.08); }
 </style>

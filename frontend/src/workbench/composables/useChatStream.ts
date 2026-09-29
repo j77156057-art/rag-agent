@@ -109,7 +109,10 @@ export function useChatStream<T extends ChatStreamTurn>(hooks: ChatStreamHooks<T
       hooks.onReasoning?.(turn)
       scheduleFlush()
     } else if (ev.type === 'notice' && ev.text) {
-      if (turn.notices[turn.notices.length - 1] !== ev.text) turn.notices.push(ev.text)
+      // Old servers may still send these progress notices; the compact running
+      // indicator owns that state. Keep only actionable notices in the history.
+      const transient = /^(已进入模型处理|模型仍在处理|正在准备本轮上下文|正在等待模型输出)/.test(ev.text)
+      if (!transient && !turn.notices.includes(ev.text)) turn.notices.push(ev.text)
     } else if (ev.type === 'plan' && Array.isArray(ev.steps)) {
       turn.plan = ev.steps as string[]
     } else if (ev.type === 'thought' || ev.type === 'action'

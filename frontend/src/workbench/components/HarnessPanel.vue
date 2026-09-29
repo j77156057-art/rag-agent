@@ -283,9 +283,9 @@ defineExpose({ show })
 
     <template v-if="open">
       <Teleport to="body">
-        <div class="hp-backdrop" @click="open = false" />
-        <div class="hp-pop" role="dialog" aria-label="AI 运行台">
-        <div class="hp-head">
+        <div class="hp-backdrop wb-modal-backdrop" @click="open = false" />
+        <div class="hp-pop wb-modal-shell" role="dialog" aria-modal="true" aria-label="AI 运行台">
+        <div class="hp-head wb-modal-head">
           <div>
             <b>AI 运行台</b>
             <p>看 AI 每次回答花了多少、操作了什么、装了哪些扩展</p>
@@ -306,17 +306,17 @@ defineExpose({ show })
         <!-- ---------------- 花费 ---------------- -->
         <div v-if="tab === 'cost'" class="hp-pane">
           <div class="hp-statgrid">
-            <div class="hp-stat">
+            <div class="hp-stat wb-card">
               <span>今日 AI 花费</span>
               <b>{{ money(budget?.day_spent) }}</b>
               <em>{{ budget?.day || '' }}</em>
             </div>
-            <div class="hp-stat">
+            <div class="hp-stat wb-card">
               <span>累计花费</span>
               <b>{{ money(budget?.global_spent) }}</b>
               <em>按模型官方单价折算</em>
             </div>
-            <div class="hp-stat">
+            <div class="hp-stat wb-card">
               <span>预算上限</span>
               <b v-if="(budget?.global_limit || 0) > 0">{{ money(budget?.global_limit) }}</b>
               <b v-else class="hp-none">不限</b>
@@ -346,7 +346,7 @@ defineExpose({ show })
           </div>
           <div v-if="!sessions.length" class="hp-empty">还没有保存的对话。到下方「AI 助手」问一个问题试试。</div>
           <div v-else class="hp-list">
-            <div v-for="s in sessions" :key="s.session_id" class="hp-item" :class="{ on: s.session_id === currentId }">
+            <div v-for="s in sessions" :key="s.session_id" class="hp-item wb-card" :class="{ on: s.session_id === currentId }">
               <div class="hp-item-main">
                 <b>{{ s.session_id }}<span v-if="s.session_id === currentId" class="hp-cur">当前</span></b>
                 <span>{{ s.turns }} 轮问答<template v-if="s.has_summary"> · 已生成早期摘要</template></span>
@@ -390,11 +390,11 @@ defineExpose({ show })
           </div>
           <div v-if="!traces.length" class="hp-empty">暂无操作记录。</div>
           <div v-else class="hp-list">
-            <div v-for="it in traces" :key="it.turn_id" class="hp-trace">
+            <div v-for="it in traces" :key="it.turn_id" class="hp-trace wb-card">
               <div class="hp-trace-head">
                 <span class="hp-time">{{ fmtTime(it.ts) }}</span>
                 <span class="hp-model">{{ providerLabel(it.provider) }}<template v-if="it.model"> · {{ it.model }}</template></span>
-                <span :class="['hp-tag', outcomeTag(it).cls]">{{ outcomeTag(it).text }}</span>
+                <span :class="['hp-tag', 'wb-status-chip', outcomeTag(it).cls]">{{ outcomeTag(it).text }}</span>
                 <span class="hp-spacer" />
                 <span class="hp-nums">{{ it.total_tokens.toLocaleString() }} token · {{ money(it.cost_cny) }} · {{ fmtMs(it.elapsed_ms) }}<template v-if="it.cache_read_tokens"> · <span class="hp-cache">缓存命中 {{ it.cache_read_tokens.toLocaleString() }}</span></template></span>
               </div>
@@ -422,7 +422,7 @@ defineExpose({ show })
             还没有安装技能。把 SKILL.md 放进 .docmind/skills/ 目录后点「重新扫描」即可。
           </div>
           <div v-else class="hp-list">
-            <div v-for="sk in skills" :key="sk.path" class="hp-skill">
+            <div v-for="sk in skills" :key="sk.path" class="hp-skill wb-card">
               <b>{{ sk.name }}</b>
               <span>{{ sk.description }}</span>
               <em>适用：{{ sk.when_to_use }}</em>

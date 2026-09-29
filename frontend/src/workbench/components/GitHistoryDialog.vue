@@ -32,9 +32,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 </script>
 
 <template>
-  <div v-if="history" class="gh-overlay" @mousedown.self="closeHistory">
-    <section class="gh-panel" role="dialog" aria-label="文件历史版本">
-      <header class="gh-top">
+  <div v-if="history" class="gh-overlay wb-modal-backdrop" @mousedown.self="closeHistory">
+    <section class="gh-panel wb-modal-shell" role="dialog" aria-modal="true" aria-label="文件历史版本">
+      <header class="gh-top wb-modal-head">
         <div class="gh-title">
           <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
             <circle cx="3.5" cy="7" r="1.5" fill="none" stroke="#58a6ff" stroke-width="1.1" />
@@ -128,6 +128,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   align-items: center;
   justify-content: center;
   padding: 34px;
+  animation: gh-overlay-in .18s ease-out both;
 }
 .gh-panel {
   width: min(980px, 95vw);
@@ -139,6 +140,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  animation: gh-panel-in .22s cubic-bezier(.2,.8,.2,1) both;
 }
 .gh-top {
   flex: 0 0 auto;
@@ -169,6 +171,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   flex: 0 0 auto;
 }
 .gh-iconbtn:hover { background: var(--bg-hover); color: var(--text); }
+.gh-iconbtn:focus-visible,
+.gh-commit:focus-visible,
+.gh-restore-btn:focus-visible { outline: 2px solid #2f6fed88; outline-offset: 2px; }
 
 .gh-body { flex: 1 1 auto; display: flex; min-height: 0; }
 
@@ -190,8 +195,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   border-radius: 6px;
   padding: 7px 9px;
   cursor: pointer;
+  transition: background .16s ease, border-color .16s ease, transform .16s ease;
 }
-.gh-commit:hover { background: var(--bg-hover); }
+.gh-commit:hover { background: var(--bg-hover); transform: translateX(2px); }
 .gh-commit.active { background: #2f6fed14; border-color: #2f6fed44; }
 .gh-commit-msg {
   font-size: 12.5px;
@@ -277,6 +283,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 }
 .gh-restore-btn:hover:not(:disabled) { background: #c8811c26; border-color: #dfb067; }
 .gh-restore-btn:disabled { opacity: 0.5; cursor: default; }
+.gh-restore-btn { transition: background .16s ease, border-color .16s ease, transform .16s ease, opacity .16s ease; }
+.gh-restore-btn:active:not(:disabled) { transform: translateY(1px); }
 
 .gh-preview {
   flex: 1 1 auto;
@@ -305,4 +313,25 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 .gh-state p { margin: 0; font-size: 12.5px; }
 .gh-faint { color: var(--text-faint); }
 .gh-error { color: #c23a40; }
+@keyframes gh-overlay-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes gh-panel-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@media (max-width: 760px) {
+  .gh-overlay { padding: 14px; }
+  .gh-panel { width: 100%; height: min(900px, 94vh); }
+  .gh-body { flex-direction: column; }
+  .gh-commits { flex: 0 0 35%; max-height: 260px; border-right: 0; border-bottom: 1px solid var(--border); }
+  .gh-preview-bar { flex-wrap: wrap; }
+  .gh-preview-info { flex-basis: 100%; }
+}
+@media (max-width: 520px) {
+  .gh-overlay { padding: 0; align-items: stretch; }
+  .gh-panel { height: 100%; border-radius: 0; border-left: 0; border-right: 0; }
+  .gh-top { padding: 10px 12px; }
+  .gh-path { display: none; }
+  .gh-commits { flex-basis: 30%; }
+  .gh-preview { font-size: 11px; padding: 10px 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gh-overlay, .gh-panel, .gh-iconbtn, .gh-commit, .gh-restore-btn { animation: none; transition: none; }
+}
 </style>

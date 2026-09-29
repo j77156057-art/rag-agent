@@ -9,9 +9,10 @@ const real: { key: WorkspaceView; name: string; icon: string }[] = [
   { key: 'overview', name: '概览', icon: 'home' },
   { key: 'code', name: '代码', icon: 'code' },
   { key: 'assets', name: '素材', icon: 'assets' },
+  { key: 'cockpit', name: '开发舱', icon: 'cockpit' },
 ]
 
-const HOTKEY: Record<string, number> = { overview: 1, code: 2, assets: 3 }
+const HOTKEY: Record<string, number> = { overview: 1, code: 2, assets: 3, cockpit: 4 }
 
 function pick(key: WorkspaceView) {
   if (key === 'code' && !tabs.value.length) return
@@ -43,6 +44,12 @@ function pick(key: WorkspaceView) {
         <circle cx="4.3" cy="4.9" r="0.95" fill="none" stroke="currentColor" stroke-width="1.05"/>
         <path d="M2.6 9.6 L5.2 7 L7.2 8.8 L8.8 7.4 L10.4 9" fill="none" stroke="currentColor" stroke-width="1.05" stroke-linejoin="round"/>
       </svg>
+      <svg v-else-if="item.icon === 'cockpit'" width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
+        <rect x="2.4" y="3.4" width="8.2" height="6.2" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.05"/>
+        <path d="M6.5 3.4 V1.8 M4.6 1.8 H8.4" fill="none" stroke="currentColor" stroke-width="1.05" stroke-linecap="round"/>
+        <circle cx="5" cy="6.4" r="0.8" fill="currentColor"/>
+        <circle cx="8" cy="6.4" r="0.8" fill="currentColor"/>
+      </svg>
       <svg v-else width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
         <path d="M4.6 4.4 L2.2 6.5 L4.6 8.6 M8.4 4.4 L10.8 6.5 L8.4 8.6" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
@@ -60,8 +67,9 @@ function pick(key: WorkspaceView) {
   gap: 2px;
   padding: 0 12px;
   height: 38px;
-  background: #f3f6fa;
+  background: linear-gradient(180deg, #f8faff 0%, #eef3f9 100%);
   border-bottom: 1px solid var(--border);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.75);
   user-select: none;
   overflow-x: auto;
   overflow-y: hidden;
@@ -78,20 +86,41 @@ function pick(key: WorkspaceView) {
   border: 1px solid transparent;
   border-radius: 8px;
   background: transparent;
-  color: var(--text-faint);
+  color: var(--text-muted);
   font-family: var(--font-ui);
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
-  transition: color .12s, background .12s;
+  position: relative;
+  transition: color .16s var(--ease-standard), background .16s var(--ease-standard), transform .16s var(--ease-spring), border-color .16s var(--ease-standard);
 }
-.ws-tab:hover:not(:disabled) { color: var(--text); background: rgba(47,111,237,.07); }
+.ws-tab:hover:not(:disabled) { color: var(--text); background: rgba(47,111,237,.08); transform: translateY(-1px); }
+.ws-tab:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 72%, white); outline-offset: 1px; }
+.ws-tab:active:not(:disabled) { transform: translateY(0); }
 .ws-active {
   color: var(--accent);
   background: var(--bg-raised);
   border-color: var(--border);
-  box-shadow: 0 1px 2px rgba(35,52,84,.06);
+  box-shadow: 0 3px 9px rgba(35,52,84,.08);
 }
-.ws-disabled { opacity: .5; cursor: default; }
+.ws-active::after {
+  content: '';
+  position: absolute;
+  left: 13px;
+  right: 13px;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  animation: ws-active-in .2s var(--ease-spring) both;
+}
+.ws-disabled { opacity: .62; cursor: default; }
 .ws-disabled:hover { background: transparent; }
+@keyframes ws-active-in {
+  from { opacity: 0; transform: scaleX(.45); }
+  to { opacity: 1; transform: scaleX(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ws-tab, .ws-active::after { transition: none; animation: none; }
+}
 </style>

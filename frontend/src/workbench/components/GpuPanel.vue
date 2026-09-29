@@ -163,9 +163,9 @@ defineExpose({ show })
     </button>
 
     <Teleport to="body"><template v-if="open">
-      <div class="gp-backdrop" @click="open = false" />
-      <div class="gp-pop">
-        <div class="gp-head">
+      <div class="gp-backdrop wb-modal-backdrop" @click="open = false" />
+      <div class="gp-pop wb-modal-shell" role="dialog" aria-modal="true" aria-label="显卡使用情况">
+        <div class="gp-head wb-modal-head">
           <b>显卡使用情况</b>
           <span class="gp-mode">{{ st ? modeLabel[st.mode] || st.mode : '—' }}</span>
           <span class="gp-spacer" />
@@ -190,7 +190,7 @@ defineExpose({ show })
         </div>
 
         <!-- 每卡状态 + 持有者 + 该卡排队 -->
-        <div v-for="g in st?.gpus || []" :key="g.index" class="gp-card">
+        <div v-for="g in st?.gpus || []" :key="g.index" class="gp-card wb-card">
           <div class="gp-card-head">
             <b>卡 {{ g.index }}<em v-if="g.name"> · {{ g.name }}</em></b>
             <span class="gp-faint">
@@ -206,7 +206,7 @@ defineExpose({ show })
           </div>
 
           <div v-if="g.holder" class="gp-holder">
-            <span class="gp-tag gp-tag-on">占用</span>
+            <span class="gp-tag wb-status-chip gp-tag-on">占用</span>
             <span class="gp-owner">{{ ownerLabel(g.holder.owner) }}</span>
             <span class="gp-faint" v-if="g.holder.purpose">· {{ g.holder.purpose }}</span>
             <span class="gp-faint">· {{ fmtDur(g.holder.held_for_seconds) }}</span>
@@ -215,7 +215,7 @@ defineExpose({ show })
             <button class="gp-mini-danger" :disabled="busy" @click="forceRelease(g.holder!.owner)">回收</button>
           </div>
           <div v-for="(q, i) in g.queue" :key="q.owner + i" class="gp-holder gp-wait">
-            <span class="gp-tag gp-tag-wait">排队 #{{ i + 1 }}</span>
+            <span class="gp-tag wb-status-chip gp-tag-wait">排队 #{{ i + 1 }}</span>
             <span class="gp-owner">{{ ownerLabel(q.owner) }}</span>
             <span class="gp-faint" v-if="q.waiting_gpu">· 任意卡</span>
             <span class="gp-spacer" />
@@ -258,7 +258,7 @@ defineExpose({ show })
           <template v-if="slots">
             <div v-if="Object.keys(slots.holders).length" class="gp-slot-list">
               <div v-for="(h, key) in slots.holders" :key="key" class="gp-holder">
-                <span class="gp-tag gp-tag-on">占用</span>
+                <span class="gp-tag wb-status-chip gp-tag-on">占用</span>
                 <span class="gp-owner">{{ key }}</span>
                 <span class="gp-faint" v-if="h.tag">· {{ h.tag }}</span>
                 <span class="gp-faint">· {{ fmtDur(h.held_seconds) }}</span>
@@ -297,19 +297,26 @@ defineExpose({ show })
 }
 .gp-trigger:hover { color: var(--text); }
 .gp-busy { border-color: #dfb067; color: #8a5a16; }
-.gp-backdrop { position: fixed; inset: 0; z-index: 299; }
+.gp-trigger { transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease; }
+.gp-trigger:hover { background: var(--bg-hover); }
+.gp-trigger:active { transform: translateY(1px); }
+.gp-trigger:focus-visible, .gp-link:focus-visible, .gp-mini:focus-visible, .gp-mini-danger:focus-visible, .gp-danger:focus-visible, .gp-input:focus-visible { outline: 2px solid #2f6fed88; outline-offset: 2px; }
+.gp-backdrop { position: fixed; inset: 0; z-index: 299; background: rgba(35,52,84,.16); backdrop-filter: blur(1px); animation: gp-fade-in .16s ease-out both; }
 .gp-pop {
   position: fixed; right: 16px; top: 64px; width: 420px; max-width: calc(100vw - 32px); max-height: calc(100vh - 80px); overflow-y: auto;
   padding: 12px; background: var(--bg-raised);
   border: 1px solid var(--border-strong); border-radius: 8px;
   z-index: 300; font-size: 12px; line-height: 1.6;
   box-shadow: 0 12px 32px rgba(35, 52, 84, 0.16);
+  animation: gp-pop-in .2s cubic-bezier(.2,.8,.2,1) both;
 }
 .gp-head { display: flex; align-items: center; gap: 8px; }
 .gp-head b { color: var(--text); font-size: 13px; }
 .gp-mode { color: var(--text-muted); font-size: 11px; }
 .gp-spacer { flex: 1; }
 .gp-link { background: none; border: none; color: #2f6fed; cursor: pointer; font-size: 11px; padding: 0; }
+.gp-link { transition: color .16s ease, opacity .16s ease; }
+.gp-link:hover:not(:disabled) { color: #174ca8; }
 .gp-warn { margin: 8px 0 0; padding: 6px 8px; border-radius: 5px; background: rgba(200, 129, 28, 0.12); color: #8a5a16; font-size: 11px; }
 .gp-err { margin: 8px 0 0; color: #c23a40; font-size: 11px; }
 .gp-faint { color: var(--text-muted); font-size: 11px; }
@@ -321,12 +328,13 @@ defineExpose({ show })
 .gp-legend i { display: inline-flex; align-items: center; gap: 4px; font-style: normal; }
 .gp-legend b { width: 8px; height: 3px; border-radius: 1px; display: inline-block; }
 
-.gp-card { margin-top: 10px; padding: 8px 9px; border: 1px solid var(--border-strong); border-radius: 6px; }
+.gp-card { margin-top: 10px; padding: 8px 9px; border: 1px solid var(--border-strong); border-radius: 6px; transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
+.gp-card:hover { border-color: #9fb0c6; box-shadow: 0 4px 12px rgba(35,52,84,.07); transform: translateY(-1px); }
 .gp-card-head { display: flex; align-items: baseline; gap: 8px; }
 .gp-card-head b { font-size: 12px; color: var(--text); font-weight: 600; }
 .gp-card-head em { font-style: normal; font-weight: 400; color: var(--text-muted); font-size: 11px; }
 .gp-bar { height: 6px; border-radius: 3px; background: rgba(35, 52, 84, 0.08); margin-top: 6px; overflow: hidden; }
-.gp-bar i { display: block; height: 100%; border-radius: 3px; background: linear-gradient(90deg, #2f6fed, #6f9cf5); }
+.gp-bar i { display: block; height: 100%; border-radius: 3px; background: linear-gradient(90deg, #2f6fed, #6f9cf5); transition: width .35s ease; }
 .gp-bar-row { display: flex; justify-content: space-between; margin-top: 3px; font-size: 11px; color: var(--text-muted); }
 
 .gp-holder { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 11px; }
@@ -339,6 +347,8 @@ defineExpose({ show })
 .gp-mini:hover:not(:disabled) { color: var(--text); border-color: #2f6fed; }
 .gp-mini-danger { background: transparent; border: 1px solid rgba(224, 72, 79, 0.5); color: #c23a40; border-radius: 4px; font-size: 10px; padding: 1px 7px; cursor: pointer; }
 .gp-mini-danger:hover:not(:disabled) { background: rgba(224, 72, 79, 0.1); }
+.gp-mini, .gp-mini-danger, .gp-danger { transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease, opacity .16s ease; }
+.gp-mini:active:not(:disabled), .gp-mini-danger:active:not(:disabled), .gp-danger:active:not(:disabled) { transform: translateY(1px); }
 button:disabled { opacity: 0.5; cursor: default; }
 
 .gp-idle { margin-top: 12px; padding: 8px 9px; border: 1px solid var(--border-strong); border-radius: 6px; }
@@ -350,4 +360,16 @@ button:disabled { opacity: 0.5; cursor: default; }
 .gp-foot { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
 .gp-danger { background: transparent; border: 1px solid rgba(224, 72, 79, 0.5); color: #c23a40; border-radius: 5px; font-size: 11px; padding: 4px 10px; cursor: pointer; }
 .gp-danger:hover:not(:disabled) { background: rgba(224, 72, 79, 0.1); }
+@keyframes gp-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes gp-pop-in { from { opacity: 0; transform: translateY(-6px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@media (max-width: 620px) {
+  .gp-pop { left: 8px; right: 8px; top: 8px; bottom: 8px; width: auto; max-width: none; max-height: none; border-radius: 10px; }
+  .gp-card-head, .gp-holder, .gp-idle-row { flex-wrap: wrap; }
+  .gp-holder .gp-spacer { display: none; }
+  .gp-holder button { margin-left: auto; }
+  .gp-legend { flex-wrap: wrap; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gp-trigger, .gp-backdrop, .gp-pop, .gp-link, .gp-card, .gp-bar i, .gp-mini, .gp-mini-danger, .gp-danger { animation: none; transition: none; }
+}
 </style>
