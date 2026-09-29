@@ -1502,3 +1502,23 @@ git status --short
 
 ### 重复完成检查（R14 红线）
 - R4/R5/R10 接线 = AI-F 独占（`realtime_bridge.py` + `api.py` 接线），无第二人动同一处；R2 voice 已澄清归 /root（AI-C 转 R7）。整链已入库，无重复认领、无重复完成。
+
+## 2026-09-29 R14 状态更新（20:43，用户问「现在呢」+ 要求补状态并审 0db20ff）
+
+### 自 20:26（ab6d89e）后新增提交
+- `0db20ff` fix: 实时链路必须在语音后补静音尾（R12 根因修复）+ `8f32730` docs: HANDOFF 声明 R12 provider 侧范围与静音尾根因。HEAD→`8f32730`。
+
+### R12 验收翻转：4/6 → 6/6（provider 侧）
+- 根因：语音后缺静音尾——服务端 VAD 靠尾部静音收句，麦克风在用户停说话后仍运行本应提供尾音，**主动掐断才是 bug**（不补静音 0/2、补 1.0s 静音 2/2）。`0db20ff` 在 `verify_realtime_acceptance.py` 推流后补静音尾（`--tail-seconds` 默认 1.0），对照实验翻转验证。
+- 指标全通过：首响应 3171ms、模型延迟 223ms、持续响应 3/3、打断、断线恢复、错误率 0.0%（0/75）。`tests/test_realtime_provider.py` 31 项全绿。
+
+### R14 复审：0db20ff 对 realtime_omni.py 的静音尾改动
+- **realtime_omni.py 改动为纯文档（+14 行 = docstring gotcha + commit() 澄清），无运行时行为变更**，安全、准确。实际静音尾逻辑在验收脚本 `verify_realtime_acceptance.py`（`_stream` 每轮后补 `tail*10` 帧静音），harness 修复正确且符合契约。
+- **发现（P2，须跟踪的生产缺口）**：R12 报告「对 R3 网关的三条硬要求」第 1 条要求采集端/网关在用户停说话后继续推 ~1s 静音（或保持链路到 `speech_stopped`）。但**生产网关路径 `realtime_bridge.take_audio → provider.send_audio(payload, captured_at)` 不注入静音、也不等 `speech_stopped`**（已 grep 确认 realtime_bridge.py 无 silence/tail/idle 逻辑）。→ 当前 6/6 通过是 harness 验证，真实用户走网关仍可能复现「有转写无回复」。**须 R3/R0（网关）或前端 lane 落实静音尾/等 speech_stopped**，否则 R12 对用户侧不算真正闭环。
+
+### 对 20:26 R14 节的更正
+- 原「未提交/未闭环」称 R12 doc untracked、4/6 open → 现已提交（0db20ff/8f32730）且翻转为 6/6，该结论作废。
+- 原列 `verify_realtime_acceptance.py` 未提交 → 已在 0db20ff 入库。
+
+### 重复完成检查（R14 红线）
+- R4/R5/R10 接线 AI-F 独占；R12 provider 侧修复由同一 lane（0db20ff）落地，无第二人认领。无重复完成。Canvas AI-G（R12）行仍标「待开始」已过时，建议更新（非本回合范围）。
