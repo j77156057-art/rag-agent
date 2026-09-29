@@ -5006,6 +5006,99 @@ def dev_lanes(arg):
     return lanes.render(res)
 
 
+def dev_propose(arg):
+    """把本轮改动打包成【可评审产物】：补丁文件 + 提交/PR 草稿。不提交、不推送。
+
+    输入（多行 keyed，全部可选）：
+      title: fix: 修好打断后不闭嘴的问题     # 草稿标题，也用来命名产物
+      body: 为什么这么改                     # 草稿正文
+      files: agent_runtime/x.py, tests/      # 只打包这些路径（默认全部未暂存改动）
+      staged: true                           # 打包暂存区而不是工作树
+      test_plan: 跑 pytest -k realtime       # 复核步骤
+      lane: AI-A                             # 署名，方便交接
+    产物写在【项目状态目录】里（不在仓库工作树内），`git status` 不会因为打包变脏。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    keys = ["title", "body", "files", "staged", "test_plan", "lane", "timeout"]
+    fields = _parse_keyed(arg, keys)
+
+    def _one(key):
+        value = fields.get(key) or ""
+        return value.splitlines()[0].strip() if value else ""
+
+    def _truthy(v):
+        return str(v or "").strip().lower() in ("1", "true", "yes", "y", "on", "是")
+
+    try:
+        timeout = int(_one("timeout") or "30")
+    except (TypeError, ValueError):
+        timeout = 30
+    from agent_runtime import proposal
+    try:
+        res = proposal.build(root, title=_one("title"),
+                             body=(fields.get("body") or "").strip(),
+                             files=_split_path_list(fields.get("files") or ""),
+                             staged=_truthy(_one("staged")),
+                             test_plan=(fields.get("test_plan") or "").strip(),
+                             lane=_one("lane"), timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        return "dev_propose 无法运行：%s: %s" % (type(exc).__name__, str(exc)[:200])
+    return proposal.render(res)
+
+
+def dev_ci_status(arg):
+    """【只读】看 CI 跑到哪了：最近的 workflow runs、失败 job、以及本地 HEAD 有没有被 CI 跑到。
+
+    输入（多行 keyed，全部可选）：
+      branch: main            # 只看这个分支（默认当前分支范围）
+      per_page: 5             # 最近几次，上限 20
+      jobs: true              # 顺带把最近一次的 job 列表拉回来（能指出哪个 job 挂了）
+      log_url: <日志地址>      # 单独抓一份 job 日志，只回错误行
+    需要 GitHub token（DOCMIND_GITHUB_TOKEN / GITHUB_TOKEN / GH_TOKEN 任一）。本工具
+    绝不触发或重跑 workflow；连不上或没权限时会明确说「未完成 + 原因」，不编状态。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    keys = ["branch", "ref", "per_page", "jobs", "log_url", "timeout"]
+    fields = _parse_keyed(arg, keys)
+
+    def _one(key):
+        value = fields.get(key) or ""
+        return value.splitlines()[0].strip() if value else ""
+
+    def _truthy(v):
+        return str(v or "").strip().lower() in ("1", "true", "yes", "y", "on", "是")
+
+    try:
+        per_page = int(_one("per_page") or 5)
+    except (TypeError, ValueError):
+        per_page = 5
+    try:
+        timeout = float(_one("timeout") or 15)
+    except (TypeError, ValueError):
+        timeout = 15.0
+    from agent_runtime import ci_status
+    log_url = _one("log_url")
+    if log_url:
+        res = ci_status.failed_log(log_url, tok=ci_status.token(), timeout=timeout)
+        if not res.get("ok"):
+            return "dev_ci_status 未完成：" + res.get("error", "")
+        lines = ["日志里的错误行（%d 条%s）：" % (len(res.get("errors") or []),
+                                          "，已截断" if res.get("truncated") else "")]
+        lines += ["  " + row for row in res.get("errors") or []]
+        return "\n".join(lines) or "日志里没找到 Error/FAILED/fatal 行。"
+    try:
+        res = ci_status.fetch(root, branch=_one("branch"), ref=_one("ref"),
+                              per_page=per_page, timeout=timeout,
+                              fetch_jobs=_truthy(_one("jobs")))
+    except Exception as exc:  # noqa: BLE001
+        return "dev_ci_status 无法运行：%s: %s" % (type(exc).__name__, str(exc)[:200])
+    return ci_status.summarize(res)
+
+
 def dev_diagnostics(arg):
     """拿结构化诊断（文件:行:列 + 规则号），而不是「过/不过」加一坨尾部日志。
 
@@ -6823,6 +6916,14 @@ TOOLS = {
     "dev_diagnostics": {
         "description": "拿【结构化诊断】而不是「过/不过」加一坨尾部日志：Python 走 ruff、前端走 `npm run typecheck`（vue-tsc），输出归一成 文件:行:列 + 规则号 + 说明 + 严重度。改完一段代码、跑测试之前先调用它，比 self_verify 更早发现问题；重命名/搬文件之后用它确认没留下未定义引用。输入：target: <文件或目录，逗号/换行分隔，留空=按 scope 扫整个代码根目录>、scope: auto|py|frontend|all（auto 按扩展名选引擎）、rules: <ruff 规则覆盖，默认只查会咬人的 E9,F401,F811,F821,F822,F841,E722；要风格全检写 rules: ALL 或 rules: E,W,F>、timeout: <秒，上限 300>、config: <项目内 ruff 配置文件>；直接把路径当输入也可以。只读：从不传 --fix，从不写文件。工具没装时会【明确说「未安装」并给出安装命令】，绝不把「没跑成」报成「没问题」；输出被截断导致解析不出条目时同样如实报，不会谎称干净。前端诊断需要在 frontend/ 里有 typecheck 脚本且能找到 npm（可用 DOCMIND_NPM_BIN 指定）。",
         "func": dev_diagnostics,
+    },
+    "dev_propose": {
+        "description": "把本轮改动打包成【可评审产物】：一份真 `git diff` 补丁 + 一份提交/PR 草稿，写完把两个路径回给你。**不提交、不推送**（提交与推送是人的决定，命令黑名单也拦着），补的是「改完了却只能口头描述」这段交付空洞。输入 keyed 多行（全部可选）：`title:` 草稿标题兼产物命名、`body:` 为什么这么改、`files: a.py, tests/` 只打包这些路径（默认全部未暂存改动）、`staged: true` 打包暂存区、`test_plan:` 复核步骤、`lane: AI-A` 署名、`timeout:`。产物写在【项目状态目录】里而不是仓库工作树——多人同仓时，把临时文件写进工作树等于给别人埋雷，所以 `git status` 不会因为打包变脏。未跟踪的新文件【不伪装成补丁】，只在草稿里列成清单并写明「需确认后再入库」。补丁可直接喂给 dev_patch 重放。",
+        "func": dev_propose,
+    },
+    "dev_ci_status": {
+        "description": "【只读】看 CI：最近的 workflow runs、结论、失败 job，以及【本地 HEAD 到底有没有被 CI 跑到】——后者在「push 得在用户机器上跑」的环境里尤其重要，没 push 时它会直说「这些 run 里没有本地 HEAD」而不是让你以为绿了。输入 keyed 多行（全部可选）：`branch: main`、`ref: <sha>`、`per_page: 5`（上限 20）、`jobs: true`（把最近一次的 job 列表拉回来，能指出是哪个 job 挂的）、`log_url: <地址>` 单独抓一份 job 日志并只回错误行、`timeout:`。需要 GitHub token（DOCMIND_GITHUB_TOKEN / GITHUB_TOKEN / GH_TOKEN 任一）。本工具绝不触发或重跑 workflow；没 token、401/403、404 或连不上时明确回「未完成 + 原因」，不会编一个状态出来。仓库归属直接读 .git/config 的 origin，不调 git 也不猜。",
+        "func": dev_ci_status,
     },
     "dev_patch": {
         "description": "把一段【unified diff】原子地打到代码库里：全成才打，任一文件对不上就一个都不改、树上不留半成品。输入就是 diff 正文（`--- a/路径`、`+++ b/路径`、`@@ -起行数,行数 +起行数,行数 @@`、空格/`+`/`-` 行），首行可加 `dry_run: true` 只做校验与语法检查不写盘（大补丁先空跑一次）。护栏：路径必须是代码根目录内的相对路径（`a/`、`b/` 前缀会自动去掉，`../` 与绝对路径拒绝）；上下文行与被删行必须逐字相等——【不做模糊匹配】，宁可报错也不改错地方；声明行号偏了但上下文一致时会自动对齐并在结果里说明落到了第几行；.py 打完还会过一遍 ast 语法检查，语法不过直接整体拒绝；删除文件一律不让补丁做（会用带确认的删除工具）。一次最多 20 个文件、单文件 200KB。改多处调用点、落地外部评审意见、回滚某段改动时优先用它，比连续多次 apply_edit 安全。",

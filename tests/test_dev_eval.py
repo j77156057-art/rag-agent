@@ -50,8 +50,10 @@ class DatasetShapeCases(unittest.TestCase):
         for case in dev_eval.DEV_DATASET:
             for row in list(case.get("steps") or []) + list(case.get("verify") or []):
                 covered.add(str(row.get("tool") or ""))
+            # direct 题在函数里调工具，看不见就白名单声明（uses），否则覆盖率会假性缺项
+            covered.update(str(name) for name in case.get("uses") or [])
         for tool in ("dev_glob", "dev_git_log", "dev_find_references", "dev_diagnostics",
-                     "dev_patch", "dev_lanes"):
+                     "dev_patch", "dev_lanes", "dev_propose", "dev_ci_status"):
             self.assertIn(tool, covered, "%s 已经不在 dev lane 题库里了" % tool)
 
     def test_validate_cases_rejects_broken_datasets(self):

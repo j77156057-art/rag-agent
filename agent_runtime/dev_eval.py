@@ -143,6 +143,11 @@ def _build_fixture(kind: str, root: str) -> str:
                  "agent_runtime/realtime_omni.py": "X = 1\n"}
     elif kind == "serve":
         files = {"index.html": "<p>hi</p>\n"}
+    elif kind == "proposal":
+        # 一个干净提交，之后故意留下一处未提交改动 + 一个未跟踪文件：
+        # 这正是 dev_propose 的输入形态，也是它最容易把仓库弄脏的时刻
+        files = {"a.py": "x = 1\n", "notes.md": "# notes\n"}
+        commits = 1
     elif kind == "plain":
         files = {"notes.md": "# notes\n"}
     for rel, body in files.items():
@@ -154,12 +159,20 @@ def _build_fixture(kind: str, root: str) -> str:
             return "git 不可用"
         _git(root, "init", "-q")
         _git(root, "config", "user.email", "eval@example.com")
+        _git(root, "config", "remote.origin.url",
+             "https://github.com/acme/rag-agent.git")
         _git(root, "config", "user.name", "First Author")
         _git(root, "add", "-A")
         _git(root, "commit", "-q", "-m", "first: add a.py",
              "--author=First Author <first@example.com>")
-        _git(root, "commit", "-q", "--allow-empty", "-m", "second: touch b.py",
-             "--author=Second Author <second@example.com>")
+        if commits >= 2:
+            _git(root, "commit", "-q", "--allow-empty", "-m", "second: touch b.py",
+                 "--author=Second Author <second@example.com>")
+        if kind == "proposal":
+            Path(os.path.join(root, "a.py")).write_text("x = 2\n", encoding="utf-8",
+                                                        newline="\n")
+            Path(os.path.join(root, "new.md")).write_text("# new\n", encoding="utf-8",
+                                                          newline="\n")
     return ""
 
 
@@ -247,6 +260,32 @@ def _case_mcp_inline_opt_in(root: str, run: Callable[..., dict]) -> list[dict]:
             _check("callable", "pong:hi" in out, out[:120])]
 
 
+def _case_propose_keeps_the_repo_clean(root: str, run: Callable[..., dict]) -> list[dict]:
+    """dev_propose 的价值前提：产物写到仓库外，打包不会把 `git status` 弄脏。
+
+    用 dev_git_diff 自己当探针——它会把未跟踪文件单列出来，产物一旦落进工作树就显形。
+    """
+    before = run("dev_git_diff", "stat: true")["text"]
+    out = run("dev_propose", "title: eval 交付产物\ntest_plan: pytest -k dev\nlane: EVAL")["text"]
+    after = run("dev_git_diff", "stat: true")["text"]
+    patch_line = next((row.split("：", 1)[1].strip() for row in out.splitlines()
+                       if row.strip().startswith("补丁：")), "")
+    inside = bool(patch_line) and os.path.normpath(patch_line).startswith(
+        os.path.normpath(root))
+    return [_check("artifact_made", "提案已生成" in out and "未提交、未推送" in out, out[:160]),
+            _check("artifacts_outside_repo", bool(patch_line) and not inside, patch_line[:160]),
+            _check("status_not_polluted", before == after,
+                   "打包前后仓库状态不一致：%r vs %r" % (before[:80], after[:80]))]
+
+
+def _case_ci_never_invents_status(root: str, run: Callable[..., dict]) -> list[dict]:
+    """没 token、连不上时不能编一个「看起来通过」的状态出来。"""
+    out = run("dev_ci_status", "per_page: 3")["text"]
+    return [_check("reports_incomplete", "未完成" in out, out[:160]),
+            _check("no_invented_green", not any(word in out for word in ("通过", "全部绿", "success")),
+                   out[:160])]
+
+
 DEV_DATASET: tuple[dict[str, Any], ...] = (
     {
         "id": "lookup-by-filename", "fixture": "ts-refs",
@@ -332,22 +371,38 @@ DEV_DATASET: tuple[dict[str, Any], ...] = (
     {
         "id": "write-tool-blocked-by-command-gate", "fixture": "plain",
         "direct": _case_command_gate,
+        "uses": ["run_command"],
         "note": "换个入口也不能绕过命令黑名单",
     },
     {
         "id": "read-sandbox-holds", "fixture": "plain",
         "direct": _case_read_file_escape,
+        "uses": ["read_file"],
         "note": "越界读取必须被拒且不回显内容",
     },
     {
         "id": "mcp-server-publishes-read-only-first", "fixture": "plain",
         "direct": _case_mcp_server_read_only,
+        "uses": ["mcp_server"],
         "note": "对外出口默认只读，写与执行要显式开",
     },
     {
         "id": "connector-injection-is-opt-in", "fixture": "plain",
         "direct": _case_mcp_inline_opt_in,
+        "uses": ["mcp_bridge"],
         "note": "没打标记的连接器连握手都不该发生",
+    },
+    {
+        "id": "proposal-artifacts-stay-outside-the-repo", "fixture": "proposal",
+        "direct": _case_propose_keeps_the_repo_clean,
+        "uses": ["dev_propose", "dev_git_diff"],
+        "note": "交付产物不能把仓库弄脏——多人同仓时这是事故",
+    },
+    {
+        "id": "ci-status-never-invents-a-green", "fixture": "plain",
+        "direct": _case_ci_never_invents_status,
+        "uses": ["dev_ci_status"],
+        "note": "读不到 CI 时必须明说，不能编一个通过状态出来",
     },
 )
 

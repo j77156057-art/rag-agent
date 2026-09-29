@@ -1,8 +1,8 @@
 {
  "schema_version": 1,
- "total": 14,
- "scored": 14,
- "passed": 14,
+ "total": 16,
+ "scored": 16,
+ "passed": 16,
  "skipped": [],
  "results": [
   {
@@ -85,6 +85,18 @@
   },
   {
    "id": "connector-injection-is-opt-in",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "proposal-artifacts-stay-outside-the-repo",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "ci-status-never-invents-a-green",
    "passed": true,
    "skipped": "",
    "failed_checks": []

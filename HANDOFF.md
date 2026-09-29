@@ -1,5 +1,17 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-30 Vibecoding 能力补全 Wave12：`dev_propose` + `dev_ci_status`（本会话，不占 R 槽位）
+
+- **补什么**：交付的后半环。命令黑名单拦住了 `git commit/push`（提交与推送是人的决定，这没改），但代价是 Agent 只能口头描述「我改了什么、CI 怎么样了」。现在有了两份能交给别人看的东西。
+- **产物**：`agent_runtime/proposal.py`（工具 `dev_propose`）、`agent_runtime/ci_status.py`（工具 `dev_ci_status`）、`tools.py` 两个实现 + TOOLS 注册、`agent.py` 两行提示、`tests/test_dev_propose_ci.py` **28 项**，并给 Wave11 门禁**加了 2 道题**（题集 14→16）。
+- **`dev_propose` 的三条硬约束**：① 只跑只读 git（`rev-parse/status/diff`，复用 `code_intel._run_git` 的白名单与有界执行），绝不 add/commit/push；② 产物只写进**项目状态目录**（`project_state.path(root, "proposals/...")`），**绝不写进仓库工作树**——多人同仓时把临时文件丢进工作树就是给别人埋雷，用例用 `dev_git_diff` 自己当探针断言打包前后仓库状态一模一样；③ 未跟踪文件【不伪装成补丁】，只在草稿里列成清单并写明「不在补丁里，需确认后再入库」。
+- **产物真的能用**：`test_generated_patch_replays_byte_identical` 把生成的补丁喂回 `patch_apply.apply_patch`，打到同一基线的镜像目录上，逐文件比对**字节一致**——不是生成一份好看但没人能用的文本。
+- **`dev_ci_status` 的诚实边界**：只读 GET，绝不触发/重跑 workflow；没 token / 401 / 403 / 404 / 连不上分别回不同原因，且断言里明确禁止出现「通过」字样。**这个沙箱出不去 github（`git push` 实测 443 被拒），所以判定逻辑全部用可注入 transport 覆盖**（假传 200/401/404/500/ConnectionError + 日志解析），真联调要等用户机器；这一点不算做完，写在这里。
+- **顺手修的两个真缺陷**：① `repo_slug`/`current_head` 原来只当 `.git` 是目录——worktree 的 `.git` 是**文件**（`gitdir:` 指针），而 remote 定义在**共享 config**（`commondir`）里，照原样读会让 Wave2 的 lane worktree 直接查不到仓库归属；现在按 gitdir→commondir 正确解析，用例覆盖（`git worktree add` 建真 worktree 验证）。② 查询串拼接会重复塞 `per_page`。
+- **门禁自己咬了我一口**：加了 2 道题没刷基线，`test_shipped_baseline_matches_the_dataset` 立刻以 `new_cases` 报红——这正是 Wave11 那条设计的用途（防止题集与基线悄悄分叉）。刷完基线后 15/15 绿，`python -m agent_runtime.dev_eval` → **16/16 通过**。
+- **验证**：Wave12 用例 28 passed；`tests/test_dev_eval.py` 15 passed；门禁 16/16；全量 pytest 见下方补记。
+- **未做**：不建 PR、不推分支、不重跑 workflow（都是有意的，但意味着「一键交付」还差最后一步，那一步归人）；`dev_propose` 不产 `git format-patch` 式的多提交系列，也没把未跟踪文件内容嵌进补丁；`dev_ci_status` 只读 runs/jobs/日志，不做队列等待或轮询（要等 CI 得自己再调一次）；真网络路径未验证。
+
 ## 2026-09-30 Vibecoding 能力补全 Wave11：dev lane 能力评测 + 基线 + CI 门（本会话，不占 R 槽位）
 
 - **补什么**：评测只有检索（retrieval_eval）与工作流（workflow_eval）两套，代码任务一条都没有——前九波加的那些工具（`dev_glob`/`dev_git_log`/`dev_find_references`/`dev_diagnostics`/`dev_patch`/`dev_lanes`/`dev_serve`/MCP server/内联投影）**到底可不可用、护栏还在不在**，此前只能靠感觉。本波把它变成会红的门。
