@@ -288,6 +288,8 @@ let liveAudioNode: AudioWorkletNode | null = null
 const liveAudioSources = new Set<AudioBufferSourceNode>()
 let liveAudioNextAt = 0
 let liveAudioSequence = 0
+let liveNativeAudioReady = false
+let liveStreamReadyForVideo = false
 let liveVoiceGate = createVoiceGate()
 let liveChunkPump = createChunkPump()
 
@@ -296,14 +298,23 @@ function getLiveAudioContext(): AudioContext | null {
   try { liveAudioContext = new AudioContext() } catch { return null }
   return liveAudioContext
 }
-function sendLiveAudioChunk(payload: Uint8Array) {
+function sendLiveAudioChunk(payload: Uint8Array): boolean {
   const socket = liveStreamSocket
-  if (!socket || socket.readyState !== WebSocket.OPEN || socket.bufferedAmount > 500_000) return
+  if (!socket || socket.readyState !== WebSocket.OPEN || socket.bufferedAmount > 500_000) return false
   liveAudioSequence += 1
   try {
     socket.send(encodeAudioPacket({ version: REALTIME_PROTOCOL_VERSION,
       sequence: liveAudioSequence, capturedAt: Date.now(), payload }))
-  } catch { /* 断线由重连路径接管 */ }
+    return true
+  } catch { /* 断线由重连路径接管 */ return false }
+}
+function sendNativeAudioReady(): boolean {
+  if (liveNativeAudioReady) return true
+  // DashScope Omni rejects input_image_buffer.append until it has seen an
+  // audio append. Send one 100ms PCM16 silence block before releasing video.
+  const sent = sendLiveAudioChunk(new Uint8Array(3_200))
+  if (sent) liveNativeAudioReady = true
+  return sent
 }
 function handleLiveAudioFrame(frame: Float32Array) {
   const context = liveAudioContext
@@ -364,7 +375,6 @@ registerProcessor('live-mic-tap', LiveMicTap)`
     context.createMediaStreamSource(liveAudioStream).connect(liveAudioNode)
     liveVoiceGate = createVoiceGate()
     liveChunkPump = createChunkPump()
-    liveAudioSequence = 0
     liveMicActive.value = true
     liveMicStatus.value = '语音已连接：说完会自动补静音尾收句，AI 说话时可直接抢话。'
   } catch (cause) {
@@ -1060,6 +1070,8 @@ function stopLiveVision(message = '') {
   liveStreamConnected.value = false
   liveStreamReconnectScheduled.value = false
   liveStreamRecovering.value = false
+  liveNativeAudioReady = false
+  liveStreamReadyForVideo = false
   liveLedger.clear()
   liveAdaptive.reset()
   liveStreamLastObservationAt = 0
@@ -1136,6 +1148,7 @@ function scheduleLiveStreamFrame(ticket: number, delay = liveAdaptive.plan().int
 }
 async function sendLiveStreamFrame(ticket: number) {
   if (!liveVisionActive.value || liveVisionPaused.value || ticket !== liveVisionGeneration) return
+  if (!liveStreamReadyForVideo) { scheduleLiveStreamFrame(ticket, 100); return }
   if (document.hidden) { scheduleLiveStreamFrame(ticket, 1000); return }
   const projectId = getProjectId(), focusRevision = liveVisionFocusRevision
   try {
@@ -1198,7 +1211,16 @@ function receiveLiveStreamObservation(raw: string, ticket: number, projectId: st
       && event.degraded_to !== 'sampled-frames') {
       liveVisionLimitations.value = [...liveVisionLimitations.value, `原生通道未起：已回退到 ${event.degraded_to}。`]
     }
+    if (mode === 'native-realtime') {
+      liveStreamReadyForVideo = sendNativeAudioReady()
+      if (!liveStreamReadyForVideo) {
+        liveVisionStatus.value = '实时模型需要先建立音频通道，正在等待音频就绪。'
+      }
+    } else {
+      liveStreamReadyForVideo = true
+    }
     if (recovered) liveVisionStatus.value = '实时视频连接已恢复，继续实时对话。'
+    scheduleLiveStreamFrame(ticket, 0)
     refreshLiveVisionPhase()
     return
   }
@@ -1297,6 +1319,9 @@ function startLiveStream(ticket: number, retry = 0) {
   const reconnecting = retry > 0 || liveStreamRecovering.value
   liveStreamSocket = socket
   liveStreamSequence = 0
+  liveAudioSequence = 0
+  liveNativeAudioReady = false
+  liveStreamReadyForVideo = false
   liveStreamFrames.clear()
   socket.onopen = () => {
     if (ticket !== liveVisionGeneration || projectId !== getProjectId()) { socket.close(); return }

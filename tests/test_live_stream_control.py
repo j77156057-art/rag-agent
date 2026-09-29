@@ -210,4 +210,6 @@ def test_cockpit_wiring_uses_the_control_module():
         "原生语音回复必须接播放管线"
     assert "resolveLiveModelAudioFormat" in source and "格式无法识别" in source, \
         "model.audio 必须按 wire 格式解码，未知编码不得静默播放"
+    assert "sendNativeAudioReady" in source and "liveStreamReadyForVideo" in source, \
+        "native provider 要求先有音频：视频发送必须等待音频就绪闸门"
     assert "1280 / video.videoWidth, 720" not in source, "固定 1280/720 采集应已被自适应档位取代"
