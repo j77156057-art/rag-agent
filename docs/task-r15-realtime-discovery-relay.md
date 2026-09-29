@@ -1,10 +1,42 @@
 # 任务表 · R15：实时模型「发现」回流（C）
 
-> 状态：**待调研 · 未认领**。发出人 AI-F，2026-09-30。用户确认「C 也可以做，只是需要调研」，
+> 状态：**R15-0 已决定 · R15-1/R15-2 已实现 · R15-3 契约回归已覆盖**。发出人 AI-F，2026-09-30。用户确认「C 也可以做，只是需要调研」，
 > 并要求发出任务表由多个 AI 分工。
 >
-> **红线：R15-0 未定之前不要动手实现。** 如果 R15-0 选择「新增事件类型」，需要用户改派 R0
-> 独占的协议文件，或由 /root 执行。
+> **红线（已解除）：R15-0 未定之前不要动手实现。** R15-0 已选「新增事件类型」，协议文件由 `/root`
+> 执行修改，随后 R15-1/R15-2/R15-3 均已实现（见下方验证记录）。
+
+## 验证记录（AI-F 独立复跑，2026-09-30）
+
+**结论：实现与 R15-0 的决定一致，原生主链路未受影响。** 复跑证据：
+
+- `pytest tests/test_realtime_gateway_bridge.py tests/test_realtime_protocol_contract.py tests/test_realtime_provider.py tests/test_realtime_resource_security.py` → **127 passed**。
+- 前端 `npx vue-tsc --noEmit` **无输出（干净）**；`npm run build` 通过，新代码确实进包（字符串字面量不受 minify 影响）：`实时模型提醒` / `model.observation` / `实时模型自述，尚未核实` 各命中 1 处 —— **刷新浏览器即可见**。
+- **安全边界复核（R15-0 决定 ① 里点名的雷）**：前端把 `model.observation` 放在**独立分支**处理
+  （在 `receiveLiveStreamObservation` 中位于 `video.observation` 处理之前、并直接 `return`），
+  所以它**永远不会**走到那条「`ok:false` / `audit=unavailable|error` → `socket.close()`」分支 ——
+  这是设计使然，不是巧合。
+- **网关侧复核**：回流事件由 `SessionBridge.next_events` 构造，`session_id` 用网关自己的
+  （不过 `_normalize_session_id`、也不带适配器会话号）；`text` 截 300 字；相似度 0.82 / 45s 去重；
+  2s 节流；`EVENT_DONE` 分支额外补一次 flush（应对适配器只发 `done`、不复述全文的情况）。
+- **仍未提交**：R15 全部改动（协议、`realtime_bridge.py`、`AutonomousCockpit.vue`、两个测试文件）在
+  工作区里都还是未提交状态，提交切分由作者/集成方决定。
+
+**一条调优提醒（给 R15-3）**：触发要求前缀出现在**助手轮次的最开头**，因此模型若说「好的。【疑似异常】…」
+这类会**漏报**。量命中率时请把这一档算进去；若要提高召回，可放宽到「轮次内首次出现」，代价是误报面变大。
+
+## R15-0 决定记录（2026-09-30）
+
+1. **载体：新增 `model.observation` 服务端事件。** 事件含 `source: "realtime-model"`、
+   `verified: false`、`text`、`captured_at`，并同步更新 Python 与 TypeScript 封闭词汇表。
+   这项协议改动由 `/root` 执行。它与 `video.observation` 完全分开，因此抽帧链路中
+   `ok:false` / `audit=unavailable|error` 的关闭分支不会处理或关闭会话。
+2. **触发：固定前缀 `【疑似异常】`。** 只接受助手轮次开头的此前缀；普通文本和用户转写不回流。
+   等模型轮次结束后再产生提醒，避免暴露半句。
+3. **消费方：只进面板提醒。** 作为“实时模型提醒 · 未核实”与抽帧告警视觉区分，提供
+   “交给 AI 排查”和忽略入口。它不进入主 Agent 时间线，也不自动启动 Agent。
+4. **网关界限：** 回流文字最多 300 字；相似度不低于 0.82 且 45 秒内去重；两秒节流。
+   这些规则限制重复和无界文本，不代表对模型自述的事实核验。
 
 ## 0. 为什么做这件事（先看这段再决定值不值得接）
 
