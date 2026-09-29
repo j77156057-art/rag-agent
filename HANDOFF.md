@@ -1,5 +1,18 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 CI 盲区修复：pytest 风格测试首次进闸门（本会话，不占 R 槽位）
+
+- **问题（实测，不是推测）**：`harness.yml` 的 `Run full test suite` 用 `python -m unittest discover -s tests`，而 unittest 只收 `TestCase` 子类，**模块级 `def test_*` 一律不收**。用 `.venv` 对本仓库实测收集：**1835 项 / 145 个文件，另有 22 个测试文件对 CI 贡献 0 项**——正好是实时/语音这条 lane：`test_realtime_*`(10)、`test_live_audio_control`、`test_live_stream_control`、`test_live_vision`、`test_live_vision_alerts`、`test_visual_feedback`、`test_visual_targeting`、`test_mcp_discovery`、`test_mcp_curated_index`、`test_capability_lease`、`test_react_token_filter`、`test_adapter_catalog`、`test_project_checkpoint_selective`。也就是说 R0–R14 的 **296 项断言此前从未进过 CI**。
+- **另一半原因**：`requirements.txt` 里没有 pytest（只有本机 `.venv` 装了 9.1.1）；`tests/conftest.py` 的 autouse 环境隔离是 pytest-only，在 unittest 步骤里等于死代码——那份「防 600s 卡死」的保护只作用于开发机。
+- **改法（两处，纯增量）**：① `requirements.txt` 加 `pytest>=9.1,<10`；② `harness.yml` 在 `Run full test suite` **之前**新增 `Run pytest-style lane`（仅 sqlite job）：用 AST 现场扫 `tests/test_*.py` 中含模块级 `def test_*` 的文件交给 pytest，并用 `test -n "$files"` 保证扫描为空时响亮失败。**不写死文件列表** → 以后任何 lane 新写 pytest 风格测试会自动进闸门，避免重演「表上 0% 而树里已实现」式的静默失明。原 unittest 步骤原样保留，不一次性把平台差异问题全翻出来。
+- **验证**：
+  - `python -c "import yaml; yaml.safe_load(open('.github/workflows/harness.yml',encoding='utf-8'))"` → 18 步解析通过；把该步 `run` 脚本原样抽出来在 bash 跑，heredoc 在 YAML 块标量里反缩进正确。
+  - AST 扫描得到 **22 个文件**，与「unittest 收集 0 项」的实测集合**完全一致**（两条独立路径互证）。
+  - 这 22 个文件跑 pytest = **296 passed**。
+  - 过程中一次引号写坏导致 pytest 收到空参数，意外完成**全量 pytest 复跑：2129 passed / 6 skipped / 60 subtests，249s 全绿**。要不要把 CI 整条切成 pytest 由用户定（Linux 平台差异未验证，本轮不越权）。
+- **已知坑（本机专属，不影响 CI）**：这台 Windows 的用户名含 `'`，pytest 默认 basetemp `D:\Temp\pytest-of-h'h'h` 直接 `PermissionError [WinError 5]`，表现为 23 errors + 1 failed。本机跑 pytest 必须带项目内 `--basetemp`。ubuntu runner 无此问题，故 CI 步骤里**不**写 `--basetemp`。
+- **未完成 / 边界**：① 本会话无 push 能力（沙箱代理断 github），改动只在本地，要等用户 push 才真正跑到 CI；② postgres job 不跑该 lane（与现有测试步骤分布一致）；③ 未装 pytest-timeout，将来若有挂死测试靠 Actions 作业超时兜底；④ 未动 `agent_runtime/realtime_omni.py`、`AutonomousCockpit.vue`、`tests/test_realtime_provider.py`、`tests/test_realtime_gateway_bridge.py`、`tests/test_live_stream_control.py`——音频先行闸门那条线正被别的 lane 在改。
+
 ## 2026-09-29 音频就绪闸门：真机对照验证（AI-D，只读，未改任何代码）
 
 - 对象：`realtime_omni.py` 里那套 provider 侧闸门（`_audio_primed` + `send_frame` 首帧引导，作者仍在工作树里 WIP）、以及 `8cefac0` 的前端闸门。**我没有改动这两个文件**，只做真机验证给作者引用。

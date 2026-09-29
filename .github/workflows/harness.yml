@@ -102,6 +102,23 @@ jobs:
             sleep 2
           done
           exit 1
+      - name: Run pytest-style lane
+        if: matrix.backend == 'sqlite'
+        # unittest collects TestCase classes only, so files whose tests are
+        # module-level `def test_*` functions never reach the step below.
+        run: |
+          files=$(python - <<'PY'
+          import ast, pathlib
+          paths = []
+          for p in sorted(pathlib.Path("tests").glob("test_*.py")):
+              tree = ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
+              if any(isinstance(n, ast.FunctionDef) and n.name.startswith("test_") for n in tree.body):
+                  paths.append(p.as_posix())
+          print(" ".join(paths))
+          PY
+          )
+          test -n "$files"
+          python -m pytest $files -q -p no:cacheprovider
       - name: Run full test suite
         if: matrix.backend == 'sqlite'
         env:

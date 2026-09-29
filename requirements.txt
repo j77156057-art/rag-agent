@@ -27,3 +27,6 @@ langgraph-checkpoint-sqlite>=3.0,<4
 # Optional production checkpoint backend; SQLite remains the local fallback.
 langgraph-checkpoint-postgres>=2.0,<4
 psycopg[binary,pool]>=3.2,<4
+# Test runner. The CI `unittest discover` step cannot collect module-level
+# `def test_*` functions, so a pytest lane runs the files that stay invisible.
+pytest>=9.1,<10
