@@ -1,5 +1,15 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 提交状态与「HEAD 未闭合」提醒（AI-A/AI-B，交 /root 收口）
+
+- 本会话交付已全部进 `main`（**未 push**）：`e654a21` 网关压力测试、`875087b` `liveStreamControl.ts`+`test_live_stream_control.py`、`075e7e6` R0 协议、`fdb9e94` 我的 cockpit R1/R6 接线 + 本节。前端自治切片用 pathspec 局部提交，未碰他人正在集成的模块，也未动共享 index 里 /root 的暂存。
+- **⚠ HEAD 当前不是自洽可测的**，请 /root 在收口批次里补上这些仍未提交的依赖：
+  - **后端网关**：`api.py@HEAD` **没有** `/api/vision/live-stream` 路由（`realtime_protocol` 也未 import）。但已入库的 `tests/test_realtime_gateway_stress.py` 会连这个端点——**干净 checkout 上它现在会红**（连不上路由 / close 码断言失败）。`api.py` 里的 R3 网关 + `realtime_protocol.py` import 需随本文件一起提交才闭合。
+  - **前端叶子模块（仍 `??` 未跟踪）**：`liveVisionSampling.ts`、`liveVisionFocus.ts`、`liveVisionAlerts.ts`、`voiceVisionSync.ts`、`visualActionLoop.ts`、`components/CockpitModelBar.vue`。`AutonomousCockpit.vue@HEAD` 已 `import` 它们，缺任一前端 `typecheck`/构建即失败。
+  - **前端 .mjs 单测（仍 `??`）**：`frontend/tests/liveVision*|voiceVisionSync|visualActionLoop.test.mjs`（用 `node --test` + 原生类型剥离跑对应 `.ts` 叶子模块，独立于 api.py，可安全先行入库）。
+- 建议收口顺序：①`api.py` 网关 + 上述前端模块随 R3/R2 各自槽位提交；②提交后在干净 worktree 跑 `pytest tests/test_realtime_gateway_stress.py`（应转绿）与 `frontend` 下 `node --test frontend/tests`、`npm run typecheck && npm run build` 三件套验收。
+- 我不擅自补提这些他人槽位文件（会构成混合提交、抢占 /root 正在组装的批次），仅留此清单。
+
 ## 2026-09-29 R1+R6：前端自适应发送与实时状态 UI（AI-B，由 AI-A 兼任）【已交付本轮】
 
 - 领取任务表 **AI-B**（R1 前端视频采集与自适应发送 + R6 实时开发舱 UI）。边界遵守：只改 `AutonomousCockpit.vue` 与新增媒体模块，**未触碰** `realtimeProtocol.ts`、`agent_runtime/realtime_protocol.py`、`api.py` 网关；`stopLiveVision` 里既有的 `session.close` 裸包写法属 /root 的协议接线，保持原样未动。
