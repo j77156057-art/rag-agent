@@ -1,5 +1,22 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 R12 provider 侧联验（AI-D：范围声明 + 一项根因，勿与 AI-G 重复）
+
+- **范围声明**：R12 在任务表里归属 AI-G（真实设备采集 + 驾驶舱体验调优）。本轮只交付 **R4 provider 侧**证据，未做摄像头/麦克风/屏幕共享采集，未改驾驶舱 UI。AI-G 接手时不必重做 provider 联验，请直接从设备侧接。
+- 产出：`verify_realtime_acceptance.py` → `docs/realtime-r12-acceptance-20260929.md`。真 Key + 真模型 `qwen3.8-omni-flash-realtime`（音色 `Jennifer`）。五项指标：首响应 3171 ms（含 3 s 推流与 VAD 等待）、模型延迟 223 ms、持续响应 3/3 轮、打断后新增 0 条、断线重连成功、错误率 0.0%（0/75）。
+- **根因（R3 网关与 R12 设备侧都得遵守）**：语音结束后**必须继续推约 1 秒静音**。服务端 VAD 靠尾部静音收句；在最后一片采样仍响亮时掐断流，turn 就一直不闭合，服务端约 8.5 s 后回收会话——现象是「转写完整（8–19 条 transcript）却零回复 + `stream_broken`」。对照实验（同片段、全新会话）：不补静音 0/2 成功，补 1.0 s 静音 2/2 成功。此前 turn-3 的失败曾被我记成「与音频内容相关」，真因是片段尾部能量高被硬截断，**不是模型不稳定、也不是账号问题**。
+- **`commit()` 不能当这个坑的兜底**：VAD 已收句后提交空 buffer 会回 `vendor_error`；`commit()` 只用于客户端 VAD 模式。
+- 同步修复：`verify_realtime_live.py` 也补了静音尾（`--tail`，默认 1.0 s），`agent_runtime/realtime_omni.py` docstring 记录该契约。
+- 给网关的三条硬要求（报告末尾同款）：① 停止说话 ≠ 停止推流；② `stream_broken` 不得当致命错误上抛，要内建重连重发；③ 成功判定看 `done`，有 `transcript` 无 `done` 视为失败。
+- 测试：`tests/test_realtime_provider.py` 31 项全绿。
+
+## 2026-09-29 R9 收口：实时资源/韧性/隔离只读审计（AI-A/AI-B，已完成·勿重复）
+
+- **审计范围**：只读测试 `tests/test_realtime_resource_security.py`，不修改 P0/P1 的 enterprise_sandbox、process_runner、命令预算或确认门实现。
+- **覆盖证据**：provider `close()` 外抛仍释放时间线和会话指标；超限音频在入口拒绝且不转发；原生 provider 拒收帧时回落抽帧槽；项目 B 状态不泄漏项目 A 时间线；`interrupt()` 外抛时 `cancel.ok` 仍先返回且会话存活。
+- **验证**：`tests/test_realtime_resource_security.py` **5 passed**；与 R9 守卫实现和 bridge 回归边界一致。
+- **重复防护**：任务表已把 R9 标记为“审计完成·勿重复”。后续只在 R12 真实设备或资源压测发现具体缺陷时追加证据，不重复实现权限/沙箱逻辑。
+
 ## 2026-09-29 R9 审计：实时链路资源/韧性/隔离测试（AI-A/AI-B 兼任）【局部提交】
 
 - 领取 R9 的只读测试部分（用户确认）。**只新增 `tests/test_realtime_resource_security.py`（5 项）**，与 AI-F 的 `test_realtime_gateway_bridge.py` 互补不重复，未改任何实现。
