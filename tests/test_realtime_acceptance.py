@@ -72,3 +72,22 @@ def test_stream_broken_is_retried_without_being_counted_as_fatal(monkeypatch):
     assert provider.started == 1
     assert calls == ["replayed"]
     assert turn.retried is True
+
+
+def test_retry_clears_stale_done_before_replay(monkeypatch):
+    class Provider:
+        def close(self):
+            pass
+
+        def start(self):
+            return True
+
+    provider = Provider()
+    turn = acceptance.Turn(label="stale-done", saw_done=True, text_deltas=0)
+    monkeypatch.setattr(acceptance.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(acceptance, "_wait_ready", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(acceptance, "_stream", lambda *_args, **_kwargs: None)
+
+    assert acceptance._retry_turn(provider, b"pcm", 1.0, turn, {"reconnects": 0}, 1.0) is False
+    assert turn.saw_done is False
+    assert acceptance.turn_needs_retry(turn) is True

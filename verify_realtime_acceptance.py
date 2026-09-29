@@ -232,6 +232,18 @@ def _retry_turn(provider: OmniRealtimeProvider, pcm: bytes, span: float,
     time.sleep(0.5)
     if not provider.start() or not _wait_ready(provider):
         return False
+    # Completion belongs to an individual attempt.  A provider can emit a
+    # terminal marker without any assistant payload before the socket breaks;
+    # retaining that marker would let a replay with payload but no fresh ``done``
+    # pass the success gate.  Keep the error history for the report, but reset
+    # all turn evidence that must be produced by this replay.
+    turn.saw_done = False
+    turn.transcript = ""
+    turn.text_deltas = 0
+    turn.audio_deltas = 0
+    turn.speech_stopped_ms = 0
+    turn.speak_ms = 0
+    turn.tail_ms = 0
     # Replay the utterance and its VAD-closing silence tail. A transcript
     # without done is deliberately replayed: audio arrival is not completion.
     _stream(provider, pcm, span, turn, tail=tail)
