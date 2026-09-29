@@ -1,5 +1,13 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 R12 真实设备联验（AI-G / 当前设备侧核对）
+
+- **判定：设备侧未通过，不能伪造真机完成。** 本机 Codex In-app Browser 能打开工作台并进入 `godot_sample` 开发舱，但没有可供授权的独立摄像头/麦克风设备；“打开摄像头”和“共享屏幕给 AI”未取得可持续媒体流，无法验证真实采集、扬声器播放、连续多轮或抢话听感。
+- **原生握手证据**：本地 `uvicorn` + `prj-3da07fde89a5` 的 `/api/vision/live-stream` 收到 `hello.ok`，模式为 `native-realtime`，provider 为 `dashscope_omni`，能力含 `audio.in/video.in/text.out/audio.out/interrupt`。
+- **新增关键阻塞（需前端/网关 lane 认领）**：对真实 `dashscope_omni` 的合成媒体对照表明，先送视频帧再送音频会返回 `vendor_error: Error append image before append audio.`；先送 1 个音频块再送视频帧未复现该错误。当前 UI 可先开摄像头/屏幕共享、再点击“开麦对话”，因此生产路径可能踩中顺序限制。设备复验前应加入音频就绪闸门，或确认 provider 支持视频先行。
+- **报告**：`docs/realtime-r12-device-acceptance-20260929.md`，含浏览器状态、原生握手、媒体顺序回包和逐项设备状态；真实设备联验仍需在有摄像头/麦克风/扬声器的 Windows Edge/Chrome 上重跑。
+- **范围边界**：本节不修改、不重复实现 R12 provider 可靠性三条（静音尾、`stream_broken` 恢复、`done` 严格成功判定）；代码/离线证据见下方既有 R12 provider 节。
+
 ## 2026-09-29 R2 语音闭环前端（liveAudioControl + cockpit 麦克风/播放接线）【AI-A/AI-B，本轮局部提交】
 
 - **定位**：把豆包式"边说边聊"缺的语音上行/下行/自动抢话缝起来。纯数学与状态机全部放**新模块 `frontend/src/workbench/liveAudioControl.ts`**（零浏览器依赖，可脱离页面跑）；`AutonomousCockpit.vue` 只做 getUserMedia/AudioWorklet/AudioContext 接线。未动 `realtimeProtocol.ts`、网关、`voice_dialogue.py`。

@@ -30,7 +30,7 @@ _HARNESS = r"""
 import assert from 'node:assert';
 import { clampInt16, floatToInt16Le, resample, frameRms,
   createVoiceGate, createChunkPump, encodeAudioPacket,
-  TARGET_SAMPLE_RATE, CHUNK_MS } from './liveAudioControl.js';
+  resolveLiveModelAudioFormat, TARGET_SAMPLE_RATE, CHUNK_MS } from './liveAudioControl.js';
 
 // ---- 采集数学 ----------------------------------------------------------------
 assert.strictEqual(clampInt16(1), 32767);
@@ -38,6 +38,20 @@ assert.strictEqual(clampInt16(-1), -32767, '对称满量程映射（×32767）�
 assert.strictEqual(clampInt16(-2), -32768, '低于 -1 削底到 -32768');
 assert.strictEqual(clampInt16(2), 32767, '超出满量程必须削顶而不是溢出');
 assert.strictEqual(clampInt16(0), 0);
+
+// ---- model.audio wire 格式 --------------------------------------------------
+const omniAudio = resolveLiveModelAudioFormat('pcm24');
+assert.deepStrictEqual(omniAudio, { sampleRate: 24000, bitsPerSample: 16, source: 'wire_encoding' },
+  'DashScope pcm24 是 24kHz 的 PCM16，不是 24-bit 样本');
+const explicitAudio = resolveLiveModelAudioFormat('pcm24', '16000');
+assert.deepStrictEqual(explicitAudio, { sampleRate: 16000, bitsPerSample: 16, source: 'wire_sample_rate' },
+  '未来显式 sample_rate 应覆盖格式名');
+assert.strictEqual(resolveLiveModelAudioFormat('opus'), null,
+  '未知编码必须拒播，不能静默按 PCM 播放');
+assert.strictEqual(resolveLiveModelAudioFormat('pcm16'), null,
+  '只有 pcm16 没有采样率时不能把输入格式猜成输出格式');
+assert.strictEqual(resolveLiveModelAudioFormat(undefined), null,
+  '缺失编码必须拒播，避免采样率漂移');
 
 const bytes = floatToInt16Le(new Float32Array([1, -1, 0]));
 assert.deepStrictEqual([...bytes], [0xff, 0x7f, 0x01, 0x80, 0x00, 0x00],

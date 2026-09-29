@@ -23,7 +23,7 @@ import {
 import type { LivePhase, LiveCaptionTurn } from '../liveStreamControl'
 import {
   createChunkPump, createVoiceGate, encodeAudioPacket, frameRms, resample,
-  OUTPUT_SAMPLE_RATE, TARGET_SAMPLE_RATE,
+  resolveLiveModelAudioFormat, TARGET_SAMPLE_RATE,
 } from '../liveAudioControl'
 import { REALTIME_PROTOCOL_VERSION } from '../realtimeProtocol'
 import CockpitApprovalQueue from './CockpitApprovalQueue.vue'
@@ -139,6 +139,9 @@ const liveVisionModeLabel = ref('兼容抽帧')
 const liveVisionModeReason = ref('当前按最新视频帧进行视觉理解。')
 const liveVisionLimitations = ref<string[]>([])
 const liveStreamCaptions = ref<LiveCaptionTurn[]>([])
+// 转写增量和最终事件属于同一个用户回合；单独保存草稿，避免每个 delta
+// 都变成一条“你说”，也避免重连/多轮时把上一回合重复拼进来。
+const liveTranscriptDraft = ref('')
 const liveStreamCapabilities = ref('')
 const liveVisionObservation = ref('')
 const liveVisionTimeline = ref<TimedObservation[]>([])
@@ -156,6 +159,7 @@ let liveLedger = createInFlightLedger()
 let liveStreamLastObservationAt = 0
 const liveStreamConnected = ref(false)
 const liveStreamReconnectScheduled = ref(false)
+const liveStreamRecovering = ref(false)
 const liveVisionPhase = ref<LivePhase>('idle')
 const liveVisionMetrics = ref<{ latencyMs: number | null; intervalMs: number; dropped: number }>(
   { latencyMs: null, intervalMs: 500, dropped: 0 })
@@ -177,6 +181,66 @@ function refreshLiveVisionMetrics(latencyMs: number | null = null) {
     intervalMs: liveAdaptive.plan().intervalMs,
     dropped: liveVisionMetrics.value.dropped,
   }
+}
+function closeOpenLiveCaption() {
+  const current = liveStreamCaptions.value
+  const last = current[current.length - 1]
+  if (!last || last.role !== 'assistant' || last.done) return
+  liveStreamCaptions.value = [...current.slice(0, -1), { ...last, done: true }]
+}
+function resolveLiveStreamRecovery() {
+  if (!liveStreamRecovering.value) return
+  liveStreamRecovering.value = false
+  liveStreamReconnectScheduled.value = false
+  liveVisionStatus.value = '实时模型连接已恢复，继续实时对话。'
+  refreshLiveVisionPhase()
+}
+function mergeLiveTranscript(previous: string, next: string): string {
+  if (!previous) return next
+  if (!next) return previous
+  // 厂商有时重复发送“当前完整前缀”，有时只发送新增尾巴；两种形态都归并。
+  if (next.startsWith(previous)) return next
+  if (previous.startsWith(next)) return previous
+  return `${previous}${next}`
+}
+function appendLiveCaption(event: ReturnType<typeof parseRealtimeServerEvent>) {
+  if (!event) return
+  if (event.type !== 'audio.transcript') {
+    // 如果服务端因抢话/重连跳过了 transcript.final，模型已经开始回答时结束
+    // 旧的用户草稿，避免下一轮 final 把上一句再次拼进去。
+    if (event.type === 'model.delta' && liveTranscriptDraft.value) liveTranscriptDraft.value = ''
+    const next = appendCaptionTurn(liveStreamCaptions.value, event)
+    if (next !== liveStreamCaptions.value) liveStreamCaptions.value = next
+    return
+  }
+  const text = typeof event.text === 'string' ? event.text.trim() : ''
+  const final = event.final === true
+  if (!final) {
+    const hadDraft = !!liveTranscriptDraft.value
+    const merged = mergeLiveTranscript(liveTranscriptDraft.value, text)
+    if (!merged) return
+    liveTranscriptDraft.value = merged
+    const current = liveStreamCaptions.value
+    const last = current[current.length - 1]
+    const updated: LiveCaptionTurn[] = hadDraft && last?.role === 'user'
+      ? [...current.slice(0, -1), { ...last, text: merged, done: true }]
+      : [...current, { role: 'user', text: merged, done: true }]
+    liveStreamCaptions.value = updated.slice(-8)
+    return
+  }
+  const finalText = text || liveTranscriptDraft.value
+  const hadDraft = !!liveTranscriptDraft.value
+  liveTranscriptDraft.value = ''
+  if (!finalText) return
+  const current = liveStreamCaptions.value
+  const last = current[current.length - 1]
+  if (hadDraft && last?.role === 'user') {
+    liveStreamCaptions.value = [...current.slice(0, -1), { ...last, text: finalText, done: true }]
+    return
+  }
+  // 某些适配器只发 final；同一事件重放时不得重复一条字幕。
+  if (last?.role === 'user' && last.text === finalText) return
+  liveStreamCaptions.value = [...current, { role: 'user', text: finalText, done: true } as LiveCaptionTurn].slice(-8)
 }
 async function refreshLiveVisionMode() {
   try {
@@ -204,6 +268,7 @@ function interruptLiveStream(reason = '用户在开发舱打断') {
   if (!socket || socket.readyState !== WebSocket.OPEN) return
   try { socket.send(JSON.stringify(realtimeCancel(reason))) } catch { return }
   stopAiPlayback()
+  closeOpenLiveCaption()
   liveLedger.clear()
   liveStreamFrames.clear()
   liveVisionPhase.value = 'viewing'
@@ -246,6 +311,7 @@ function handleLiveAudioFrame(frame: Float32Array) {
   const signal = liveVoiceGate.feed(frameRms(frame), Date.now(), liveAiSpeaking.value)
   if (signal.bargeIn) {
     stopAiPlayback()
+    closeOpenLiveCaption()
     const socket = liveStreamSocket
     if (socket && socket.readyState === WebSocket.OPEN) {
       try { socket.send(JSON.stringify(realtimeCancel('用户抢话'))) } catch { /* 忽略 */ }
@@ -317,19 +383,31 @@ async function stopLiveMic(message = '麦克风已关闭。') {
   stopAiPlayback()
   if (message) liveMicStatus.value = message
 }
-function playLiveModelAudio(raw: { audio?: unknown; encoding?: unknown }) {
+function playLiveModelAudio(raw: { audio?: unknown; encoding?: unknown; sample_rate?: unknown; sampleRate?: unknown }) {
   if (typeof raw.audio !== 'string' || !raw.audio) return
   const context = getLiveAudioContext()
   if (!context) return
   try {
+    // DashScope's `pcm24` means 16-bit PCM at 24 kHz.  Prefer an explicit
+    // sample_rate if a future provider supplies one; reject unknown metadata
+    // instead of playing bytes at the wrong speed and masking a protocol drift.
+    const format = resolveLiveModelAudioFormat(raw.encoding, raw.sample_rate ?? raw.sampleRate)
+    if (!format) {
+      liveMicStatus.value = `模型音频格式无法识别（encoding=${String(raw.encoding ?? '缺失')}），已跳过播放。`
+      return
+    }
     const binary = atob(raw.audio)
     const bytes = new Uint8Array(binary.length)
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+    if (bytes.byteLength % (format.bitsPerSample / 8) !== 0) {
+      liveMicStatus.value = '模型音频长度不是完整 PCM16 样本，已跳过播放。'
+      return
+    }
     const samples = new Float32Array(bytes.length / 2)
     const view = new DataView(bytes.buffer)
     for (let i = 0; i < samples.length; i++) samples[i] = view.getInt16(i * 2, true) / 32767
     if (!samples.length) return
-    const buffer = context.createBuffer(1, samples.length, OUTPUT_SAMPLE_RATE)
+    const buffer = context.createBuffer(1, samples.length, format.sampleRate)
     buffer.copyToChannel(samples, 0)
     const source = context.createBufferSource()
     source.buffer = buffer
@@ -981,10 +1059,12 @@ function stopLiveVision(message = '') {
   }
   liveStreamConnected.value = false
   liveStreamReconnectScheduled.value = false
+  liveStreamRecovering.value = false
   liveLedger.clear()
   liveAdaptive.reset()
   liveStreamLastObservationAt = 0
   liveStreamCaptions.value = []
+  liveTranscriptDraft.value = ''
   liveStreamCapabilities.value = ''
   liveVisionMetrics.value = { latencyMs: null, intervalMs: 500, dropped: 0 }
   liveVisionPhase.value = 'idle'
@@ -1100,6 +1180,9 @@ function receiveLiveStreamObservation(raw: string, ticket: number, projectId: st
   const event = parseRealtimeServerEvent(raw)
   if (!event) return
   if (event.type === 'hello.ok') {
+    const recovered = liveStreamRecovering.value
+    liveStreamRecovering.value = false
+    liveStreamReconnectScheduled.value = false
     const mode = event.mode === 'native-realtime' || event.mode === 'sampled-frames'
       ? event.mode : 'sampled-frames'
     liveVisionMode.value = mode
@@ -1108,25 +1191,27 @@ function receiveLiveStreamObservation(raw: string, ticket: number, projectId: st
       ? event.reason : mode === 'native-realtime'
         ? '当前会话使用原生实时模型。' : '当前会话按最新视频帧理解。'
     liveStreamCapabilities.value = describeLiveCapabilities(event.provider_capabilities)
-    liveStreamCaptions.value = []
     liveVisionLimitations.value = mode === 'native-realtime'
-      ? ['模型连接失败时会自动降级为兼容抽帧模式。', '语音回复按 pcm16 / 24kHz 播放；若真机有噪声需按服务端实际格式校正（liveAudioControl 单点常量）。']
+      ? ['模型连接失败时会自动降级为兼容抽帧模式。', '当前 Omni 语音按 wire 的 pcm24（16-bit / 24kHz）播放；未知音频格式会跳过并提示。']
       : ['当前只处理最新视频帧，不提供原生音频流回复。', '理解结果可能晚于正在播放的画面。']
     if (mode === 'sampled-frames' && typeof event.degraded_to === 'string' && event.degraded_to
       && event.degraded_to !== 'sampled-frames') {
       liveVisionLimitations.value = [...liveVisionLimitations.value, `原生通道未起：已回退到 ${event.degraded_to}。`]
     }
+    if (recovered) liveVisionStatus.value = '实时视频连接已恢复，继续实时对话。'
+    refreshLiveVisionPhase()
     return
   }
   if (event.type === 'model.audio') {
+    resolveLiveStreamRecovery()
     liveStreamLastObservationAt = Date.now()
     refreshLiveVisionPhase()
     playLiveModelAudio(event as typeof event & { audio?: unknown; encoding?: unknown })
     return
   }
   if (event.type === 'model.delta' || event.type === 'audio.transcript') {
-    const next = appendCaptionTurn(liveStreamCaptions.value, event)
-    if (next !== liveStreamCaptions.value) liveStreamCaptions.value = next
+    resolveLiveStreamRecovery()
+    appendLiveCaption(event)
     liveStreamLastObservationAt = Date.now()
     refreshLiveVisionPhase()
     return
@@ -1135,6 +1220,13 @@ function receiveLiveStreamObservation(raw: string, ticket: number, projectId: st
   if (event.type === 'error') {
     const message = typeof event.message === 'string' ? event.message : '实时视觉连接发生错误。'
     if (event.code === 'audio_not_ready') return
+    if (event.code === 'stream_broken' && event.retryable === true) {
+      liveStreamRecovering.value = true
+      liveStreamReconnectScheduled.value = true
+      liveVisionStatus.value = '实时模型连接中断，正在恢复并重放未完成语音…'
+      refreshLiveVisionPhase()
+      return
+    }
     liveVisionStatus.value = message
     return
   }
@@ -1202,6 +1294,7 @@ function startLiveStream(ticket: number, retry = 0) {
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const socket = new WebSocket(`${scheme}//${location.host}/api/vision/live-stream?project_id=${encodeURIComponent(projectId)}`)
   let connectedAt = 0
+  const reconnecting = retry > 0 || liveStreamRecovering.value
   liveStreamSocket = socket
   liveStreamSequence = 0
   liveStreamFrames.clear()
@@ -1210,6 +1303,7 @@ function startLiveStream(ticket: number, retry = 0) {
     connectedAt = Date.now()
     liveStreamConnected.value = true
     liveStreamReconnectScheduled.value = false
+    liveStreamRecovering.value = false
     liveAdaptive.reset()
     liveLedger.clear()
     refreshLiveVisionPhase()
@@ -1220,13 +1314,20 @@ function startLiveStream(ticket: number, retry = 0) {
         try { socket.send(JSON.stringify({ v: 1, type: 'heartbeat', sent_at: Date.now() })) } catch { /* reconnect path */ }
       }
     }, 12_000)
-    liveVisionStatus.value = `实时视频已连接 · ${liveVisionSource.value} · 画面持续传送，AI 异步理解最新帧`
+    liveVisionStatus.value = reconnecting
+      ? `实时视频连接已恢复 · ${liveVisionSource.value} · 继续传送画面和语音`
+      : `实时视频已连接 · ${liveVisionSource.value} · 画面持续传送，AI 异步理解最新帧`
   }
   socket.onmessage = event => receiveLiveStreamObservation(String(event.data), ticket, projectId)
   socket.onclose = event => {
     if (liveStreamSocket !== socket || ticket !== liveVisionGeneration) return
+    const recoveryFailed = liveStreamRecovering.value
     liveStreamSocket = null
     liveStreamConnected.value = false
+    liveStreamRecovering.value = false
+    stopAiPlayback()
+    closeOpenLiveCaption()
+    liveTranscriptDraft.value = ''
     if (liveStreamHeartbeatTimer) { clearInterval(liveStreamHeartbeatTimer); liveStreamHeartbeatTimer = null }
     if (!liveVisionActive.value || projectId !== getProjectId()) { refreshLiveVisionPhase(); return }
     if (event.code === 1008) {
@@ -1238,7 +1339,9 @@ function startLiveStream(ticket: number, retry = 0) {
     const nextRetry = connectedAt && Date.now() - connectedAt > 10_000 ? 0 : retry + 1
     const delay = Math.min(10_000, 500 * 2 ** Math.min(nextRetry, 4))
     liveStreamReconnectScheduled.value = true
-    liveVisionStatus.value = `视频仍在播放；视觉连接已断开，${Math.ceil(delay / 1000)} 秒后重连…`
+    liveVisionStatus.value = recoveryFailed
+      ? `实时模型恢复失败；${Math.ceil(delay / 1000)} 秒后重新连接…`
+      : `视频仍在播放；视觉连接已断开，${Math.ceil(delay / 1000)} 秒后重连…`
     refreshLiveVisionPhase()
     liveStreamReconnectTimer = setTimeout(() => {
       liveStreamReconnectScheduled.value = false
@@ -1276,6 +1379,7 @@ async function startMediaVision(source: 'screen' | 'camera') {
     liveVisionMetrics.value = { latencyMs: null, intervalMs: 500, dropped: 0 }
     liveStreamLastObservationAt = 0
     liveStreamCaptions.value = []
+    liveTranscriptDraft.value = ''
     liveStreamCapabilities.value = ''
     liveVisionPhase.value = 'connecting'
     liveVisionStatus.value = `${liveVisionSource.value}已启动，正在连接实时视觉流…`

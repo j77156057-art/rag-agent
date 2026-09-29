@@ -5,7 +5,9 @@
  * 因此可脱离页面用 node 做行为契约测试。
  *
  * 关键契约（来自 AI-D 真机实测，HANDOFF 2026-09-29 / commit 0db20ff）：
- * - 输入 pcm16 mono 16k，输出 pcm16 24k；
+ * - 输入 pcm16 mono 16k；DashScope Omni 的 response.audio.delta 线上值为
+ *   ``encoding: "pcm24"``，实测/适配器约定是 **16-bit little-endian PCM、24 kHz、mono**。
+ *   ``pcm24`` 是服务端的 24 kHz 格式名，不是 24-bit 样本；播放端必须按 2 字节样本解码。
  * - **停止说话 ≠ 停止推流**：说完后必须继续推 ~1 秒静音，服务端 VAD 靠尾部静音收句，
  *   在响亮采样上掐流会导致 turn 永不闭合、服务端回收会话（现象是"转写完整却零回复"）。
  * 协议包字段沿用 R0 的媒体包头（v/type/sequence/captured_at + '\n' + 载荷），
@@ -13,11 +15,43 @@
  */
 
 export const TARGET_SAMPLE_RATE = 16_000
-/** 播放 model.audio 的解码假设：16-bit LE PCM @ 24kHz（wire 只报 "pcm24"，未报采样率）。
- *  真机若有噪声，R12 只需改这一个常量与 playLiveModelAudio 的位深读法。 */
+/** 当前 Omni provider 的 model.audio：16-bit LE PCM @ 24kHz。 */
 export const OUTPUT_SAMPLE_RATE = 24_000
+export const OUTPUT_ENCODING = 'pcm24'
+export const OUTPUT_BITS_PER_SAMPLE = 16 as const
 export const CHUNK_MS = 100
 const MAX_CHUNK_BYTES = 1_000_000
+
+export interface LiveModelAudioFormat {
+  sampleRate: number
+  bitsPerSample: 16
+  /** 字段来源，方便诊断服务端是否开始携带显式采样率。 */
+  source: 'wire_sample_rate' | 'wire_encoding'
+}
+
+/**
+ * Resolve the provider's model.audio format before decoding bytes.
+ *
+ * The normalised provider event carries `encoding: "pcm24"`; the name is
+ * DashScope's 24 kHz PCM16 shorthand.  A future provider may carry an
+ * explicit `sample_rate`, which wins over the shorthand.  Unknown/missing
+ * metadata is rejected so a different wire format cannot be played at the
+ * wrong speed while looking successful.
+ */
+export function resolveLiveModelAudioFormat(
+  encoding: unknown,
+  sampleRate: unknown = undefined,
+): LiveModelAudioFormat | null {
+  const explicit = typeof sampleRate === 'number'
+    ? sampleRate
+    : typeof sampleRate === 'string' && sampleRate.trim() ? Number(sampleRate) : NaN
+  if (Number.isFinite(explicit) && explicit >= 8_000 && explicit <= 96_000) {
+    return { sampleRate: Math.round(explicit), bitsPerSample: OUTPUT_BITS_PER_SAMPLE, source: 'wire_sample_rate' }
+  }
+  const token = typeof encoding === 'string' ? encoding.trim().toLowerCase() : ''
+  if (token === 'pcm24') return { sampleRate: OUTPUT_SAMPLE_RATE, bitsPerSample: OUTPUT_BITS_PER_SAMPLE, source: 'wire_encoding' }
+  return null
+}
 
 export function clampInt16(value: number): number {
   const scaled = Math.round(value * 32767)

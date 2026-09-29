@@ -196,10 +196,18 @@ def test_cockpit_wiring_uses_the_control_module():
     assert "realtimeCancel" in source, "打断按钮必须通过 R0 的 cancel 控制包实现"
     assert "appendCaptionTurn" in source and "model.delta" in source and "audio.transcript" in source, \
         "cockpit 必须消费 R4 的回答流/转写事件，否则字幕区是死组件"
+    assert "appendLiveCaption" in source and "liveTranscriptDraft" in source, \
+        "连续多轮转写必须把 delta/final 归并为一条用户回合，不能逐条重复显示"
+    assert "stream_broken" in source and "正在恢复并重放未完成语音" in source, \
+        "可恢复的 stream_broken 必须给出明确的恢复中反馈"
+    assert "closeOpenLiveCaption" in source and "stopAiPlayback()" in source, \
+        "抢话或断线时必须收口未完成字幕并清空旧的播放队列"
     assert "describeLiveCapabilities" in source and "provider_capabilities" in source, \
         "hello.ok 送到的模型能力必须在 UI 呈现（R13 验收：界面说明当前模式和限制）"
     assert "liveAudioControl" in source and "createVoiceGate" in source and "encodeAudioPacket" in source, \
         "麦克风上行必须复用 liveAudioControl 的 VAD/分片/封包，不得在组件里另写一套数学"
     assert "model.audio" in source and "playLiveModelAudio" in source, \
         "原生语音回复必须接播放管线"
+    assert "resolveLiveModelAudioFormat" in source and "格式无法识别" in source, \
+        "model.audio 必须按 wire 格式解码，未知编码不得静默播放"
     assert "1280 / video.videoWidth, 720" not in source, "固定 1280/720 采集应已被自适应档位取代"
