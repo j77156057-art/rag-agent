@@ -32,7 +32,7 @@ pytestmark = pytest.mark.skipif(
 _HARNESS = r"""
 import assert from 'node:assert';
 import { createAdaptiveSender, classifyLivePhase, LIVE_PHASE_LABELS, createInFlightLedger,
-  appendCaptionTurn, describeLiveCapabilities } from './liveStreamControl.js';
+  appendCaptionTurn, closeUserTranscript, describeLiveCapabilities } from './liveStreamControl.js';
 
 const now = () => Date.now();
 
@@ -144,6 +144,31 @@ for (let i = 0; i < 20; i++) many = appendCaptionTurn(many, { type: 'audio.trans
 assert.strictEqual(many.length, 8, '字幕窗口必须有界');
 assert.strictEqual(many[many.length - 1].text, 'u19');
 
+// ---- 用户语音收尾：记账与「该不该转交」共用同一条判定（A 档：全部转交）---------
+// 返回值 null 是契约：代表这条 final 是**重放**。调用方据此同时不上字幕、不转交，
+// 所以这里钉住 null 的出现条件，就等于钉住「语音指令不会被重复派给主 Agent」。
+const u0 = [{ role: 'user', text: '把按钮往右挪一点', done: true }];
+
+let cu = closeUserTranscript(u0, '把按钮往右挪一点', false);
+assert.strictEqual(cu, null, '同上一条同文的 final 是重放：必须返回 null（不记账也不转交）');
+
+cu = closeUserTranscript(u0, '把按钮往右挪一点。', false);
+assert.strictEqual(cu.length, 2, '新内容要新起一条用户回合');
+assert.strictEqual(cu[1].text, '把按钮往右挪一点。');
+assert.strictEqual(cu[1].done, true);
+
+cu = closeUserTranscript(u0, '把按钮往右挪一点', true);
+assert.strictEqual(cu.length, 1, '有草稿时整条替换草稿，不得新增一条');
+assert.strictEqual(cu[0].text, '把按钮往右挪一点');
+assert.strictEqual(cu[0].done, true);
+
+assert.strictEqual(closeUserTranscript(u0, '   ', false), null, '空 final 不记账也不转交');
+assert.strictEqual(closeUserTranscript([], '第一句', false).length, 1, '首条语音要能开回合');
+
+let bounded = [];
+for (let i = 0; i < 12; i++) bounded = closeUserTranscript(bounded, 'u' + i, false);
+assert.strictEqual(bounded.length, 8, '用户字幕窗口同样有界');
+
 assert.match(describeLiveCapabilities(['audio.in', 'text.out']), /麦克风音频输入.*文字回复/);
 assert.strictEqual(describeLiveCapabilities(undefined), '', '抽帧模式没有能力表，返回空串而不是报错');
 assert.strictEqual(describeLiveCapabilities([]), '');
@@ -212,4 +237,8 @@ def test_cockpit_wiring_uses_the_control_module():
         "model.audio 必须按 wire 格式解码，未知编码不得静默播放"
     assert "sendNativeAudioReady" in source and "liveStreamReadyForVideo" in source, \
         "native provider 要求先有音频：视频发送必须等待音频就绪闸门"
+    assert "sendVoiceTurnToAgent" in source and "【语音指令】" in source, \
+        "语音转写必须转交主 Agent：实时模型没有工具通道，改文件只能由主 Agent 执行"
+    assert "closeUserTranscript" in source and "if (!next) return" in source, \
+        "转交必须与字幕记账走同一条判定：重放（null）时既不上字幕也不转交"
     assert "1280 / video.videoWidth, 720" not in source, "固定 1280/720 采集应已被自适应档位取代"

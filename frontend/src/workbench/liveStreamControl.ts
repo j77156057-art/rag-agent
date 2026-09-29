@@ -180,6 +180,35 @@ export function describeLiveCapabilities(caps: unknown): string {
  * 关键语义：适配器先发增量 .delta，再发一条 final 的全量文本——final 时必须
  * **整条替换**当前助手回合，否则回答会被拼接成两遍。
  */
+/**
+ * 用户语音转写的收尾：把一条 `audio.transcript` 的 final 归并进字幕时间线。
+ *
+ * 返回值语义是这条契约的核心：**返回 `null` 表示这条 final 是重放，忽略它**——
+ * 调用方据此同时决定「不记账」和「不转交」。两边绑在一条路径上，就不可能出现
+ * 「字幕去了重、语音指令却重复转交」或反过来漏转的情况。
+ *
+ * 三种形态：
+ * - 有草稿（增量已显示）：整条替换草稿，final 的全量文本更准；
+ * - 无草稿、但与上一条用户字幕同文：适配器只发 final 且被重放 → null；
+ * - 其余：新起一条用户回合。
+ */
+export function closeUserTranscript(
+  captions: LiveCaptionTurn[],
+  text: string,
+  hadDraft: boolean,
+  limit = 8,
+): LiveCaptionTurn[] | null {
+  const finalText = text.trim()
+  if (!finalText) return null
+  const last = captions[captions.length - 1]
+  if (hadDraft && last && last.role === 'user') {
+    return [...captions.slice(0, -1), { ...last, text: finalText, done: true }].slice(-limit)
+  }
+  if (last && last.role === 'user' && last.text === finalText) return null
+  const spoken: LiveCaptionTurn = { role: 'user', text: finalText, done: true }
+  return [...captions, spoken].slice(-limit)
+}
+
 export function appendCaptionTurn(
   captions: LiveCaptionTurn[],
   wire: { type: string; text?: unknown; final?: unknown },

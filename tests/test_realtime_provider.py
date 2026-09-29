@@ -279,6 +279,26 @@ class OmniAdapterTests(unittest.TestCase):
         provider.close()
         self.assertFalse(provider._audio_primed, "close 后应视为新会话，需重新引导")
 
+    def test_session_carries_the_cockpit_persona_by_default(self):
+        """不配 DOCMIND_OMNI_INSTRUCTIONS 时必须下发出厂人设。
+
+        没有 instructions 时模型按厂商默认助手答话，实测会说「我没法直接帮你改」——
+        它不知道自己是开发舱的语音前端、也不知道用户的话会被转交开发 Agent。
+        """
+        provider, ws = self._start()
+        sent = [item for item in ws.sent if item["type"] == "session.update"][0]
+        instructions = sent["session"].get("instructions") or ""
+        self.assertIn("语音前端", instructions, f"出厂人设没下发：{instructions[:80]}")
+        self.assertIn("开发 Agent", instructions, "人设必须讲清『你的话会被转交开发 Agent』")
+        # 人设里会**引用**那句错误回答来禁止它，所以断言的是「禁令在」，不是「字面不在」。
+        self.assertIn("不要回答", instructions, "必须明确禁止『我没法修改』这类回答")
+
+    def test_explicit_instructions_override_the_default(self):
+        os.environ["DOCMIND_OMNI_INSTRUCTIONS"] = "只说你好。"
+        provider, ws = self._start()
+        sent = [item for item in ws.sent if item["type"] == "session.update"][0]
+        self.assertEqual(sent["session"]["instructions"], "只说你好。")
+
     def test_interrupt_clears_buffer(self):
         provider, ws = self._start()
         self.assertTrue(provider.interrupt())

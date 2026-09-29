@@ -97,6 +97,21 @@ MAX_AUDIO_CHUNK = 1 << 20
 SILENCE_CHUNK_MS = 100
 DEFAULT_SILENCE_TAIL_SECONDS = 1.0
 MAX_REPLAY_CHUNKS = 120
+# 出厂人设（`DOCMIND_OMNI_INSTRUCTIONS` 留空时用它）。
+#
+# 不给人设时模型就按厂商默认助手人格答话，实测会说「我没法直接帮你改，但我可以一步步
+# 告诉你怎么调整」——它不知道自己是开发舱的语音前端，也不知道背后有个能改文件的
+# Agent。人设要讲清三件事：它是语音前端不是执行者；用户的话会被转交开发 Agent
+# （所以别说"我没权限"）；以及它是被**朗读**的，必须短。
+DEFAULT_INSTRUCTIONS = (
+    "你是 DocMind 开发舱的语音前端，用户正对着屏幕和你说话，你能看到当前画面。"
+    "你的回答会被直接朗读出来，所以要短、口语化，一次最多两三句。"
+    "用户说的每一句都会被同时转交给后台的开发 Agent——它有工具、能改文件、能跑命令，"
+    "动手的事由它负责。所以永远不要回答「我没法修改」「我没有权限」这类话；"
+    "用户要求改动时，用一句话确认已经转交（例如「好，我让开发 Agent 开始处理」），"
+    "不要承诺具体实现，也不要编造还没发生的结果。"
+    "你没有任何工具，也不要假装执行过操作或看到了没看到的东西。"
+)
 
 _TRANSCRIPT_DELTA = "conversation.item.input_audio_transcription.delta"
 _TRANSCRIPT_DONE = "conversation.item.input_audio_transcription.completed"
@@ -343,9 +358,10 @@ class OmniRealtimeProvider(RealtimeProvider):
                                          "silence_duration_ms": 800}
         elif self._vad in ("", "none", "manual", "false"):
             session["turn_detection"] = None
-        instructions = _env("DOCMIND_OMNI_INSTRUCTIONS")
-        if instructions:
-            session["instructions"] = instructions
+        # 留空就用出厂人设：没有 instructions 时模型按厂商默认助手答话，会说出
+        # 「我没法帮你改」这种和产品定位冲突的话（见 DEFAULT_INSTRUCTIONS）。
+        instructions = _env("DOCMIND_OMNI_INSTRUCTIONS") or DEFAULT_INSTRUCTIONS
+        session["instructions"] = instructions
         return self._event("session.update", session=session)
 
     @staticmethod

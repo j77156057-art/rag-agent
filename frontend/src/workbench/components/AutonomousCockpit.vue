@@ -18,7 +18,7 @@ import type { VisualActionLoop, VisualActionStep } from '../visualActionLoop'
 import { encodeVideoFrame, parseRealtimeServerEvent, realtimeHello, realtimeCancel } from '../realtimeProtocol'
 import {
   classifyLivePhase, createAdaptiveSender, createInFlightLedger, LIVE_PHASE_LABELS,
-  appendCaptionTurn, describeLiveCapabilities,
+  appendCaptionTurn, closeUserTranscript, describeLiveCapabilities,
 } from '../liveStreamControl'
 import type { LivePhase, LiveCaptionTurn } from '../liveStreamControl'
 import {
@@ -228,19 +228,40 @@ function appendLiveCaption(event: ReturnType<typeof parseRealtimeServerEvent>) {
     liveStreamCaptions.value = updated.slice(-8)
     return
   }
-  const finalText = text || liveTranscriptDraft.value
   const hadDraft = !!liveTranscriptDraft.value
+  const finalText = text || liveTranscriptDraft.value
   liveTranscriptDraft.value = ''
-  if (!finalText) return
-  const current = liveStreamCaptions.value
-  const last = current[current.length - 1]
-  if (hadDraft && last?.role === 'user') {
-    liveStreamCaptions.value = [...current.slice(0, -1), { ...last, text: finalText, done: true }]
-    return
-  }
-  // 某些适配器只发 final；同一事件重放时不得重复一条字幕。
-  if (last?.role === 'user' && last.text === finalText) return
-  liveStreamCaptions.value = [...current, { role: 'user', text: finalText, done: true } as LiveCaptionTurn].slice(-8)
+  // 一条线性路径：`null` = 这条 final 是重放（同文或空），既不上字幕、也不转交。
+  // 转交与记账绑在一起，就不可能一边去重一边重复转交（或反过来漏转）。
+  const next = closeUserTranscript(liveStreamCaptions.value, finalText, hadDraft)
+  if (!next) return
+  liveStreamCaptions.value = next
+  sendVoiceTurnToAgent(finalText)
+}
+/**
+ * 语音指令转交主 Agent（A 档：**全部转交**）。
+ *
+ * 为什么必须在我们这侧做：实时模型**没有工具通道**（网关只转发音频/视频/文本事件），
+ * 它自己永远改不了文件。所以「接收到指令就让主 Agent 开始改」只能由我们把这条转写
+ * 当成一条对话消息派进开发舱对话台——主 Agent 有工具、有工作流和审批门，由它判断该不该动手。
+ *
+ * 不传 uiContext：让对话台按既有规则自动选 cockpit_live_vision（附带实时观察时间线），
+ * 当前画面也由对话台自动附上，这就是「边看边聊」的落地路径。
+ */
+function sendVoiceTurnToAgent(text: string) {
+  const projectId = getProjectId()
+  if (!projectId) return
+  appEvents.emit('docmind:send-chat', {
+    target: 'cockpit',
+    projectId,
+    prompt: `【语音指令】${text}\n（来自开发舱实时语音；用户此刻正看着当前画面。）`,
+    onStatus: (status, detail) => {
+      // 对话台正忙/有待审的门时，这条语音指令不会自动重试——必须让用户知道它没送到。
+      if (status === 'pending') {
+        liveVisionStatus.value = detail || '对话台正忙，这条语音指令未能送入，请稍后重说。'
+      }
+    },
+  })
 }
 async function refreshLiveVisionMode() {
   try {

@@ -88,6 +88,22 @@
 - 建议收口时把「绕过闸门必须仍能复现原错误」写成回归用例，否则这个闸门以后被误删没人会发现。
 - 另注：本地较 `origin/main` 多 8 个他人提交尚未推送（远端仍停在 `8f32730`），我没有代推别人的 WIP。
 
+## 2026-09-29 语音指令转交主 Agent（A 档：全部转交）+ 语音前端人设（AI-F，用户指派「A. 全部转交」）
+
+- **起因（用户实测）**：对着开发舱说话说「你能帮我改吗？」，模型答「我没法直接帮你改，但我可以一步步告诉你怎么调整」。
+- **根因两条，都不是 bug 而是从来没接**：
+  1. **原生实时模型根本没有系统提示**：`.env.example` 预留了 `DOCMIND_OMNI_INSTRUCTIONS`，但 `.env` 没设，`_session_payload()` 只在非空时才带 `instructions` → 会话一条人设都没有，模型按厂商默认助手人格答话。它那句「没法帮你改」是**字面实话**——它不知道自己是谁、也不知道背后有个能改文件的 Agent。
+  2. **语音转写从来没有转交主 Agent**：前端对 `audio.transcript` 的全部消费只有「合并进字幕 + 刷新相位」，没有任何一处把语音指令派给主 Agent。（R7 的「用户纠正即转交」、画布目标的「边看边聊」此前只做了一半：能聊，不能转。）
+  ⚠️ **技术前提**：实时模型**没有工具通道**（网关只转发音视频/文本事件），它自己永远改不了文件——「转交」必须在我们这侧做。
+- **用户选定的档位**：A（**全部转交**），代价是闲聊也会触发一轮 Agent，已被告知。
+- **实现**：
+  - `agent_runtime/realtime_omni.py`：新增 `DEFAULT_INSTRUCTIONS`（出厂人设：你是开发舱的**语音前端**、回答会被朗读所以要短、用户每句话都会被同时转交开发 Agent 所以**永远不要说「我没法修改」**、不要承诺实现或编造结果）。`DOCMIND_OMNI_INSTRUCTIONS` 仍可覆盖；`.env.example` 注释同步说明「留空则用内置人设」。
+  - `frontend/src/workbench/components/AutonomousCockpit.vue`：用户转写 final 收尾后 `sendVoiceTurnToAgent()` → `appEvents.emit('docmind:send-chat')`（**不传 uiContext**，让对话台按既有规则自动选 `cockpit_live_vision` 并附上当前画面与实时观察时间线）。对话台忙（有待审的审批门）时不会自动重试，所以把 `pending` 明写到状态栏，用户能看到这条语音指令没送进去。
+  - `frontend/src/workbench/liveStreamControl.ts`：新增纯函数 `closeUserTranscript(captions, text, hadDraft, limit)`，**返回值 `null` 表示「这条 final 是重放」**——调用方据此同时不上字幕、不转交。转交与记账绑在一条线性路径上，就不可能出现「字幕去了重、语音指令却重复派给主 Agent」或反过来漏转。
+- **验证**：`tests/test_realtime_provider.py` 38 passed（新增 2 条：默认人设必须下发、显式 `DOCMIND_OMNI_INSTRUCTIONS` 必须覆盖默认）；`tests/test_live_stream_control.py` node 断言扩到含「重放返回 null / 有草稿整条替换 / 空 final 不记账 / 窗口有界」+ 接线断言（含 `closeUserTranscript` 与 `if (!next) return` 必须成对出现）；**反向验证承重**：关掉同文去重守卫 → node 断言立刻红。前端 `npm run typecheck` + `npm run build` 通过；全量套件 **2221 passed / 6 skipped / 0 failed（272s）**。
+- **顺手纠正自己**：我先写的那条「转交必须排在收尾分支之后」的源码断言是**假守卫**（分支条件文本本身在调用之前，插进分支里也照样通过），已删掉，改成「纯函数的行为断言 + 接线成对断言」——能真失败。
+- **仍待办**：①后端要**重启**才生效（截图里 `Error append image before append audio.` 还在，说明 23:41 的构建已生效但 uvicorn 仍是旧进程）；②档2（`item_id`）价值下降——R13 lane 已在 `appendLiveCaption` 里加了「同文 final 去重」，覆盖了重放重复的常见情形，剩下的只是「中间隔了 AI 回复的重放」，要根治仍需 `item_id`（厂商是否下发该字段目前**无据可查**，需要一次真机探针）。
+
 ## 2026-09-29 媒体顺序闸门（首帧前先补音频）+ 修掉本文件长期的收尾 flake（AI-F，用户指派「接」）
 
 ### 一、媒体顺序：首帧之前必须先有音频
