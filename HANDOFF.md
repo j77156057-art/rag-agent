@@ -1,5 +1,17 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-30 Vibecoding 能力补全 Wave9：harness 自己成为 MCP server（本会话，不占 R 槽位）
+
+- **补什么**：harness 原本只有 MCP **client**（`mcp_client.py`）——DocMind 有 90 多个工具，但同一仓库里并肩干活的其他 AI 一个都调不到，只能靠公告表和 markdown 互相转述。现在它们能直接调。
+- **产物**：`agent_runtime/mcp_server.py`（`python -m agent_runtime.mcp_server --project <目录> [--allow-writes] [--tools a,b] [--list]`）；`tests/test_mcp_server_expose.py` **15 项**；`requirements.txt` 加 `mcp>=2,<3`（此前只有 .venv 里有，没声明）。
+- **默认只读**：`READ_ONLY_TOOLS` 12 个 = search_code / grep / read_file / list_dir / dev_glob / dev_git_diff / dev_git_log / dev_find_references / dev_diagnostics / self_verify / search_knowledge / dev_lanes。改代码的 5 个（apply_edit / create_file / dev_apply_edits / dev_patch / dev_move）必须 `--allow-writes` 才注册。
+- **`NEVER_EXPOSED` 是硬名单，开了写权限也不给**：`run_command`、`python_exec`、`dev_mcp_call`/`dev_route_connector`（会二次放大权限的连接器跳转）、四个 `*_external_file`（越界文件操作）、`install_tool`、`dev_commit*`/`dev_rollback_changeset`、`start_workflow`。用例同时钉住这些名字**在清单里**，防止后来者顺手删掉守卫。
+- **安全设计的关键点**：这不是新写一套执行路径——server 只是把 `tools.TOOLS[name]["func"]` 包一层，所以原有的路径沙箱、越界拒绝、区域写权限、审批门**全部继续生效**。`--project` 只是设 code_root，界的就是这个沙箱。传输用 **stdio（本机进程）**，不开网络端口，因此没有远程可达面；`openWorldHint=False`、`readOnlyHint/idempotentHint` 都按实际语义标注，别的 agent 的客户端能据此决定是否放行。
+- **mcp 2.x 的 API 变化（踩过）**：`FastMCP` 已改名 `MCPServer`（`from mcp.server import MCPServer`），`mcp.server.fastmcp` 现在直接抛 ModuleNotFoundError 并让你钉 `mcp<2`。另外 pydantic 模型属性是 **snake_case**（`read_only_hint`、`server_info`、`is_error`），而构造时接受 camelCase 别名——写断言时别混用。
+- **验证（真 client 走真传输，不是只测常量）**：用官方 `mcp.client.stdio` + `ClientSession` 起子进程连上去：默认态 `tools: 12`，`dev_glob("*.vue")` 命中 `demo.vue`；`read_file ../outside.txt` 回「拒绝访问：不在代码根目录内」；`dev_patch` 报 `Unknown tool`、`is_error=True`。加 `--allow-writes` 后 `count 17`、`dev_patch` 真把 `two` 改成 `TWO`、越界补丁被整体拒绝（文件没被创建）、`forbidden present: []`。`tests/test_mcp_server_expose.py` 15 passed；全量 pytest 见下方补记。
+- **别人怎么接**：在别的 AI 的 MCP 配置里加一条 stdio server，command 指向本仓库 `.venv` 的 python，args `["-m","agent_runtime.mcp_server","--project","D:/WorkBuddy/rag-agent"]`；想让对面能改代码再加 `--allow-writes`。`--list` 可以直接看会暴露什么。
+- **未做**：没接 HTTP/SSE 传输（有意不做——那会引入鉴权与远程可达面，需要单独设计）；没有 resources/prompts 出口（只出工具）；工具入参仍是单个 `input` 字符串，没给每个工具生成结构化 schema（与工作台 Action Input 同形，换来的是零漂移）；`mcp_server` 未挂进 `api.py`，起停由用户手动。
+
 ## 2026-09-30 Vibecoding 能力补全 Wave5：`dev_patch` + `dev_move`（本会话，不占 R 槽位）
 
 - **补什么**：跨文件重构此前只有 `dev_apply_edits`（手写 old_text 块）；从 `dev_git_diff`、评审意见或别处拿到的**真 unified diff 没有入口**。`dev_patch` 补上，并且强制**全成或全不成**。

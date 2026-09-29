@@ -38,3 +38,6 @@ tree-sitter-javascript>=0.25,<1
 # Lint engine behind dev_diagnostics (Python half). The tool reports "not
 # installed" instead of a false clean when this is missing.
 ruff>=0.16,<1
+# MCP SDK: client side plus `agent_runtime.mcp_server`, which re-publishes the
+# harness's own read-only tools to the other agents working this repo.
+mcp>=2,<3
