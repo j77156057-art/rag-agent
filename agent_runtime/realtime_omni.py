@@ -125,6 +125,9 @@ class OmniRealtimeProvider(RealtimeProvider):
         self._workspace = _env("DOCMIND_OMNI_WORKSPACE")
         self._replay_audio: deque[tuple[bytes, int]] = deque(maxlen=MAX_REPLAY_CHUNKS)
         self._replay_lock = threading.Lock()
+        # 这个会话里是否已经送过音频。真实 dashscope_omni 要求同一会话**先音频后图像**
+        # （见 :meth:`send_frame`），所以首帧之前要靠它决定要不要补一个静音块。
+        self._audio_primed = False
 
     # -- configuration --------------------------------------------------------
     @property
@@ -187,6 +190,9 @@ class OmniRealtimeProvider(RealtimeProvider):
 
     def close(self) -> None:
         self._running = False
+        # 关掉的是一条会话，重连（`recover()` = close + start）后是全新会话，
+        # 供应商的「先音频后图像」约束按会话计——所以这里要把引导标记清掉。
+        self._audio_primed = False
         ws, self._ws = self._ws, None
         if ws is not None:
             try:
@@ -210,8 +216,17 @@ class OmniRealtimeProvider(RealtimeProvider):
         stamp = int(captured_at or time.time() * 1000)
         with self._replay_lock:
             self._replay_audio.append((bytes(pcm), stamp))
-        return self._send(self._event("input_audio_buffer.append",
+        sent = self._send(self._event("input_audio_buffer.append",
                                       audio=base64.b64encode(pcm).decode("ascii")))
+        if sent:
+            # 只在真的送出去之后才置位：送失败就得让下一帧重新引导（见 send_frame）。
+            self._audio_primed = True
+        return sent
+
+    @staticmethod
+    def _silence_chunk(step_ms: int) -> bytes:
+        """PCM16 @16 kHz 的等长零样本；静音尾与首帧引导用同一个算法，避免两处漂移。"""
+        return b"\x00" * (16_000 * 2 * step_ms // 1000)
 
     def send_silence_tail(self, seconds: float = DEFAULT_SILENCE_TAIL_SECONDS,
                           *, chunk_ms: int = SILENCE_CHUNK_MS) -> bool:
@@ -222,7 +237,7 @@ class OmniRealtimeProvider(RealtimeProvider):
         except (TypeError, ValueError):
             return False
         count = int(round(duration * 1000 / step_ms))
-        chunk = b"\x00" * (16_000 * 2 * step_ms // 1000)
+        chunk = self._silence_chunk(step_ms)
         ok = True
         for _ in range(count):
             ok = self.send_audio(chunk, captured_at=int(time.time() * 1000)) and ok
@@ -261,6 +276,17 @@ class OmniRealtimeProvider(RealtimeProvider):
             return False
         if not image:
             return True
+        if not self._audio_primed:
+            # 真实 dashscope_omni 在同一会话里要求**先有音频、后有图像**：还没送过音频就送帧，
+            # 会回 `vendor_error: Error append image before append audio.`（2026-09-29 设备侧
+            # 实测；一个音频块即可解除）。而 UI 的自然顺序恰恰是「先开摄像头/屏幕共享，再点
+            # 开麦对话」，也就是生产路径会稳定踩中它。这里补一个静音块把顺序满足掉——不改
+            # 协议、不改前端顺序、只此一处。
+            #
+            # 走 `send_audio` 而不是自己拼事件：这样它也进重放缓冲（重连后顺序依然成立），
+            # `_audio_primed` 也由同一条路径置位。送失败就保持未置位，下一帧再试。
+            self.send_audio(self._silence_chunk(SILENCE_CHUNK_MS),
+                            captured_at=int(captured_at or time.time() * 1000))
         # ``image`` field name follows the documented input_image_buffer.append
         # event; correct here in one place if the console disagrees.
         return self._send(self._event("input_image_buffer.append",

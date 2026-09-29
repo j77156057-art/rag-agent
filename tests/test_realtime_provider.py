@@ -17,7 +17,8 @@ from unittest.mock import patch
 from agent_runtime import realtime_provider as rp
 from agent_runtime import realtime_timeline as rt
 from agent_runtime.realtime_omni import (
-    DEFAULT_MODEL, INPUT_AUDIO_FORMAT, OUTPUT_AUDIO_FORMAT, OmniRealtimeProvider,
+    DEFAULT_MODEL, INPUT_AUDIO_FORMAT, OUTPUT_AUDIO_FORMAT, SILENCE_CHUNK_MS,
+    OmniRealtimeProvider,
 )
 
 _ENV_KEYS = ("DOCMIND_REALTIME_PROVIDER", "DOCMIND_OMNI_API_KEY", "DASHSCOPE_API_KEY",
@@ -227,6 +228,56 @@ class OmniAdapterTests(unittest.TestCase):
             time.sleep(0.01)
         sent = [item for item in ws.sent if item["type"] == "input_image_buffer.append"][0]
         self.assertEqual(base64.b64decode(sent["image"]), b"jpegbytes")
+
+    def _wait_for_types(self, ws, event_type, count=1, timeout=2.0):
+        deadline = time.time() + timeout
+        while ws.types().count(event_type) < count and time.time() < deadline:
+            time.sleep(0.01)
+        return ws.types()
+
+    def test_first_frame_primes_the_session_with_audio(self):
+        """首帧前必须先有音频：真实 dashscope_omni 对同一会话要求「先音频后图像」。
+
+        先送帧会回 `vendor_error: Error append image before append audio.`（2026-09-29
+        设备侧实测），而 UI 的自然顺序是「先开摄像头/屏幕共享，再点开麦对话」——生产
+        路径会稳定踩中，所以首帧之前必须补一个音频块。
+        """
+        provider, ws = self._start()
+        self.assertTrue(provider.send_frame(b"jpegbytes", captured_at=1700000000000))
+        types = self._wait_for_types(ws, "input_image_buffer.append")
+        self.assertIn("input_audio_buffer.append", types, f"首帧前必须先有音频：{types}")
+        self.assertLess(types.index("input_audio_buffer.append"),
+                        types.index("input_image_buffer.append"),
+                        f"音频必须在图像之前：{types}")
+        primed = [item for item in ws.sent if item["type"] == "input_audio_buffer.append"][0]
+        self.assertEqual(base64.b64decode(primed["audio"]),
+                         b"\x00" * (16_000 * 2 * SILENCE_CHUNK_MS // 1000),
+                         "引导块必须是 100ms 的 16kHz PCM16 静音")
+
+    def test_frames_after_real_audio_are_not_primed_again(self):
+        """用户先说话（音频已在流里）时不该再多塞静音：每帧都要是干净的一帧。"""
+        provider, ws = self._start()
+        self.assertTrue(provider.send_audio(b"\x01\x02\x03\x04", captured_at=1700000000000))
+        self.assertTrue(provider.send_frame(b"one", captured_at=1700000000001))
+        types = self._wait_for_types(ws, "input_image_buffer.append")
+        self.assertEqual(types.count("input_audio_buffer.append"), 1, f"只该有用户那一片：{types}")
+
+    def test_first_frame_primes_only_once(self):
+        """只补一次：第二帧不许再塞静音（否则每帧都多一片，白占带宽与 turn）。"""
+        provider, ws = self._start()
+        provider.send_frame(b"one", captured_at=1700000000001)
+        provider.send_frame(b"two", captured_at=1700000000002)
+        types = self._wait_for_types(ws, "input_image_buffer.append", count=2)
+        self.assertEqual(types.count("input_audio_buffer.append"), 1, f"引导只该发生一次：{types}")
+
+    def test_reconnect_primes_again_for_the_new_session(self):
+        """重连后是全新会话，供应商的顺序约束重新生效——引导标记必须清掉。"""
+        provider, ws = self._start()
+        self.assertTrue(provider.send_frame(b"one", captured_at=1700000000001))
+        self._wait_for_types(ws, "input_image_buffer.append")
+        self.assertTrue(provider._audio_primed)
+        provider.close()
+        self.assertFalse(provider._audio_primed, "close 后应视为新会话，需重新引导")
 
     def test_interrupt_clears_buffer(self):
         provider, ws = self._start()
