@@ -21,7 +21,7 @@ import os
 import re
 from typing import Any
 
-from . import process_runner
+from . import process_runner, ts_index
 
 # --------------------------------------------------------------------------- #
 # constants
@@ -777,13 +777,24 @@ def find_references(root: str, symbol: str, *, scope: list[str] | None = None,
     references: list[dict] = []
     scanned = 0
     hit_limit = False
+    ts_files = 0
+    ts_notes: list[str] = []
     for full in _walk_source_files(root_abs, scope):
         scanned += 1
         lines = _read_lines(full)
         if lines is None:
             continue
         rel = os.path.relpath(full, root_abs).replace("\\", "/")
-        if full.endswith(".py") or full.endswith(".pyi"):
+        exact = None
+        if os.path.splitext(rel)[1].lower() in ts_index.TS_EXTS:
+            exact = ts_index.ts_matches(rel, "\n".join(lines), symbol)
+        if exact is not None:
+            defs, refs, notes = exact
+            ts_files += 1
+            for note in notes:
+                if note not in ts_notes:
+                    ts_notes.append(note)
+        elif rel.endswith((".py", ".pyi")):
             defs, refs = _py_matches(lines, symbol, rel)
         else:
             defs, refs = _regex_matches(lines, symbol, rel)
@@ -814,6 +825,13 @@ def find_references(root: str, symbol: str, *, scope: list[str] | None = None,
             f"命中过多已提前停止（扫描 {scanned} 个文件）；请用 scope: 限定目录或换更精确的符号名。")
     if not definitions and not references:
         result["notes"].append("未找到任何匹配；确认符号名与拼写，或该符号位于被跳过的构建目录中。")
+    if ts_files:
+        result["ts_indexed_files"] = ts_files
+        result["notes"].append(
+            f"{ts_files} 个 TS/JS/Vue 文件按 tree-sitter 语法精确匹配——注释与字符串里的同名文本不算引用。")
+        for note in ts_notes:
+            if note not in result["notes"]:
+                result["notes"].append(note)
     return result
 
 

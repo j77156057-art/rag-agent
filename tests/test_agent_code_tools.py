@@ -182,10 +182,13 @@ class TestFindReferencesBody(_CodeRootCase):
         self.assertEqual(res["references"], [])
 
     def test_non_python_uses_word_boundary(self):
+        # 原断言写于「非 Python 只能走正则」的年代；.js 现在也走 tree-sitter，
+        # `const foo = 1` 被判成【定义】而不是引用。作者意图不变：注释与 foobar 都不算。
         self.write("a.js", "const foo = 1;\n// foo in comment\nfoobar = 2;\n")
         res = code_intel.find_references(self.tmp, "foo")
-        lines = [r["line"] for r in res["references"]]
-        self.assertEqual(lines, [1])  # 注释与 foobar 都不算
+        self.assertEqual([d["line"] for d in res["definitions"]], [1])
+        self.assertEqual([r["line"] for r in res["references"]], [])
+        self.assertEqual(res["ts_indexed_files"], 1)
 
     def test_render_includes_headings(self):
         self.write("m.py", PY_SRC)
