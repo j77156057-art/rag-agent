@@ -401,6 +401,13 @@ class SessionBridge:
             return False
         return bool(self.provider.interrupt())
 
+    def recover(self) -> bool:
+        """Reconnect a provider after a retryable stream break, when supported."""
+        if not self.native or self.provider is None:
+            return False
+        recover = getattr(self.provider, "recover", None)
+        return bool(recover()) if callable(recover) else False
+
     # -- 出站 ----------------------------------------------------------------
     def observation_elapsed_ms(self) -> float:
         """网关收帧 → 现在。用于 `observation_latency_ms`。"""

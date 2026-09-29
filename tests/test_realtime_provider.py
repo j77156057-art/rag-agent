@@ -12,6 +12,7 @@ import os
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from agent_runtime import realtime_provider as rp
 from agent_runtime import realtime_timeline as rt
@@ -200,6 +201,17 @@ class OmniAdapterTests(unittest.TestCase):
             time.sleep(0.01)
         sent = [item for item in ws.sent if item["type"] == "input_audio_buffer.append"][0]
         self.assertEqual(base64.b64decode(sent["audio"]), pcm)
+
+    def test_send_silence_tail_emits_one_second_of_vad_audio(self):
+        provider, ws = self._start()
+        with patch("agent_runtime.realtime_omni.time.sleep"):
+            self.assertTrue(provider.send_silence_tail(1.0))
+        deadline = time.time() + 2
+        while ws.types().count("input_audio_buffer.append") < 10 and time.time() < deadline:
+            time.sleep(0.01)
+        chunks = [item for item in ws.sent if item["type"] == "input_audio_buffer.append"]
+        self.assertEqual(len(chunks), 10)
+        self.assertTrue(all(len(base64.b64decode(item["audio"])) == 3200 for item in chunks))
 
     def test_oversized_audio_rejected(self):
         provider, ws = self._start()

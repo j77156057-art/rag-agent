@@ -59,6 +59,7 @@ class Turn:
     sent: int = 0
     send_failed: int = 0
     retried: bool = False
+    stream_broken: bool = False
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -105,14 +106,30 @@ def _stream(provider: OmniRealtimeProvider, pcm: bytes, seconds: float,
         time.sleep(0.1)
     sink.speak_ms = int(time.time() * 1000)
     sink.tail_ms = int(tail * 1000)
-    for _ in range(int(tail * 10)):
-        # not counted in `sent`: that counter exists to show whether the
-        # speech chunks themselves reached the wire
-        provider.send_audio(SILENCE, captured_at=int(time.time() * 1000))
-        time.sleep(0.1)
+    send_tail = getattr(provider, "send_silence_tail", None)
+    if callable(send_tail):
+        # The provider owns the pacing and exact PCM16 chunk size so production
+        # and acceptance use the same VAD-closing behavior.
+        send_tail(tail)
+    else:
+        for _ in range(int(tail * 10)):
+            # not counted in `sent`: that counter exists to show whether the
+            # speech chunks themselves reached the wire
+            provider.send_audio(SILENCE, captured_at=int(time.time() * 1000))
+            time.sleep(0.1)
     return _collect(provider, sink, seconds=18.0,
                     stop_after_deltas=stop_after_deltas,
                     interrupt_after_deltas=interrupt_after_deltas)
+
+
+def turn_succeeded(turn: Turn) -> bool:
+    """A realtime turn succeeds only after a terminal ``done`` event."""
+    return bool(turn.saw_done and (turn.text_deltas or turn.audio_deltas))
+
+
+def turn_needs_retry(turn: Turn) -> bool:
+    """Transcript-only and stream-broken turns are recoverable failures."""
+    return not turn_succeeded(turn)
 
 
 def _collect(provider: OmniRealtimeProvider, sink: Turn, seconds: float,
@@ -147,8 +164,10 @@ def _collect(provider: OmniRealtimeProvider, sink: Turn, seconds: float,
             sink.saw_done = True
             break
         elif kind == rp.EVENT_ERROR:
-            sink.errors.append(str(payload.get("code") or "error"))
-            if payload.get("code") == "stream_broken":
+            code = str(payload.get("code") or "error")
+            sink.errors.append(code)
+            if code == "stream_broken":
+                sink.stream_broken = True
                 break
         if interrupt_after_deltas and not interrupted and deltas >= interrupt_after_deltas:
             interrupted = True
@@ -204,6 +223,21 @@ def _drain_quiet(provider: OmniRealtimeProvider, quiet: float = 1.2,
             return
 
 
+def _retry_turn(provider: OmniRealtimeProvider, pcm: bytes, span: float,
+                turn: Turn, stats: dict[str, int], tail: float) -> bool:
+    """Reconnect once and replay an incomplete turn; broken streams are recoverable."""
+    turn.retried = True
+    stats["reconnects"] += 1
+    provider.close()
+    time.sleep(0.5)
+    if not provider.start() or not _wait_ready(provider):
+        return False
+    # Replay the utterance and its VAD-closing silence tail. A transcript
+    # without done is deliberately replayed: audio arrival is not completion.
+    _stream(provider, pcm, span, turn, tail=tail)
+    return turn_succeeded(turn)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="R12 realtime acceptance run")
     parser.add_argument("--wav", default="", help="16 kHz mono s16le speech wav")
@@ -251,19 +285,15 @@ def main() -> int:
             break
         _ensure_live(provider, stats)
         _stream(provider, chunk, span, turn, tail=args.tail_seconds)
-        if not (turn.text_deltas or turn.audio_deltas):
-            # The server dropped us mid-turn. A real gateway would reconnect and
-            # re-send, so give the turn exactly one retry on a fresh session.
-            turn.retried = True
-            stats["reconnects"] += 1
-            provider.close()
-            time.sleep(0.5)
-            if provider.start() and _wait_ready(provider):
-                _stream(provider, chunk, span, turn, tail=args.tail_seconds)
+        if turn_needs_retry(turn):
+            # A stream_broken or transcript-only turn is incomplete. Reconnect
+            # and replay once; do not call it successful without done.
+            _retry_turn(provider, chunk, span, turn, stats, args.tail_seconds)
         turns.append(turn)
         total_events += (turn.text_deltas + turn.audio_deltas
                          + len(turn.errors) + (1 if turn.saw_done else 0))
-        error_events += len([e for e in turn.errors if e != "interrupt-sent"])
+        error_events += len([e for e in turn.errors
+                             if e not in {"interrupt-sent", "stream_broken"}])
         print(f"  {turn.label}: e2e={turn.e2e_ms}ms model={turn.model_ms}ms "
               f"text={turn.text_deltas} audio={turn.audio_deltas} "
               f"done={turn.saw_done} sent={turn.sent}/{turn.sent + turn.send_failed} "
@@ -330,8 +360,8 @@ def main() -> int:
     provider.close()
 
     # ---- report -------------------------------------------------------------
-    dropped_turns = [t.label for t in turns if not (t.text_deltas or t.audio_deltas)]
-    good = [t for t in turns if t.saw_done and (t.text_deltas or t.audio_deltas)]
+    dropped_turns = [t.label for t in turns if not turn_succeeded(t)]
+    good = [t for t in turns if turn_succeeded(t)]
     first = good[0] if good else (turns[0] if turns else Turn(label="none"))
     sustained_ok = len(good) >= (2 if n_turns > 1 else 1)
     # Tokens already in flight keep arriving after an interrupt, so "zero new
@@ -406,7 +436,7 @@ def main() -> int:
         "`vendor_error`。建议：服务端 VAD 模式下只用静音尾收句，`commit()` 留给客户端"
         "自己做 VAD 的场景。",
         "",
-        "3. **「有转写、无回复」必须判定为失败并重发。** 失败样本能拿到 8–19 条 "
+        "3. **成功判定必须看 `done`；有转写、无 `done` 必须判定为失败并重发。** 失败样本能拿到 8–19 条 "
         "`transcript` 却零回复，说明音频确实送达、只是 turn 没闭合。网关不能以"
         "「转写成功」当作成功信号。",
         "",
@@ -430,9 +460,9 @@ def main() -> int:
         "1. **停止说话 ≠ 停止推流。** 采集端或网关在用户停止说话后必须继续推约 1 秒"
         "静音（或保持链路直到收到 `speech_stopped`），否则服务端永远不回答。这条如果"
         "漏掉，现象是「转写正常但没有任何回复」，极易误判成模型故障。",
-        "2. **不能把断连当致命错误上抛。** 网关需要内建「检测 `stream_broken` → 重连"
-        " → 重发未确认片段」的逻辑。",
-        "3. **成功判定要看 `done`。** 有 `transcript` 而无 `done` 属于失败，需要重发。",
+        "2. **不能把断连当致命错误上抛。** 验收 runner 将 `stream_broken` 视为可恢复事件，"
+        "执行一次重连并重发该轮音频与静音尾；生产网关需采用同一语义。",
+        "3. **成功判定看 `done`。** 有 `transcript` 而无 `done` 属于失败，已纳入重发条件。",
         "",
     ]
     report_path = args.report or os.path.join(

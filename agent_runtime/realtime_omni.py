@@ -68,6 +68,7 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from typing import Any, Callable
 
 from agent_runtime.realtime_provider import (
@@ -93,6 +94,9 @@ OUTPUT_AUDIO_FORMAT = "pcm24"
 TRANSCRIPTION_MODEL = "gummy-realtime-v1"
 # 1 MiB of PCM16 @16 kHz ≈ 32 s; anything larger is a caller bug, not a stream.
 MAX_AUDIO_CHUNK = 1 << 20
+SILENCE_CHUNK_MS = 100
+DEFAULT_SILENCE_TAIL_SECONDS = 1.0
+MAX_REPLAY_CHUNKS = 120
 
 _TRANSCRIPT_DELTA = "conversation.item.input_audio_transcription.delta"
 _TRANSCRIPT_DONE = "conversation.item.input_audio_transcription.completed"
@@ -119,6 +123,8 @@ class OmniRealtimeProvider(RealtimeProvider):
         self._vad = _env("DOCMIND_OMNI_VAD", "server_vad").lower()
         # Optional business-space id; the SDK sends it as a header when set.
         self._workspace = _env("DOCMIND_OMNI_WORKSPACE")
+        self._replay_audio: deque[tuple[bytes, int]] = deque(maxlen=MAX_REPLAY_CHUNKS)
+        self._replay_lock = threading.Lock()
 
     # -- configuration --------------------------------------------------------
     @property
@@ -201,8 +207,54 @@ class OmniRealtimeProvider(RealtimeProvider):
             self._emit(EVENT_ERROR, code="audio_too_large", message="音频分片超过 1MiB",
                        chars=len(pcm))
             return False
+        stamp = int(captured_at or time.time() * 1000)
+        with self._replay_lock:
+            self._replay_audio.append((bytes(pcm), stamp))
         return self._send(self._event("input_audio_buffer.append",
                                       audio=base64.b64encode(pcm).decode("ascii")))
+
+    def send_silence_tail(self, seconds: float = DEFAULT_SILENCE_TAIL_SECONDS,
+                          *, chunk_ms: int = SILENCE_CHUNK_MS) -> bool:
+        """Keep the microphone stream alive with silence so server VAD closes the turn."""
+        try:
+            duration = max(0.0, min(float(seconds), 5.0))
+            step_ms = max(20, min(int(chunk_ms), 500))
+        except (TypeError, ValueError):
+            return False
+        count = int(round(duration * 1000 / step_ms))
+        chunk = b"\x00" * (16_000 * 2 * step_ms // 1000)
+        ok = True
+        for _ in range(count):
+            ok = self.send_audio(chunk, captured_at=int(time.time() * 1000)) and ok
+            time.sleep(step_ms / 1000.0)
+        return ok
+
+    def recover(self, *, timeout: float = 8.0) -> bool:
+        """Reconnect after ``stream_broken`` and replay the unfinished audio turn."""
+        with self._replay_lock:
+            pending = list(self._replay_audio)
+        self.close()
+        if not self.start():
+            return False
+        deadline = time.time() + max(0.5, float(timeout))
+        ready = False
+        while time.time() < deadline:
+            event = self.poll(timeout=0.2)
+            if event is None:
+                continue
+            if event.kind == EVENT_STATUS:
+                ready = True
+                break
+            if event.kind == EVENT_ERROR and event.payload.get("code") == "stream_broken":
+                return False
+        if not ready:
+            return False
+        with self._replay_lock:
+            self._replay_audio.clear()
+        for pcm, captured_at in pending:
+            if not self.send_audio(pcm, captured_at):
+                return False
+        return True
 
     def send_frame(self, image: bytes, captured_at: int = 0) -> bool:
         if not self._ready():
@@ -237,7 +289,11 @@ class OmniRealtimeProvider(RealtimeProvider):
         # ``input_audio_buffer.cleared``. Cutting the model's spoken output off
         # is the server's job: session.created reports interrupt_response=true,
         # so it stops itself the moment the user starts speaking again.
-        return self._send(self._event("input_audio_buffer.clear"))
+        ok = self._send(self._event("input_audio_buffer.clear"))
+        if ok:
+            with self._replay_lock:
+                self._replay_audio.clear()
+        return ok
 
     # -- protocol payloads ----------------------------------------------------
     def _session_payload(self) -> dict[str, Any]:
@@ -312,6 +368,9 @@ class OmniRealtimeProvider(RealtimeProvider):
                 continue
             event = self._translate(message)
             if event is not None:
+                if event.kind == EVENT_DONE:
+                    with self._replay_lock:
+                        self._replay_audio.clear()
                 self._events.put(event)
 
     def _translate(self, message: dict[str, Any]) -> RealtimeEvent | None:

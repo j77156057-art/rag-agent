@@ -2597,6 +2597,18 @@ async def live_vision_stream(websocket: WebSocket):
                     return
                 except Exception:
                     return
+                # A provider socket break is retryable: the provider may
+                # reconnect and replay its bounded unfinished audio turn. Keep
+                # this WebSocket alive so the client does not lose the session.
+                if (event.get("type") == "error"
+                        and event.get("code") == "stream_broken"
+                        and event.get("retryable") is True):
+                    try:
+                        recovered = await asyncio.to_thread(bridge.recover)
+                    except Exception:  # noqa: BLE001 - recovery is best effort
+                        recovered = False
+                    if not recovered:
+                        return
 
     async def process_frames() -> None:
         nonlocal pending, previous_observation, processor, generation

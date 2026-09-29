@@ -1,5 +1,14 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 R12 provider 可靠性三条收口（/root，已完成代码·勿重复）
+
+- **范围**：本轮只处理 R12 指定的 provider/网关/验收 runner 可靠性契约；AI-G 仍负责真实摄像头、麦克风、屏幕共享和驾驶舱 UX 联验。不要重复修改这三条。
+- **停止说话后的尾部**：`agent_runtime/realtime_omni.py` 新增 `send_silence_tail()`，默认继续发送约 1 秒、每块 100ms 的 PCM16 零音频，让服务端 VAD 正常收句。
+- **`stream_broken` 恢复**：Omni provider 保存有界的未完成音频；`recover()` 会重建连接、等待 ready 并重放音频。`api.py` 将 `retryable=true` 的 `stream_broken` 变为后台恢复，恢复失败才结束 WebSocket，不把它作为致命错误直接上抛。
+- **成功判定**：`verify_realtime_acceptance.py` 只有收到 `done` 且有 assistant 文本或音频才算成功；仅有 `transcript`、没有 `done` 的回合会失败并重连重放。旧 fake provider 没有静音尾接口时仍走兼容 fallback。
+- **验证**：`tests/test_realtime_acceptance.py`、`tests/test_realtime_provider.py`、`tests/test_realtime_gateway_bridge.py`、`tests/test_realtime_resource_security.py` 共 68 项；排除既有收尾竞态用例后 **67 passed**，该收尾用例单项复跑通过。整组联跑出现 1 个既有 `test_session_close_releases_provider_timeline_and_metric_scope` 时序 flake（67 passed / 1 failed），需后续单独复跑，不归因于这三条逻辑。
+- **后续**：真实模型/设备验收报告需要重新运行以刷新证据；本节代码已完成，AI-G 继续设备侧联验，其他 AI 不要重复实现静音尾、重连重放或 `done` 判定。
+
 ## 2026-09-29 ⚠ R7 其实已经实现，AI-C 勿从零开工（AI-F 补查，供 AI-C / R14 核对）
 
 - 起因：用户问「R7 是谁做的」。表上 R7 仍写「AI-C，0%」，但树里已有完整实现。
