@@ -141,8 +141,15 @@ def _clean_bridge_state():
     等前置文件的会话收尾尚未落地），所以把同步点放在唯一的地方：用例之间。
     """
     realtime_bridge.reset_state()
-    yield
-    _wait_for(lambda: realtime_bridge.active_timeline_projects() == [], timeout=10.0)
+    # 原生模式的**旁路观察**（每 docmind_native_observe_interval 秒多产出一条
+    # video.observation）会改变原生会话的线上事件序列，本文件多数用例断言的是精确序列，
+    # 所以这里默认关掉它，只有专门测它的那条用例自己打开。
+    # 同时清掉按项目的计时表：本文件所有用例共用同一个 project_id，不清就会互相压制
+    # （前一条用例刚点过，后一条就永远轮不到）。
+    api._NATIVE_OBSERVE_LAST.clear()
+    with patch.object(api, "_NATIVE_OBSERVE_INTERVAL", 0.0):
+        yield
+        _wait_for(lambda: realtime_bridge.active_timeline_projects() == [], timeout=10.0)
     realtime_bridge.reset_state()
 
 
@@ -453,6 +460,65 @@ def test_provider_interrupt_failure_still_completes_the_local_cancel(gateway, pr
         assert second["type"] == "error" and second["code"] == "interrupt_failed", second
         assert _session_survived(socket), "provider 打断故障不该打死会话"
     assert provider.interrupts == 0
+
+
+# ---- 8. 原生模式的旁路观察（A 档：把「主动发现画面问题」接回来） ----------------
+#
+# 原生模式下画面理解在实时模型那侧：它看得见，但没有工具、不产出结构化告警，说的话也不进
+# 主 Agent 上下文——所以「AI 主动发现画面问题」这条链原本是断的（live_vision_alerts 只挂在
+# 抽帧路径上）。现在按 docmind_native_observe_interval（默认 5s）放一帧给视觉模型做旁路观察。
+# 两条契约：①帧照旧直送 provider，旁路只是附加；②旁路失败**绝不上线**——客户端收到
+# ok:false 的 video.observation 会直接 close socket，而原生会话上还挂着语音。
+
+def test_native_mode_also_runs_a_low_rate_observation_probe(gateway, provider):
+    """原生模式：帧直送 provider（不降级），同时按低频产出一次观察（供告警与时间线）。"""
+    client, analyzer = gateway
+    with patch.object(api, "_NATIVE_OBSERVE_INTERVAL", 1.0):
+        with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+            _handshake(socket)
+            socket.send_bytes(_frame(0))
+            event = socket.receive_json()
+    assert event["type"] == "video.observation", f"旁路观察没有产出：{event}"
+    assert event["observations"] == ["抽帧观察"]
+    assert analyzer.calls == 1, "旁路观察必须真的调用视觉模型"
+    assert len(provider.frames) == 1, "帧仍必须直送 provider（旁路不是降级）"
+
+
+def test_native_observation_probe_failure_never_reaches_the_client(gateway, provider):
+    """旁路探针失败时一个字都不许上线：客户端收到 ok:false 会关掉整个 socket（含语音）。"""
+    client, analyzer = gateway
+    failing = {"ok": False, "error": "视觉模型暂不可用", "audit": {"mode": "unavailable"}}
+
+    async def broken(_file, previous_observation="", focused_region=""):
+        await _file.read()
+        analyzer.calls += 1
+        return failing
+
+    with patch.object(api, "analyze_live_frame_ep", side_effect=broken), \
+            patch.object(api, "_NATIVE_OBSERVE_INTERVAL", 1.0):
+        with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+            _handshake(socket)
+            socket.send_bytes(_frame(0))
+            time.sleep(1.0)          # 让旁路任务跑完；若它上线了，下面的读会先拿到它
+            socket.send_text(_control("heartbeat"))
+            event = socket.receive_json()
+    assert analyzer.calls == 1, "前置：旁路探针确实跑过（否则这条用例是空转）"
+    assert event["type"] == "heartbeat", f"失败的旁路观察不得上线：{event}"
+
+
+def test_native_probe_can_be_switched_off(gateway, provider):
+    """`DOCMIND_NATIVE_OBSERVE_INTERVAL=0` 时原生模式不再跑旁路观察（省算力）。"""
+    client, analyzer = gateway
+    with patch.object(api, "_NATIVE_OBSERVE_INTERVAL", 0.0):
+        with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+            _handshake(socket)
+            socket.send_bytes(_frame(0))
+            time.sleep(1.0)
+            socket.send_text(_control("heartbeat"))
+            event = socket.receive_json()
+    assert analyzer.calls == 0, "关掉开关后不得再调用视觉模型"
+    assert event["type"] == "heartbeat", f"关掉后不该有观察上线：{event}"
+    assert len(provider.frames) == 1, "关闭旁路不影响原生主链路"
 
 
 # ---- 4. 原生通道的帧/音频/打断路由 ------------------------------------------

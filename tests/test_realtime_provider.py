@@ -292,6 +292,9 @@ class OmniAdapterTests(unittest.TestCase):
         self.assertIn("开发 Agent", instructions, "人设必须讲清『你的话会被转交开发 Agent』")
         # 人设里会**引用**那句错误回答来禁止它，所以断言的是「禁令在」，不是「字面不在」。
         self.assertIn("不要回答", instructions, "必须明确禁止『我没法修改』这类回答")
+        # B：原生模式下网关不再兜抽帧观察，所以要求它自己主动报明显的界面问题。
+        self.assertIn("主动提醒用户", instructions, "必须要求主动报告画面中的明显问题")
+        self.assertIn("不要凭推测报异常", instructions, "误报比不报更伤信任：必须禁止推测式报异常")
 
     def test_explicit_instructions_override_the_default(self):
         os.environ["DOCMIND_OMNI_INSTRUCTIONS"] = "只说你好。"

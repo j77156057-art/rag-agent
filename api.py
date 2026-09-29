@@ -184,6 +184,28 @@ try:
 except (TypeError, ValueError):
     _LIVE_VISION_MIN_INTERVAL = 1.4
 _LIVE_VISION_MAX_BYTES = min(CHAT_IMAGE_MAX_BYTES, 8 * 1024 * 1024)
+try:
+    # 原生实时模式下**旁路**跑抽帧观察的间隔（秒）。默认 5s，设 0 关闭。
+    # 为什么需要它：原生模式下画面理解在实时模型那侧——它看得见，但没有工具、不产出
+    # 结构化告警，说的话也不进主 Agent 上下文。所以「AI 主动发现画面问题」这条链在原生
+    # 模式下是断的（那个专门做告警的 live_vision_alerts 只挂在抽帧路径上）。这条低频旁路
+    # 把它接回来：只为异常告警与实时时间线，不改主链路。
+    _NATIVE_OBSERVE_INTERVAL = max(0.0, float(os.getenv("DOCMIND_NATIVE_OBSERVE_INTERVAL", "5")))
+except (TypeError, ValueError):
+    _NATIVE_OBSERVE_INTERVAL = 5.0
+_NATIVE_OBSERVE_LAST: dict[str, float] = {}
+
+
+def _native_observe_due(project_id: str, now: float) -> bool:
+    """原生模式下是否到了该跑一次旁路观察的时刻（每项目独立计时）。"""
+    if _NATIVE_OBSERVE_INTERVAL <= 0:
+        return False
+    with _LIVE_VISION_LOCK:
+        previous = _NATIVE_OBSERVE_LAST.get(project_id, 0.0)
+        if now - previous < _NATIVE_OBSERVE_INTERVAL:
+            return False
+        _NATIVE_OBSERVE_LAST[project_id] = now
+        return True
 
 
 def _desktop_host_for(project_id):
@@ -2622,7 +2644,7 @@ async def live_vision_stream(websocket: WebSocket):
                     if not recovered:
                         return
 
-    async def process_frames() -> None:
+    async def process_frames(native_probe: bool = False) -> None:
         nonlocal pending, previous_observation, processor, generation
         while not closed:
             packet = pending
@@ -2655,6 +2677,16 @@ async def live_vision_stream(websocket: WebSocket):
                     result = {"ok": False, "error": "视觉服务返回了无法解析的响应。"}
             if not isinstance(result, dict):
                 result = {"ok": False, "error": "视觉服务返回了无效响应。"}
+            if native_probe:
+                # 原生模式下的观察是**旁路探针**，失败绝不能打扰主链路：客户端收到
+                # ok:false 或 audit=unavailable/error 的 video.observation 会直接
+                # `socket.close()`（那条分支是给抽帧模式写的），而原生会话上还挂着语音，
+                # 被一次旁路探针误杀的代价太大。被节流或没真分析的也一并跳过：
+                # 没有新观察就不该上线。
+                audit_mode = str((result.get("audit") or {}).get("mode") or "")
+                if (not result.get("ok") or result.get("throttled")
+                        or audit_mode in ("unavailable", "error")):
+                    return
             raw_observations = result.get("observations")
             observations = ([item for item in raw_observations if isinstance(item, str)]
                             if isinstance(raw_observations, list) else [])
@@ -2810,6 +2842,14 @@ async def live_vision_stream(websocket: WebSocket):
                     bridge.note_model_failure()
                 bridge.note_frame(header, queued=not native_taken)
             if native_taken:
+                # 帧已经交给实时模型；额外按低频（DOCMIND_NATIVE_OBSERVE_INTERVAL，默认 5s；
+                # 0 = 关）放**一帧**给视觉模型做旁路观察，只为两件事：异常告警
+                # （live_vision_alerts → 面板「AI 发现疑似界面异常」）与实时时间线。
+                # 旁路失败静默跳过（见 process_frames(native_probe=True)），不动主链路。
+                if _native_observe_due(project_id, time.monotonic()):
+                    pending = (header, payload)
+                    if processor is None or processor.done():
+                        processor = asyncio.create_task(process_frames(native_probe=True))
                 continue
             pending = (header, payload)
             if processor is None or processor.done():
@@ -2836,6 +2876,9 @@ async def live_vision_stream(websocket: WebSocket):
         # 接收线程（真机实测约 3s），让槽位被一个正在拆除的会话多占 3s 没有必要。
         with _LIVE_VISION_LOCK:
             _LIVE_VISION_CLIENTS.pop(project_id, None)
+            # 旁路观察的计时同样按项目记着，会话结束时一并回收：否则进程长期运行下
+            # 每个连过的项目都会留一条（与 _LIVE_VISION_LAST/_CLIENTS 同类的不回收坑）。
+            _NATIVE_OBSERVE_LAST.pop(project_id, None)
         # 接线（R4/R5/R10）：关掉 provider、释放项目时间线、回收指标会话作用域。
         if bridge is not None:
             try:
