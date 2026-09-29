@@ -9,6 +9,41 @@
 - 验证：本文件 5 passed 连跑两遍稳定（~2.4s）；混跑 `-k "realtime or live_vision or live_stream or voice"` = **270 passed / 0 failed**。
 - 未覆盖（如实说明）：服务重启恢复（bridge/timeline 为纯内存设计，重启即清零属预期，无媒体落盘可验）；GPU/CPU 限制不在实时链路内（归本地模型线）。R12 真机下这两项需复核。
 
+## 2026-09-29 修 R9 缺口：网关三处 provider 转发调用加守卫（AI-F，用户指派「修」）
+
+- **缺口（R9 只读审计报出，见本文件 R9 节）**：`api.py` 的 cancel / 音频 / 视频分支直接调
+  `bridge.interrupt()`、`bridge.take_audio()`、`bridge.send_frame()`，**一个 try 都没有**；而
+  `start()` 与 pump 循环都有。provider 基类契约写明「fail-closed，返回 False 而非外抛」，但契约
+  不等于保证——适配器违约一次，外抛就顺着外层 try（只接 WebSocketDisconnect）打穿整条会话。
+- **修法（三处各按语义兜底，都不动成功路径）**：`interrupt` 外抛 → 本地取消照常完成，另发一条
+  `interrupt_failed` 如实说明模型没停住；`take_audio` 外抛 → 按「没接管」落回既有
+  `audio_not_ready` 降级回复；`send_frame` 外抛 → **只降级这一帧**到抽帧路径，不中途翻转整场会话
+  的模式（模式已在 `hello.ok` 里承诺过）。三处都记 `note_model_failure()`。
+- **次序是契约的一部分（踩过）**：错误事件必须发在 `cancel.ok` **之后**。先发错误会让
+  「读第一条回包」的断言静默变绿（错误恰好不是 cancel.ok），缺口关闭了却看不出来；调过来后
+  R9 那条 known-gap 测试会按作者预写的方式响亮报错。
+- **R9 测试已按作者预写的说明翻转**：`test_known_gap_interrupt_is_not_guarded_and_kills_the_session`
+  → `test_guarded_cancel_survives_a_provider_that_raises`（断言 cancel.ok 先返回、随后 error、
+  心跳往返证明会话存活）。该文件当前版本同时删掉了那条负载敏感的 rapid-cycles 用例（作者所为）。
+  它必须与次序调整**同批**入库，否则 HEAD 上「旧断言 + 新次序」是红的——所以它在 `d923445` 里
+  与我的改动一起提交，其余内容仍属其作者 lane。
+- **验证**：`tests/test_realtime_gateway_bridge.py` **27 passed**（新增 3 条分别覆盖三处）；
+  **并反向验证过承重**——去掉守卫跑 `503e27e` 版 api.py，3 条全红。R9 文件 5 passed，
+  两文件合跑 32 passed；全量套件 **2117 passed / 6 skipped / 0 failed**（186s）。
+- 提交：`6832251`（三处守卫）+ `d923445`（取消答复次序 + 翻转 R9 测试）。
+
+### ⚠ 两条通报（不是我的改动，请相关 lane 认领）
+
+1. **本文件下方「补全桌面复验前端链路（AI-F）」一节署名 AI-F，但不是本会话所做**——我这个会话
+   没有碰过任何前端文件（本会话的改动只有：`agent_runtime/process_runner.py`、
+   `agent_runtime/realtime_bridge.py`、`api.py`、三个测试文件、HANDOFF）。代码本身是完整且正确
+   的（链路逐段核对过：Cockpit `dispatchFeedback` → `docmind:send-chat` → ChatDock `onSendChat`
+   → `send(reviewRef)` → `askGrounded` 的 FormData → 后端对账），但 `chat.ts` 与 `ChatDock.vue`
+   的这两处改动**目前仍未提交**（mtime 20:02，在我那次前端收口提交之后）。署名请核一下，
+   以免交接时误判谁在改哪个文件。
+2. 原先记的「前端不转发 workflowId/feedbackId」缺口**已关闭**（同上，由那条链路补齐），
+   所以 `/api/chat` 的桌面复验分支不再只是测试在调。
+
 ## 2026-09-29 补全桌面复验前端链路（AI-F）
 
 - 缺口：后端 `/api/chat` 在 `ui_context=desktop_visual_review` 时强制 `workflow_id`+
