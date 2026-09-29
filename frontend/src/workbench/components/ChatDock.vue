@@ -467,10 +467,12 @@ const usageTitle = computed(() => {
 })
 
 // ---------------------------------------------------------------- 发送 / 停止
-async function send(text?: string, attached?: File[], onAccepted?: () => void, uiContext?: ChatUiContext, activity?: { kind: ChatActivityKind; label: string }): Promise<boolean> {
+async function send(text?: string, attached?: File[], onAccepted?: () => void, uiContext?: ChatUiContext, activity?: { kind: ChatActivityKind; label: string }, reviewRef?: { workflowId?: string; feedbackId?: string }): Promise<boolean> {
   const q = (text ?? input.value).trim()
   const imgs = attached ? attached.slice() : pendingImages.value.slice()
-  if (props.scope === 'cockpit' && !attached && liveVisionFrame && imgs.length === 0) {
+  // 共享屏幕进行中对两种对话都附加最新帧：用户切页后落到的普通工作台对话同样在"看着"，
+  // 不再出现"刚共享完换个地方问就说看不到"。手动附过图（attached/pendingImages）则不覆盖。
+  if (!attached && liveVisionFrame && imgs.length === 0) {
     const extension = liveVisionFrame.type === 'image/jpeg' ? 'jpg' : 'png'
     imgs.push(new File([liveVisionFrame], `current-view-${Date.now()}.${extension}`, { type: liveVisionFrame.type || 'image/png' }))
   }
@@ -545,6 +547,8 @@ async function send(text?: string, attached?: File[], onAccepted?: () => void, u
       sessionId: currentSessionId(),
       uiContext: props.scope === 'cockpit' && liveVisionTimeline.length && !uiContext ? 'cockpit_live_vision' : uiContext,
       visualTimeline: props.scope === 'cockpit' ? liveVisionTimeline : [],
+      workflowId: reviewRef?.workflowId,
+      feedbackId: reviewRef?.feedbackId,
     })
     drain()
     const t = live()
@@ -1058,7 +1062,10 @@ async function onSendChat(detail: PreviewFeedbackRequest) {
     const activity = detail.uiContext === 'app_interface_inspect'
       ? { kind: 'inspect' as const, label: 'AI 浏览当前界面' }
       : undefined
-    const finished = await send(prompt, files, () => detail.onStatus?.('processing'), detail.uiContext, activity)
+    const finished = await send(prompt, files, () => detail.onStatus?.('processing'), detail.uiContext, activity,
+      detail.uiContext === 'desktop_visual_review'
+        ? { workflowId: detail.workflowId, feedbackId: detail.feedbackId }
+        : undefined)
     detail.onStatus?.(finished ? 'awaiting_review' : 'failed', finished ? 'AI 回复已结束，请检查预览效果' : '本次对话未完成，已执行操作不会自动撤销，请检查后重试')
   } catch {
     detail.onStatus?.('failed', '本次对话未完成，请检查项目当前状态后重试')
@@ -1081,13 +1088,12 @@ onMounted(() => {
   offSendChat = appEvents.on('docmind:send-chat', onSendChat)
   offContextChanged = appEvents.on('docmind:project-context-changed', resetChatContext)
   offOpenModelSettings = appEvents.on('docmind:open-model-settings', () => openModelSettings())
-  if (props.scope === 'cockpit') {
-    offLiveVisionFrame = appEvents.on('docmind:live-vision-frame', detail => {
-      if (detail.projectId !== getProjectId()) return
-      liveVisionFrame = detail.image
-      liveVisionTimeline = detail.image ? detail.timeline || [] : []
-    })
-  }
+  // 两种 scope 都订阅最新帧（附加发送已放开给普通对话）；时间线仍只有驾驶舱消费。
+  offLiveVisionFrame = appEvents.on('docmind:live-vision-frame', detail => {
+    if (detail.projectId !== getProjectId()) return
+    liveVisionFrame = detail.image
+    if (props.scope === 'cockpit') liveVisionTimeline = detail.image ? detail.timeline || [] : []
+  })
   window.addEventListener('pagehide', onPageHide)
   window.addEventListener('beforeunload', onBeforeLeave)
   if (props.scope === 'default') startTabProbe()   // 普通工作台沿用跨标签探测

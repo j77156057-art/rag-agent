@@ -1,5 +1,28 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 BUG 修复：共享屏幕后切页问 AI"看不到"（AI-B lane，ChatDock 帧附加放开）
+
+- **用户报告**：共享整个屏幕后切换页面，再问 AI 能不能看到，AI 答"看不到"。
+- **根因（代码级核实）**：开发舱在 App.vue 是 `v-if=everMounted + v-show`——切页不卸载 cockpit、共享持续推流；但"下一条消息附最新共享帧"的订阅与附加在 `ChatDock.vue` 都带 `scope==='cockpit'` 门（原 :1090/:473）。切页后驾驶舱聊天槽被隐藏，用户实际用的是普通工作台对话——那条消息没有任何画面，AI 只能诚实说看不到。属"驾驶舱专属对话"历史设计与"共享=一直在看"心智的冲突。
+- **修复**：共享帧对**两种对话**都附加（`!attached && liveVisionFrame && imgs.length===0`，手动附图仍优先）；default scope 只订阅帧、不消费 visualTimeline/uiContext（R8 时间线通道保持 cockpit 专属）。与驾驶舱同一内存附件路径，无新增隐私面；停共享/切项目的清理逻辑原样生效。
+- **验证**：前端 typecheck、build 通过。行为级验收需真实共享会话（自动化浏览器无可共享屏幕）：请用户复测"共享→切普通页→问'现在看到什么'"，应能描述当前屏幕内容。
+- **冲突声明**：`ChatDock.vue` 上有 AI-F 未提交的桌面复验改动，本 pathspec 整文件提交会一并入库其 WIP，特此说明。
+
+## 2026-09-29 Vibecoding 能力补全 Wave3：TS/JS/Vue 走 tree-sitter 精确引用（本会话，不占 R 槽位）
+
+- **补的是什么**：`code_intel` 只有 Python 一条 AST 精确路径（`_py_matches`），其余一律 `_regex_matches`——而本项目最活跃的是 `.vue/.ts`（cockpit 一轮改 308 行）。也就是说 `dev_find_references` / `game_impact` 对 TS/Vue 基本是正则猜：注释、字符串字面量、对象键都会混进「引用」。
+- **产物**：
+  - 新模块 `agent_runtime/ts_index.py`：`ts_matches()` 用 tree-sitter 找定义与引用，`.ts/.tsx` 用 typescript/tsx 语法、`.js/.jsx/.cjs/.mjs` 用 javascript 语法、`.vue` 解析 `<script>`/`<script setup>` 块（按 `lang="js"` 选 flavor，多块逐个解析），**行号映射回文件真实行**。
+  - `code_intel.find_references` 按扩展名分发；语法包缺失时 `ts_matches` 返回 None → 自动回退正则并在 notes 说明，**不静默丢结果**。
+  - `requirements.txt` 加 `tree-sitter` / `tree-sitter-typescript` / `tree-sitter-javascript`（都有 linux wheel，CI 装得上）；`tools.py`/`agent.py` 的 `dev_find_references` 文案同步改写（**新行为必须写进提示，否则模型仍按旧语义理解结果**）。
+  - `tests/test_ts_index.py`：**17 项**，`skipUnless(TS_READY)` 保证没装语法的机器不炸。
+- **精确性用例（钉死相对正则的全部价值）**：注释里的同名文本不算引用；字符串字面量里的不算；`{ foo: 1 }` 这种**对象字面量的键**单列为低置信 `kind:"str"`（重命名要同步改，但不是读引用）；`live.state.foo` 记为 `attr`；`interface Shape { foo: string }` 判成定义；JSX 元素名算引用；Vue 的 `<!-- greeting -->` 模板注释**不算**引用而 `{{ greeting }}`/`@click="bump"` 算。
+- **真代码验证**（不是夹具）：`find_references(<repo>, 'sendNativeAudioReady', scope=['frontend/src'])` → 定义 `AutonomousCockpit.vue:311` + 引用 `:1215`；`liveNativeAudioReady` → 定义 `:291` + 4 处引用（`:312/:316/:1073/:1323`），与 `grep -rn` 逐行一致，即**没有因收紧匹配而漏报**；`OUTPUT_SAMPLE_RATE` → 定义 `liveAudioControl.ts:19`。本轮扫描 114 个 TS/JS/Vue 文件。
+- **三个踩过的坑（后人少跌）**：① 语法入口名不统一——`tree-sitter-typescript` 导出 `language_typescript/language_tsx`，而 `tree-sitter-javascript` 0.25 只导出 `language`，`getattr` 拿到**函数对象**而不是 capsule 时报 `TypeError: an integer is required`，已用 `_grammar_entry` 按候选名解析；② 解析截取片段时**字节偏移必须用该片段的 bytes**，用整文件的 bytes 会把每个符号都读错位（Vue 曾因此全部命中为空）；③ `str.splitlines()` 把 `\x1c-\x1e` 当换行，所以记录分隔符只能用 `\x01/\x1f`（与上一波同源）。
+- **改动了别人的断言（如实通报）**：`tests/test_agent_code_tools.py::test_non_python_uses_word_boundary` 原写「非 Python 时 `const foo = 1` 算引用」，现在它被判成**定义**（作者意图——注释与 `foobar` 不算——保持不变并继续钉住）。已加注释说明改动原因，属行为改进而非回归；该文件作者 lane 如不认可可回滚这一条用例。
+- **验证**：Wave1/2/3 测试 + `test_native_tools`（注册表/模式数量守恒）合跑 **140 passed**；全量 pytest 见本会话下一条补记（本机需 `--basetemp`）。
+- **未做**：没接 pyright/BasedPyright 做**类型**解析（tree-sitter 只给语法，不给跨文件类型推断，例如 `foo` 在不同模块同名会各自成立）；`.svelte`/`.go`/`.rs` 仍在正则路径；`game_impact` 未复用新路径（它走 `symbols.py` 的 GDScript 索引）。这些留给 Wave4 之后评估。
+
 ## 2026-09-29 Vibecoding 能力补全 Wave2：`dev_lanes` 认领登记表（本会话，不占 R 槽位）
 
 - **动机（本会话实测的摩擦）**：多人同树靠公告表和 markdown 排他，会**朝两个方向过期**——表上写 0% 而实现早已进树（R2/R7 就是这样），或者两个会话同时领同一块；我这半小时里 HANDOFF 本身被别的 lane 改了两次（`file has been modified since read`），而别人的收口提交会把谁的半成品卷进 HEAD 全靠运气。本波把「谁在动哪些文件」变成机器可查的**带 TTL 租约**。
