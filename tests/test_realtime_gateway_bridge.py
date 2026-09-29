@@ -168,7 +168,15 @@ def gateway():
     with patch.object(api.projects, "get_project", side_effect=_get_project), \
             patch.object(api, "analyze_live_frame_ep", side_effect=analyzer.analyze):
         with TestClient(api.app) as client:
-            yield client, analyzer
+            try:
+                yield client, analyzer
+            finally:
+                # **必须在退出这个 client 之前**等收尾跑完。`with TestClient(...)` 退出会把
+                # 它的事件循环拆掉，而会话拆除跑在服务端 handler 的异步 finally 里、比客户端
+                # socket 退出晚；循环一拆，那个 finally 就再也不会完成——时间线/指标作用域
+                # 永远不回收，于是「等一会儿再断言」的用例只能靠运气（本文件间歇红的根因）。
+                # 拿它当同步点：等到没有活跃时间线，说明 finally 已经跑完。
+                _wait_for(lambda: realtime_bridge.active_timeline_projects() == [], timeout=20.0)
 
 
 def _hello(session_id: str = SESSION_ID) -> str:
@@ -600,25 +608,35 @@ def test_model_failure_is_counted_as_a_rejection(gateway):
 
 
 # ---- 7. 收尾：provider、时间线、指标作用域都要回收 ---------------------------
+#
+# 这条属性**直接驱动 SessionBridge** 来钉，不走 WebSocket。
+# 经网关的版本断言的是服务端 handler 的异步 finally，而 TestClient 的客户端 socket
+# 退出并不等它（本文件开头的坑）；更要命的是 `gateway` 夹具退出时会把事件循环拆掉，
+# 那个 finally 就再也不会完成——断言只剩「循环拆掉之前它恰好跑完了」这一种运气
+# （实测：同一条用例 5 次跑里红 1~3 次，等 20s 也没用，因为等的对象已经死了）。
+# 所以把属性放在能确定性观察的层面：close() 是同步的，三件事的次序在源码里是
+# provider.close() → release_timeline() → drop_session()。
+# 经网关的收尾另由夹具统一同步（见 `gateway`），R9 的
+# test_provider_close_exception_still_releases_timeline_and_metric_scope 覆盖 close 抛错的情形。
 
-def test_session_close_releases_provider_timeline_and_metric_scope(gateway, provider):
-    client, _ = gateway
-    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
-        _handshake(socket)
-        # 记一帧，让会话作用域里同时有计数器与直方图，才能证明整个作用域被回收。
-        socket.send_bytes(_frame(0))
-        provider.emit_text("回答一")
-        assert socket.receive_json()["type"] == "model.delta"
-    assert _wait_for(lambda: provider.closed is True), "会话结束必须关闭 provider"
-    assert _wait_for(lambda: PROJECT_ID not in realtime_bridge.active_timeline_projects()), \
-        "本项目的时间线必须被释放"
-    body = client.get(f"/api/vision/realtime/status?project_id={PROJECT_ID}").json()
-    # drop_session 生效的证明：会话作用域被彻底回收，metric 注册表不会无界增长。
-    # 这条曾经真的漏过：start() 用适配器自造的 rt-... 覆盖了网关会话号，
-    # drop_session(网关会话号) 永远清不掉那个作用域。
-    assert _wait_for(lambda: SESSION_ID not in
-                     realtime_bridge.METRICS.snapshot()["sessions"]), \
-        f"会话作用域没有被回收：{sorted(body['metrics']['sessions'])}"
+def test_close_releases_provider_timeline_and_metric_scope(provider):
+    """一次收尾要把三件事都做掉：关 provider、释放项目时间线、回收指标会话作用域。
+
+    第三件曾经真的漏过：`start()` 用适配器自造的 `rt-...` 覆盖了网关会话号，
+    `drop_session(网关会话号)` 就永远清不掉那个作用域（进程长期运行无界增长）。
+    """
+    bridge = _bridge()
+    bridge.note_frame({"captured_at": _now_ms(), "sequence": 1})
+    bridge.note_model_failure()
+    assert SESSION_ID in realtime_bridge.METRICS.snapshot()["sessions"], "前置：作用域应已建立"
+    assert PROJECT_ID in realtime_bridge.active_timeline_projects(), "前置：时间线应已建立"
+
+    bridge.close()
+
+    assert provider.closed is True, "会话结束必须关闭 provider"
+    assert PROJECT_ID not in realtime_bridge.active_timeline_projects(), "本项目的时间线必须被释放"
+    assert SESSION_ID not in realtime_bridge.METRICS.snapshot()["sessions"], \
+        f"会话作用域没有被回收：{sorted(realtime_bridge.METRICS.snapshot()['sessions'])}"
 
 
 def test_provider_session_id_never_hijacks_the_gateway_session(gateway, provider):
