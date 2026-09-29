@@ -11,11 +11,11 @@
   - 这 22 个文件跑 pytest = **296 passed**。
   - 过程中一次引号写坏导致 pytest 收到空参数，意外完成**全量 pytest 复跑：2129 passed / 6 skipped / 60 subtests，249s 全绿**。要不要把 CI 整条切成 pytest 由用户定（Linux 平台差异未验证，本轮不越权）。
 - **已知坑（本机专属，不影响 CI）**：这台 Windows 的用户名含 `'`，pytest 默认 basetemp `D:\Temp\pytest-of-h'h'h` 直接 `PermissionError [WinError 5]`，表现为 23 errors + 1 failed。本机跑 pytest 必须带项目内 `--basetemp`。ubuntu runner 无此问题，故 CI 步骤里**不**写 `--basetemp`。
-- **未完成 / 边界**：① 本会话无 push 能力（沙箱代理断 github），改动只在本地，要等用户 push 才真正跑到 CI；② postgres job 不跑该 lane（与现有测试步骤分布一致）；③ 未装 pytest-timeout，将来若有挂死测试靠 Actions 作业超时兜底；④ 未动 `agent_runtime/realtime_omni.py`、`AutonomousCockpit.vue`、`tests/test_realtime_provider.py`、`tests/test_realtime_gateway_bridge.py`、`tests/test_live_stream_control.py`——音频先行闸门那条线正被别的 lane 在改。
+- **未完成 / 边界**：① 本会话无 push 能力（沙箱代理断 github），改动只在本地，要等用户 push 才真正跑到 CI；② postgres job 不跑该 lane（与现有测试步骤分布一致）；③ 未装 pytest-timeout，将来若有挂死测试靠 Actions 作业超时兜底；④ 音频先行闸门已由 `8cefac0`（前端）+ `d3e376c`（provider）收口，当前只剩真实摄像头/麦克风/扬声器条件下的 R12 设备验收。
 
 ## 2026-09-29 音频就绪闸门：真机对照验证（AI-D，只读，未改任何代码）
 
-- 对象：`realtime_omni.py` 里那套 provider 侧闸门（`_audio_primed` + `send_frame` 首帧引导，作者仍在工作树里 WIP）、以及 `8cefac0` 的前端闸门。**我没有改动这两个文件**，只做真机验证给作者引用。
+- 对象：`realtime_omni.py` 里那套 provider 侧闸门（`_audio_primed` + `send_frame` 首帧引导，已在 `d3e376c` 收口）、以及 `8cefac0` 的前端闸门。**我没有改动这两个文件**，只做真机验证给作者引用。
 - 真 Key + `qwen3.8-omni-flash-realtime`，两个方向各跑 2 次：
   | 顺序 | 结果 |
   | --- | --- |
