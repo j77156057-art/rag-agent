@@ -26,9 +26,16 @@ Live probe results (2026-09-29, real ``sk-ws-`` key, read-only):
   each make the server drop the connection (10054). Manual mode is therefore
   unavailable on this endpoint; only server-VAD streaming works, so
   :meth:`commit` and :meth:`interrupt` degrade to the buffer-clear path.
-* **Still unproven** — ``session.update`` returns no ``session.updated``, and a
-  1 s tone triggered neither VAD nor any response event, so the exact session
-  field spelling and the VAD trigger need a real human voice (plan R12).
+* **Blocked on the account** — real speech (whisper.cpp's 16 kHz ``jfk.wav``,
+  11 s) produced zero events and the server dropped the connection about 1 s
+  into the stream, for all three framings tried: JSON ``input_audio_buffer.
+  append`` (with and without ``event_id``, field ``audio`` and ``data``) and raw
+  PCM binary frames. The same key answers fine over HTTP for ``qwen-plus`` and
+  ``qwen-omni-turbo``, so this points at the realtime service not being enabled
+  for the workspace rather than at this adapter. A workspace-specific endpoint
+  and enabling Omni Realtime in Model Studio are the next things to try (R12).
+* **Still unproven** — ``session.update`` returns no ``session.updated``, so the
+  session field spelling is inferred from the ``session.created`` echo only.
 """
 from __future__ import annotations
 
@@ -106,7 +113,7 @@ class OmniRealtimeProvider(RealtimeProvider):
                         "reason": "缺少 websocket-client 依赖", "degraded_to": DEGRADED_SAMPLED_FRAMES}
         return {"ok": True, "provider": self.name, "model": self._model,
                 "voice": self._voice, "vad": self._vad, "verified": "connect-only",
-                "note": "连接与 session.created 已真机验证；commit/cancel 被服务端断连，VAD 触发待真人声联验"}
+                "note": "连接与 session.created 已真机验证；commit/cancel 与真人声音频输入均被服务端断连，疑似未开通实时多模态服务"}
 
     # -- lifecycle ------------------------------------------------------------
     def start(self) -> bool:
