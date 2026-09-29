@@ -1,5 +1,21 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 Vibecoding 能力补全 Wave1：`dev_glob` + `dev_git_log`（本会话，不占 R 槽位）
+
+- **背景**：用户拍板把 vibecoding 能力缺口按波次全量补齐（清单见本会话前段；Wave 编号对应任务表）。本条是第 1 波，纯增量、只读、不动实时线。
+- **补什么**：harness 此前「找文件」只能 `list_dir` 一层层翻或 `grep` 搜内容，「看历史」完全没有入口——`code_intel` 的只读白名单只有 `rev-parse|status|diff`，Agent 看不见「谁在什么时候改了什么」。这两件事在多人并行 lane 的协作里是刚需：判断是否重复劳动、确认某实现是否已入库、找回被覆盖前的写法。
+- **产物**：
+  - `agent_runtime/code_intel.py`：`glob_files()` + `render_glob()`（按文件名/相对路径通配，浅层优先排序，跳过 `_SKIP_DIRS` 但**故意不受 `_SOURCE_EXTS` 限制**，因为找 `Dockerfile`/`*.yml`/lockfile 正是它的用途）；`git_log_preview()` + `render_git_log()`（`paths/limit/since/until/author/at/files/timeout`）；`_GIT_ALLOWED` 增加 `log`（仍为只读）。
+  - `tools.py`：`dev_glob`、`dev_git_log` 两个实现 + TOOLS 注册。
+  - `agent.py`：系统提示工具目录里补上这两行（**新工具必须同步登记提示，否则模型不知道它存在**——这条对后续每个 Wave 都成立）。
+  - `tests/test_dev_glob_git_log.py`：39 项（unittest 风格，两个 CI 步骤都会收）。
+- **护栏**：`since/until/author/at` 取值经 `_clean_scalar`，以 `-`/`=` 开头或含控制字符一律拒绝（参数注入）；`paths:` 复用既有 `_validate_paths`（越界拒绝）；`scope` 走 `_contained_path` 同规则；pattern 含控制字符/超长拒绝；walk 有 50000 条目硬上限并如实标注不完整；`limit` 上限 500（glob）/ 200（log）。
+- **两个踩过的坑（后人少跌）**：① 记录分隔符最初用 `\x1e`，而 `_strip_git_noise` 的 `str.splitlines()` **把 `\x1c-\x1e` 当换行**，结果整段历史被压成一条、其余提交变成「第一条的文件名列表」——改用 `\x01`/`\x1f`（不在 splitlines 集合内），并写了两条钉死该回归的用例。② 空仓库不是错误：git 的 `fatal: ... does not have any commits yet` 会被噪声过滤剥光，所以**不能靠措辞判断**，改为 probe `rev-parse --verify HEAD`，返回 ok + 「还没有任何提交」提示。
+- **顺手修**：`_run_git` 保留 `raw_output`（未过滤原文），只用于失败消息——此前报错只剩「无输出」，Agent 拿不到 git 的原话。
+- **验证**：`tests/test_dev_glob_git_log.py` + `tests/test_agent_code_tools.py` 合跑 **77 passed**；再加 `test_native_tools`（`len(tool_schemas())==len(TOOLS)` 这条会因漏注册而红）等 5 个文件 **121 passed**；**全量 pytest 2168 passed / 6 skipped / 278s 全绿**（本机需 `--basetemp`，见上一节 Windows 坑）。
+- **未做（如实说明）**：原计划本波还想接 `dev_review`，查证后**主动放弃**——`independent_review.review_project()` 已由 `game_workflow.py:3227` 在工作流里调用，且 `execution_mode()!="enterprise"` 时直接返回 `local_mode`，再包一层工具是重复建设。开发机真正缺的是「看 diff + 跑测试」，那由 `self_verify`/`dev_git_diff` 覆盖。
+- **后续波次（同一任务表，勿重复领）**：worktree 隔离 + lane 认领、TS/Vue tree-sitter 精确引用、`dev_diagnostics`、`dev_patch`/`dev_move`、`dev_serve`/浏览器观测、媒体夹具（R12 设备依赖）、vitest、harness 作为 MCP server、MCP 工具一等公民、dev lane 评测集、`dev_propose`/`dev_ci_status`。
+
 ## 2026-09-29 CI 盲区修复：pytest 风格测试首次进闸门（本会话，不占 R 槽位）
 
 - **问题（实测，不是推测）**：`harness.yml` 的 `Run full test suite` 用 `python -m unittest discover -s tests`，而 unittest 只收 `TestCase` 子类，**模块级 `def test_*` 一律不收**。用 `.venv` 对本仓库实测收集：**1835 项 / 145 个文件，另有 22 个测试文件对 CI 贡献 0 项**——正好是实时/语音这条 lane：`test_realtime_*`(10)、`test_live_audio_control`、`test_live_stream_control`、`test_live_vision`、`test_live_vision_alerts`、`test_visual_feedback`、`test_visual_targeting`、`test_mcp_discovery`、`test_mcp_curated_index`、`test_capability_lease`、`test_react_token_filter`、`test_adapter_catalog`、`test_project_checkpoint_selective`。也就是说 R0–R14 的 **296 项断言此前从未进过 CI**。

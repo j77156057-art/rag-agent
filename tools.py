@@ -4852,6 +4852,85 @@ def dev_git_diff(arg):
     return code_intel.render_git_diff(res)
 
 
+def dev_glob(arg):
+    """按文件名通配在代码库里找文件（grep 只能搜内容，list_dir 只能一层层翻）。
+
+    输入（多行 keyed）：
+      pattern: **/liveAudioControl.ts     # 必填；不含 / 时按文件名匹配
+      scope: frontend/src                 # 可选，限定目录（相对代码根目录）
+      limit: 40                           # 可选，返回条数，默认 80，上限 500
+    也可以直接把 pattern 当输入（如 `*.vue`）。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    keys = ["pattern", "scope", "limit"]
+    fields = _parse_keyed(arg, keys)
+    bare = [ln.strip() for ln in (arg or "").splitlines()
+            if ln.strip() and not re.match(r"^\s*(" + "|".join(keys) + r")\s*[:：]", ln)]
+    pattern = (fields.get("pattern") or "").strip() or (bare[0] if bare else "")
+    pattern = pattern.splitlines()[0].strip() if pattern else ""
+    try:
+        limit = int(str(fields.get("limit") or "80").strip())
+    except (TypeError, ValueError):
+        limit = 80
+
+    from agent_runtime import code_intel
+    res = code_intel.glob_files(root, pattern,
+                                scope=(fields.get("scope") or "").strip(), limit=limit)
+    return code_intel.render_glob(res)
+
+
+def dev_git_log(arg):
+    """【只读】看历史：谁在什么时候改了什么、某个文件被哪些提交动过、某人最近在做什么。
+
+    和 dev_git_diff 的分工：diff 看「现在还没提交的改动」，log 看「已经进历史的那些」。
+
+    输入（多行 keyed，全部可选）：
+      paths: agent_runtime/realtime_omni.py, frontend/src   # 限定文件/目录，逗号或换行分隔
+      limit: 20          # 条数，默认 20，上限 200
+      since: 2026-09-25  # 起始时间（git 认的日期写法都行）
+      until: 2026-09-29
+      author: root       # 作者名片段（用来分辨是哪条 lane 干的）
+      at: b78bd52        # 只看某一个提交（也可写 HEAD / 分支名 / a..b）
+      files: true        # 每条提交附带它改动的文件清单
+      timeout: 20
+    也可以直接把路径当输入（如 `tools.py`），语义等同 paths:。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    keys = ["paths", "limit", "since", "until", "author", "at", "files", "timeout"]
+    fields = _parse_keyed(arg, keys)
+    bare = [ln.strip() for ln in (arg or "").splitlines()
+            if ln.strip() and not re.match(r"^\s*(" + "|".join(keys) + r")\s*[:：]", ln)]
+    raw_paths = fields.get("paths") or ""
+    paths = _split_path_list(raw_paths) if raw_paths else bare
+
+    def _truthy(v):
+        return str(v or "").strip().lower() in ("1", "true", "yes", "y", "on", "是")
+
+    try:
+        limit = int(str(fields.get("limit") or "20").strip())
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        timeout = int(str(fields.get("timeout") or "20").strip())
+    except (TypeError, ValueError):
+        timeout = 20
+
+    from agent_runtime import code_intel
+    res = code_intel.git_log_preview(
+        root, paths=paths, limit=limit,
+        since=(fields.get("since") or "").strip(),
+        until=(fields.get("until") or "").strip(),
+        author=(fields.get("author") or "").strip(),
+        at=(fields.get("at") or "").strip(),
+        files=_truthy(fields.get("files")), timeout=timeout,
+    )
+    return code_intel.render_git_log(res)
+
+
 def dev_find_references(arg):
     """重构前定位符号的全部引用点（重命名/删函数/改签名前必用）。
 
@@ -6461,6 +6540,14 @@ TOOLS = {
     "dev_git_diff": {
         "description": "【只读】预览你刚改了什么：工作树或暂存区相对 HEAD 的差异，绝不写入/暂存/提交。改完代码、提交前、以及想确认「自己到底动了哪些文件」时用它。输入可留空（=整个代码根目录），也可限定：paths: <文件或目录，逗号/换行分隔>、staged: true（看已 git add 的，默认看未暂存）、stat: true（只要文件级统计，不要正文）、context: <上下文行数，默认 3>、timeout: <秒，上限 60>；直接把路径当输入也可以。返回变更清单（区分已暂存/未暂存/未跟踪）+ 统计 + 差异正文；正文过长会窗口化并标注，此时加 paths: 限定到单文件再看。注意：未跟踪的新文件不会出现在 diff 正文里，工具会单独列出提示。",
         "func": dev_git_diff,
+    },
+    "dev_glob": {
+        "description": "按文件名通配在代码库里【找文件】（grep 只能搜内容、list_dir 只能一层层翻，开局勘察结构时用它）。输入：pattern: <必填>、scope: <限定目录>、limit: <条数，默认 80，上限 500>；直接把 pattern 当输入也可以。规则：pattern 不含 `/` 时按文件名匹配（`*.vue`、`test_realtime_*.py`、`Dockerfile`）；含 `/` 时按相对路径匹配（`frontend/src/**/*.ts`，`**` 可用单层通配理解）；`**/xxx.ts` 等价于按文件名找任意深度。全小写的 pattern 也会匹配大小写不同的名字，一旦含大写字母就严格区分。返回按「浅层优先」排序的相对路径清单，命中过多会截断并提示收窄。这里【不】限制扩展名（找 lockfile、*.yml、Dockerfile 正是它的用途），但始终跳过 .git/.venv/node_modules/__pycache__ 等噪声目录。",
+        "func": dev_glob,
+    },
+    "dev_git_log": {
+        "description": "【只读】看提交历史：谁在什么时候改了什么、某个文件被哪些提交动过、某条 lane 最近在干什么。与 dev_git_diff 的分工——diff 回答「还没提交的改动」，log 回答「已经进历史的那些」；判断重复劳动、确认某改动是否已入库、找回被覆盖前的实现都必须用它。输入（全部可选）：paths: <文件或目录，逗号/换行分隔>、limit: <条数，默认 20，上限 200>、since: <日期，如 2026-09-25>、until: <日期>、author: <作者名片段>、at: <某个提交，如 HEAD 或 b78bd52，也可 a..b>、files: true（每条附带改动文件清单）、timeout: <秒，上限 60>；直接把路径当输入也可以。只走 rev-parse/status/diff/log 四个只读子命令，绝不写入、绝不提交；取值里以 `-` 或 `=` 开头、含控制字符的一律拒绝（防参数注入）。返回 `hash 日期 作者 标题` 流水并标注当前 HEAD。",
+        "func": dev_git_log,
     },
     "dev_find_references": {
         "description": "重构前定位符号的全部引用点（重命名/删函数/改签名/搬文件前必用）。Python 走 ast 精确匹配——注释与字符串里的同名文本【不会】被误报；其它语言走词边界正则并跳过纯注释行。输入：symbol: <符号名>（必填），可选 scope: <限定目录或文件>、kind: def|ref|all（默认 all）、limit: <条数上限，默认 80>；直接把符号名当输入也可以。返回定义处与引用处（file:行号 + 代码行，按文件聚合计数）。命中过多时请用 scope 缩小范围。",

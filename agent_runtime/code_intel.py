@@ -4,7 +4,10 @@ Both helpers are strictly read-only and bounded:
 
 * :func:`git_diff_preview` shells out to ``git`` through the bounded runner
   (:mod:`agent_runtime.process_runner`) so a runaway repo can never hang the agent,
-  and only ever calls ``rev-parse``/``status``/``diff``.
+  and only ever calls ``rev-parse``/``status``/``diff``/``log``.
+* :func:`git_log_preview` is the read-only history view (who changed what, and
+  which commits touched a path).
+* :func:`glob_files` finds files by name pattern, which ``grep`` cannot do.
 * :func:`find_references` walks the source tree with a hard file/byte budget and
   uses :mod:`ast` for Python so comments and string literals are never reported
   as references (the whole reason this exists instead of ``grep``).
@@ -13,6 +16,7 @@ Both helpers are strictly read-only and bounded:
 from __future__ import annotations
 
 import ast
+import fnmatch
 import os
 import re
 from typing import Any
@@ -27,7 +31,7 @@ _GIT_TIMEOUT = 20
 _GIT_MAX_TIMEOUT = 60
 
 #: git subcommands this module is allowed to run. Read-only by construction.
-_GIT_ALLOWED = frozenset({"rev-parse", "status", "diff"})
+_GIT_ALLOWED = frozenset({"rev-parse", "status", "diff", "log"})
 
 _STAT_CHARS = 6000
 _LIST_FILES = 60
@@ -88,6 +92,7 @@ def _run_git(args: list[str], *, cwd: str, timeout: int = _GIT_TIMEOUT) -> dict[
     # git writes warnings to stderr, which the runner merges into stdout. Left
     # alone they get parsed as status entries ("w ning: could not open ...").
     if rep.get("output"):
+        rep["raw_output"] = rep["output"]
         rep["output"] = _strip_git_noise(rep["output"])
     return rep
 
@@ -315,6 +320,295 @@ def render_git_diff(result: dict[str, Any]) -> str:
         lines.append("提示: " + note)
     if result.get("ok") and result.get("error"):
         lines.append("注意: " + result["error"])
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# file lookup by name pattern
+# --------------------------------------------------------------------------- #
+
+_GLOB_MAX_LIMIT = 500
+_GLOB_MAX_SCANNED = 50000
+
+
+def _glob_match(name: str, pattern: str) -> bool:
+    """fnmatch without the platform case-folding surprise.
+
+    All-lowercase patterns also match capitalized names (the Windows habit); a
+    pattern containing an uppercase letter is compared exactly, so ``Foo.vue``
+    never satisfies a search for ``foo.vue``.
+    """
+    if any(ch.isupper() for ch in pattern):
+        return fnmatch.fnmatchcase(name, pattern)
+    return fnmatch.fnmatchcase(name.lower(), pattern.lower())
+
+
+def _glob_hits(rel: str, pattern: str) -> bool:
+    base = rel.rsplit("/", 1)[-1]
+    if pattern.startswith("**/"):
+        return _glob_match(base, pattern[3:]) or _glob_match(rel, pattern[3:])
+    if "/" in pattern:
+        return _glob_match(rel, pattern.replace("**", "*"))
+    if pattern.startswith("*"):
+        return _glob_match(rel, pattern) or _glob_match(base, pattern)
+    return _glob_match(base, pattern)
+
+
+def _contained_path(root_abs: str, raw: str) -> tuple[str, str]:
+    """Resolve ``raw`` inside ``root_abs``; reject flag-looking or escaping input."""
+    p = str(raw or "").strip().strip("'\"")
+    if not p:
+        return "", ""
+    if p.startswith("-"):
+        return "", f"拒绝路径 {p!r}：看起来像命令行选项，疑似参数注入。"
+    candidate = os.path.normpath(p if os.path.isabs(p) else os.path.join(root_abs, p))
+    if not (candidate == root_abs or candidate.startswith(root_abs + os.sep)):
+        return "", f"拒绝路径 {p!r}：不在代码根目录内（禁止越界读取）。"
+    return candidate, ""
+
+
+def glob_files(root: str, pattern: str, *, scope: str = "",
+               limit: int = _GLOB_MAX_LIMIT) -> dict[str, Any]:
+    """Find files by name pattern under the code root; ``grep`` only sees contents.
+
+    ``_SOURCE_EXTS`` deliberately does not apply here: looking files up by name
+    is exactly how an agent finds ``Dockerfile``, lockfiles and ``*.yml``.
+    """
+    result: dict[str, Any] = {
+        "ok": False, "pattern": "", "root": root, "scope": "", "files": [],
+        "count": 0, "truncated": False, "scanned": 0, "scan_capped": False,
+        "error": "", "notes": [],
+    }
+    pat = str(pattern or "").strip().strip("'\"")
+    if not pat:
+        result["error"] = "缺少 pattern：例如 tests/test_realtime_*.py、**/liveAudioControl.ts、*.vue"
+        return result
+    if pat.startswith("-") or any(ord(ch) < 32 for ch in pat):
+        result["error"] = f"拒绝 pattern {pat!r}：含控制字符或疑似参数注入。"
+        return result
+    if len(pat) > 200:
+        result["error"] = "拒绝 pattern：过长（上限 200 字符）。"
+        return result
+    result["pattern"] = pat
+    root_abs = os.path.normpath(root or "")
+    if not root or not os.path.isdir(root_abs):
+        result["error"] = "代码根目录不存在或未配置。"
+        return result
+    base, err = _contained_path(root_abs, scope)
+    if err:
+        result["error"] = err
+        return result
+    base = base or root_abs
+    if not os.path.isdir(base):
+        result["error"] = f"scope 不是目录：{scope}"
+        return result
+    try:
+        cap = int(limit)
+    except (TypeError, ValueError):
+        cap = _GLOB_MAX_LIMIT
+    cap = max(1, min(cap, _GLOB_MAX_LIMIT))
+    rel_scope = os.path.relpath(base, root_abs).replace("\\", "/")
+    result["scope"] = "" if rel_scope == "." else rel_scope
+
+    matches: list[str] = []
+    scanned = 0
+    scan_capped = False
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        rel_dir = os.path.relpath(dirpath, root_abs).replace("\\", "/")
+        if rel_dir == ".":
+            rel_dir = ""
+        for name in sorted(filenames):
+            scanned += 1
+            if scanned > _GLOB_MAX_SCANNED:
+                scan_capped = True
+                break
+            rel = f"{rel_dir}/{name}" if rel_dir else name
+            if _glob_hits(rel, pat):
+                matches.append(rel)
+        if scan_capped:
+            break
+    result["ok"] = True
+    result["scanned"] = scanned
+    result["scan_capped"] = scan_capped
+    matches.sort(key=lambda rel: (rel.count("/"), rel))
+    result["count"] = len(matches)
+    result["truncated"] = len(matches) > cap
+    result["files"] = matches[:cap]
+    if scan_capped:
+        result["notes"].append(f"目录条目超过 {scanned} 上限，结果可能不完整；请用 scope: 缩小范围。")
+    return result
+
+
+def render_glob(result: dict[str, Any]) -> str:
+    if not result.get("ok"):
+        return "dev_glob 失败：" + (result.get("error") or "未知错误")
+    pat = result.get("pattern") or ""
+    scope = result.get("scope") or ""
+    files = result.get("files") or []
+    title = f"匹配 {pat!r}" + (f"（限定 {scope}/）" if scope else "")
+    if not files:
+        lines = [title + "：没有命中文件。检查拼写，或去掉 scope 再看一次。"]
+    else:
+        more = f"，只显示前 {len(files)} 个" if result.get("truncated") else ""
+        lines = [f"{title}：命中 {result.get('count')} 个{more}（相对代码根目录，浅层优先）"]
+        lines += [f"  {rel}" for rel in files]
+    for note in result.get("notes") or []:
+        lines.append("提示: " + note)
+    if result.get("truncated"):
+        lines.append("提示: 用更具体的 pattern（如 **/workbench/live*.ts）或加 scope: 收窄。")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# git history preview
+# --------------------------------------------------------------------------- #
+
+#: 输出里的分隔符。必须避开 `str.splitlines()` 认作换行的字符（\x1c-\x1e 在内），
+#: 否则 _strip_git_noise 会把记录边界当换行吃掉——曾经只剩第一条提交。
+_LOG_FIELD_SEP = "\x1f"
+_LOG_RECORD_SEP = "\x01"
+_LOG_DEFAULT_LIMIT = 20
+_LOG_MAX_LIMIT = 200
+#: 用 git 的 %xNN 转义（参数本身保持纯 ASCII），不要把控制字符放进 argv。
+_LOG_PRETTY = "--pretty=format:%x01%h%x1f%ad%x1f%an%x1f%s"
+
+
+def _clean_scalar(value: str, field: str) -> tuple[str, str]:
+    """A git option value that can never open a new flag or carry control chars."""
+    text = str(value or "").strip().strip("'\"")
+    if not text:
+        return "", ""
+    if text.startswith("-") or text.startswith("=") or any(ord(ch) < 32 for ch in text):
+        return "", f"拒绝 {field}：取值 {text!r} 疑似参数注入。"
+    if len(text) > 120:
+        return "", f"拒绝 {field}：取值过长（上限 120 字符）。"
+    return text, ""
+
+
+def _parse_log_records(text: str) -> list[dict[str, Any]]:
+    """Parse the ``\\x1e``-delimited log format above; stray output lines are dropped."""
+    records: list[dict[str, Any]] = []
+    for chunk in (text or "").split(_LOG_RECORD_SEP):
+        body = chunk.strip("\n")
+        if not body.strip():
+            continue
+        header, _, rest = body.partition("\n")
+        fields = [part.strip() for part in header.split(_LOG_FIELD_SEP)]
+        if len(fields) < 4:
+            continue
+        records.append({"hash": fields[0], "date": fields[1], "author": fields[2],
+                        "subject": fields[3],
+                        "files": [ln.strip() for ln in rest.splitlines() if ln.strip()]})
+    return records
+
+
+def git_log_preview(root: str, *, paths: list[str] | None = None,
+                    limit: int = _LOG_DEFAULT_LIMIT, since: str = "", until: str = "",
+                    author: str = "", at: str = "", files: bool = False,
+                    timeout: int = _GIT_TIMEOUT) -> dict[str, Any]:
+    """Read-only history: recent commits, commits touching paths, or one commit."""
+    result: dict[str, Any] = {
+        "ok": False, "root": root, "top": None, "head": "", "entries": [],
+        "count": 0, "truncated": False, "error": "", "notes": [],
+    }
+    root_abs = os.path.normpath(root or "")
+    if not root or not os.path.isdir(root_abs):
+        result["error"] = "代码根目录不存在或未配置。"
+        return result
+    top, reason = _repo_top(root_abs)
+    if top is None:
+        result["error"] = reason
+        return result
+    result["top"] = top
+
+    values: dict[str, str] = {}
+    for field, raw in (("since", since), ("until", until), ("author", author), ("at", at)):
+        clean, err = _clean_scalar(raw, field)
+        if err:
+            result["error"] = err
+            return result
+        values[field] = clean
+    try:
+        want = int(limit)
+    except (TypeError, ValueError):
+        want = _LOG_DEFAULT_LIMIT
+    want = max(1, min(want, _LOG_MAX_LIMIT))
+
+    # `at:` 指向单个 revision 时就是「只看这一条」；写成 a..b 区间时才按 limit 展开。
+    single_ref = bool(values["at"]) and ".." not in values["at"]
+    span = 1 if single_ref else want + 1
+    args = ["log", "--no-color", "--date=short", _LOG_PRETTY, "--max-count", str(span)]
+    for flag in ("--since", "--until", "--author"):
+        value = values[flag[2:]]
+        if value:
+            args.append(f"{flag}={value}")
+    if files:
+        args.append("--name-only")
+    if values["at"]:
+        args.append(values["at"])
+    requested = [p for p in (paths or []) if str(p).strip()]
+    if requested:
+        kept, err = _validate_paths(requested, root_abs, top)
+        if kept is None:
+            result["error"] = err
+            return result
+        args += ["--"] + kept
+
+    rep = _run_git(args, cwd=top, timeout=timeout)
+    if rep.get("error"):
+        result["error"] = f"无法执行 git log：{rep['error']}"
+        return result
+    output = rep.get("output") or ""
+    if rep.get("timed_out"):
+        result["error"] = "git log 超时，仓库可能过大；请用 limit: 或 paths: 缩小范围。"
+        return result
+    if rep.get("exit_code") != 0:
+        # 空仓库是合法状态而非错误。不能靠 git 的措辞判断（诊断行会被
+        # _strip_git_noise 剥掉），所以直接问 HEAD 存不存在。
+        probe = _run_git(["rev-parse", "--verify", "HEAD"], cwd=top)
+        if not probe.get("error") and probe.get("exit_code") != 0:
+            result["ok"] = True
+            result["notes"].append("仓库还没有任何提交（新建仓库，或改动全都未提交）。")
+            return result
+        detail = (rep.get("raw_output") or output).strip().splitlines()
+        result["error"] = "git log 失败：" + (detail[-1][:200] if detail else "无输出")
+        return result
+
+    records = _parse_log_records(output)
+    result["truncated"] = len(records) > want
+    records = records[:want]
+    result["entries"] = records
+    result["count"] = len(records)
+    result["ok"] = True
+    if not records:
+        result["notes"].append("该范围内没有提交（空仓库、ref 不存在或该路径从未被提交）。")
+    if files:
+        result["notes"].append("files 来自 --name-only，重命名可能只显示目标路径。")
+    head = _run_git(["rev-parse", "--short", "HEAD"], cwd=top)
+    if not head.get("error") and head.get("exit_code") == 0:
+        line = (head.get("output") or "").strip().splitlines()
+        result["head"] = line[0] if line else ""
+    return result
+
+
+def render_git_log(result: dict[str, Any]) -> str:
+    if not result.get("ok"):
+        return "dev_git_log 失败：" + (result.get("error") or "未知错误")
+    entries = result.get("entries") or []
+    title = "提交流水"
+    if result.get("head"):
+        title += f"（当前 HEAD={result['head']}）"
+    if not entries:
+        lines = [title + "：没有记录"]
+    else:
+        more = "（还有更早的历史，用 limit: 调大或加 paths: 收窄）" if result.get("truncated") else ""
+        lines = [f"{title}：最近 {len(entries)} 条{more}"]
+        for item in entries:
+            lines.append(f"{item['hash']} {item['date']} {item['author']}  {item['subject']}")
+            lines += [f"      {name}" for name in item.get("files") or []]
+    for note in result.get("notes") or []:
+        lines.append("提示: " + note)
     return "\n".join(lines)
 
 
