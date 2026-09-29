@@ -292,6 +292,13 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(spec.group, "game")
         self.assertNotIn("game_screenshot", agent_mod._NO_PARALLEL_TOOLS)
 
+    def test_desktop_capture_is_readonly_observation(self):
+        self.assertIn("dev_desktop_capture", tools_mod.TOOLS)
+        spec = coerce_tool_spec(
+            "dev_desktop_capture", tools_mod.TOOLS["dev_desktop_capture"])
+        self.assertEqual(spec.capability.value, "read_local")
+        self.assertEqual(spec.side_effect.value, "pure")
+
     def test_role_whitelists(self):
         roles = agent_mod._SUBAGENT_ROLES
         self.assertIn("game_screenshot", roles["tester"]["tools"])

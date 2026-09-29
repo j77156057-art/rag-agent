@@ -204,7 +204,9 @@ class EndToEndCompactionTests(_Base):
                 # 压缩当轮：开工事件在前，notice 后的收尾事件在最后
                 compacted = (ctxs[0], ctxs[-1])
         self.assertTrue(notices, "累积历史超过 80% 额度后应触发自动压缩")
-        self.assertIn("压缩", notices[0])
+        # run() 还会发送“准备上下文/等待模型”等过程通知，压缩通知
+        # 不保证是第一条；只要求本轮确实出现过压缩提示。
+        self.assertTrue(any("压缩" in notice for notice in notices))
         self.assertGreaterEqual(len(a.history), sessions.KEEP_TURNS_MIN)
         self.assertTrue(a.summary)
         # notice 后的收尾事件必须把进度条刷回去（至少回落一整轮的体积）

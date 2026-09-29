@@ -14,12 +14,15 @@ from game_workbench import approval
 
 class GeneratedAdapterRuntimeTests(unittest.TestCase):
     def setUp(self):
+        self.local_mode = patch.dict(os.environ, {"DOCMIND_EXECUTION_MODE": "local"})
+        self.local_mode.start()
         self.tmp = tempfile.TemporaryDirectory(prefix="docmind_generated_adapter_")
         self.root = self.tmp.name
         self.old_root = config.get_runtime("code_root")
         config.set_runtime("code_root", self.root)
 
     def tearDown(self):
+        self.local_mode.stop()
         if self.old_root:
             config.set_runtime("code_root", self.old_root)
         else:

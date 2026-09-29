@@ -74,6 +74,12 @@ class EffectiveMaxStepsTests(unittest.TestCase):
         agent_mod.SUBAGENT_MAX_STEPS = self._old_default
 
     def test_table_driven_auto_budget(self):
+        self.assertEqual(effective_workflow_max_steps(40), 0)
+        with patch.dict(os.environ, {"DOCMIND_WORKFLOW_STEPS_MIN": "24",
+                                     "DOCMIND_WORKFLOW_STEPS_MAX": "200"}, clear=False):
+            self._assert_bounded_auto_budget()
+
+    def _assert_bounded_auto_budget(self):
         cases = [
             (1, 24),    # 1*6+4=10 → 下限 24
             (4, 28),    # 4*6+4=28
@@ -88,19 +94,26 @@ class EffectiveMaxStepsTests(unittest.TestCase):
 
     def test_explicit_policy_wins(self):
         self.assertEqual(effective_workflow_max_steps(16, explicit=50), 50)
-        self.assertEqual(effective_workflow_max_steps(16, explicit=300), 200)
+        self.assertEqual(effective_workflow_max_steps(16, explicit=300), 300)
         # 显式 24 等价于「未调高」，自动预算照常生效
-        self.assertEqual(effective_workflow_max_steps(4, explicit=24), 28)
+        with patch.dict(os.environ, {"DOCMIND_WORKFLOW_STEPS_MIN": "24",
+                                     "DOCMIND_WORKFLOW_STEPS_MAX": "200"}, clear=False):
+            self.assertEqual(effective_workflow_max_steps(16, explicit=300), 200)
+            self.assertEqual(effective_workflow_max_steps(4, explicit=24), 24)
 
 
 class PlanBudgetTests(unittest.TestCase):
     def setUp(self):
+        self.env_patch = patch.dict(os.environ, {"DOCMIND_WORKFLOW_STEPS_MIN": "24",
+                                                "DOCMIND_WORKFLOW_STEPS_MAX": "200"}, clear=False)
+        self.env_patch.start()
         self.manager = GameWorkflowManager(tempfile.mkdtemp())
         self._old_default = agent_mod.SUBAGENT_MAX_STEPS
         agent_mod.SUBAGENT_MAX_STEPS = 6
 
     def tearDown(self):
         agent_mod.SUBAGENT_MAX_STEPS = self._old_default
+        self.env_patch.stop()
 
     def _start_and_plan(self, task_count, policy):
         state = self.manager.start("多阶段开发任务", policy=policy)
@@ -151,22 +164,22 @@ class EnvConfigurableStepLimitsTests(unittest.TestCase):
 
     def test_env_overrides_auto_budget(self):
         with patch.dict(os.environ, self.ENV, clear=False):
-            # 自动公式不变（n*6+4），但夹取区间换成 [50,120]
+            # 自动公式跟随子代理默认 24 步，夹取区间为 [50,120]
             self.assertEqual(effective_workflow_max_steps(0), 50)
-            self.assertEqual(effective_workflow_max_steps(4), 50)   # 28 → 抬到 50
-            self.assertEqual(effective_workflow_max_steps(10), 64)
+            self.assertEqual(effective_workflow_max_steps(4), 100)
+            self.assertEqual(effective_workflow_max_steps(10), 120)
             self.assertEqual(effective_workflow_max_steps(40), 120)
             # 显式值：高者夹硬顶，中段保留，低于下限者视为未调高走自动
             self.assertEqual(effective_workflow_max_steps(1, explicit=300), 120)
             self.assertEqual(effective_workflow_max_steps(1, explicit=80), 80)
-            self.assertEqual(effective_workflow_max_steps(4, explicit=24), 50)
+            self.assertEqual(effective_workflow_max_steps(4, explicit=24), 24)
 
     def test_invalid_env_falls_back_to_builtin_defaults(self):
         with patch.dict(os.environ, {"DOCMIND_WORKFLOW_STEPS_MIN": "abc",
                                      "DOCMIND_WORKFLOW_STEPS_MAX": "  "},
                         clear=False):
-            self.assertEqual(effective_workflow_max_steps(1), 24)
-            self.assertEqual(effective_workflow_max_steps(40), 200)
+            self.assertEqual(effective_workflow_max_steps(1), 0)
+            self.assertEqual(effective_workflow_max_steps(40), 0)
 
     def test_max_below_min_is_lifted(self):
         with patch.dict(os.environ, {"DOCMIND_WORKFLOW_STEPS_MIN": "100",
@@ -396,8 +409,8 @@ class WorkflowTelemetryStepsTests(unittest.TestCase):
                  {"id": "c", "role": "tester", "task": "验证",
                   "depends_on": ["b"], "max_steps": 8}]
         planned = manager.plan(wid, tasks)
-        # 3*6+4=22 低于下取整 24 → 生效 24
-        self.assertEqual(planned["policy"]["max_steps"], 24)
+        # 默认 0 表示无限；计数仍在 observability 中持续记录。
+        self.assertEqual(planned["policy"]["max_steps"], 0)
         self.assertEqual(
             planned["context_layers"]["step_budget"]["source"], "auto")
 

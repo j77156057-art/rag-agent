@@ -52,10 +52,11 @@ class WebSearchSiteAppendTests(unittest.TestCase):
     """site/platform 必须拼成 site: 透传给后端。"""
 
     def _auto(self):
-        return {**os.environ, "WEB_SEARCH_BACKEND": "auto"}
+        return {**os.environ, "WEB_SEARCH_BACKEND": "auto", "DOCMIND_WEB_CACHE": "0"}
 
     def test_site_passed_to_backend(self):
         with patch.dict(tools.os.environ, self._auto(), clear=True), \
+                patch("tools._github_search", return_value="GitHub API 暂不可用（test）"), \
                 patch("tools._ddg_search", return_value="· 结果") as m:
             tools.web_search("query: 某关键词\nsite: github.com")
         sent = m.call_args[0][0]
@@ -64,6 +65,7 @@ class WebSearchSiteAppendTests(unittest.TestCase):
 
     def test_platform_passed_as_site(self):
         with patch.dict(tools.os.environ, self._auto(), clear=True), \
+                patch("tools._github_search", return_value="GitHub API 暂不可用（test）"), \
                 patch("tools._ddg_search", return_value="· 结果") as m:
             tools.web_search("platform: github\n某关键词")
         sent = m.call_args[0][0]
@@ -74,14 +76,14 @@ class BaiduBackendTests(unittest.TestCase):
     """auto 下百度作为 ddg 失败后的兜底层之一。"""
 
     def _auto(self):
-        return {**os.environ, "WEB_SEARCH_BACKEND": "auto"}
+        return {**os.environ, "WEB_SEARCH_BACKEND": "auto", "DOCMIND_WEB_CACHE": "0"}
 
     def test_baidu_used_when_ddg_fails(self):
         with patch.dict(tools.os.environ, self._auto(), clear=True), \
                 patch("tools._ddg_search", side_effect=OSError("blocked")), \
                 patch("tools._baidu_search", return_value="· 某关键词百度结果") as m:
             out = tools.web_search("某关键词")
-        self.assertEqual(out, "· 某关键词百度结果")
+        self.assertIn("· 某关键词百度结果", out)
         m.assert_called_once()
 
     def test_forced_baidu_backend(self):

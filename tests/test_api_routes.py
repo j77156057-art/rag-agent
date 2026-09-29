@@ -35,6 +35,18 @@ def _routes():
 
 
 class ApiRouteTests(unittest.TestCase):
+    def test_workflow_choice_keeps_execution_behind_user_approval(self):
+        from starlette.testclient import TestClient
+        from api_routes import agent as agent_routes
+
+        with patch.object(agent_routes.WORKFLOWS, 'choose', return_value={
+                'workflow_id': 'wf-gate-test', 'status': 'planning'}) as choose:
+            response = TestClient(api.app).post(
+                '/api/agent/workflow/wf-gate-test/choice', json={'choice': 'opt_1'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json().get('ok'))
+        self.assertFalse(choose.call_args.kwargs['auto_execute'])
+
     def test_no_duplicate_path_and_method(self):
         """同路径+同方法只能注册一次；重复会让后注册的处理器静默失效。"""
         counter = collections.Counter(_routes())

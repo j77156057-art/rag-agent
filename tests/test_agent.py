@@ -51,6 +51,11 @@ class AgentGuardTests(unittest.TestCase):
         agent_mod.TOOLS = self._old_tools
         set_runtime("code_root", "")
 
+    def test_repeated_sentence_detector_ignores_normal_long_text(self):
+        repeated = "请根据已经读取的文件继续核对血条归零后的处理逻辑。\n" * 3
+        self.assertTrue(agent_mod._repeated_sentence(repeated))
+        self.assertEqual(agent_mod._repeated_sentence("这是很长的正常说明。\n" * 2), "")
+
     def test_empty_arg_is_blocked_without_tool_step(self):
         """空 Action Input：不执行工具、不计步数，回填后模型可正常收尾。"""
         called = []
@@ -196,8 +201,9 @@ class AgentGuardTests(unittest.TestCase):
         scripts = [_act("fake_tool", f"inp{i}") for i in range(1, 9)]
         scripts.append(_act("fake_tool", "inp9"))  # 触发强制收尾 nudge
         scripts.append(_FINAL_OK)                 # 模型基于观察收尾
-        a = agent_mod.Agent(llm=_ScriptedLLM(scripts))
-        events = _run(a)
+        with patch.object(agent_mod, "MAX_AGENT_STEPS", 8):
+            a = agent_mod.Agent(llm=_ScriptedLLM(scripts))
+            events = _run(a)
         self.assertEqual(counter["n"], 8)          # 第 9 次未执行
         self.assertTrue(any("收尾" in e.get("text", "")
                             for e in events if e["type"] == "reflection"))
@@ -213,8 +219,9 @@ class AgentGuardTests(unittest.TestCase):
         scripts = [_act("fake_tool", f"inp{i}") for i in range(1, 9)]
         scripts.append(_act("fake_tool", "inp9"))   # 强制 nudge
         scripts.append(_act("fake_tool", "inp10"))  # 仍要工具 -> 证据兜底
-        a = agent_mod.Agent(llm=_ScriptedLLM(scripts))
-        events = _run(a)
+        with patch.object(agent_mod, "MAX_AGENT_STEPS", 8):
+            a = agent_mod.Agent(llm=_ScriptedLLM(scripts))
+            events = _run(a)
         finals = [e for e in events if e["type"] == "final"]
         self.assertEqual(len(finals), 1)
         text = finals[0]["text"]
@@ -243,6 +250,14 @@ class AgentGuardTests(unittest.TestCase):
         self.assertEqual(called, ["audit1", "audit2", "audit3", "audit4"])
         self.assertEqual([e["text"] for e in events if e["type"] == "final"], ["已确认结论。"])
 
+    def test_code_review_default_budget_allows_more_than_old_twelve_steps(self):
+        called = []
+        agent_mod.TOOLS = {"fake_tool": {"func": lambda arg: called.append(arg) or f"obs-{arg}"}}
+        scripts = [_act("fake_tool", f"file{i}") for i in range(20)] + [_FINAL_OK]
+        events = list(agent_mod.Agent(llm=_ScriptedLLM(scripts)).run("帮我审查代码", stream=True))
+        self.assertEqual(len(called), 20)
+        self.assertEqual([e["text"] for e in events if e["type"] == "final"], ["已确认结论。"])
+
     def test_dynamic_budget_does_not_expand_ordinary_questions(self):
         """动态预算只匹配代码/项目审查，不因普通问题里出现“问题”二字就放宽。"""
         with patch.object(agent_mod, "MAX_AGENT_STEPS", 2), \
@@ -254,7 +269,7 @@ class AgentGuardTests(unittest.TestCase):
 
     def test_python_exec_runs_within_code_root(self):
         """配置 code_root 后，python_exec 的相对路径按代码根解析。"""
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {"DOCMIND_EXECUTION_MODE": "local"}):
             marker = os.path.join(d, "marker_t5.txt")
             with open(marker, "w", encoding="utf-8") as f:
                 f.write("x")
@@ -339,7 +354,8 @@ class AgentGuardTests(unittest.TestCase):
 
     def test_python_exec_unescapes_literal_newlines(self):
         """模型把多行写成单行（字面量 \\n）时，SyntaxError 后反转义一次再执行。"""
-        out = tools_mod.python_exec(r'print("a")\nprint("b")')
+        with patch.dict(os.environ, {"DOCMIND_EXECUTION_MODE": "local"}):
+            out = tools_mod.python_exec(r'print("a")\nprint("b")')
         self.assertIn("a\nb", out)
         self.assertNotIn("SyntaxError", out)
 
@@ -379,6 +395,10 @@ class AgentGuardTests(unittest.TestCase):
             "read_file", 'path: "a/b.java", start: 315, end: 360'
         )
         self.assertEqual(norm, "a/b.java\nstart: 315\nend: 360")
+        self.assertEqual(
+            agent_mod._normalize_tool_arg("read_file", 'path="ui/hud.gd"'),
+            "ui/hud.gd",
+        )
         # 非关键字风格保持原样
         self.assertEqual(agent_mod._normalize_tool_arg("grep", "LOOP_ONE"), "LOOP_ONE")
         self.assertEqual(agent_mod._normalize_tool_arg("list_dir", "(顶层)"), ".")

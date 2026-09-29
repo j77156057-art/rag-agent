@@ -123,6 +123,36 @@ class MiddlewareRoutingTests(RoutingBase):
         from starlette.testclient import TestClient
         self.client = TestClient(_build_probe_app())
 
+    def test_chat_agent_worker_keeps_selected_project(self):
+        """StreamingResponse + plain Thread must both retain the selected root."""
+        from starlette.testclient import TestClient
+
+        old_provider = config.get_runtime("llm_provider")
+        old_embedding = config.get_runtime("embedding_provider")
+        config.set_runtime("llm_provider", "mock")
+        config.set_runtime("embedding_provider", "mock")
+
+        def fake_run(_agent, *_args, **_kwargs):
+            root = config.get_runtime("code_root")
+            yield {"type": "final", "text": root}
+
+        try:
+            with mock.patch.object(api.Agent, "run", fake_run):
+                response = TestClient(api.app).post(
+                    "/api/chat", data={"question": "介绍这个项目"},
+                    headers={"X-DocMind-Project": self.pid_b},
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            import json
+            events = [json.loads(line[6:]) for line in response.text.splitlines()
+                      if line.startswith("data: ")]
+            final = next(event for event in events if event.get("type") == "final")
+            self.assertEqual(final["text"], self.root_b)
+            self.assertNotIn("模型仍在处理", response.text)
+        finally:
+            config.set_runtime("llm_provider", old_provider)
+            config.set_runtime("embedding_provider", old_embedding)
+
     def test_header_routes_to_project_root(self):
         r = self.client.get("/api/__probe__", headers={"X-DocMind-Project": self.pid_a})
         self.assertEqual(r.status_code, 200)

@@ -158,13 +158,34 @@ class TestReadSave(WbTestBase):
 
     def test_read_binary_and_unsupported(self):
         self.write("pic.png", "\x00\x01PNG")
-        with self.assertRaises(wb.FsError) as cm:
-            wb.read_full(self.root, "pic.png")
-        self.assertEqual(cm.exception.status, 415)
-        self.write("blob.bin", "abc")
-        with self.assertRaises(wb.FsError) as cm:
-            wb.read_full(self.root, "blob.bin")
-        self.assertEqual(cm.exception.status, 415)
+        image = wb.read_full(self.root, "pic.png")
+        self.assertEqual(image["preview_kind"], "binary")
+        self.assertFalse(image["writable"])
+        self.assertIn("十六进制", image["content"])
+        binary_path = os.path.join(self.root, "blob.bin")
+        with open(binary_path, "wb") as fh:
+            fh.write(b"\x00\x01\xffBINARY")
+        binary = wb.read_full(self.root, "blob.bin")
+        self.assertEqual(binary["preview_kind"], "binary")
+        self.assertIn("SHA-256", binary["content"])
+        self.assertFalse(binary["writable"])
+        with self.assertRaises(wb.FsError):
+            wb.save_file(self.root, "blob.bin", "corrupt", reindex=False)
+
+    def test_gitignore_is_editable_and_binary_scene_is_read_only(self):
+        self.write(".gitignore", ".godot/\n*.bin\n")
+        text = wb.read_full(self.root, ".gitignore")
+        self.assertTrue(text["writable"])
+        self.assertIn("*.bin", text["content"])
+        saved = wb.save_file(self.root, ".gitignore", ".godot/\n", reindex=False)
+        self.assertTrue(saved["changed"])
+        scene = os.path.join(self.root, "cached.scn")
+        with open(scene, "wb") as fh:
+            fh.write(b"RSRC\x00\x01\x02\x03scene-name")
+        preview = wb.read_full(self.root, "cached.scn")
+        self.assertEqual(preview["preview_kind"], "binary")
+        self.assertFalse(preview["writable"])
+        self.assertIn("Godot", preview["content"])
 
     def test_read_utf8_bom_tolerated(self):
         p = os.path.join(self.root, "bom.gd")

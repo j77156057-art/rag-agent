@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 import agent as agent_mod
 import agent_trace
@@ -294,6 +295,62 @@ class _TruncFakeLLM:
 
 
 class TruncationRetryTests(_IsoBase):
+    def test_final_answer_continues_without_rewriting_or_losing_first_part(self):
+        class FinalLLM(_TruncFakeLLM):
+            def chat(self, messages, stream=True, enable_thinking=None, **kw):
+                self.calls.append((enable_thinking, messages[-1]["content"]))
+                segments = [
+                    ("Final Answer: 已核对 agent.py 的入口、", "length"),
+                    ("工具调用和错误处理。另有完整测试记录、", "length"),
+                    ("以及最终审查结论。", "stop"),
+                ]
+                text, reason = segments[min(len(self.calls) - 1, len(segments) - 1)]
+                return _TruncStream([text], finish_reason=reason)
+
+        llm = FinalLLM()
+        a = agent_mod.Agent(llm=llm, session_id="s-final-continuation")
+        a.thinking_enabled = True
+        events = list(a.run("帮我审查一下代码", stream=True))
+        finals = [ev for ev in events if ev["type"] == "final"]
+        self.assertEqual(len(finals), 1)
+        self.assertEqual(finals[0]["text"],
+                         "已核对 agent.py 的入口、工具调用和错误处理。另有完整测试记录、以及最终审查结论。")
+        self.assertEqual(llm.calls[1][0], False)
+        self.assertNotIn("3-6 句", llm.calls[1][1])
+        self.assertFalse(any(ev["type"] == "reflection" for ev in events))
+
+    def test_continuation_merges_repeated_tail_and_marker(self):
+        self.assertEqual(agent_mod._join_final_continuation(
+            "第一段结论，第二段", "Final Answer: 第二段继续。"),
+            "第一段结论，第二段继续。")
+
+    def test_continuation_preserves_word_boundary(self):
+        class SplitLLM(_TruncFakeLLM):
+            def chat(self, messages, stream=True, enable_thinking=None, **kw):
+                self.calls.append(enable_thinking)
+                if len(self.calls) == 1:
+                    return _TruncStream(["Final Answer: Hello "], finish_reason="length")
+                return _TruncStream(["world"], finish_reason="stop")
+
+        a = agent_mod.Agent(llm=SplitLLM(), session_id="s-final-space")
+        final = next(ev for ev in a.run("say hello", stream=True) if ev["type"] == "final")
+        self.assertEqual(final["text"], "Hello world")
+
+    def test_repeated_length_returns_partial_as_incomplete_not_success(self):
+        class NeverEndingLLM(_TruncFakeLLM):
+            def chat(self, messages, stream=True, enable_thinking=None, **kw):
+                self.calls.append(enable_thinking)
+                return _TruncStream(["Final Answer: 第一段。" if len(self.calls) == 1 else "第二段。"],
+                                    finish_reason="length")
+
+        with patch.object(agent_mod, "_MAX_FINAL_CONTINUATIONS", 2):
+            a = agent_mod.Agent(llm=NeverEndingLLM(), session_id="s-final-incomplete")
+            events = list(a.run("帮我审查代码", stream=True))
+        final = next(ev for ev in events if ev["type"] == "final")
+        self.assertEqual(final.get("status"), "error")
+        self.assertIn("第一段。第二段。", final["text"])
+        self.assertIn("回答尚未结束", final["text"])
+
     def test_truncation_retry_suppresses_thinking(self):
         llm = _TruncFakeLLM()
         a = agent_mod.Agent(llm=llm, session_id="s-trunc")

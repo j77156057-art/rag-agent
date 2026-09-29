@@ -284,6 +284,14 @@ class ModelPersistenceTests(unittest.TestCase):
                          base_url="https://example.test/v1",
                          embedding_provider="ollama")
         self.assertTrue(response["ok"])
+        presets = config.load_model_presets()
+        self.assertEqual(len(presets), 1)
+        self.assertEqual((presets[0]["provider"], presets[0]["model"], presets[0]["base_url"]),
+                         ("custom", "vision-local", "https://example.test/v1"))
+        # Re-saving the same model must not fill the quick switcher with duplicates.
+        self.assertTrue(_call(provider="custom", model="vision-local",
+                              base_url="https://example.test/v1")["ok"])
+        self.assertEqual(len(config.load_model_presets()), 1)
         config._RUNTIME.clear()
         config._apply_persisted_state()
         self.assertEqual(config.get_runtime("llm_provider"), "custom")

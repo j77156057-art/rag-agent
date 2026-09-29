@@ -167,6 +167,32 @@ class MemoryTests(_IsoBase):
             client.delete("/api/sessions/deleted")
         self.assertIsNone(memory.latest_checkpoint(scope, "deleted"))
 
+    def test_explicit_user_profile_round_trip_and_capture(self):
+        profile = memory.update_profile("user-1", {
+            "display_name": "小林", "language": "中文", "timezone": "Asia/Shanghai",
+            "location": "南宁", "goals": ["完成项目"], "preferences": {"detail": "具体"},
+        })
+        self.assertEqual(profile["display_name"], "小林")
+        self.assertEqual(memory.get_profile("user-1")["goals"], ["完成项目"])
+        captured = memory.capture_explicit_profile("我叫小李，我在广州，请用中文", "user-2")
+        self.assertEqual(captured["display_name"], "小李")
+        self.assertEqual(captured["location"], "广州")
+        self.assertEqual(captured["language"], "中文")
+
+    def test_profile_does_not_infer_from_unrelated_text(self):
+        profile = memory.capture_explicit_profile("帮我检查项目里的 location 和语言配置", "user-3")
+        self.assertEqual(profile["display_name"], "")
+        self.assertEqual(profile["location"], "")
+
+    def test_profile_api_uses_stable_user_header(self):
+        import api
+        from starlette.testclient import TestClient
+        with TestClient(api.app) as client:
+            response = client.patch("/api/agent/profile", headers={"X-DocMind-User": "api-user"}, json={"language": "中文"})
+            self.assertTrue(response.json()["ok"])
+            fetched = client.get("/api/agent/profile", headers={"X-DocMind-User": "api-user"}).json()["profile"]
+            self.assertEqual(fetched["language"], "中文")
+
 
 if __name__ == "__main__":
     unittest.main()

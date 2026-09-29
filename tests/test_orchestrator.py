@@ -10,6 +10,7 @@ import agent as agent_mod
 import agent_trace
 import orchestrator as orch
 import sessions
+import config
 
 
 class ParsePlanTests(unittest.TestCase):
@@ -77,6 +78,24 @@ class TopologyTests(unittest.TestCase):
 
 
 class RunPlanTests(unittest.TestCase):
+    def test_parallel_runner_keeps_context_per_task(self):
+        """Parallel workflow tasks must retain the request project's ContextVar."""
+        old = config.get_runtime("code_root")
+        token = config.set_context_code_root("project-root-for-orchestrator")
+        try:
+            def runner(task, _context):
+                return {"status": "ok", "conclusion": config.get_runtime("code_root"), "steps": 1}
+
+            result = orch.run_plan(
+                [{"id": "a", "task": "a"}, {"id": "b", "task": "b"}],
+                runner, max_parallel=2,
+            )
+            self.assertEqual(result["results"]["a"]["conclusion"], "project-root-for-orchestrator")
+            self.assertEqual(result["results"]["b"]["conclusion"], "project-root-for-orchestrator")
+        finally:
+            config.reset_context_code_root(token)
+            config.set_runtime("code_root", old)
+
     def _plan(self):
         return orch.parse_plan([
             {"id": "a", "task": "甲"},

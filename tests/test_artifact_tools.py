@@ -34,6 +34,43 @@ class ArtifactToolsTests(unittest.TestCase):
                               "sections": [{"heading": "范围", "paragraphs": ["内容"]}]})
         self.assertGreaterEqual(result["validation"]["pages"], 1)
 
+    def test_project_intro_requires_real_sources_and_substantive_content(self):
+        for name in ("project.godot", "player.gd"):
+            with open(os.path.join(self.root, name), "w", encoding="utf-8") as file:
+                file.write("current game project")
+        payload = {
+            "format": "pdf", "purpose": "project_intro", "filename": "game.pdf",
+            "title": "游戏介绍", "source_files": ["project.godot", "player.gd"],
+            "sections": [
+                {"heading": heading, "paragraphs": ["项目文件显示的真实功能与待核实事项。" * 14]}
+                for heading in ("玩法", "操作", "项目结构", "运行与验证")
+            ],
+        }
+        result = self.create(payload)
+        self.assertEqual(result["source_files"], ["project.godot", "player.gd"])
+        self.assertGreaterEqual(result["validation"]["pages"], 1)
+
+        payload["source_files"] = ["project.godot", "../outside.py"]
+        rejected = json.loads(artifact_tools.create_artifact(json.dumps(payload, ensure_ascii=False)))
+        self.assertFalse(rejected["ok"])
+        self.assertIn("当前项目以外", rejected["error"])
+
+        payload["source_files"] = ["project.godot", "player.gd"]
+        payload["sections"] = [{"heading": "概述", "paragraphs": ["简短"]}]
+        rejected = json.loads(artifact_tools.create_artifact(json.dumps(payload, ensure_ascii=False)))
+        self.assertFalse(rejected["ok"])
+        self.assertIn("过短", rejected["error"])
+
+        # A weak model may omit purpose; the active user request still enforces it.
+        payload.pop("purpose")
+        token = artifact_tools.bind_project_intro_request(True)
+        try:
+            rejected = json.loads(artifact_tools.create_artifact(json.dumps(payload, ensure_ascii=False)))
+        finally:
+            artifact_tools.reset_project_intro_request(token)
+        self.assertFalse(rejected["ok"])
+        self.assertIn("过短", rejected["error"])
+
     def test_creates_and_validates_pptx(self):
         result = self.create({"format": "pptx", "filename": "review.pptx", "title": "Review",
                               "slides": [{"title": "Status", "bullets": ["Done"]}]})

@@ -83,6 +83,15 @@ class WebResearchProductTests(unittest.TestCase):
         self.assertTrue(out.startswith("搜索结果相关性不足"))
         self.assertNotIn("https://godotengine.org", out)
 
+    def test_travel_recommendation_rejects_bing_only_candidate(self):
+        with patch.object(tools, "_ddg_search", return_value="搜索未返回结果"), \
+                patch.object(tools, "_baidu_search", return_value="搜索未返回结果"), \
+                patch.object(tools, "_bing_search", return_value="· 泛化攻略\n  泛化摘要\n  https://example.test/travel"), \
+                patch.object(tools, "_infer_search_sources", return_value=[]):
+            out = tools._builtin_search("builtin_auto", "南宁旅游攻略")
+        self.assertTrue(out.startswith("搜索结果相关性不足"))
+        self.assertIn("Bing 单一", out)
+
     def test_bing_encoded_redirect_recovers_original_source(self):
         import base64
         target = "https://docs.godotengine.org/en/stable/scene.html"
@@ -187,6 +196,13 @@ class WebResearchProductTests(unittest.TestCase):
         self.assertIn("知乎评价", out)
         self.assertIn("小红书探店", out)
         self.assertIn("通用结果", out)
+
+    def test_travel_queries_fan_out_beyond_general_engine(self):
+        sources = tools._infer_search_sources("南宁旅游攻略 景点 路线")
+        self.assertIn("zhihu.com", sources)
+        self.assertIn("xiaohongshu.com", sources)
+        self.assertIn("bilibili.com", sources)
+        self.assertIn("tieba.baidu.com", sources)
 
     def test_batch_search_runs_queries_in_parallel_and_excludes_seen(self):
         rows = {

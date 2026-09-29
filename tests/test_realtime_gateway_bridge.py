@@ -1,0 +1,588 @@
+"""R4/R5/R10 接线（`agent_runtime/realtime_bridge.py`）接进网关后的行为契约（R11）。
+
+这一组测试**不连任何真实服务**：原生通道用一个注册进 `realtime_provider` 的假 provider
+驱动，所以首 token / 首音频这类只有原生通道才会产生的指标也能确定性地覆盖。
+
+它锁住四件事：
+
+1. **降级要响亮**：没配 provider 时 `hello.ok` 必须报 `sampled-frames` + 原因，
+   并且帧仍然走抽帧路径产出 `video.observation`。
+2. **原生要如实上报**：配了 provider 时 `hello.ok` 报 `native-realtime`，
+   `degraded_to` 为 null，能力集合来自 provider。
+3. **适配器的握手事件不得冒充网关的握手**（真机复现过的坑）：provider 的
+   `EVENT_STATUS` 被 `WIRE_BY_KIND` 映射成 `hello.ok`，其 `EVENT_DONE` 被映射成
+   `session.closed`。两者转发都会撒谎——尤其前者会让前端把原生会话显示成"兼容抽帧"。
+   但 `EVENT_DONE` 也**不能只是丢掉**：有转写时 `model.delta final: true` 会收口，
+   抢话打断/无转写时没有它，前端回合永远收不了口，所以要补一条结束标记
+   （见 `realtime_bridge` 模块文档 2.2 与下面 3.1 的三个用例）。
+4. **收尾要干净**：会话结束时 provider 被关闭、项目时间线被释放、指标会话作用域被回收
+   （不回收就是无界增长）。
+
+已知环境陷阱（本仓库踩过）：
+* `AsyncMock` 配"可调用实例"不会 await 返回的协程——所以假 provider 是**真类**。
+* Starlette `TestClient` 里若处理器抛异常，`receive_*` 会永久阻塞——所以下面的读取都
+  只在**已确定会有事件**时才读，不靠超时兜底。
+"""
+from __future__ import annotations
+
+import base64
+import json
+import time
+from unittest.mock import patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+import api
+from agent_runtime import realtime_bridge, realtime_metrics as metrics, realtime_provider
+
+ENDPOINT = "/api/vision/live-stream"
+PROJECT_ID = "bridge-project"
+SESSION_ID = "bridge-session"
+FAKE_NAME = "fake-native"
+PAYLOAD = b"\xff\xd8bridge-jpeg\xff\xd9"
+
+
+# ---- 夹具 -------------------------------------------------------------------
+
+class FakeRealtimeProvider(realtime_provider.RealtimeProvider):
+    """可编排的假适配器：记录网关送进来的东西，按测试要求吐事件。"""
+
+    name = FAKE_NAME
+
+    def __init__(self, *, start_ok: bool = True, announce_ready: bool = True) -> None:
+        super().__init__()
+        self.start_ok = start_ok
+        self.announce_ready = announce_ready
+        self.started = False
+        self.closed = False
+        self.frames: list[tuple[bytes, int]] = []
+        self.audio: list[tuple[bytes, int]] = []
+        self.interrupts = 0
+
+    def capabilities(self) -> list[str]:
+        return [realtime_provider.CAP_AUDIO_IN, realtime_provider.CAP_VIDEO_IN,
+                realtime_provider.CAP_TEXT_OUT, realtime_provider.CAP_AUDIO_OUT,
+                realtime_provider.CAP_INTERRUPT]
+
+    def availability(self) -> dict:
+        return {"ok": True, "provider": FAKE_NAME}
+
+    def start(self) -> bool:
+        if not self.start_ok:
+            return False
+        self.started = True
+        self._running = True
+        if self.announce_ready:
+            # 真实适配器收到 vendor 的 session.created 后就是这么发的，
+            # 而它会被 WIRE_BY_KIND 映射成 hello.ok（见模块文档 2.1）。
+            self._emit(realtime_provider.EVENT_STATUS, state="ready", provider=FAKE_NAME)
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+        super().close()
+
+    def send_frame(self, image: bytes, captured_at: int = 0) -> bool:
+        self.frames.append((image, captured_at))
+        return True
+
+    def send_audio(self, pcm: bytes, captured_at: int = 0) -> bool:
+        self.audio.append((pcm, captured_at))
+        return True
+
+    def interrupt(self) -> bool:
+        self.interrupts += 1
+        return True
+
+    def emit_text(self, text: str, *, final: bool = False) -> None:
+        self._emit(realtime_provider.EVENT_TEXT_DELTA, text=text, role="assistant", final=final)
+
+    def emit_audio(self, audio: bytes) -> None:
+        self._emit(realtime_provider.EVENT_AUDIO_DELTA, audio=audio, chars=len(audio))
+
+    def emit_done(self) -> None:
+        self._emit(realtime_provider.EVENT_DONE, reason="completed")
+
+
+@pytest.fixture
+def provider():
+    """注册假 provider 并让网关选中它；退出时反注册，避免污染别的测试。"""
+    instance = FakeRealtimeProvider()
+    realtime_provider.register(FAKE_NAME, lambda: instance)
+    with patch.dict("os.environ", {realtime_provider.DEFAULT_PROVIDER_ENV: FAKE_NAME}):
+        try:
+            yield instance
+        finally:
+            realtime_provider.unregister(FAKE_NAME)
+
+
+@pytest.fixture(autouse=True)
+def _clean_bridge_state():
+    """每个用例前后清空接线状态；**收尾前先等上一个会话的异步拆除跑完**。
+
+    网关的拆除（`bridge.close()` → 释放时间线）跑在服务端处理器的 `finally` 里，
+    比客户端 socket 上下文退出晚。不等它，下一个用例就会和上一个用例的迟到收尾抢
+    同一张 `_timelines` 表：本文件所有用例共用同一个 `project_id`，迟到的
+    `release_timeline` 会把引用计数从 1 减到 0，**把正在跑的会话的时间线误释放掉**。
+    这正是本文件在"单独跑全绿、混进全量套件却红一项"的原因（`realtime_bench_tool`
+    等前置文件的会话收尾尚未落地），所以把同步点放在唯一的地方：用例之间。
+    """
+    realtime_bridge.reset_state()
+    yield
+    _wait_for(lambda: realtime_bridge.active_timeline_projects() == [], timeout=10.0)
+    realtime_bridge.reset_state()
+
+
+def _get_project(project_id):
+    return {"root": f"root-{project_id}"} if project_id == PROJECT_ID else None
+
+
+class _StubAnalyzer:
+    """抽帧路径的占位视觉模型（原生路径不会走到它）。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def analyze(self, file, previous_observation="", focused_region=""):
+        await file.read()
+        self.calls += 1
+        return {"ok": True, "observations": ["抽帧观察"], "anomalies": [], "audit": {}}
+
+
+@pytest.fixture
+def gateway():
+    analyzer = _StubAnalyzer()
+    with patch.object(api.projects, "get_project", side_effect=_get_project), \
+            patch.object(api, "analyze_live_frame_ep", side_effect=analyzer.analyze):
+        with TestClient(api.app) as client:
+            yield client, analyzer
+
+
+def _hello(session_id: str = SESSION_ID) -> str:
+    return json.dumps({"v": api.PROTOCOL_VERSION, "type": "hello", "project_id": PROJECT_ID,
+                       "session_id": session_id, "capabilities": ["video.frame"]})
+
+
+def _now_ms() -> int:
+    """`captured_at` 必须是**当前**时间：网关只接受 now-120s ~ now+60s 的时间戳，
+    写死一个历史时间戳会被判 `invalid_media`（本仓库踩过）。"""
+    return int(time.time() * 1000)
+
+
+def _frame(sequence: int = 0, focused: bool = False) -> bytes:
+    header = {"v": api.PROTOCOL_VERSION, "type": "video.frame", "sequence": sequence,
+              "captured_at": _now_ms()}
+    if focused:
+        header["focused"] = True
+    return json.dumps(header).encode("utf-8") + b"\n" + PAYLOAD
+
+
+def _audio_chunk(sequence: int = 0) -> bytes:
+    header = {"v": api.PROTOCOL_VERSION, "type": "audio.chunk", "sequence": sequence,
+              "captured_at": _now_ms()}
+    return json.dumps(header).encode("utf-8") + b"\n" + b"\x00\x01\x02\x03"
+
+
+def _wait_for(predicate, *, timeout: float = 5.0, interval: float = 0.02) -> bool:
+    """等一个异步收尾条件成立。
+
+    客户端的 socket 上下文退出**不等**服务端处理器的 `finally`：原生会话的
+    `bridge.close()` 要关 WebSocket 并 join 接收线程，实测在客户端退出之后才跑完
+    （探针里 `close:exit` 打在读取语句之后）。所以断言收尾结果必须等，不能立即读。
+    带硬期限，超时就返回 False 让断言给出明确的失败信息，不会挂死。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _handshake(socket, session_id: str = SESSION_ID) -> dict:
+    socket.send_text(_hello(session_id))
+    hello = socket.receive_json()
+    assert hello.get("type") == "hello.ok", f"握手失败：{hello}"
+    return hello
+
+
+# ---- 1. 降级：响亮上报，且抽帧路径照旧 ---------------------------------------
+
+def test_degraded_hello_reports_the_sampled_mode_with_a_reason(gateway):
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        hello = _handshake(socket)
+    assert hello["mode"] == realtime_bridge.MODE_SAMPLED
+    assert hello["degraded_to"] == realtime_bridge.MODE_SAMPLED
+    assert hello["reason"], "降级必须给出原因，不能静默"
+    assert hello["provider"] == ""
+    assert hello["provider_capabilities"] == []
+    assert "video.observation" in hello["capabilities"]
+
+
+def test_degraded_frames_still_produce_observations(gateway):
+    client, analyzer = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        socket.send_bytes(_frame(0))
+        event = socket.receive_json()
+    assert event["type"] == "video.observation" and event["ok"] is True
+    assert event["sequence"] == 0
+    assert analyzer.calls == 1, "降级路径必须真的调用抽帧视觉模型"
+
+
+# ---- 2. 原生：如实上报 -------------------------------------------------------
+
+def test_native_hello_reports_mode_provider_and_capabilities(gateway, provider):
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        hello = _handshake(socket)
+    assert hello["mode"] == realtime_bridge.MODE_NATIVE
+    assert hello["degraded_to"] is None
+    assert hello["reason"] == ""
+    assert hello["provider"] == FAKE_NAME
+    assert set(hello["provider_capabilities"]) == {
+        "audio.in", "video.in", "text.out", "audio.out", "interrupt"}
+    # 原生会话仍必须保留网关自己的控制能力。
+    assert {"heartbeat", "cancel"} <= set(hello["capabilities"])
+    assert provider.started is True
+
+
+def test_start_failure_degrades_instead_of_faking_a_session(gateway):
+    """provider 起不来时必须降级，绝不能假装原生会话已经建立。"""
+    failing = FakeRealtimeProvider(start_ok=False)
+    realtime_provider.register(FAKE_NAME, lambda: failing)
+    with patch.dict("os.environ", {realtime_provider.DEFAULT_PROVIDER_ENV: FAKE_NAME}):
+        try:
+            client, analyzer = gateway
+            with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+                hello = _handshake(socket)
+                socket.send_bytes(_frame(0))
+                event = socket.receive_json()
+        finally:
+            realtime_provider.unregister(FAKE_NAME)
+    assert hello["mode"] == realtime_bridge.MODE_SAMPLED
+    assert hello["reason"], "降级原因不能为空"
+    # 起不来就必须真的回到抽帧路径，而不是把帧吞掉。
+    assert event["type"] == "video.observation"
+    assert analyzer.calls == 1
+
+
+# ---- 3. 适配器事件不得冒充网关事件（真机复现过的坑） --------------------------
+
+def test_provider_ready_never_leaks_a_second_hello_ok(gateway, provider):
+    """假 provider 在 start() 里就发了一条 ready，它必须被拦下。
+
+    真机上这条会以 `hello.ok` 上线，且不带 `mode` 字段——前端
+    `AutonomousCockpit.vue` 收到后会把模式显示改写成"兼容抽帧"，
+    于是原生会话被显示成抽帧。这里用"下一条事件必须是模型 delta"来证明它没上线。
+    """
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        hello = _handshake(socket)
+        provider.emit_text("原生回答")
+        event = socket.receive_json()
+    assert hello["mode"] == realtime_bridge.MODE_NATIVE
+    assert event["type"] == "model.delta", f"第二条不该是握手事件：{event}"
+    assert event["text"] == "原生回答"
+
+
+def test_provider_done_is_not_relayed_as_session_closed(gateway, provider):
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        provider.emit_text("先来一条回答", final=True)
+        first = socket.receive_json()
+        provider.emit_done()
+        provider.emit_text("轮次结束后的下一条")
+        second = socket.receive_json()
+    assert first["type"] == "model.delta" and first["final"] is True
+    # 模型一轮说完不等于会话结束：中间不能冒出 session.closed。
+    assert second["type"] == "model.delta", f"session.closed 不该被转发：{second}"
+
+
+# ---- 3.1 `EVENT_DONE` 变结束标记（模块文档 2.2） ------------------------------
+#
+# `EVENT_DONE` 不能只丢：一轮回答结束的信号通常由 `model.delta final: true` 承载，
+# 但那条只在**有转写**时才发。抢话打断 / 本轮只有音频时若把它一起丢掉，前端那条
+# `done: false` 的助手回合就永远不收口。
+#
+# 这三个用例直接驱动 `SessionBridge`（不经 WebSocket）：结束标记与被拦下的
+# `EVENT_DONE` 可能落在两次 poll 里，必须能精确控制"哪几条事件在同一次 next_events"。
+
+def _bridge():
+    bridge = realtime_bridge.SessionBridge(PROJECT_ID, provider_name=FAKE_NAME, auto_start=True)
+    bridge.bind_session(SESSION_ID)
+    return bridge
+
+
+def _wire_types(events):
+    return [str(event.get("type") or "") for event in events]
+
+
+def test_turn_without_transcript_still_gets_an_end_marker(provider):
+    """只有音频、没有转写的一轮：`EVENT_DONE` 必须补一条结束标记。"""
+    bridge = _bridge()
+    try:
+        provider.emit_audio(b"\x00\x01" * 8)
+        audio = bridge.next_events()
+        provider.emit_done()
+        ended = bridge.next_events()
+    finally:
+        bridge.close()
+    assert _wire_types(audio) == ["model.audio"], f"前置音频没转发：{audio}"
+    assert _wire_types(ended) == ["model.delta"], f"一轮结束必须有结束标记：{ended}"
+    marker = ended[0]
+    assert marker["final"] is True and marker["text"] == ""
+    assert marker["session_id"] == SESSION_ID, "结束标记的会话号必须是网关的"
+    assert bridge.suppressed.get("session.closed") == 1
+
+
+def test_final_transcript_is_not_followed_by_a_duplicate_end_marker(provider):
+    """本轮已由 `final: true` 收过口：结束标记不得二次补发。
+
+    这里两条事件**分处两次 `next_events`**——`_turn_closed` 若是局部变量，这一例必红。
+    """
+    bridge = _bridge()
+    try:
+        provider.emit_text("说完了", final=True)
+        first = bridge.next_events()
+        provider.emit_done()
+        second = bridge.next_events()
+    finally:
+        bridge.close()
+    assert _wire_types(first) == ["model.delta"] and first[0]["final"] is True
+    assert second == [], f"同一轮不该出现两个结束标记：{second}"
+    assert bridge.suppressed.get("session.closed") == 1
+
+
+def test_each_turn_gets_its_own_end_marker(provider):
+    """结束标记按轮次计：上一轮补过之后，下一轮仍然要补。"""
+    bridge = _bridge()
+    try:
+        provider.emit_done()
+        first = bridge.next_events()
+        provider.emit_done()
+        second = bridge.next_events()
+    finally:
+        bridge.close()
+    assert _wire_types(first) == ["model.delta"], f"第一轮缺结束标记：{first}"
+    assert _wire_types(second) == ["model.delta"], f"第二轮缺结束标记：{second}"
+    assert bridge.suppressed.get("session.closed") == 2
+
+
+# ---- 4. 原生通道的帧/音频/打断路由 ------------------------------------------
+
+def test_native_frames_go_to_the_provider_not_the_sampler(gateway, provider):
+    client, analyzer = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        socket.send_bytes(_frame(7))
+        provider.emit_text("看过了")
+        event = socket.receive_json()
+    assert event["type"] == "model.delta", "原生通道不该产出 video.observation"
+    assert len(provider.frames) == 1
+    frame, captured_at = provider.frames[0]
+    assert frame == PAYLOAD
+    assert abs(captured_at - _now_ms()) < 5_000, "captured_at 必须原样传给 provider"
+    assert analyzer.calls == 0, "原生通道不得再调用抽帧模型"
+
+
+def test_native_audio_is_accepted_instead_of_audio_not_ready(gateway, provider):
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        socket.send_bytes(_audio_chunk())
+        provider.emit_text("听到了")
+        event = socket.receive_json()
+    assert event["type"] == "model.delta", f"原生通道不该回 audio_not_ready：{event}"
+    assert len(provider.audio) == 1
+    pcm, _ = provider.audio[0]
+    assert pcm == b"\x00\x01\x02\x03"
+
+
+def test_degraded_audio_still_reports_audio_not_ready(gateway):
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        socket.send_bytes(_audio_chunk())
+        event = socket.receive_json()
+    assert event["type"] == "error" and event["code"] == "audio_not_ready"
+
+
+def test_cancel_interrupts_the_native_provider(gateway, provider):
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        socket.send_text(json.dumps({"v": api.PROTOCOL_VERSION, "type": "cancel",
+                                     "reason": "user_interrupt"}))
+        event = socket.receive_json()
+    assert event["type"] == "cancel.ok"
+    assert provider.interrupts == 1, "用户抢话必须真的打断原生模型"
+
+
+# ---- 5. 音频 delta 必须能过 JSON（前端只解析文本事件） -----------------------
+
+def test_native_audio_delta_reaches_the_wire_as_base64(gateway, provider):
+    client, _ = gateway
+    raw = b"\x00\x01\xfe\xff"
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        provider.emit_audio(raw)
+        event = socket.receive_json()
+    assert event["type"] == "model.audio"
+    # 裸 bytes 会抛 TypeError，而前端只认字符串，所以只能是 base64。
+    assert isinstance(event["audio"], str)
+    assert base64.b64decode(event["audio"]) == raw
+    assert event["encoding"]
+
+
+# ---- 6. 时间线（R5）与指标（R10） -------------------------------------------
+
+def test_timeline_records_frames_and_observations_then_releases(gateway):
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        socket.send_bytes(_frame(0))
+        assert socket.receive_json()["type"] == "video.observation"
+        snapshot = client.get(f"/api/vision/realtime/status?project_id={PROJECT_ID}").json()
+        kinds = [entry["kind"] for entry in snapshot["timeline"]["entries"]]
+        assert "frame" in kinds and "observation" in kinds
+        assert PROJECT_ID in snapshot["timeline_projects"]
+    # 会话结束后时间线必须被释放，否则长期运行会无界增长。
+    assert _wait_for(lambda: PROJECT_ID not in realtime_bridge.active_timeline_projects())
+    after = client.get(f"/api/vision/realtime/status?project_id={PROJECT_ID}").json()
+    assert after["timeline"]["count"] == 0
+    assert after["timeline_projects"] == []
+
+
+def test_status_endpoint_serves_timeline_and_metrics_but_not_mode(gateway):
+    """模式只由 /api/vision/realtime-status(R13) 与 hello.ok 提供，避免两份互相矛盾。"""
+    client, _ = gateway
+    body = client.get(f"/api/vision/realtime/status?project_id={PROJECT_ID}").json()
+    assert set(body) == {"timeline", "timeline_projects", "metrics"}
+    assert "mode" not in body and "degraded_to" not in body
+
+
+def test_metrics_record_frames_latency_and_connection_scope(gateway):
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        for sequence in range(3):
+            socket.send_bytes(_frame(sequence))
+            assert socket.receive_json()["type"] == "video.observation"
+        body = client.get(f"/api/vision/realtime/status?project_id={PROJECT_ID}").json()
+    session = body["metrics"]["sessions"][SESSION_ID]
+    assert session["counters"][metrics.FRAMES_SENT] == 3
+    assert session["counters"][metrics.CONNECTIONS] == 1
+    assert session["histograms"][metrics.OBSERVATION_LATENCY_MS]["count"] == 3
+
+
+def test_native_session_records_first_token_and_first_audio(gateway, provider):
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        provider.emit_text("第一段")
+        provider.emit_audio(b"\x01\x02")
+        assert socket.receive_json()["type"] == "model.delta"
+        assert socket.receive_json()["type"] == "model.audio"
+        body = client.get(f"/api/vision/realtime/status?project_id={PROJECT_ID}").json()
+    histograms = body["metrics"]["sessions"][SESSION_ID]["histograms"]
+    assert histograms[metrics.FIRST_TOKEN_MS]["count"] == 1
+    assert histograms[metrics.FIRST_AUDIO_MS]["count"] == 1
+    assert histograms[metrics.FIRST_TOKEN_MS]["p50"] >= 0
+
+
+def test_first_token_is_recorded_once_even_for_many_deltas(gateway, provider):
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        for index in range(3):
+            provider.emit_text(f"第{index}段")
+            assert socket.receive_json()["type"] == "model.delta"
+        body = client.get(f"/api/vision/realtime/status?project_id={PROJECT_ID}").json()
+    assert body["metrics"]["sessions"][SESSION_ID]["histograms"][metrics.FIRST_TOKEN_MS]["count"] == 1
+
+
+def test_model_failure_is_counted_as_a_rejection(gateway):
+    """抽帧模型抛错时既要回错误观察，也要记一次模型拒绝（R10）。"""
+    async def boom(file, previous_observation="", focused_region=""):
+        await file.read()
+        raise RuntimeError("视觉服务不可用")
+
+    with patch.object(api.projects, "get_project", side_effect=_get_project), \
+            patch.object(api, "analyze_live_frame_ep", side_effect=boom):
+        with TestClient(api.app) as client:
+            with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+                _handshake(socket)
+                socket.send_bytes(_frame(0))
+                event = socket.receive_json()
+                # 在会话还活着时读，避免和异步收尾抢时序（收尾会回收整个作用域）。
+                counters = realtime_bridge.METRICS.snapshot()["sessions"][SESSION_ID]["counters"]
+    assert event["type"] == "video.observation" and event["ok"] is False
+    assert counters[metrics.MODEL_REJECTIONS] == 1
+
+
+# ---- 7. 收尾：provider、时间线、指标作用域都要回收 ---------------------------
+
+def test_session_close_releases_provider_timeline_and_metric_scope(gateway, provider):
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        # 记一帧，让会话作用域里同时有计数器与直方图，才能证明整个作用域被回收。
+        socket.send_bytes(_frame(0))
+        provider.emit_text("回答一")
+        assert socket.receive_json()["type"] == "model.delta"
+    assert _wait_for(lambda: provider.closed is True), "会话结束必须关闭 provider"
+    assert _wait_for(lambda: PROJECT_ID not in realtime_bridge.active_timeline_projects()), \
+        "本项目的时间线必须被释放"
+    body = client.get(f"/api/vision/realtime/status?project_id={PROJECT_ID}").json()
+    # drop_session 生效的证明：会话作用域被彻底回收，metric 注册表不会无界增长。
+    # 这条曾经真的漏过：start() 用适配器自造的 rt-... 覆盖了网关会话号，
+    # drop_session(网关会话号) 永远清不掉那个作用域。
+    assert _wait_for(lambda: SESSION_ID not in
+                     realtime_bridge.METRICS.snapshot()["sessions"]), \
+        f"会话作用域没有被回收：{sorted(body['metrics']['sessions'])}"
+
+
+def test_provider_session_id_never_hijacks_the_gateway_session(gateway, provider):
+    """适配器自造的 `rt-...` 不得冒用网关的会话号，也不得成为指标作用域的键。
+
+    这条是真机复现过的漏点：`start()` 一旦用适配器会话号覆盖网关会话号，
+    `drop_session(网关会话号)` 就永远清不掉指标作用域 → 无界增长。
+    """
+    provider.session_id = "rt-fake-123456"
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        hello = _handshake(socket)
+        socket.send_bytes(_frame(0))
+        provider.emit_text("回答")
+        event = socket.receive_json()
+        # 会话还活着的时候检查，避免和异步收尾抢时序。
+        scopes = realtime_bridge.METRICS.snapshot()["sessions"]
+    assert hello["session_id"] == SESSION_ID
+    assert event["session_id"] == SESSION_ID, "转发事件必须带网关的会话号"
+    assert event["provider_session_id"] == "rt-fake-123456", "适配器会话号只作诊断保留"
+    assert SESSION_ID in scopes, "指标必须记在网关会话号下"
+    assert "rt-fake-123456" not in scopes, "适配器会话号不得成为作用域键"
+
+
+def test_two_sessions_share_one_timeline_and_release_on_the_last_close():
+    first = realtime_bridge.SessionBridge(PROJECT_ID)
+    first.bind_session("s1")
+    second = realtime_bridge.SessionBridge(PROJECT_ID)
+    second.bind_session("s2")
+    assert realtime_bridge.active_timeline_projects() == [PROJECT_ID]
+    first.close()
+    assert realtime_bridge.active_timeline_projects() == [PROJECT_ID], "还有活跃会话就不能释放"
+    second.close()
+    assert realtime_bridge.active_timeline_projects() == []
+
+
+def test_close_is_idempotent(gateway, provider):
+    bridge = realtime_bridge.SessionBridge(PROJECT_ID, provider_name=FAKE_NAME)
+    bridge.bind_session("s-idem")
+    bridge.close()
+    bridge.close()
+    assert provider.closed is True

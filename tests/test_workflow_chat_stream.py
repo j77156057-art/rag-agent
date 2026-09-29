@@ -302,7 +302,8 @@ class ChatSseWorkflowEventTests(unittest.TestCase):
                 if line.startswith("data: "):
                     types.append(json.loads(line[6:]).get("type"))
             self.assertIn("workflow", types)
-            self.assertIn("notice", types)
+            # 工作流卡片走结构化 workflow 事件，不再另发通用 notice（token 已告知用户）。
+            self.assertNotIn("notice", types)
             # 取走即清：整个 SSE 流只补发一次
             self.assertEqual(types.count("workflow"), 1)
         finally:
@@ -331,7 +332,9 @@ class ChatSseWorkflowEventTests(unittest.TestCase):
                 with TestClient(api.app) as client:
                     resp = client.post("/api/chat", data={"question": "等待模型"})
             self.assertEqual(resp.status_code, 200)
-            self.assertIn("模型仍在处理", resp.text)
+            # 心跳改为 SSE 注释行：保持连接且不往对话里塞重复提示。
+            self.assertIn(": keep-alive", resp.text)
+            self.assertNotIn("模型仍在处理", resp.text)
             self.assertIn("等待后完成", resp.text)
         finally:
             api.CHAT_STREAM_HEARTBEAT_S = old_heartbeat

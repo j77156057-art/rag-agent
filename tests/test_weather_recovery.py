@@ -1,4 +1,5 @@
 import datetime
+import json
 import unittest
 from unittest.mock import patch
 
@@ -8,6 +9,49 @@ from tests.test_agent_trace import _FakeLLM, _IsoBase
 
 
 class WeatherTests(_IsoBase):
+    def test_transport_fare_requires_concrete_date(self):
+        llm = _FakeLLM(["Final Answer: 不应调用"])
+        a = agent.Agent(llm=llm, session_id="transport-date")
+        events = list(a.run("北京到南宁高铁还是飞机，多少钱", web_enabled=True))
+        self.assertTrue(events[0]["clarification_required"])
+        self.assertIn("具体出发日期", events[0]["text"])
+        self.assertEqual(llm.i, 0)
+
+    def test_followup_ticket_request_does_not_invent_tomorrow(self):
+        llm = _FakeLLM(["Final Answer: 不应调用"])
+        a = agent.Agent(llm=llm, session_id="transport-followup")
+        a.history = [{"user": "我想去南宁玩", "assistant": "可以规划行程。"}]
+        events = list(a.run("我要确切的计划，具体多少钱，目前有什么票", web_enabled=True))
+        self.assertTrue(events[0]["clarification_required"])
+        self.assertIn("具体出发日期", events[0]["text"])
+        self.assertNotIn("明天", events[0]["text"])
+        self.assertEqual(llm.i, 0)
+
+    def test_transport_tool_never_marks_search_snippet_as_fare(self):
+        with patch.object(tools, "web_search_batch", return_value="· 票价摘要\n  800 元\n  https://example.test"):
+            out = tools.web_transport(json.dumps({
+                "origin": "北京", "destination": "南宁", "departure_date": "2099-01-02"
+            }, ensure_ascii=False))
+        payload = json.loads(out)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["verified_fare"])
+        self.assertIn("不能当作当前价格", payload["message"])
+
+    def test_transport_tool_rejects_missing_date(self):
+        out = tools.web_transport(json.dumps({"origin": "北京", "destination": "南宁"}, ensure_ascii=False))
+        payload = json.loads(out)
+        self.assertFalse(payload["ok"])
+        self.assertIn("departure_date", payload["needs"])
+
+    def test_transport_final_drops_unverified_price(self):
+        out = agent._guard_transport_final(
+            "北京到南宁目前约 800 元，还有余票。",
+            "我要确切的计划，具体多少钱，目前有什么票",
+            [],
+        )
+        self.assertNotIn("800", out)
+        self.assertIn("无法确认票价", out)
+
     def test_missing_city_clarifies_without_model_or_search(self):
         llm = _FakeLLM(["Final Answer: 不应调用"])
         a = agent.Agent(llm=llm, session_id="weather")
