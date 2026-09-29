@@ -19,33 +19,40 @@ required. The SDK also sends ``X-DashScope-WorkSpace`` when one is configured;
             response.done, conversation.item.input_audio_transcription.completed
   audio     in PCM 16 kHz mono 16-bit, out PCM 24 kHz mono 16-bit
 
-Live probe results (2026-09-29, real ``sk-ws-`` key, read-only):
+Live probe results (2026-09-29, real ``sk-ws-`` key):
 
-* **Protocol confirmed correct.** A bare connection that sends *no*
-  ``session.update`` at all receives ``session.created`` echoing
-  ``input_audio_format: "pcm16"``, ``output_audio_format: "pcm24"``,
-  ``input_audio_transcription: {model: "gummy-realtime-v1"}`` and
-  ``turn_detection: {type: "server_vad", threshold: 0.5, prefix_padding_ms:
-  300, silence_duration_ms: 800, create_response: true}`` — the server's own
-  defaults already equal this module's wire values, so the earlier uncertainty
-  about field spelling is resolved. Beware: the endpoint accepts *any* model
-  name (``no-such-model-v1`` also connects and returns ``session.created``
-  verbatim), so a healthy handshake is **not** evidence that realtime is
-  enabled for the account.
-* **Account side is not enabled — this is the drop.** An idle session stays up
-  indefinitely (>10 s with nothing sent). The moment real speech flows the
-  server closes the socket ~2 s later and emits **zero** business events — no
-  ``speech_started``, no transcript, nothing. The drop is time-driven, not
-  volume-driven: 3 chunks died at 1.56 s, 5 at 2.74 s, 20 at 1.99 s. Framing
-  was ruled out — every JSON ``input_audio_buffer.append`` variant was
-  accepted; only raw binary PCM frames were rejected (3.36 s).
-* **Client events re-tested on a healthy connection.** The earlier "commit and
-  cancel drop the link" verdict was contaminated by the audio drop above. On a
-  clean session: ``response.create`` and ``input_image_buffer.append`` are
-  tolerated, while ``input_audio_buffer.commit``, ``input_audio_buffer.clear``,
-  ``response.cancel`` and ``conversation.item.create`` each close the socket
-  2.7–3.3 s later. So :meth:`commit` and :meth:`interrupt` must never reach
-  the wire, and ``interrupt`` is no longer advertised as a capability.
+* **Root cause of the earlier failures: a retiring model, not the account.**
+  ``qwen-omni-turbo-realtime`` is retired on 2026-10-10 and is already
+  half-disabled — it completes the handshake and echoes a normal
+  ``session.created``, then drops the socket ~2 s after audio starts with zero
+  business events. Switching to ``qwen3.8-omni-flash-realtime`` (the console's
+  current entry model for live audio+video) fixed it immediately. The account
+  has full free quota; nothing was ever gated on permissions.
+* **Voices are model-specific.** ``Chelsie`` — the legacy default — is
+  rejected by the current model with ``Voice 'Chelsie' is not supported``; so
+  are Cherry, Ethan and Nofish. ``Jennifer``, ``Ryan`` and ``Katerina`` are
+  verified working. This is why :data:`DEFAULT_VOICE` changed too.
+* **End-to-end verified on the current model** with an 11 s JFK speech clip:
+  ``session.created`` → ``session.updated`` (the update *is* acknowledged, and
+  echoes the requested voice) → ``input_audio_buffer.speech_started`` →
+  ``conversation.item.created`` → transcription deltas → ``speech_stopped`` →
+  ``input_audio_buffer.committed`` → ``response.created`` → 26 × ``response.
+  audio_transcript.delta`` → ``response.audio.delta`` → ``response.done``.
+  Transcript came back as ``"And so, my fellow Americans."`` — correct — and
+  the model answered ``"That sounds like the opening of a presidential
+  address..."``.
+* **Two wire details worth keeping.** Partials arrive in
+  ``conversation.item.input_audio_transcription.delta`` with a stable ``text``
+  and an unsettled ``stash``; early on only ``stash`` has content, so
+  :meth:`_translate` falls back to it. Errors are **nested** under an
+  ``error`` object (``{error: {code, message}}``), not at the top level.
+* **Client events, re-tested on the current model:** ``commit`` and ``clear``
+  are both safe (``clear`` is answered with ``input_audio_buffer.cleared``);
+  ``response.cancel`` does not break the session either, it merely warns
+  ``Conversation has none active response`` when nothing is generating. An
+  earlier version of this module refused ``commit``/``interrupt`` locally —
+  that was the retiring model's behaviour leaking into the adapter, and has
+  been undone.
 """
 from __future__ import annotations
 
@@ -58,7 +65,7 @@ import uuid
 from typing import Any, Callable
 
 from agent_runtime.realtime_provider import (
-    CAP_AUDIO_IN, CAP_AUDIO_OUT, CAP_TEXT_OUT, CAP_VIDEO_IN,
+    CAP_AUDIO_IN, CAP_AUDIO_OUT, CAP_INTERRUPT, CAP_TEXT_OUT, CAP_VIDEO_IN,
     DEGRADED_SAMPLED_FRAMES, EVENT_AUDIO_DELTA, EVENT_DONE, EVENT_ERROR,
     EVENT_STATUS, EVENT_TEXT_DELTA, EVENT_TRANSCRIPT, RealtimeEvent,
     RealtimeProvider, register,
@@ -66,8 +73,14 @@ from agent_runtime.realtime_provider import (
 
 PROVIDER_NAME = "dashscope_omni"
 DEFAULT_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
-DEFAULT_MODEL = "qwen-omni-turbo-realtime"
-DEFAULT_VOICE = "Chelsie"
+# qwen-omni-turbo-realtime is retired on 2026-10-10 and already half-disabled:
+# it accepts the handshake then drops the socket ~2 s after audio starts. The
+# console's current entry model for live audio+video is qwen3.8-omni-flash-realtime.
+DEFAULT_MODEL = "qwen3.8-omni-flash-realtime"
+# Voices are model-specific. Chelsie/Cherry/Ethan/Nofish belong to the legacy
+# model and are rejected with "Voice '...' is not supported"; Jennifer, Ryan
+# and Katerina all verified working on the current one.
+DEFAULT_VOICE = "Jennifer"
 # Wire values confirmed by the live session.created echo, not the SDK docs.
 INPUT_AUDIO_FORMAT = "pcm16"
 OUTPUT_AUDIO_FORMAT = "pcm24"
@@ -75,6 +88,7 @@ TRANSCRIPTION_MODEL = "gummy-realtime-v1"
 # 1 MiB of PCM16 @16 kHz ≈ 32 s; anything larger is a caller bug, not a stream.
 MAX_AUDIO_CHUNK = 1 << 20
 
+_TRANSCRIPT_DELTA = "conversation.item.input_audio_transcription.delta"
 _TRANSCRIPT_DONE = "conversation.item.input_audio_transcription.completed"
 
 
@@ -110,11 +124,7 @@ class OmniRealtimeProvider(RealtimeProvider):
         return f"{self._url}{separator}model={self._model}"
 
     def capabilities(self) -> list[str]:
-        # CAP_INTERRUPT is deliberately absent: the two server-side primitives
-        # for it (response.cancel, input_audio_buffer.clear) both closed the
-        # connection when probed on an otherwise healthy session, so advertising
-        # the capability would promise the UI something that breaks the stream.
-        return [CAP_AUDIO_IN, CAP_VIDEO_IN, CAP_TEXT_OUT, CAP_AUDIO_OUT]
+        return [CAP_AUDIO_IN, CAP_VIDEO_IN, CAP_TEXT_OUT, CAP_AUDIO_OUT, CAP_INTERRUPT]
 
     def availability(self) -> dict[str, Any]:
         if not self.api_key:
@@ -128,10 +138,9 @@ class OmniRealtimeProvider(RealtimeProvider):
                 return {"ok": False, "provider": self.name,
                         "reason": "缺少 websocket-client 依赖", "degraded_to": DEGRADED_SAMPLED_FRAMES}
         return {"ok": True, "provider": self.name, "model": self._model,
-                "voice": self._voice, "vad": self._vad, "verified": "connect-only",
-                "note": "握手与 session.created 已真机验证（服务端口径与本协议一致）；"
-                        "但真人声一进流服务端约 2 秒后即断开且零业务事件，"
-                        "疑似该账号/业务空间未开通 Omni Realtime（见模块 docstring）"}
+                "voice": self._voice, "vad": self._vad, "verified": "end-to-end",
+                "note": "已真机端到端验证：转写 / 文本增量 / 音频增量全通。"
+                        "注意 qwen-omni-turbo-realtime 将于 2026-10-10 下线且已半停用，勿切回"}
 
     # -- lifecycle ------------------------------------------------------------
     def start(self) -> bool:
@@ -200,30 +209,25 @@ class OmniRealtimeProvider(RealtimeProvider):
                                       image=base64.b64encode(image).decode("ascii")))
 
     def commit(self) -> bool:
-        """Manual mode is not available on this endpoint.
+        """Flush the buffer so the server opens a turn now.
 
-        Probed on an otherwise healthy session, ``input_audio_buffer.commit``
-        closes the connection ~2.7 s later, so this never reaches the wire: the
-        session stays in server-VAD mode and the server picks the turn boundary.
-        """
-        self._emit(EVENT_ERROR, code="commit_unsupported",
-                   message="该端点不支持手动提交（实测 input_audio_buffer.commit 会断连），请使用服务端 VAD 断句")
-        return False
-
-    def interrupt(self) -> bool:
-        """No safe interrupt primitive exists here either.
-
-        Both candidates were probed on a healthy session: ``response.cancel``
-        and ``input_audio_buffer.clear`` each close the connection 2.7–3.3 s
-        later. Sending either would trade a live stream for a no-op, so this
-        reports instead.
+        Verified safe on ``qwen3.8-omni-flash-realtime`` (no error, no drop).
+        It is unnecessary in server-VAD mode — the server emits
+        ``input_audio_buffer.committed`` on its own once speech stops — so this
+        only matters for manual turn control.
         """
         if not self._ready():
             return False
-        self._emit(EVENT_ERROR, code="interrupt_unsupported",
-                   message="该端点无可用的打断原语（实测 response.cancel 与 "
-                           "input_audio_buffer.clear 均会断连）")
-        return False
+        return self._send(self._event("input_audio_buffer.commit"))
+
+    def interrupt(self) -> bool:
+        if not self._ready():
+            return False
+        # ``input_audio_buffer.clear`` is verified safe here and answered with
+        # ``input_audio_buffer.cleared``. Cutting the model's spoken output off
+        # is the server's job: session.created reports interrupt_response=true,
+        # so it stops itself the moment the user starts speaking again.
+        return self._send(self._event("input_audio_buffer.clear"))
 
     # -- protocol payloads ----------------------------------------------------
     def _session_payload(self) -> dict[str, Any]:
@@ -283,8 +287,9 @@ class OmniRealtimeProvider(RealtimeProvider):
             except Exception:
                 if self._running:
                     self._emit(EVENT_ERROR, code="stream_broken", retryable=True,
-                               message="服务端关闭了连接；若发生在音频开始后约 2 秒，"
-                                       "通常是该账号/业务空间未开通 Omni Realtime")
+                               message="服务端关闭了连接；若音频一进流就被断开，先确认模型是否"
+                                       "已下线（qwen-omni-turbo-realtime 于 2026-10-10 下线）"
+                                       "或音色是否被当前模型支持")
                 self._running = False
                 return
             if raw in (None, ""):
@@ -303,13 +308,34 @@ class OmniRealtimeProvider(RealtimeProvider):
         """Map a vendor event onto the neutral vocabulary. Unknown → ignored."""
         event_type = str(message.get("type") or "")
         if event_type in ("session.created", "session.updated"):
+            session = message.get("session") or {}
             return RealtimeEvent(EVENT_STATUS, session_id=self.session_id,
                                  payload={"state": "ready", "provider": self.name,
-                                          "model": self._model})
+                                          "model": str(session.get("model") or self._model),
+                                          "voice": str(session.get("voice") or "")})
+        if event_type == "input_audio_buffer.speech_started":
+            return RealtimeEvent(EVENT_STATUS, session_id=self.session_id,
+                                 payload={"state": "listening", "provider": self.name,
+                                          "audio_start_ms": message.get("audio_start_ms")})
+        if event_type == "input_audio_buffer.speech_stopped":
+            return RealtimeEvent(EVENT_STATUS, session_id=self.session_id,
+                                 payload={"state": "thinking", "provider": self.name,
+                                          "audio_end_ms": message.get("audio_end_ms")})
+        if event_type == _TRANSCRIPT_DELTA:
+            # Live partials arrive as a stable ``text`` plus an unsettled
+            # ``stash`` tail; only the stash carries content early on, so fall
+            # back to it or the first words are lost.
+            partial = str(message.get("text") or "") or str(message.get("stash") or "")
+            if not partial:
+                return None
+            return RealtimeEvent(EVENT_TRANSCRIPT, session_id=self.session_id,
+                                 payload={"text": partial, "role": "user", "final": False,
+                                          "language": str(message.get("language") or "")})
         if event_type == _TRANSCRIPT_DONE:
             return RealtimeEvent(EVENT_TRANSCRIPT, session_id=self.session_id,
                                  payload={"text": str(message.get("transcript") or ""),
-                                          "role": "user"})
+                                          "role": "user", "final": True,
+                                          "language": str(message.get("language") or "")})
         if event_type == "response.audio_transcript.delta":
             return RealtimeEvent(EVENT_TEXT_DELTA, session_id=self.session_id,
                                  payload={"text": str(message.get("delta") or ""),
@@ -328,13 +354,26 @@ class OmniRealtimeProvider(RealtimeProvider):
                                  payload={"audio": audio, "encoding": OUTPUT_AUDIO_FORMAT,
                                           "chars": len(audio)})
         if event_type == "response.done":
+            # The id lives in the nested ``response`` object, not at the top
+            # level — reading the top level silently yields an empty string.
+            detail = message.get("response")
+            if not isinstance(detail, dict):
+                detail = {}
+            status = str(detail.get("status") or "")
             return RealtimeEvent(EVENT_DONE, session_id=self.session_id,
-                                 payload={"response_id": str(message.get("response_id") or ""),
-                                          "reason": "completed"})
+                                 payload={"response_id": str(detail.get("id")
+                                                             or message.get("response_id") or ""),
+                                          "reason": status or "completed"})
         if event_type == "error":
+            # Vendor errors nest: {"type":"error","error":{"code":..,"message":..}}.
+            detail = message.get("error")
+            if not isinstance(detail, dict):
+                detail = {}
             return RealtimeEvent(EVENT_ERROR, session_id=self.session_id,
-                                 payload={"code": str(message.get("code") or "vendor_error"),
-                                          "message": str(message.get("message") or "")[:400]})
+                                 payload={"code": str(detail.get("code")
+                                                      or message.get("code") or "vendor_error"),
+                                          "message": str(detail.get("message")
+                                                         or message.get("message") or "")[:400]})
         return None
 
 

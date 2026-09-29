@@ -16,7 +16,7 @@ import unittest
 from agent_runtime import realtime_provider as rp
 from agent_runtime import realtime_timeline as rt
 from agent_runtime.realtime_omni import (
-    INPUT_AUDIO_FORMAT, OUTPUT_AUDIO_FORMAT, OmniRealtimeProvider,
+    DEFAULT_MODEL, INPUT_AUDIO_FORMAT, OUTPUT_AUDIO_FORMAT, OmniRealtimeProvider,
 )
 
 _ENV_KEYS = ("DOCMIND_REALTIME_PROVIDER", "DOCMIND_OMNI_API_KEY", "DASHSCOPE_API_KEY",
@@ -186,13 +186,6 @@ class OmniAdapterTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertIsNone(ws.sent[0]["session"]["turn_detection"])
 
-    def test_commit_refused_because_endpoint_drops_connection(self):
-        provider, ws = self._start()
-        self.assertFalse(provider.commit())
-        self.assertNotIn("input_audio_buffer.commit", ws.types())
-        error = provider.poll(timeout=1)
-        self.assertEqual(error.payload["code"], "commit_unsupported")
-
     def test_interrupt_does_not_send_cancel(self):
         provider, ws = self._start()
         provider.interrupt()
@@ -223,19 +216,68 @@ class OmniAdapterTests(unittest.TestCase):
         sent = [item for item in ws.sent if item["type"] == "input_image_buffer.append"][0]
         self.assertEqual(base64.b64decode(sent["image"]), b"jpegbytes")
 
-    def test_interrupt_stays_local_because_server_drops_it(self):
-        """Probed on a healthy session, clear and cancel both close the socket."""
+    def test_interrupt_clears_buffer(self):
         provider, ws = self._start()
-        self.assertFalse(provider.interrupt())
-        self.assertNotIn("input_audio_buffer.clear", ws.types())
-        self.assertNotIn("response.cancel", ws.types())
-        error = provider.poll(timeout=1)
-        self.assertEqual(error.payload["code"], "interrupt_unsupported")
+        self.assertTrue(provider.interrupt())
+        self.assertIn("input_audio_buffer.clear", ws.types())
 
-    def test_interrupt_not_advertised(self):
+    def test_commit_reaches_the_wire(self):
+        provider, ws = self._start()
+        self.assertTrue(provider.commit())
+        self.assertIn("input_audio_buffer.commit", ws.types())
+
+    def test_interrupt_advertised_again(self):
+        """The retiring model forced a local no-op; the current one supports it."""
         provider = OmniRealtimeProvider(project_id="prj-test")
-        self.assertNotIn(rp.CAP_INTERRUPT, provider.capabilities())
-        self.assertIn(rp.CAP_AUDIO_IN, provider.capabilities())
+        self.assertIn(rp.CAP_INTERRUPT, provider.capabilities())
+
+    def test_transcription_delta_falls_back_to_stash(self):
+        """Early partials carry only ``stash``; text is still empty."""
+        provider, _ws = self._start([
+            _event("conversation.item.input_audio_transcription.delta",
+                   text="", stash="And", language="en"),
+            _event("conversation.item.input_audio_transcription.delta",
+                   text="And so", stash="", language="en"),
+        ])
+        first = provider.poll(timeout=2)
+        second = provider.poll(timeout=2)
+        self.assertEqual(first.kind, rp.EVENT_TRANSCRIPT)
+        self.assertEqual(first.payload["text"], "And")
+        self.assertFalse(first.payload["final"])
+        self.assertEqual(second.payload["text"], "And so")
+
+    def test_speech_boundaries_become_status(self):
+        provider, _ws = self._start([
+            _event("input_audio_buffer.speech_started", audio_start_ms=40),
+            _event("input_audio_buffer.speech_stopped", audio_end_ms=2320),
+        ])
+        started = provider.poll(timeout=2)
+        stopped = provider.poll(timeout=2)
+        self.assertEqual(started.payload["state"], "listening")
+        self.assertEqual(started.payload["audio_start_ms"], 40)
+        self.assertEqual(stopped.payload["state"], "thinking")
+        self.assertEqual(stopped.payload["audio_end_ms"], 2320)
+
+    def test_nested_vendor_error_is_unwrapped(self):
+        """Vendor errors nest under ``error``, not at the top level."""
+        provider, _ws = self._start([
+            {"type": "error", "error": {"code": "COMMON_ERROR",
+                                        "message": "Voice 'Chelsie' is not supported."}},
+        ])
+        error = provider.poll(timeout=2)
+        self.assertEqual(error.kind, rp.EVENT_ERROR)
+        self.assertEqual(error.payload["code"], "COMMON_ERROR")
+        self.assertIn("Chelsie", error.payload["message"])
+
+    def test_response_done_reads_nested_id(self):
+        """The id is under ``response.id``; the top level is empty."""
+        provider, _ws = self._start([
+            _event("response.done", response={"id": "resp_abc", "status": "completed"}),
+        ])
+        done = provider.poll(timeout=2)
+        self.assertEqual(done.kind, rp.EVENT_DONE)
+        self.assertEqual(done.payload["response_id"], "resp_abc")
+        self.assertEqual(done.payload["reason"], "completed")
 
     def test_workspace_header_and_model_query_forwarded(self):
         os.environ["DOCMIND_OMNI_WORKSPACE"] = "ws-abc123"
@@ -251,7 +293,7 @@ class OmniAdapterTests(unittest.TestCase):
         self.assertTrue(provider.start())
         self.assertIn("X-DashScope-WorkSpace: ws-abc123", captured["headers"])
         self.assertIn("Authorization: Bearer test-key", captured["headers"])
-        self.assertIn("model=qwen-omni-turbo-realtime", captured["url"])
+        self.assertIn(f"model={DEFAULT_MODEL}", captured["url"])
 
     def test_no_workspace_header_when_unset(self):
         captured: dict[str, object] = {}
