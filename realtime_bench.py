@@ -28,6 +28,11 @@
   - `model_ms=0` 时，rtt 的 p50/p95 约等于**网关自身开销**；
   - `model_ms>0` 时，`overhead = rtt - model_ms` 才是网关开销，工具会把两者分开报。
 * stream 模式的延迟**含排队时间**，是上界而非纯处理时间。
+* **只测兼容抽帧通道**：运行期间临时清空 `DOCMIND_REALTIME_PROVIDER`，让网关确定走
+  抽帧路径。原生通道的帧不产生 `video.observation`（观察由 vendor 事件驱动），
+  逐帧延迟无法归因，而且本机 `.env` 真的配了 `dashscope_omni`，跑起来会真连外部服务
+  （有网络往来与费用）。原生通道的首 token/首音频延迟由
+  `tests/test_realtime_gateway_bridge.py` 里的假 provider 确定性覆盖，真机数字属 R12。
 * 真实摄像头/麦克风/屏幕共享 + 真实实时模型的联验属于 R12，本工具不能替代它。
 
 用法：
@@ -40,6 +45,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import threading
 import time
@@ -50,7 +56,9 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import api
+from agent_runtime import realtime_bridge
 from agent_runtime import realtime_metrics as metrics
+from agent_runtime import realtime_provider as provider_registry
 
 ENDPOINT = "/api/vision/live-stream"
 PROJECT_ID = "bench-project"
@@ -151,14 +159,28 @@ class RunResult:
 
 @contextmanager
 def gateway(analyzer: _StubAnalyzer):
-    """把真实网关挂上占位模型和项目表；不修改 `api.py` 的任何实现。"""
+    """把真实网关挂上占位模型和项目表；不修改 `api.py` 的任何实现。
+
+    **临时清空 `DOCMIND_REALTIME_PROVIDER`**：这台机器的 `.env` 里真的配了
+    `dashscope_omni`，网关会按配置走原生通道。原生通道下帧被直接转给 provider，
+    不再产生 `video.observation`——本工具会一直等一个永远不来的观察（实测挂死），
+    而且每次连接都会真的对外建连（有网络往来与费用）。所以基准固定在兼容抽帧通道上，
+    并在握手时断言 mode，避免"挂死"这种最难排查的失败形态。
+    """
     def get_project(project_id):
         return {"root": f"root-{project_id}"} if project_id == PROJECT_ID else None
 
-    with patch.object(api.projects, "get_project", side_effect=get_project), \
+    original = os.environ.get(provider_registry.DEFAULT_PROVIDER_ENV, "")
+    with patch.dict(os.environ, {provider_registry.DEFAULT_PROVIDER_ENV: ""}), \
+            patch.object(api.projects, "get_project", side_effect=get_project), \
             patch.object(api, "analyze_live_frame_ep", side_effect=analyzer.analyze):
         with TestClient(api.app) as client:
-            yield client
+            try:
+                yield client
+            finally:
+                if original:
+                    print(f"（基准期间已临时停用 {provider_registry.DEFAULT_PROVIDER_ENV}="
+                          f"{original}；原生通道延迟需真实模型，属 R12）")
 
 
 @contextmanager
@@ -168,6 +190,11 @@ def _session(client):
         socket.send_text(_hello())
         hello = socket.receive_json()
         assert hello.get("type") == "hello.ok", f"握手失败：{hello}"
+        assert hello.get("mode") == realtime_bridge.MODE_SAMPLED, (
+            f"基准要求兼容抽帧通道，但 hello.ok 报的 mode 是 {hello.get('mode')!r}"
+            f"（degraded_to={hello.get('degraded_to')!r} reason={hello.get('reason')!r}）。"
+            f"原生通道不产生 video.observation，继续跑只会等到超时——"
+            f"检查是不是有别的开关把 {provider_registry.DEFAULT_PROVIDER_ENV} 又打开了。")
         yield socket
 
 
