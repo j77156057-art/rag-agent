@@ -15,11 +15,20 @@ Verified against the official docs (2026-09):
             response.done, conversation.item.input_audio_transcription.completed
   audio     in PCM 16 kHz mono 16-bit, out PCM 24 kHz mono 16-bit
 
-NOT verified (no key yet, so not claimed as done): the exact ``session.*`` field
-spelling for Omni raw WS and the cancel event name. Both are isolated in
-:meth:`_session_payload` and :meth:`interrupt` so they can be corrected in one
-place once a real key exists. ``availability()`` stays explicit that the mode
-is unproven until then.
+Live probe results (2026-09-29, real ``sk-ws-`` key, read-only):
+
+* **Confirmed working** — connection and auth against the default endpoint; the
+  server immediately emits ``session.created`` with ``input_audio_format:
+  "pcm16"``, ``output_audio_format: "pcm24"``, ``turn_detection.type:
+  server_vad`` (threshold 0.5), ``input_audio_transcription: {model:
+  "gummy-realtime-v1"}``. Those wire values are what this module now sends.
+* **Confirmed rejected** — ``input_audio_buffer.commit`` and ``response.cancel``
+  each make the server drop the connection (10054). Manual mode is therefore
+  unavailable on this endpoint; only server-VAD streaming works, so
+  :meth:`commit` and :meth:`interrupt` degrade to the buffer-clear path.
+* **Still unproven** — ``session.update`` returns no ``session.updated``, and a
+  1 s tone triggered neither VAD nor any response event, so the exact session
+  field spelling and the VAD trigger need a real human voice (plan R12).
 """
 from __future__ import annotations
 
@@ -42,8 +51,10 @@ PROVIDER_NAME = "dashscope_omni"
 DEFAULT_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
 DEFAULT_MODEL = "qwen-omni-turbo-realtime"
 DEFAULT_VOICE = "Chelsie"
-INPUT_AUDIO_FORMAT = "pcm_16000hz_mono_16bit"
-OUTPUT_AUDIO_FORMAT = "pcm_24000hz_mono_16bit"
+# Wire values confirmed by the live session.created echo, not the SDK docs.
+INPUT_AUDIO_FORMAT = "pcm16"
+OUTPUT_AUDIO_FORMAT = "pcm24"
+TRANSCRIPTION_MODEL = "gummy-realtime-v1"
 # 1 MiB of PCM16 @16 kHz ≈ 32 s; anything larger is a caller bug, not a stream.
 MAX_AUDIO_CHUNK = 1 << 20
 
@@ -94,8 +105,8 @@ class OmniRealtimeProvider(RealtimeProvider):
                 return {"ok": False, "provider": self.name,
                         "reason": "缺少 websocket-client 依赖", "degraded_to": DEGRADED_SAMPLED_FRAMES}
         return {"ok": True, "provider": self.name, "model": self._model,
-                "voice": self._voice, "vad": self._vad,
-                "verified": False, "note": "接口未经真实 Key 联验"}
+                "voice": self._voice, "vad": self._vad, "verified": "connect-only",
+                "note": "连接与 session.created 已真机验证；commit/cancel 被服务端断连，VAD 触发待真人声联验"}
 
     # -- lifecycle ------------------------------------------------------------
     def start(self) -> bool:
@@ -160,35 +171,40 @@ class OmniRealtimeProvider(RealtimeProvider):
                                       image=base64.b64encode(image).decode("ascii")))
 
     def commit(self) -> bool:
-        if not self._ready():
-            return False
-        self._send(self._event("input_audio_buffer.commit"))
-        return self._send(self._event("response.create"))
+        """Manual mode is not available on this endpoint.
+
+        A live probe (2026-09-29) showed ``input_audio_buffer.commit`` makes the
+        server drop the connection, so this never reaches the wire: the session
+        stays in server-VAD mode and the server decides the turn boundary.
+        """
+        self._emit(EVENT_ERROR, code="commit_unsupported",
+                   message="该端点不支持手动提交（实测 input_audio_buffer.commit 会断连），请使用服务端 VAD 断句")
+        return False
 
     def interrupt(self) -> bool:
         if not self._ready():
             return False
-        cleared = self._send(self._event("input_audio_buffer.clear"))
-        # ``response.cancel`` is best effort: the docs list buffer.clear, the
-        # cancel event name is not confirmed yet. Failure must not look fatal.
-        try:
-            self._send(self._event("response.cancel"))
-        except Exception:
-            pass
-        return cleared
+        # ``response.cancel`` is deliberately NOT sent: it also dropped the
+        # connection in the live probe. Clearing the input buffer is the only
+        # interrupt primitive this endpoint tolerated.
+        return self._send(self._event("input_audio_buffer.clear"))
 
     # -- protocol payloads ----------------------------------------------------
     def _session_payload(self) -> dict[str, Any]:
+        # Field names below are taken from the live ``session.created`` echo
+        # (2026-09-29 real-key probe), not from the SDK docs: the wire format
+        # strings are "pcm16" / "pcm24", transcription is an object, and a
+        # payload with unknown fields is dropped silently by the server (no
+        # session.updated and no error event).
         session: dict[str, Any] = {
             "modalities": ["text", "audio"],
             "voice": self._voice,
             "input_audio_format": INPUT_AUDIO_FORMAT,
             "output_audio_format": OUTPUT_AUDIO_FORMAT,
-            "enable_input_audio_transcription": True,
+            "input_audio_transcription": {"model": TRANSCRIPTION_MODEL},
         }
         if self._vad in ("server_vad", "semantic_vad"):
-            session["turn_detection"] = {"type": self._vad, "threshold": 0.2,
-                                         "silence_duration_ms": 800}
+            session["turn_detection"] = {"type": self._vad, "silence_duration_ms": 800}
         elif self._vad in ("", "none", "manual", "false"):
             session["turn_detection"] = None
         instructions = _env("DOCMIND_OMNI_INSTRUCTIONS")

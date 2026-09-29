@@ -15,7 +15,9 @@ import unittest
 
 from agent_runtime import realtime_provider as rp
 from agent_runtime import realtime_timeline as rt
-from agent_runtime.realtime_omni import OmniRealtimeProvider
+from agent_runtime.realtime_omni import (
+    INPUT_AUDIO_FORMAT, OUTPUT_AUDIO_FORMAT, OmniRealtimeProvider,
+)
 
 _ENV_KEYS = ("DOCMIND_REALTIME_PROVIDER", "DOCMIND_OMNI_API_KEY", "DASHSCOPE_API_KEY",
              "DOCMIND_OMNI_MODEL", "DOCMIND_OMNI_VOICE", "DOCMIND_OMNI_VAD",
@@ -170,7 +172,9 @@ class OmniAdapterTests(unittest.TestCase):
         session = ws.sent[0]["session"]
         self.assertEqual(session["modalities"], ["text", "audio"])
         self.assertEqual(session["turn_detection"]["type"], "server_vad")
-        self.assertEqual(session["input_audio_format"], "pcm_16000hz_mono_16bit")
+        self.assertEqual(session["input_audio_format"], INPUT_AUDIO_FORMAT)
+        self.assertEqual(session["output_audio_format"], OUTPUT_AUDIO_FORMAT)
+        self.assertEqual(session["input_audio_transcription"]["model"], "gummy-realtime-v1")
         self.assertTrue(provider.running)
 
     def test_manual_mode_disables_vad(self):
@@ -180,8 +184,18 @@ class OmniAdapterTests(unittest.TestCase):
         while not ws.sent and time.time() < deadline:
             time.sleep(0.01)
         self.assertIsNone(ws.sent[0]["session"]["turn_detection"])
-        self.assertTrue(provider.commit())
-        self.assertIn("response.create", ws.types())
+
+    def test_commit_refused_because_endpoint_drops_connection(self):
+        provider, ws = self._start()
+        self.assertFalse(provider.commit())
+        self.assertNotIn("input_audio_buffer.commit", ws.types())
+        error = provider.poll(timeout=1)
+        self.assertEqual(error.payload["code"], "commit_unsupported")
+
+    def test_interrupt_does_not_send_cancel(self):
+        provider, ws = self._start()
+        provider.interrupt()
+        self.assertNotIn("response.cancel", ws.types())
 
     def test_audio_is_base64_framed(self):
         provider, ws = self._start()
