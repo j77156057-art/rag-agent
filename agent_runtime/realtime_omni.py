@@ -11,6 +11,12 @@ in an ``Authorization: Bearer`` header, so no workspace-specific host is
 required. The SDK also sends ``X-DashScope-WorkSpace`` when one is configured;
 ``DOCMIND_OMNI_WORKSPACE`` exposes the same knob here.
 
+  gotcha    **never end a stream on loud audio.** server VAD closes a turn on
+            the quiet *after* the last word, so a caller that stops pushing the
+            instant the clip ends leaves the turn open: full transcript, no
+            answer, then ``stream_broken`` ~8 s later. Push ~1 s of silence
+            (zeros, same chunk size) after speech -- see ``verify_realtime_
+            acceptance.py`` and ``docs/realtime-r12-acceptance-*.md``.
   models    qwen-omni-turbo-realtime (voice Chelsie) / qwen3.5-omni-plus-realtime
   client    session.update, input_audio_buffer.append|commit|clear,
             input_image_buffer.append, response.create
@@ -211,10 +217,14 @@ class OmniRealtimeProvider(RealtimeProvider):
     def commit(self) -> bool:
         """Flush the buffer so the server opens a turn now.
 
-        Verified safe on ``qwen3.8-omni-flash-realtime`` (no error, no drop).
-        It is unnecessary in server-VAD mode — the server emits
+        Unnecessary in server-VAD mode — the server emits
         ``input_audio_buffer.committed`` on its own once speech stops — so this
         only matters for manual turn control.
+
+        Do **not** reach for this as a fix for "transcript but no answer": if
+        server VAD already closed the turn, committing the now-empty buffer
+        comes back as ``vendor_error``. The fix there is a second of silence
+        after the speech, not a commit.
         """
         if not self._ready():
             return False

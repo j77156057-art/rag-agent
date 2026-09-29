@@ -84,6 +84,9 @@ def main() -> int:
                         help="how much of the clip to stream (default 11)")
     parser.add_argument("--wait", type=float, default=20.0,
                         help="how long to wait for the response (default 20)")
+    parser.add_argument("--tail", type=float, default=1.0,
+                        help="silence pushed after the clip so the server VAD "
+                             "closes the turn (default 1.0)")
     parser.add_argument("--keep-sample", action="store_true",
                         help="do not delete the downloaded sample afterwards")
     args = parser.parse_args()
@@ -122,6 +125,14 @@ def main() -> int:
             provider.send_audio(pcm[i * step:(i + 1) * step],
                                 captured_at=int(time.time() * 1000))
             time.sleep(0.1)
+        # Trailing silence is mandatory. The server VAD closes a turn on the
+        # quiet after the last word, so cutting the stream while the clip is
+        # still loud leaves the turn open: you get a full transcript, no answer,
+        # and a stream_broken ~8 s later. Real microphones keep running after
+        # the speaker stops, which is what normally supplies this tail.
+        for _ in range(int(args.tail * 10)):
+            provider.send_audio(b"\x00" * step, captured_at=int(time.time() * 1000))
+            time.sleep(0.1)
         deadline = time.time() + args.wait
         kinds: list[str] = []
         samples: dict[str, str] = {}
@@ -153,6 +164,10 @@ def main() -> int:
                            rp.EVENT_AUDIO_DELTA, rp.EVENT_DONE) if k not in counts]
     if missing:
         print(f"\nRESULT: PARTIAL — missing {missing}")
+        if rp.EVENT_DONE in missing and rp.EVENT_TRANSCRIPT in counts:
+            print("Hint: transcript arrived but no answer -> the turn was never "
+                  "closed. Raise --tail (silence after the clip); see "
+                  "docs/realtime-r12-acceptance-*.md finding 1.")
         print("Hint: if audio was followed by an immediate disconnect, check the "
               "model has not been retired and that the voice is supported by it.")
         return 1
