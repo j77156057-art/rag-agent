@@ -2718,7 +2718,18 @@ async def live_vision_stream(websocket: WebSocket):
                     pending = None
                     # 用户抢话/取消：原生通道要连带中断 provider 正在生成的回答。
                     if bridge is not None:
-                        bridge.interrupt()
+                        # provider 基类契约要求「fail-closed：返回 False 而非外抛」，但契约不是
+                        # 保证。这里先前没有守卫，一次外抛就会顺着外层 try（只接
+                        # WebSocketDisconnect）打穿整个会话。本地取消已经生效（generation 已 +、
+                        # pending 已清），所以照旧回 cancel.ok，只把「provider 没停住」报出来。
+                        try:
+                            bridge.interrupt()
+                        except Exception as exc:  # noqa: BLE001 - provider 故障不得打死会话
+                            bridge.note_model_failure()
+                            await _realtime_send_error(
+                                websocket, "interrupt_failed",
+                                f"本轮本地生成已停止，但实时模型未能中断：{type(exc).__name__}",
+                                retryable=True, session_id=session_id or None)
                     await websocket.send_json(server_event("cancel.ok", session_id=session_id,
                                                            reason=control.get("reason") or "cancelled"))
                 elif event_type == "session.close":
@@ -2745,7 +2756,14 @@ async def live_vision_stream(websocket: WebSocket):
                 continue
             if header.get("type") == "audio.chunk":
                 # 原生通道接管音频；只有降级到抽帧时才回 audio_not_ready。
-                if bridge is not None and bridge.take_audio(payload, header.get("captured_at") or 0):
+                # provider 外抛按「没接管」处理：落回下面同一条降级回复，别打死会话。
+                taken = False
+                if bridge is not None:
+                    try:
+                        taken = bool(bridge.take_audio(payload, header.get("captured_at") or 0))
+                    except Exception:  # noqa: BLE001 - provider 故障不得打死会话
+                        bridge.note_model_failure()
+                if taken:
                     continue
                 await _realtime_send_error(
                     websocket, "audio_not_ready", "音频包已进入协议，但当前网关尚未接入音频模型。",
@@ -2753,8 +2771,14 @@ async def live_vision_stream(websocket: WebSocket):
                 continue
             # 原生通道：帧即时转给 provider，观察由 pump_provider 泵回；
             # 抽帧通道：帧进单槽，只保留最新一帧。
-            native_taken = bridge is not None and bridge.send_frame(payload, header)
+            native_taken = False
             if bridge is not None:
+                try:
+                    native_taken = bool(bridge.send_frame(payload, header))
+                except Exception:  # noqa: BLE001 - provider 故障不得打死会话
+                    # 只降级这一帧：改走抽帧路径。不因为单帧错误翻转整场会话的模式——
+                    # 模式已经在 hello.ok 里对客户端承诺过，中途翻脸比降级一帧更误导。
+                    bridge.note_model_failure()
                 bridge.note_frame(header, queued=not native_taken)
             if native_taken:
                 continue

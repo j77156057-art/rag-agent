@@ -50,7 +50,8 @@ class FakeRealtimeProvider(realtime_provider.RealtimeProvider):
 
     name = FAKE_NAME
 
-    def __init__(self, *, start_ok: bool = True, announce_ready: bool = True) -> None:
+    def __init__(self, *, start_ok: bool = True, announce_ready: bool = True,
+                 fail_on: tuple = ()) -> None:
         super().__init__()
         self.start_ok = start_ok
         self.announce_ready = announce_ready
@@ -59,6 +60,9 @@ class FakeRealtimeProvider(realtime_provider.RealtimeProvider):
         self.frames: list[tuple[bytes, int]] = []
         self.audio: list[tuple[bytes, int]] = []
         self.interrupts = 0
+        # 让某个转发方法外抛，用来验证网关的兜底（基类契约要求 fail-closed，
+        # 但网关不能指望适配器一定守约）。
+        self.fail_on = set(fail_on)
 
     def capabilities(self) -> list[str]:
         return [realtime_provider.CAP_AUDIO_IN, realtime_provider.CAP_VIDEO_IN,
@@ -84,14 +88,22 @@ class FakeRealtimeProvider(realtime_provider.RealtimeProvider):
         super().close()
 
     def send_frame(self, image: bytes, captured_at: int = 0) -> bool:
+        if "send_frame" in self.fail_on:
+            raise RuntimeError("假适配器 send_frame 故障")
         self.frames.append((image, captured_at))
         return True
 
     def send_audio(self, pcm: bytes, captured_at: int = 0) -> bool:
+        # 注意：网关调的是 bridge.take_audio()，桥再转到这里——注入点必须落在
+        # provider 这一层，桥那层没有可注入的方法。
+        if "send_audio" in self.fail_on:
+            raise RuntimeError("假适配器 send_audio 故障")
         self.audio.append((pcm, captured_at))
         return True
 
     def interrupt(self) -> bool:
+        if "interrupt" in self.fail_on:
+            raise RuntimeError("假适配器 interrupt 故障")
         self.interrupts += 1
         return True
 
@@ -370,6 +382,65 @@ def test_each_turn_gets_its_own_end_marker(provider):
     assert _wire_types(first) == ["model.delta"], f"第一轮缺结束标记：{first}"
     assert _wire_types(second) == ["model.delta"], f"第二轮缺结束标记：{second}"
     assert bridge.suppressed.get("session.closed") == 2
+
+
+# ---- 3.2 provider 外抛不得打死会话（fail-closed 契约的兜底） ------------------
+#
+# provider 基类契约写明「每个方法都应 fail-closed：返回 False 而非外抛」，`start()` 与
+# pump 循环也都加了守卫；但网关在 cancel / 音频 / 视频三处**直接调用** bridge 的转发
+# 方法时曾经一个 try 都没有——适配器违约一次，外抛就会顺着外层 try（只接
+# WebSocketDisconnect）打穿整个会话。下面三条钉死这三处兜底。
+
+def _control(event_type: str) -> str:
+    return json.dumps({"v": api.PROTOCOL_VERSION, "type": event_type, "sent_at": _now_ms()})
+
+
+def _session_survived(socket) -> bool:
+    """发一次 heartbeat 并拿到回包 = 控制环没被打穿，会话还活着。"""
+    socket.send_text(_control("heartbeat"))
+    return socket.receive_json().get("type") == "heartbeat"
+
+
+def test_provider_frame_failure_degrades_that_frame_and_keeps_the_session(gateway, provider):
+    """`send_frame` 外抛：只降级这一帧到抽帧路径，会话不死、模式不中途翻脸。"""
+    provider.fail_on = {"send_frame"}
+    client, analyzer = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        hello = _handshake(socket)
+        socket.send_bytes(_frame(0))
+        event = socket.receive_json()
+        assert event["type"] == "video.observation", f"这一帧该降级到抽帧：{event}"
+        assert event["ok"] is True and event["observations"] == ["抽帧观察"]
+        assert analyzer.calls == 1
+        assert _session_survived(socket), "provider 单帧故障不该打死会话"
+    assert hello["mode"] == realtime_bridge.MODE_NATIVE
+
+
+def test_provider_audio_failure_falls_back_to_the_degraded_reply(gateway, provider):
+    """`send_audio` 外抛：按「没接管」处理，回 audio_not_ready，会话不死。"""
+    provider.fail_on = {"send_audio"}
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        socket.send_bytes(_audio_chunk(0))
+        event = socket.receive_json()
+        assert event["type"] == "error" and event["code"] == "audio_not_ready", event
+        assert _session_survived(socket), "provider 音频故障不该打死会话"
+
+
+def test_provider_interrupt_failure_still_completes_the_local_cancel(gateway, provider):
+    """`interrupt` 外抛：本地取消照旧完成（cancel.ok），但如实报出模型没停住。"""
+    provider.fail_on = {"interrupt"}
+    client, _ = gateway
+    with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
+        _handshake(socket)
+        socket.send_text(_control("cancel"))
+        first = socket.receive_json()
+        second = socket.receive_json()
+        assert first["type"] == "error" and first["code"] == "interrupt_failed", first
+        assert second["type"] == "cancel.ok", second
+        assert _session_survived(socket), "provider 打断故障不该打死会话"
+    assert provider.interrupts == 0
 
 
 # ---- 4. 原生通道的帧/音频/打断路由 ------------------------------------------
