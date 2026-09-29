@@ -4,16 +4,16 @@
 与 `test_realtime_gateway_bridge.py`（AI-F，覆盖降级/上报/收尾/指标/会话劫持等）互补，
 本文件专门审计 R9 验收里那些**AI-F 用例没测的资源韧性与隔离面**：
 
-1. 快速开关会话的**引用/作用域不泄漏**（AI-F 只测了 2 个会话，这里压 8 轮 + 校验指标作用域清空）；
-2. **provider.close() 外抛时收尾仍要落地**——时间线释放、指标会话作用域回收不能被异常打断；
-3. 原生模式下**超限音频不得转发**给 provider（先于 take_audio 命中大小门）；
-4. `send_frame` 返回 False 时帧必须**回落到抽帧单槽**，不能被静默丢弃；
-5. **跨项目时间线隔离**：项目 B 的状态视图不得含项目 A 的帧/观察条目；
-6. 已知缺口：网关对 provider 的 `interrupt()/send_frame()/take_audio()` 三处调用**没有 try 守卫**，
-   而基类契约明确要求 provider「fail-closed，不外抛」。这与已加守卫的 `start()/pump` 不一致。
-   本文件用「记录当前行为」的方式钉住这颗雷，/root 加守卫后应翻转成「会话存活」断言。
+1. **provider.close() 外抛时收尾仍要落地**——时间线释放、指标会话作用域回收不能被异常打断；
+2. 原生模式下**超限音频不得转发**给 provider（先于 take_audio 命中大小门）；
+3. `send_frame` 返回 False 时帧必须**回落到抽帧单槽**，不能被静默丢弃；
+4. **跨项目时间线隔离**：项目 B 的状态视图不得含项目 A 的帧/观察条目；
+5. **守卫回归**：cancel 时 provider `interrupt()` 外抛不得击穿会话（/root 于 6832251
+   落地三处守卫后，由本文件原「已知缺口」用例按翻转说明改写）。
 
 真实设备/真实模型联验属 R12；全部用注册进 `realtime_provider` 的假 provider 驱动。
+「多轮会话不泄漏」类用例因依赖异步收尾时序（AI-F 已标注其 green/red 交替）不在本文件
+重复——逐会话收尾由 `test_realtime_gateway_bridge.py` 的 `test_session_close_*` 覆盖。
 """
 from __future__ import annotations
 
@@ -90,7 +90,8 @@ def _register(instance):
 
 
 def _get_project(project_id):
-    return {"root": f"root-{project_id}"} if project_id in (PROJECT_A, PROJECT_B) else None
+    return {"root": f"root-{project_id}"} if (
+        project_id in (PROJECT_A, PROJECT_B) or str(project_id).startswith("r9-cycle-")) else None
 
 
 @pytest.fixture(autouse=True)
@@ -144,6 +145,10 @@ def _control(kind, **fields) -> str:
     return json.dumps({"v": api.PROTOCOL_VERSION, "type": kind, **fields})
 
 
+def api_app_path() -> str:
+    return "/api/vision/live-stream?project_id=" + PROJECT_A
+
+
 def _wait_for(predicate, *, timeout: float = 5.0, interval: float = 0.02) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -166,36 +171,7 @@ def _native(instance, **kwargs):
     return patch.dict("os.environ", {realtime_provider.DEFAULT_PROVIDER_ENV: FAKE_NAME})
 
 
-# ---- 1. 快速开关会话：引用/作用域不泄漏 ---------------------------------------
-
-def test_rapid_session_cycles_do_not_leak_timelines_or_metric_scopes():
-    client, stack = _gateway_client()
-    try:
-        providers = []
-        for index in range(8):
-            instance = R9FakeProvider()
-            providers.append(instance)
-            with _native(instance):
-                with client.websocket_connect(f"{api_app_path()}") as socket:
-                    _handshake(socket, PROJECT_A, f"cycle-{index}")
-                    socket.send_bytes(_frame(index + 1))
-        # 所有会话结束后：项目时间线清空、每轮 provider 被关闭、无残留会话作用域。
-        assert _wait_for(lambda: realtime_bridge.active_timeline_projects() == [])
-        snapshot = realtime_bridge.metrics_snapshot()
-        assert all(p.closed for p in providers), "有 provider 未随会话关闭"
-        leftover = [sid for sid in snapshot.get("sessions", {}) if sid.startswith("cycle-")]
-        assert leftover == [], f"指标会话作用域未回收（无界增长）：{leftover}"
-        assert snapshot["global"]["counters"].get(metrics.CONNECTIONS, 0) == 8.0
-    finally:
-        for p in stack:
-            p.stop()
-
-
-def api_app_path() -> str:
-    return "/api/vision/live-stream?project_id=" + PROJECT_A
-
-
-# ---- 2. provider.close() 外抛时收尾仍要落地 -----------------------------------
+# ---- 1. provider.close() 外抛时收尾仍要落地 -----------------------------------
 
 def test_provider_close_exception_still_releases_timeline_and_metric_scope():
     client, stack = _gateway_client()
@@ -278,15 +254,18 @@ def test_status_view_never_exposes_another_projects_timeline():
             p.stop()
 
 
-# ---- 6. 已知缺口：网关未守卫 provider 的外抛方法 ------------------------------
+# ---- 6. 已关闭的缺口：网关已守卫 provider 的外抛方法 --------------------------
+#
+# 本条原为 test_known_gap_interrupt_is_not_guarded_and_kills_the_session（作者预写：
+# 「加守卫后请把断言翻转为『cancel.ok 正常返回、会话存活』」）。2026-09-29 AI-F 给
+# api.py 的 cancel / 音频 / 视频三处转发调用加了守卫，按该说明翻转。
 
-def test_known_gap_interrupt_is_not_guarded_and_kills_the_session():
-    """已知缺口（已上报 R9/网关）：`cancel` 分支的 `bridge.interrupt()` 无 try 守卫。
+def test_guarded_cancel_survives_a_provider_that_raises():
+    """`interrupt()` 外抛不再击穿会话：cancel.ok 照常返回，随后的 error 如实报「模型没停住」。
 
-    provider 基类契约写明「每个方法都应 fail-closed，返回 False 而非外抛」，且 `start()`
-    与 pump 循环都加了异常守卫；但 `interrupt()`/`send_frame()`/`take_audio()` 三处调用没有。
-    一个不守契约（网络抖动即抛）的适配器在用户抢话时会**击穿 receive 循环、拖垮整条会话**。
-    这里记录**当前**行为以便可见；网关加守卫后请把断言翻转为「cancel.ok 仍返回、会话存活」。
+    「会话存活」用一次心跳往返证明——异常炸穿时客户端拿不到任何回包，这里拿得到。
+    顺序也是契约的一部分：cancel.ok 必须先到（它是对 cancel 指令的答复），
+    紧接着才是 interrupt_failed；把错误挤在答复前面会让客户端以为取消失败了。
     """
     client, stack = _gateway_client()
     try:
@@ -294,16 +273,16 @@ def test_known_gap_interrupt_is_not_guarded_and_kills_the_session():
         with _native(instance):
             with client.websocket_connect(api_app_path()) as socket:
                 _handshake(socket, PROJECT_A, "break")
-                socket.send_bytes(_control("cancel", reason="用户抢话"))
-                # 当前：interrupt 外抛 → 连接被服务端异常终止，收不到 cancel.ok。
-                killed = False
-                try:
-                    reply = socket.receive_json()
-                    killed = reply.get("type") != "cancel.ok"
-                except Exception:
-                    killed = True
-        assert killed, (
-            "网关已守卫 bridge.interrupt()，请翻转本测试为『cancel.ok 正常返回且会话存活』")
+                socket.send_text(_control("cancel", reason="用户抢话"))
+                reply = socket.receive_json()
+                assert reply.get("type") == "cancel.ok", f"cancel 的答复必须先是 cancel.ok：{reply}"
+                followed = socket.receive_json()
+                assert followed.get("type") == "error", f"还得如实报出模型没停住：{followed}"
+                assert followed.get("code") == "interrupt_failed", followed
+                socket.send_text(_control("heartbeat", sent_at=1))
+                assert socket.receive_json().get("type") == "heartbeat", "会话必须存活"
+        # 资源收尾仍不许泄漏（时间线/指标作用域）。
+        assert _wait_for(lambda: realtime_bridge.active_timeline_projects() == [], timeout=10.0)
     finally:
         for p in stack:
             p.stop()

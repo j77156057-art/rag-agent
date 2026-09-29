@@ -2717,21 +2717,26 @@ async def live_vision_stream(websocket: WebSocket):
                     generation += 1
                     pending = None
                     # 用户抢话/取消：原生通道要连带中断 provider 正在生成的回答。
+                    interrupt_error = ""
                     if bridge is not None:
                         # provider 基类契约要求「fail-closed：返回 False 而非外抛」，但契约不是
                         # 保证。这里先前没有守卫，一次外抛就会顺着外层 try（只接
                         # WebSocketDisconnect）打穿整个会话。本地取消已经生效（generation 已 +、
-                        # pending 已清），所以照旧回 cancel.ok，只把「provider 没停住」报出来。
+                        # pending 已清），所以照旧回 cancel.ok。
                         try:
                             bridge.interrupt()
                         except Exception as exc:  # noqa: BLE001 - provider 故障不得打死会话
                             bridge.note_model_failure()
-                            await _realtime_send_error(
-                                websocket, "interrupt_failed",
-                                f"本轮本地生成已停止，但实时模型未能中断：{type(exc).__name__}",
-                                retryable=True, session_id=session_id or None)
+                            interrupt_error = type(exc).__name__
+                    # **先回 cancel.ok**：它是对这条 cancel 指令的答复，客户端按它推进本地状态。
                     await websocket.send_json(server_event("cancel.ok", session_id=session_id,
                                                            reason=control.get("reason") or "cancelled"))
+                    # 再报「模型没停住」：本地停了，但 provider 可能还在往外吐内容，不能瞒着用户。
+                    if interrupt_error:
+                        await _realtime_send_error(
+                            websocket, "interrupt_failed",
+                            f"本轮本地生成已停止，但实时模型未能中断：{interrupt_error}",
+                            retryable=True, session_id=session_id or None)
                 elif event_type == "session.close":
                     await websocket.send_json(server_event("session.closed", session_id=session_id,
                                                            reason=control.get("reason") or "client"))

@@ -429,7 +429,11 @@ def test_provider_audio_failure_falls_back_to_the_degraded_reply(gateway, provid
 
 
 def test_provider_interrupt_failure_still_completes_the_local_cancel(gateway, provider):
-    """`interrupt` 外抛：本地取消照旧完成（cancel.ok），但如实报出模型没停住。"""
+    """`interrupt` 外抛：本地取消照旧完成（cancel.ok），但如实报出模型没停住。
+
+    顺序是契约的一部分：`cancel.ok` 必须先到——它是对这条 cancel 指令的答复，
+    客户端按它推进本地状态；「模型没停住」是随后的独立告知，不能挤在答复前面。
+    """
     provider.fail_on = {"interrupt"}
     client, _ = gateway
     with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:
@@ -437,8 +441,8 @@ def test_provider_interrupt_failure_still_completes_the_local_cancel(gateway, pr
         socket.send_text(_control("cancel"))
         first = socket.receive_json()
         second = socket.receive_json()
-        assert first["type"] == "error" and first["code"] == "interrupt_failed", first
-        assert second["type"] == "cancel.ok", second
+        assert first["type"] == "cancel.ok", f"cancel 的答复必须先是 cancel.ok：{first}"
+        assert second["type"] == "error" and second["code"] == "interrupt_failed", second
         assert _session_survived(socket), "provider 打断故障不该打死会话"
     assert provider.interrupts == 0
 
