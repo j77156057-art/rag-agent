@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import ctypes
 import functools
 import json
 import os
@@ -71,6 +72,161 @@ _BASE_FLAGS = ("--headless=new", "--disable-gpu", "--no-first-run",
                "--no-default-browser-check", "--remote-debugging-port=0",
                "--remote-allow-origins=*")
 _MAX_EXTRA_FLAGS = 32
+_PROFILE_PREFIX = "docmind-visual-preview-"
+# 单次回环最长几十秒，但同事的会话是并发的，阈值必须远大于一次运行才不至于删到活的。
+_PROFILE_MAX_AGE_SECONDS = 6 * 3600
+
+
+class _JobBasicLimits(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JobExtendedLimits(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobBasicLimits),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+_KILL_ON_JOB_CLOSE = 0x2000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+
+
+def _kernel32():
+    """显式声明每个入口的 restype/argtypes。
+
+    不写的话 ctypes 默认按 C int 传参，x64 上句柄会被截成 32 位——表现为赋值偶尔失败，
+    而失败被下面那个 best-effort 分支吃掉，比直接崩更难查。
+    """
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = (ctypes.c_void_p, ctypes.c_int,
+                                                 ctypes.c_void_p, ctypes.c_ulong)
+    kernel32.SetInformationJobObject.restype = ctypes.c_int
+    kernel32.AssignProcessToJobObject.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.restype = ctypes.c_int
+    return kernel32
+
+
+def _reap_with_parent(process) -> Any:
+    """把浏览器绑进 kill-on-close 的作业对象，交回作业句柄；不适用时回 None。
+
+    finally 里的 taskkill 只有父进程【正常退出】才跑得到。实测 44 套孤儿全都在
+    `parent=GONE` 状态——Agent 会话被硬杀或重启时 finally 根本不执行，headless Edge 却
+    一直活着，462 个进程把 CPU 顶到 99°C。作业对象把这层保证交给操作系统：句柄随进程
+    关闭，整棵树跟着没。
+    """
+    if os.name != "nt":
+        return None
+    handle = None
+    try:
+        kernel32 = _kernel32()
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            return None
+        limits = _JobExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = _KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+                handle, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(limits), ctypes.sizeof(limits)):
+            raise OSError("SetInformationJobObject rejected")
+        # 必须在子进程已经创建、但还没派生渲染进程之前绑上；靠 Chromium 自己在浏览器
+        # 进程消失时终止其余进程来覆盖绑定时机之外的那几个。
+        if not kernel32.AssignProcessToJobObject(handle, process._handle):
+            raise OSError("AssignProcessToJobObject rejected")
+        return handle
+    except OSError:
+        if handle:
+            try:
+                _kernel32().CloseHandle(handle)
+            except OSError:
+                pass
+        return None
+
+
+def _close_reaper(job: Any) -> None:
+    if job is None:
+        return
+    try:
+        _kernel32().CloseHandle(job)
+    except OSError:
+        pass
+
+
+def _release_profile(profile) -> bool:
+    """删掉 profile，扛住 Edge 退出前那段文件锁；返回是否真的删干净了。
+
+    正常退出路径实测 10/10 次都留下目录：`process.wait(3)` 一超时我们就开始删，而 Edge
+    还锁着自己的文件。`ignore_cleanup_errors=True` 只是不抛异常，不等于删掉了，且
+    `TemporaryDirectory.cleanup()` 只执行一次，重试只能自己做。删不净的由
+    `sweep_stale_profiles` 兜底。
+    """
+    path = profile.name
+    for _ in range(20):
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.isdir(path):
+            return True
+        time.sleep(0.15)
+    profile.cleanup()
+    return not os.path.isdir(path)
+
+
+def sweep_stale_profiles(directory: str | Path) -> list[str]:
+    """回收硬杀父进程留下的旧 profile 目录，返回被删掉的路径。
+
+    与 `_reap_with_parent` 同一个成因：`finally` 里的 `profile.cleanup()` 也只跑得到正常
+    退出，实测一夜留下 41 个目录、8.3 GB。只认我们自己的前缀、且必须老到远超一次运行，
+    并发同事正在用的目录不会被碰。
+    """
+    parent = Path(str(directory or ""))
+    removed: list[str] = []
+    try:
+        entries = list(os.scandir(parent))
+    except OSError:
+        return removed
+    deadline = time.time() - _PROFILE_MAX_AGE_SECONDS
+    for entry in entries:
+        if not entry.name.startswith(_PROFILE_PREFIX):
+            continue
+        try:
+            if not entry.is_dir() or entry.stat().st_mtime >= deadline:
+                continue
+            shutil.rmtree(entry.path, ignore_errors=True)
+            # 用 path 而不是 entry 复查：DirEntry 会缓存 stat，删完再问它仍然说「在」。
+            if not os.path.isdir(entry.path):
+                removed.append(entry.path)
+        except OSError:
+            continue
+    return removed
+
 
 
 def sanitize_flags(flags: Any) -> list[str]:
@@ -126,6 +282,12 @@ def browser_session(timeout: float = 25.0, extra_flags: Any = ()):
 
     拆出来是因为媒体夹具需要在同一批启动参数上追加假设备开关——两条启动路径各自演化
     迟早会出现「预览能过、媒体过不了」这种无法解释的差集。
+
+    **新建任何"要看一眼界面"的脚本都必须走这里，不要引 playwright。** playwright 启动的
+    浏览器拿不到进程句柄，绑不了 kill-on-close 的作业对象（`_reap_with_parent`），父进程被
+    硬杀（会话重启、工具超时）时必然留下孤儿 headless 进程与 `playwright_chromiumdev_profile-*`
+    目录——实测几百个 msedge 把 CPU 顶到 99°C。这条路径由作业对象 + 显式 taskkill /T /F +
+    profile 重试回收 + 启动前 sweep 四道兜住。
     """
     edge = _edge_binary()
     try:
@@ -133,16 +295,19 @@ def browser_session(timeout: float = 25.0, extra_flags: Any = ()):
     except Exception as exc:  # pragma: no cover - depends on desktop bundle
         raise VisualAcceptanceError("浏览器控制依赖 websocket-client 未安装。") from exc
     flags = sanitize_flags(extra_flags)
-    profile = tempfile.TemporaryDirectory(prefix="docmind-visual-preview-",
+    sweep_stale_profiles(tempfile.gettempdir())
+    profile = tempfile.TemporaryDirectory(prefix=_PROFILE_PREFIX,
                                           ignore_cleanup_errors=True)
     process = None
     connection = None
+    job = None
     try:
         creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen([edge, *_BASE_FLAGS, *flags,
                                     "--user-data-dir=%s" % profile.name, "about:blank"],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    creationflags=creation)
+        job = _reap_with_parent(process)
         active = Path(profile.name) / "DevToolsActivePort"
         deadline = time.monotonic() + min(15.0, max(3.0, float(timeout) / 2))
         while not active.exists() and time.monotonic() < deadline:
@@ -184,7 +349,11 @@ def browser_session(timeout: float = 25.0, extra_flags: Any = ()):
                     process.kill()
                 except Exception:
                     pass
-        profile.cleanup()
+        # 顺序要紧：先让上面那条显式关闭跑完，再解绑作业。提前关句柄会当场杀掉浏览器，
+        # 把「谁关的、为什么关」这条排查线索抹掉。
+        _close_reaper(job)
+        job = None
+        _release_profile(profile)
 
 
 _MAX_CONSOLE = 30
