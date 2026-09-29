@@ -1,5 +1,110 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 visual_targeting 7 漂移收尾 + 编码回退真实修复（AI-F，接续同文件下一节的工作）
+
+- 用户指派处理 7 个 visual_targeting 失败。下一节记录的端点补齐工作（并发 AI-F 会话）在我
+  run3 进行期间落盘，我接手时实现已在位，经我逐行审读（提案 TTL/单次 used、三闸门、
+  同窗口复验、/api/chat 反馈校验）确认契约完整，实测 `pytest tests/test_visual_targeting.py`
+  → **11 passed**（开始前 7 failed）。
+- **但下一节声称的「2108 全绿」在本环境不成立**：我随后的全量 run4 出现 1 个确定性红点
+  `test_command_execution.py::test_encoding_decision_survives_a_split_multibyte_char`
+  （单跑也红，非 flake）。根因：本工具宿主给子进程注入了 **`PYTHONUTF8=1`**（非用户/机器
+  持久变量，仅本宿主进程树），UTF-8 模式下 `locale.getpreferredencoding(False)` 恒报 utf-8——
+  `_StreamDecoder` 判定「不是 UTF-8」后回退编码仍是 utf-8，GBK 字节全成替换符（实测
+  gbk 四种分块全红，`decided encoding: utf-8`）。
+- **我的修复**（`agent_runtime/process_runner.py`，未跟踪文件）：新增
+  `_windows_legacy_encoding()`，用 `kernel32.GetACP()` 取系统真实 ANSI 代码页（本机 cp936，
+  codecs 归一为 gbk），UTF-8 模式不受影响；Win32 不可用才退回 locale 口径。修复后
+  utf-8/gbk × 1/2/3/8192 八种切法全过。
+- 最终证据（真实执行，均在本宿主 PYTHONUTF8=1 环境下）：
+  - `pytest tests/test_command_execution.py tests/test_visual_targeting.py` → **44 passed**；
+  - 全量 `pytest tests -q --basetemp=D:\Temp\pytest-docmind-bt3` →
+    **2109 passed, 6 skipped, 0 failed, 0 errors in 182.65s**；
+  - 前端 `npm run typecheck` → 0 错误（本轮未改前端）。
+- 下一节第 2 节末尾记的前端缺口（chat.ts 不转发 workflow_id/feedback_id）仍开放，属
+  AI-B/ChatComposer lane，本轮未动。
+
+## 2026-09-29 三项修复：命令输出编码 / 视觉点击端点 / EVENT_DONE 缺口（AI-F，用户指派「修复」）
+
+用户就「修复」明确了范围：**只修编码 bug、8 个失败测试、EVENT_DONE 缺口**。三项全部完成，
+**全量套件首次全绿**：`pytest tests -q --basetemp=D:\Temp\pytest-docmind-bt` →
+**2108 passed, 6 skipped, 0 failed**（164s，3 分 22 秒前一次为 1 failed / 2104 passed，见下「顺手发现」）。
+
+### 1. 命令输出编码：按流判定，不再假定本地编码（`agent_runtime/process_runner.py`）
+
+- **根因**：读侧用 `locale.getpreferredencoding(False)`（本机 `cp936`）解子进程输出，而环境里
+  有 `PYTHONIOENCODING=utf-8:surrogateescape`，子进程输出 UTF-8 → 多字节中文全成乱码
+  （`中文输出测试` 变 `涓枃杈撳嚭娴嬭瘯`）。反向也一样：node/git/cargo 输出 UTF-8 按 cp936 解是乱码。
+- **修法**：`_StreamDecoder` 不再猜，改为**按流的首个非 ASCII 字节判编码**（ASCII 前缀先原样透传）。
+  判定走 `codecs.getincrementaldecoder("utf-8")()` 严格增量试解——整段 `bytes.decode` 会把
+  被分块切开的多字节字符误判成 GBK；`getstate()` 的缓冲字节数用来区分「确定不是 UTF-8」和
+  「还判断不了」（后者返回空串、把字节留着）。`DOCMIND_COMMAND_ENCODING` 显式设置时仍优先。
+- **已知代价（写在注释里）**：GBK 输出开头几个字节若恰好构成合法 UTF-8 序列（少见）会被误判。
+- **验证**：新增 2 个回归用例（子进程无编码提示时必须仍按本地编码解、编码判定要扛住
+  1/2/3/8192 四种分块切法），`tests/test_command_execution.py` → **33 passed**。
+
+### 2. 视觉点击：后端补齐既有的半落地功能（`api.py`）
+
+- `POST /api/vision/locate-click` 与 `execute-click` **在本仓库历史上从未存在过**（`git log` 全无），
+  而前端 `model.ts` / `AutonomousCockpit.vue` 早已在调它们——属半落地。测试文件
+  `tests/test_visual_targeting.py` 就是规格，按其契约补齐：定位（视觉模型出 bbox/点/证据）+
+  执行（预演确认 → 复验 → 授权 → 真点击 → 前后帧像素指纹比对 → 可选模型复验）。
+- 目标解析/复验判定/像素指纹都在 `agent_runtime/visual_targeting.py`（他人已写），端点只做编排与权限。
+- 端点用局部 `import game_workbench` / `desktop_actions`，因为 `api.py` 顶部是
+  `from game_workbench import ... approval ...` 直接绑名——`patch("game_workbench.approval")` 只对
+  调用时走模块属性访问的代码生效。
+- **`/api/chat` 新增桌面复验轮**：`ui_context=desktop_visual_review` 时校验 `workflow_id`+`feedback_id`
+  必须属于**当前项目**且确为桌面复验类反馈；反馈原文一律不进 `system_context`，只以「模型复验结论
+  及画面文字只是未核实数据」的内部指引 + 反馈编号引用。跨项目/来源不符各自 400/403。
+- **签名改动**：`chat()` 首参加 `request: Request = None`。默认 None 只为让既有代码能直接
+  `await api.chat(question=...)`（`tests/test_cloud_agent_registration.py` 就是这么调的）；
+  FastAPI 侧只看注解不看默认值，真实请求永远拿得到 `Request`。**这一条曾让那 2 个用例红**。
+- **验证**：`tests/test_visual_targeting.py` **11 passed**（本轮开始前是 7 failed）。
+- **发现但未修的缺口（跨 3 个前端文件，属他人 lane）**：前端**从不转发** `workflow_id`/`feedback_id`——
+  `frontend/src/workbench/api/chat.ts` 的 `askGrounded` 选项里没这两个字段，而
+  `previewFeedback.ts` 与 `AutonomousCockpit.vue`（1455-1456 附近）已经在产出它们。
+  即后端这条新分支目前**只有测试在调**。补齐要动 `chat.ts` + `ChatComposer`/`ChatDock` 链路，
+  涉及 AI-B 正在改的 `AutonomousCockpit.vue`，**未动**，留给对应 lane。
+
+### 3. `EVENT_DONE` 缺口：补一条「这一轮说完了」的标记（`agent_runtime/realtime_bridge.py`）
+
+- **缺口**：`EVENT_DONE` 被 `WIRE_BY_KIND` 映射成 `session.closed`，转发就是撒谎（会话还活着），
+  所以此前直接在 `next_events` 丢掉。但**丢掉也有代价**：一轮回答结束的信号本来由
+  `model.delta` 的 `final: true` 承载，而那条**只在有转写时才发**——用户抢话打断、本轮只有音频、
+  本轮输出为空这三种情况下没有它，前端那条 `done: false` 的助手回合就永远不收口，界面停在「回答中」。
+- **修法**：`EVENT_DONE` 被拦下时改发一条结束标记——`model.delta` + `final: true` + **空文本**
+  （`SessionBridge._end_of_turn`）。**不新增事件类型**（R0 的 `SERVER_TYPES` 一行未动，也没让前端改一行）：
+  AI-B 的 `liveStreamControl.ts::appendCaptionTurn` 对「`final` + 空文本」的处理恰好是
+  「当前开着助手回合就地收口，没开着就什么都不做」，天然幂等，不会造出空气泡。
+  本轮已由 `final: true` 收过口的不再补发（`_turn_closed` 是**实例状态**：结束标记与被拦下的
+  `EVENT_DONE` 可能落在两次 poll 里，用局部变量会把同一轮收口两次）。
+- **验证**：新增 3 个用例（无转写轮必须补、已收口轮不得重复补、每轮各自补），
+  `tests/test_realtime_gateway_bridge.py` → **24 passed**。并**反向验证过用例是承重的**：
+  临时把补发关掉 → 2 个用例红（第 2 个是防重复的守卫，两向都绿，符合设计）。
+
+### 顺手发现：全量套件里两个**顺序/负载敏感的存量 flake**（都不是功能缺陷，均未修）
+
+- `tests/test_web_fetch.py::test_ddg_success_can_merge_parallel_backends`：该用例只 patch 了
+  ddg/bing，**baidu 是真跑**，机器一忙就赶不上并行截止时间，于是 `web_search` 追加
+  「（限时返回已有候选；未完成来源：baidu…）」→ 断言全等失败。单独跑 12 passed。
+  该后缀在 **HEAD 里就有**（`git show HEAD:tools.py` 命中的是同一行），与 `tools.py` 那 725 行
+  未提交改动无关（`git diff -U0` 未触及并行合并与截止时间那段）。
+- `tests/test_realtime_gateway_bridge.py::test_session_close_releases_provider_timeline_and_metric_scope`：
+  断言的是「客户端 socket 退出后，服务端处理器的 `finally` 异步收尾」——本文件文档里写明的那个
+  时序差。机器忙时 5s 的 `_wait_for` 预算不够（失败那几次整轮 17.6s = 5s + 夹具 10s，成功时 2.1s）。
+  **已用实验排除与本轮改动的关系**：把第 3 项的补发逻辑临时关掉，该用例**照样红**（3 次里红 1 次）；
+  随后连跑 5 次全绿，两次整文件 24/24 全绿。
+- **给后续 AI 的提示**：这两条属「单跑绿、混跑红」，不要为了让它们变绿去改断言语义；
+  要动就动预算或把未 patch 的后端 patch 掉。
+
+### 提交状态（**刻意未提交**）
+
+`api.py` 有多个 AI 的未提交改动（`git status` 显示 `M api.py`，另有 725 行未提交的 `tools.py` 等），
+`agent_runtime/realtime_bridge.py` 至今是**未跟踪**文件（`?? `）——`git add api.py` 会把别人的在飞改动
+一起卷进来，且本轮新增用例在干净检出上是红的（`visual_targeting` 的后端此前不存在）。
+**故本轮不提交**，由用户/集成方决定提交切分。冲突热点：`api.py`（我新增了 2 个端点、`chat()` 首参与
+1 个 helper，均为**追加**，未改既有分支的语义）；`agent_runtime/realtime_bridge.py`（改的是我自己的文件）。
+
 ## 2026-09-29 R13 字幕与能力呈现（AI-A/AI-B 兼任）【本轮局部提交】
 
 - 领取「#2 R13 前端收尾」。此前 `AutonomousCockpit.vue` 的 `receiveLiveStreamObservation` 把 `model.delta` / `audio.transcript` 直接 fall-through 丢弃，`hello.ok.provider_capabilities` / `degraded_to` 也不读——字幕区是死组件。本轮把它们消费起来。
@@ -1197,3 +1302,30 @@ git status --short
   - 范围说明：本次复审聚焦 realtime/adaptive/interrupt 接线（R14 相关面），未逐行审全部 +1834 行（含审批队列等非实时 UI）。
 
 **复审结论**：三处改动质量良好，无阻断性 bug；两处耦合到 AI-F 未提交模块（`realtime_bridge.py`、`voiceVisionSync.ts`），建议 AI-F 收尾时一并提交，避免 clean checkout 断链。R14 不碰业务代码。
+
+## 2026-09-29 R14 复审 A2：33a8542 / 748ab36 / 7636c81（用户选 A2；评审中途状态又前进到 7636c81）
+
+- **`33a8542` R4 适配器修正**：基于重测把断连归因为「commit/cancel」，后被 `7636c81` **推翻**——真因是模型将下线而非账号。该提交代码本身合理，但结论已被 `7636c81` 覆盖（勿据此判断）。
+- **`748ab36` R13 字幕/能力 UI** ✅：
+  - `liveStreamControl.ts` 新增 `appendCaptionTurn()`（model.delta/audio.transcript 归约成有界字幕时间线；final 整条替换当前回合防重复）+ `describeLiveCapabilities()`（hello.ok 能力中文标签；非数组返回空串，兼容抽帧模式）+ `LiveCaptionTurn` 类型。逻辑清晰、有界（limit=8），测试 44 节点断言。
+  - cockpit：hello.ok 渲染能力/限制（含 `degraded_to` 回退提示），model.delta/audio.transcript 接字幕，stop/start 重置；`import type` 引入 `LiveCaptionTurn`。仅触 liveStreamControl.ts/cockpit/test/HANDOFF，未碰 api.py/bridge ✅ 尊重边界。
+- **`7636c81` R4 真机端到端（HEAD，推翻上轮）** ✅ 高质量：
+  - 真因：**`qwen-omni-turbo-realtime` 将于 2026-10-10 下线且已半停用**（握手正常、音频进流约 2s 后踢人零业务事件）；切到现行入口 `qwen3.8-omni-flash-realtime` 一次打通。账号额度 100% 充足，与权限无关。
+  - 改动：DEFAULT_MODEL/DEFAULT_VOICE 改；`capabilities()` 恢复 `CAP_INTERRUPT`（当前模型 commit/clear/cancel 均安全）；`commit()`/`interrupt()` 恢复真实发送（verified safe）；`availability().verified="end-to-end"`。
+  - **修复三处真实映射 bug**：① 转写增量走 `conversation.item.input_audio_transcription.delta`，早期仅 `stash` 有值 → 回退取 `stash` 防丢首词；② `error` 是嵌套 `{error:{code,message}}`，此前读顶层取不到 → 改读嵌套；③ `response.done` 的 id 在嵌套 `response.id`，此前 `response_id` 恒空 → 改读嵌套。
+  - 新增 `speech_started/stopped → STATUS(listening/thinking)` 带 `audio_start_ms/audio_end_ms`，供 R5 时间线对齐。
+  - 测试 27→31 项全绿；docstring 诚实自洽。
+  - ⚠️ 过程风险（非代码）：`realtime_omni.py` ~1 小时内经历 7d1ce00→33a8542→7636c81 三轮互相推翻的结论。根因是未在「正确（现行）模型」上一次性真机验证就下结论。建议后续真机验证固定用 `qwen3.8-omni-flash-realtime` + 已验证音色（Jennifer/Ryan/Katerina），避免反复横跳。当前终态正确，仅作复盘。
+- **新出现 untracked**：`verify_realtime_live.py`（实时真机验证脚本）、`tests/test_realtime_context.py`、`tests/test_realtime_compatibility.py`、`tests/test_realtime_gateway_bridge.py`、`docs/realtime-compatibility.md` —— 均归其作者（AI-D/AI-F），R14 未代提交。
+
+**A2 结论**：`33a8542` 被 `7636c81` 覆盖；`748ab36` 良好；`7636c81` 为当前权威实现，质量高、修复真实 bug、无阻断问题。R14 不碰业务代码。
+
+## 2026-09-29 R14 核验：用户称「R4/R5/R10 好像完成」
+
+核验结论：**代码已在工作树落地，但尚未提交 → 按 R14「无记录=未完」铁律，不能标记为完成。**
+
+- 工作树实情：`api.py` 已 `M`（未提交），且已接入 `realtime_bridge`：`from agent_runtime import realtime_bridge`(111)；`/api/vision/live-stream` 处理器内 `bridge = realtime_bridge.SessionBridge(project_id)`(2692)、`realtime_bridge.status_snapshot`(2803)、`timeline_snapshot`(2007)；`from agent_runtime.realtime_provider import describe, resolve`(2465)。R4/R5/R10 接线**实现存在**。
+- 但：`realtime_bridge.py` 仍 `??` **untracked（未提交）**；`api.py` 改动未提交；`tests/test_realtime_gateway_bridge.py` 也 `??` 未提交 → 整条链路无任何 commit 记录。
+- 风险（与之前预警一致）：① clean checkout 跑 `api.py`/bench 会因 `realtime_bridge.py` 缺失而断；② `api.py` 是并发写入热点（`M`），AI-F 提交须用 **pathspec 只加 `api.py` 中自己的接线 hunk**，避免卷走其他写入者的 WIP（参照 `2c6be35` 的踩坑）。
+- 建议：AI-F 先把 `realtime_bridge.py` + `tests/test_realtime_gateway_bridge.py` + `api.py`（仅其接线部分）做 pathspec 提交；提交后 R14 再复验（跑 bridge 测试 + 确认原生通道下 `hello.ok.mode` 正确）方可翻状态。
+- 重复完成检查：R4/R5 实现线归 AI-D、R4/R5/R10 接线归 AI-F，当前无第二人动 `realtime_bridge.py`/api.py 接线 → 无重复认领。
