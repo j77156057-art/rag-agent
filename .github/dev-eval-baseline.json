@@ -1,0 +1,93 @@
+{
+ "schema_version": 1,
+ "total": 14,
+ "scored": 14,
+ "passed": 14,
+ "skipped": [],
+ "results": [
+  {
+   "id": "lookup-by-filename",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "precise-references-ignore-comment-and-string",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "history-answers-who-and-what",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "diagnostics-find-real-errors",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "diagnostics-clean-file-is-clean",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "patch-applies-atomically",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "patch-rejects-partial-and-writes-nothing",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "patch-refuses-delete-and-escape",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "lane-claim-blocks-overlap",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "lane-check-answers-ownership",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "write-tool-blocked-by-command-gate",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "read-sandbox-holds",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "mcp-server-publishes-read-only-first",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "connector-injection-is-opt-in",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  }
+ ]
+}

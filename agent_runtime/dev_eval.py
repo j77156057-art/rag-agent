@@ -1,0 +1,546 @@
+"""Dev-lane 能力评测与回归门：代码任务这条链到底通不通。
+
+现有评测只覆盖检索（retrieval_eval）与工作流（workflow_eval），代码任务一条都没有——
+于是「新工具是否真的可用、护栏是否还在」全凭手感。本模块补这一段，语义与
+workflow_eval 一致：本地确定性评测是唯一事实源，CI 与人工跑同一份题、同一套判定。
+
+测的是【harness 这条循环】而不是模型智商：每题给一个 fixture 代码库 + 一段固定的
+ReAct 轨迹，用真 Agent + 真工具跑，然后三处同时断言——
+① 工具确实被调用过；② 观察结果满足条件（含/不含某些文本）；③ 【文件系统真的变成什么样】。
+第 ③ 点是关键：只测「模型调了对的工具」而不管副作用，补丁打了一半、护栏被绕过这类
+问题照样溜过去。模型质量评测走 run_golden.py + agent_eval.py（需要真模型，不在这个门里）。
+
+用法：
+  python -m agent_runtime.dev_eval --self-check
+  python -m agent_runtime.dev_eval --self-check --baseline .github/dev-eval-baseline.json --json
+  python -m agent_runtime.dev_eval --write-baseline .github/dev-eval-baseline.json
+"""
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Any, Callable, Mapping
+
+import config
+
+
+def _check(name: str, ok: Any, detail: Any = "") -> dict[str, Any]:
+    return {"name": name, "ok": bool(ok), "detail": str(detail)[:300]}
+
+
+# --------------------------------------------------------------------------- #
+# 脚本化模型：按预定顺序吐出 ReAct 步骤，最后一轮必须收尾
+# --------------------------------------------------------------------------- #
+
+class _ScriptedLLM:
+    """把 cases 里的 steps 当成模型输出，其余与真实回路完全一致。"""
+
+    def __init__(self, steps: list[str]):
+        self._steps = list(steps)
+        self.calls = 0
+
+    def chat(self, messages, stream=True, **kwargs):  # noqa: ANN001, ARG002
+        index = min(self.calls, len(self._steps) - 1)
+        self.calls += 1
+        return [self._steps[index]]
+
+    def count_tokens(self, text):  # noqa: ARG002
+        return 0
+
+
+def _react(tool: str, arg: str) -> dict[str, str]:
+    """结构化工具步：题库里存【用了哪个工具 + 什么入参】，渲染交给回放器。
+
+    存成渲染好的字符串会让「这题动了哪些工具」查不出来——覆盖率体检和
+    validate_cases 就都成了摆设。
+    """
+    return {"tool": tool, "input": arg}
+
+
+def _final(text: str) -> dict[str, str]:
+    return {"final": text}
+
+
+def _render(step: dict[str, str]) -> str:
+    if "tool" in step:
+        return "Thought: 先看证据\nAction: %s\nAction Input: %s" % (
+            step["tool"], step.get("input") or "")
+    return "Thought: 够了\nFinal Answer: %s" % (step.get("final") or "完成")
+
+
+# --------------------------------------------------------------------------- #
+# fixture 代码库
+# --------------------------------------------------------------------------- #
+
+_TS_FIXTURE = {
+    "frontend/src/App.tsx": (
+        "// handleResize 只在这里被提到，不算引用\n"
+        "export function handleResize() { return 1 }\n"
+        "export function mount() { return handleResize() }\n"
+    ),
+    "frontend/src/notes.ts": "export const text = 'handleResize 出现在字符串里'\n",
+}
+
+_PATCH_TARGET = "one\ntwo\nthree\n"
+_OTHER_TARGET = "alpha\nbeta\ngamma\n"
+
+_CLEAN_PATCH = """--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+ one
+-two
++TWO
+ three
+"""
+
+_BAD_SECOND_PATCH = _CLEAN_PATCH + """--- a/b.txt
++++ b/b.txt
+@@ -1,3 +1,3 @@
+ alpha
+-this line does not exist
++whatever
+ gamma
+"""
+
+
+def _git_ready() -> bool:
+    try:
+        return subprocess.run(["git", "--version"], capture_output=True,
+                              timeout=15).returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _git(root: str, *args: str) -> None:
+    proc = subprocess.run(["git", *args], cwd=root, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace", timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError("git %s 失败：%s" % (" ".join(args),
+                                              (proc.stdout + proc.stderr)[:200]))
+
+
+def _build_fixture(kind: str, root: str) -> str:
+    """按题型铺一个 fixture 代码库，返回跳过原因（""=不跳）。"""
+    files: dict[str, str] = {}
+    commits = 0
+    if kind == "ts-refs":
+        files = dict(_TS_FIXTURE)
+    elif kind == "git-history":
+        files = {"a.py": "VALUE = 1\n", "b.py": "other = 2\n", "README.md": "# demo\n"}
+        commits = 2
+    elif kind == "patch":
+        files = {"a.txt": _PATCH_TARGET, "b.txt": _OTHER_TARGET,
+                 "bad.py": "def broken(:\n    return 1\n", "ok.py": "print(1)\n"}
+    elif kind == "lanes":
+        files = {"frontend/src/workbench/live.ts": "export const a = 1\n",
+                 "agent_runtime/realtime_omni.py": "X = 1\n"}
+    elif kind == "serve":
+        files = {"index.html": "<p>hi</p>\n"}
+    elif kind == "plain":
+        files = {"notes.md": "# notes\n"}
+    for rel, body in files.items():
+        full = os.path.join(root, *rel.split("/"))
+        os.makedirs(os.path.dirname(full) or root, exist_ok=True)
+        Path(full).write_text(body, encoding="utf-8", newline="\n")
+    if commits:
+        if not _git_ready():
+            return "git 不可用"
+        _git(root, "init", "-q")
+        _git(root, "config", "user.email", "eval@example.com")
+        _git(root, "config", "user.name", "First Author")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "first: add a.py",
+             "--author=First Author <first@example.com>")
+        _git(root, "commit", "-q", "--allow-empty", "-m", "second: touch b.py",
+             "--author=Second Author <second@example.com>")
+    return ""
+
+
+# --------------------------------------------------------------------------- #
+# cases
+# --------------------------------------------------------------------------- #
+
+def _case_read_file_escape(root: str, run: Callable[..., dict]) -> list[dict]:
+    outside = os.path.join(os.path.dirname(root), "secret.txt")
+    Path(outside).write_text("TOP-SECRET\n", encoding="utf-8")
+    result = run("read_file", "../secret.txt")
+    return [_check("escape_refused", "拒绝" in result["text"] or "越界" in result["text"],
+                   result["text"][:160]),
+            _check("secret_not_leaked", "TOP-SECRET" not in result["text"], result["text"][:160])]
+
+
+def _case_command_gate(root: str, run: Callable[..., dict]) -> list[dict]:
+    result = run("run_command", "rm -rf /")
+    return [_check("blocked", "拦" in result["text"] or "拒" in result["text"],
+                   result["text"][:160]),
+            _check("did_not_run", "rm" not in result["text"].lower()
+                   or "拦截" in result["text"] or "拦下" in result["text"], result["text"][:160])]
+
+
+def _case_mcp_server_read_only(root: str, run: Callable[..., dict]) -> list[dict]:
+    from agent_runtime import mcp_server
+
+    buffer = io.StringIO()
+    from contextlib import redirect_stdout
+    with redirect_stdout(buffer):
+        mcp_server.main(["--list"])
+    listed = buffer.getvalue().split()
+    with redirect_stdout(buffer):
+        mcp_server.main(["--list", "--allow-writes"])
+    with_writes = buffer.getvalue().split()
+    return [_check("read_only_default", "dev_glob" in listed and "dev_patch" not in listed,
+                   " ".join(listed[:6])),
+            _check("writes_opt_in", "dev_patch" in with_writes and "dev_move" in with_writes,
+                   " ".join(with_writes[-6:])),
+            _check("exec_never_exposed", not any(
+                name in set(listed) | set(with_writes)
+                for name in ("run_command", "python_exec", "dev_mcp_call")), "名单泄漏")]
+
+
+def _case_mcp_inline_opt_in(root: str, run: Callable[..., dict]) -> list[dict]:
+    from agent_runtime import mcp_bridge
+
+    class Fake:
+        def __init__(self):
+            self.list_calls: list[str] = []
+
+        def server_configs(self, _root):
+            return [{"key": "off", "transport": "stdio", "enabled": True},
+                    {"key": "on", "transport": "stdio", "enabled": True,
+                     "inline_tools": True}]
+
+        def list_tools(self, _root, key):
+            self.list_calls.append(key)
+            return {"ok": True, "tools": [{"name": "ping", "description": "d",
+                                          "input_schema": {"type": "object",
+                                                           "properties": {
+                                                               "msg": {"type": "string"}},
+                                                           "required": ["msg"]}}]}
+
+        def call_tool(self, _root, key, name, arguments=None, timeout=30):
+            return {"ok": True, "text": "pong:%s" % (arguments or {}).get("msg", "")}
+
+    fake = Fake()
+    real = sys.modules.get("mcp_client")
+    mcp_bridge.reset_cache()
+    sys.modules["mcp_client"] = fake
+    try:
+        found = mcp_bridge.discover(root)
+        names = [row["name"] for row in found["entries"]]
+        specs = mcp_bridge.build_specs(found["entries"])
+        out = list(specs.values())[0].func("hi") if specs else ""
+    finally:
+        if real is None:
+            sys.modules.pop("mcp_client", None)
+        else:
+            sys.modules["mcp_client"] = real
+        mcp_bridge.reset_cache()
+    return [_check("only_marked_inlined", names == ["mcp__on__ping"], str(names)),
+            _check("unmarked_not_handshaked", fake.list_calls == ["on"], str(fake.list_calls)),
+            _check("callable", "pong:hi" in out, out[:120])]
+
+
+DEV_DATASET: tuple[dict[str, Any], ...] = (
+    {
+        "id": "lookup-by-filename", "fixture": "ts-refs",
+        "steps": [_react("dev_glob", "*.tsx"), _final("只有一个 tsx")],
+        "expect": {"called": ["dev_glob"],
+                   "observation_contains": ["frontend/src/App.tsx"]},
+        "note": "找文件不该靠 list_dir 一层层翻",
+    },
+    {
+        "id": "precise-references-ignore-comment-and-string", "fixture": "ts-refs",
+        "steps": [_react("dev_find_references", "handleResize"), _final("两处真引用")],
+        "expect": {"called": ["dev_find_references"],
+                   "observation_contains": ["App.tsx", "mount()"],
+                   "observation_not_contains": ["只在这里被提到", "出现在字符串里"]},
+        "note": "tree-sitter 层的价值：注释与字符串不误报",
+    },
+    {
+        "id": "history-answers-who-and-what", "fixture": "git-history",
+        "steps": [_react("dev_git_log", "paths: a.py"), _final("a.py 由 First Author 引入")],
+        "expect": {"called": ["dev_git_log"],
+                   "observation_contains": ["first: add a.py", "First Author"]},
+        "note": "只读历史：判断是否重复劳动",
+    },
+    {
+        "id": "diagnostics-find-real-errors", "fixture": "patch",
+        "steps": [_react("dev_diagnostics", "target: bad.py\nscope: py"),
+                  _final("语法有错")],
+        "expect": {"called": ["dev_diagnostics"],
+                   "observation_contains": ["bad.py", "E9"]},
+        "note": "结构化诊断而不是「过/不过」",
+    },
+    {
+        "id": "diagnostics-clean-file-is-clean", "fixture": "patch",
+        "steps": [_react("dev_diagnostics", "target: ok.py\nscope: py"), _final("没问题")],
+        "expect": {"called": ["dev_diagnostics"],
+                   "observation_contains": ["没有发现问题"]},
+        "note": "报「干净」的前提是真跑成了，不是没跑",
+    },
+    {
+        "id": "patch-applies-atomically", "fixture": "patch",
+        "steps": [_react("dev_patch", _CLEAN_PATCH), _final("改好了")],
+        "expect": {"called": ["dev_patch"], "observation_contains": ["补丁已应用"],
+                   "files": {"a.txt": "one\nTWO\nthree\n", "b.txt": _OTHER_TARGET}},
+        "post": "patch",
+        "note": "打对的地方要真的打对",
+    },
+    {
+        "id": "patch-rejects-partial-and-writes-nothing", "fixture": "patch",
+        "steps": [_react("dev_patch", _BAD_SECOND_PATCH), _final("被打回")],
+        "expect": {"called": ["dev_patch"], "observation_contains": ["补丁被拒绝"],
+                   "files": {"a.txt": _PATCH_TARGET, "b.txt": _OTHER_TARGET}},
+        "note": "多文件补丁第二块不匹配时第一个文件必须原样——不留半成品（断效果而不是断措辞）",
+    },
+    {
+        "id": "patch-refuses-delete-and-escape", "fixture": "patch",
+        "steps": [_react("dev_patch", "--- a/a.txt\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-one\n"),
+                  _final("不让删")],
+        "expect": {"called": ["dev_patch"], "observation_contains": ["拒绝"],
+                   "files": {"a.txt": _PATCH_TARGET}},
+        "note": "删除不许借补丁发生",
+    },
+    {
+        "id": "lane-claim-blocks-overlap", "fixture": "lanes",
+        "steps": [_react("dev_lanes", "action: claim\nlane: AI-A\nowner: 甲\n"
+                                      "paths: frontend/src/**"),
+                  _react("dev_lanes", "action: claim\nlane: AI-B\nowner: 乙\n"
+                                      "paths: frontend/src/workbench/live.ts"),
+                  _final("冲突，找甲")],
+        "expect": {"called": ["dev_lanes"],
+                   "observation_contains": ["认领成功", "冲突", "AI-A", "甲"],
+                   "files_absent": []},
+        "note": "多人同仓的排他：冲突要当场说出对方是谁",
+    },
+    {
+        "id": "lane-check-answers-ownership", "fixture": "lanes",
+        "steps": [_react("dev_lanes", "action: claim\nlane: AI-A\nowner: 甲\n"
+                                      "paths: agent_runtime/**"),
+                  _react("dev_lanes", "action: check\npath: agent_runtime/realtime_omni.py"),
+                  _final("这块是甲的")],
+        "expect": {"called": ["dev_lanes"], "observation_contains": ["AI-A", "甲"]},
+        "note": "动文件前先问归属",
+    },
+    {
+        "id": "write-tool-blocked-by-command-gate", "fixture": "plain",
+        "direct": _case_command_gate,
+        "note": "换个入口也不能绕过命令黑名单",
+    },
+    {
+        "id": "read-sandbox-holds", "fixture": "plain",
+        "direct": _case_read_file_escape,
+        "note": "越界读取必须被拒且不回显内容",
+    },
+    {
+        "id": "mcp-server-publishes-read-only-first", "fixture": "plain",
+        "direct": _case_mcp_server_read_only,
+        "note": "对外出口默认只读，写与执行要显式开",
+    },
+    {
+        "id": "connector-injection-is-opt-in", "fixture": "plain",
+        "direct": _case_mcp_inline_opt_in,
+        "note": "没打标记的连接器连握手都不该发生",
+    },
+)
+
+
+# --------------------------------------------------------------------------- #
+# 执行与判定
+# --------------------------------------------------------------------------- #
+
+def _read_files(root: str, names: list[str]) -> dict[str, str]:
+    out = {}
+    for rel in names:
+        full = os.path.join(root, *rel.split("/"))
+        try:
+            out[rel] = Path(full).read_text(encoding="utf-8")
+        except OSError:
+            out[rel] = ""
+    return out
+
+
+def evaluate_case(case: Mapping[str, Any]) -> dict[str, Any]:
+    cid = str(case.get("id") or "?")
+    report: dict[str, Any] = {"id": cid, "checks": [], "skipped": "", "passed": False}
+    root = tempfile.mkdtemp(prefix="docmind_deveval_")
+    state = tempfile.mkdtemp(prefix="docmind_deveval_state_")
+    import tools as tools_module
+    prev_root = tools_module.get_runtime("code_root")
+    prev_state = config.STATE_ROOT
+    try:
+        reason = _build_fixture(str(case.get("fixture") or "plain"), root)
+        if reason:
+            report["skipped"] = reason
+            report["passed"] = True
+            return report
+        config.STATE_ROOT = state
+        tools_module.set_runtime("code_root", root)
+        expect = dict(case.get("expect") or {})
+
+        def run(tool: str, arg: str) -> dict[str, Any]:
+            meta = tools_module.TOOLS.get(tool) or {}
+            func = meta.get("func")
+            if not callable(func):
+                return {"text": "__TOOL_MISSING__:%s" % tool}
+            try:
+                out = func(arg)
+            except Exception as exc:  # noqa: BLE001
+                return {"text": "__TOOL_RAISED__:%s" % exc}
+            return {"text": out if isinstance(out, str) else str(getattr(out, "text", out))}
+
+        direct = case.get("direct")
+        if direct is not None:
+            report["checks"] = list(direct(root, run))
+        else:
+            from agent import Agent
+            steps = [_render(row) for row in (case.get("steps") or [])]
+            actions: list[str] = []
+            observations: list[str] = []
+            agent = Agent(llm=_ScriptedLLM(steps), session_id=None)
+            for event in agent.run(str(case.get("question") or "按步骤执行。"), stream=True):
+                kind = event.get("type")
+                if kind == "action":
+                    actions.append(str(event.get("text") or event.get("tool") or ""))
+                elif kind == "observation":
+                    observations.append(str(event.get("text") or ""))
+            blob = "\n".join(observations)
+            for tool in expect.get("called") or []:
+                report["checks"].append(_check(
+                    "called:%s" % tool, any(tool in line for line in actions),
+                    " / ".join(actions[:3])))
+            for needle in expect.get("observation_contains") or []:
+                report["checks"].append(_check("contains:%s" % str(needle)[:40],
+                                               str(needle) in blob, blob[:200]))
+            for needle in expect.get("observation_not_contains") or []:
+                report["checks"].append(_check("not_contains:%s" % str(needle)[:40],
+                                               str(needle) not in blob, blob[:200]))
+        for rel, want in (expect.get("files") or {}).items():
+            got = _read_files(root, [rel])[rel]
+            report["checks"].append(_check("file:%s" % rel, got == want,
+                                           "实际 %r" % got[:160]))
+        report["passed"] = all(item["ok"] for item in report["checks"]) and bool(report["checks"])
+        if not report["checks"]:
+            report["checks"] = [_check("has_checks", False, "这题没产生任何断言")]
+        return report
+    except Exception as exc:  # noqa: BLE001 - 单题异常不能拖垮整轮
+        report["checks"] = [_check("case_error", False, "%s: %s" % (type(exc).__name__, exc))]
+        report["passed"] = False
+        return report
+    finally:
+        tools_module.set_runtime("code_root", prev_root)
+        config.STATE_ROOT = prev_state
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(state, ignore_errors=True)
+
+
+def validate_cases(cases: list[dict[str, Any]], tools_module: Any) -> list[str]:
+    """题集自身的体检：工具被删了、题号重了、没有断言——这些都会让门禁变成装饰。"""
+    problems: list[str] = []
+    seen: set[str] = set()
+    for case in cases:
+        cid = str(case.get("id") or "")
+        if not cid:
+            problems.append("有题目缺少 id")
+            continue
+        if cid in seen:
+            problems.append("%s：id 重复" % cid)
+        seen.add(cid)
+        used = [str(row.get("tool") or "") for row in case.get("steps") or [] if "tool" in row]
+        used += [str(row.get("tool") or "") for row in case.get("verify") or []]
+        if not (case.get("expect") or case.get("direct")):
+            problems.append("%s：既没有 expect 也没有 direct" % cid)
+        if not used and not case.get("direct"):
+            problems.append("%s：既没调用工具也没有 direct 断言" % cid)
+        for tool in used:
+            if tool not in getattr(tools_module, "TOOLS", {}):
+                problems.append("%s：用了不存在的工具 %s" % (cid, tool))
+    return problems
+
+
+def evaluate(dataset: Iterable[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    import tools as tools_module
+    cases = [dict(case) for case in (dataset or DEV_DATASET)]
+    results = [evaluate_case(case) for case in cases]
+    problems = validate_cases(cases, tools_module)
+    ran = [row for row in results if not row["skipped"]]
+    passed = [row for row in ran if row["passed"]]
+    return {"ok": bool(ran) and not problems and len(passed) == len(ran),
+            "problems": problems,
+            "total": len(results), "scored": len(ran),
+            "passed": len(passed), "failed": [row["id"] for row in ran if not row["passed"]],
+            "skipped": [row["id"] for row in results if row["skipped"]],
+            "results": results}
+
+
+def compare_to_baseline(report: Mapping[str, Any], baseline_path: str | Path) -> dict[str, Any]:
+    baseline = json.loads(Path(baseline_path).read_text(encoding="utf-8"))
+    before = {str(row.get("id")): row for row in baseline.get("results") or []}
+    regressions = [row["id"] for row in report["results"]
+                   if not row["skipped"] and before.get(row["id"], {}).get("passed")
+                   and not row["passed"]]
+    improvements = [row["id"] for row in report["results"]
+                    if not row["skipped"] and not before.get(row["id"], {}).get("passed")
+                    and row["passed"]]
+    new_cases = [row["id"] for row in report["results"] if row["id"] not in before]
+    score = int(baseline.get("passed") or 0) / max(1, int(baseline.get("scored") or 1))
+    now = report["passed"] / max(1, report["scored"])
+    return {"ok": not regressions and not report.get("failed"),
+            "regressions": regressions, "improvements": improvements, "new_cases": new_cases,
+            "baseline_pass_rate": round(score, 4), "current_pass_rate": round(now, 4),
+            "regressed": bool(regressions)}
+
+
+def write_baseline(report: Mapping[str, Any], path: str | Path) -> None:
+    payload = {"schema_version": 1, "total": report["total"], "scored": report["scored"],
+               "passed": report["passed"], "skipped": report["skipped"],
+               "results": [{"id": row["id"], "passed": row["passed"],
+                            "skipped": row["skipped"],
+                            "failed_checks": [item["name"] for item in row["checks"]
+                                             if not item["ok"]]}
+                           for row in report["results"]]}
+    target = Path(path)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    os.replace(tmp, target)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="dev lane 能力评测门")
+    parser.add_argument("--self-check", action="store_true", help="跑内置题集（默认就是）")
+    parser.add_argument("--baseline", default="", help="与基线比对，出现回退则退出码非零")
+    parser.add_argument("--write-baseline", default="", help="把本次结果写成基线文件")
+    parser.add_argument("--json", action="store_true", help="机器可读输出（CI 用）")
+    args = parser.parse_args(argv)
+
+    report = evaluate()
+    gate = compare_to_baseline(report, args.baseline) if args.baseline else None
+    if args.write_baseline:
+        write_baseline(report, args.write_baseline)
+    if args.json:
+        print(json.dumps({"report": report, "gate": gate}, ensure_ascii=False))
+    else:
+        print("dev-eval：%d/%d 通过（共 %d 题，跳过 %d）"
+              % (report["passed"], report["scored"], report["total"], len(report["skipped"])))
+        for row in report["results"]:
+            if row["passed"] or row["skipped"]:
+                continue
+            bad = [item for item in row["checks"] if not item["ok"]]
+            print("  失败 %s：%s" % (row["id"], "; ".join(
+                "%s→%s" % (item["name"], item["detail"][:90]) for item in bad[:3])))
+        if gate:
+            print("  基线 %s → 现在" % gate["baseline_pass_rate"], gate["current_pass_rate"],
+                  "| 回退：", gate["regressions"] or "无")
+    ok = report["ok"] and not (gate and gate["regressed"])
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

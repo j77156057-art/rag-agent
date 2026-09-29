@@ -66,6 +66,8 @@ jobs:
           python -c "import inspect, psycopg, psycopg_pool; print(psycopg.__version__); print(inspect.signature(psycopg_pool.ConnectionPool))"
       - name: Run workflow regression gate
         run: python -m agent_runtime.workflow_eval --self-check --baseline .github/workflow-eval-baseline.json --json
+      - name: Run dev lane capability gate
+        run: python -m agent_runtime.dev_eval --self-check --baseline .github/dev-eval-baseline.json --json
       - name: Run retrieval regression gate
         run: python -m agent_runtime.retrieval_eval --dataset .github/retrieval-eval.json --baseline .github/retrieval-eval-baseline.json --minimum 0.75 --json
       - name: Run live Chroma retrieval gate

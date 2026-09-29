@@ -1,5 +1,18 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-30 Vibecoding 能力补全 Wave11：dev lane 能力评测 + 基线 + CI 门（本会话，不占 R 槽位）
+
+- **补什么**：评测只有检索（retrieval_eval）与工作流（workflow_eval）两套，代码任务一条都没有——前九波加的那些工具（`dev_glob`/`dev_git_log`/`dev_find_references`/`dev_diagnostics`/`dev_patch`/`dev_lanes`/`dev_serve`/MCP server/内联投影）**到底可不可用、护栏还在不在**，此前只能靠感觉。本波把它变成会红的门。
+- **形态照抄既有约定**：题集写在模块内的 `DEV_DATASET`（与 `workflow_eval.GAME_WORKFLOW_DATASET` 一致），基线是 JSON（`.github/dev-eval-baseline.json`），CLI 与 `--self-check/--baseline/--json` 同一形状；CI 里紧挨 retrieval gate 加了一步 `Run dev lane capability gate`。
+- **每题跑两层，两层都要过**：① **脚本轨迹层**——fixture 代码库 + 固定 ReAct 步骤，走【真 Agent + 真工具回路】，再用 `agent_eval.score_record` 按 expect 打分；这层抓的是注册漏项、名字漂移、护栏误杀这类「模型根本调不到」的问题。② **效果层**——`verify` / `expect.files` 直接断言 **fixture 落盘成什么样**（哪些文件被改、哪些必须原样、哪些不该存在）。只测「调了对的工具」而不看副作用，补丁打一半、越界被放行这类失败照样溜过去。
+- **明确不测什么**：不测模型智商。模型质量走 `run_golden.py --questions golden/questions_v2.json` + `agent_eval.py`（需要真模型、不确定、不进 CI）。本门是【harness 能力回归】，两件事别混。
+- **14 道题覆盖**：按文件名找文件、TS 精确引用（注释与字符串不误报）、git 历史回答「谁改的」、诊断出真错误、诊断干净文件时确实说「没有发现问题」、补丁打对、**多文件补丁第二块不匹配时第一个文件必须原样**、补丁不许删文件、lane 认领冲突要点名对方 owner、lane check 回答归属、命令黑名单换个入口也不能绕、越界读取拒绝且不回显、MCP 出口默认只读且执行类永不暴露、连接器没打内联标记连握手都不发。
+- **门禁自己必须会咬人（这比题目通过更重要）**：`tests/test_dev_eval.py` **15 项**里专门有——伪造一次回退（基线说这题过了、现在没过）必须 `regressed=True` 且 `main()` 退 1；题号重复／引用不存在的工具／没有 expect 都要 `validate_cases` 报错；**题集比基线多出题也要响**（防止加了题却不刷基线，让覆盖率悄悄漂移）；还有一条「能力覆盖面清单」断言：六类工具一旦从题面消失就红。
+- **踩到并修掉的自身缺陷**：`steps` 最初存成**渲染好的 ReAct 字符串**，于是「这题到底动了哪些工具」查不出来——覆盖率断言和 `validate_cases` 全成了摆设；改成结构化工具步 + 回放时渲染。另外断言措辞也纠了一次：原本要求拒绝信息里必须出现 `a.txt`，而工具只点出对不上的 `b.txt`——**该断效果（文件没被改）而不是断文案**。
+- **隔离**：每题一个临时 fixture 目录 + 临时 `config.STATE_ROOT`（lane 登记表、预算文件都落在那里），跑完还原 `code_root`/`STATE_ROOT`；用例专门断言跑完不会把真仓库写出 `a.txt` 之类的残留。git 类题在没有 git 的环境记为 skipped（不算失败也不算通过）。
+- **验证**：`tests/test_dev_eval.py` 15 passed；`python -m agent_runtime.dev_eval --self-check --baseline .github/dev-eval-baseline.json --json` → **14/14 通过，regressions []，current_pass_rate 1.0**；harness.yml 解析 19 步含新 gate；全量 pytest 见下方补记。
+- **未做**：基线只记通过与否 + 失败断言名，没记耗时分布（`min|max_actions` 已在 expect 里可用，但没进基线）；direct 类题（安全边界、MCP 出口）目前写在模块里而不是 JSON，若要给非作者编辑题目，需要把 direct 断言也做成数据驱动；`run_golden.py` 的 dev 题（真模型版）还没出，等有可用模型配额时补。
+
 ## 2026-09-30 Vibecoding 能力补全 Wave6：`dev_serve` + 预览可指向已运行的服务（本会话，不占 R 槽位）
 
 - **先纠正范围（重要，别重造轮子）**：我原来把 Wave6 写成「缺 dev_serve + 缺浏览器观测」。**实测发现后半句是错的**：`agent_runtime/visual_acceptance.py` 早就在用 CDP 采 console（`_record_console`）和失败请求（`Network.responseReceived` / `loadingFailed` → `failed_requests`）并截图，`preview_project` 就是它的入口。真正缺的只有两件：① 它只会把项目目录当**静态站**临时服务，Vite/Vue 这类必须跑 dev server 的前端不 build 就预览不到；② 没有任何工具会**启动** dev server。本波只做这两件。
