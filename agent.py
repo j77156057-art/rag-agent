@@ -52,6 +52,7 @@ from agent_runtime.output_audit import audit_evidence
 from agent_runtime.context_router import ContextRouter
 from agent_runtime.local_runtime import effective_parallelism, local_llm_slot
 from agent_runtime.tools import Capability, SideEffect, coerce_tool_spec, execute_tool, upgrade_registry
+from agent_runtime import mcp_bridge as _mcp_bridge
 from agent_runtime import langsmith as _langsmith
 
 # 单轮总截止时间（秒）：0 或负数表示不限时。防止一次问答无限拖长。
@@ -1524,6 +1525,15 @@ class Agent:
         # a tool owned by another product surface.
         self.tools = {name: spec for name, spec in normalized.items()
                       if application_id in spec.applications}
+        # 连接器的 MCP 工具投影成一等条目：只有操作者在连接器配置里显式打了
+        # `inline_tools` 的服务才会进来，prompt 与请求参数都加不出工具。
+        self.mcp_inline = {"added": [], "skipped": [], "notes": []}
+        try:
+            self.mcp_inline = _mcp_bridge.attach(
+                self.tools, get_runtime("code_root") or "", application_id=application_id)
+        except Exception as exc:  # noqa: BLE001 - 投影失败不能炸掉会话构造
+            self.mcp_inline = {"added": [], "skipped": [],
+                               "notes": ["内联投影失败（已忽略）：%s" % str(exc)[:200]]}
         if system_prompt is not None:
             self.system_prompt = system_prompt
         elif application_id == "developer":
