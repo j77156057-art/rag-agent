@@ -1,5 +1,34 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 R9 审计：实时链路资源/韧性/隔离测试（AI-A/AI-B 兼任）【局部提交】
+
+- 领取 R9 的只读测试部分（用户确认）。**只新增 `tests/test_realtime_resource_security.py`（5 项）**，与 AI-F 的 `test_realtime_gateway_bridge.py` 互补不重复，未改任何实现。
+- 覆盖：`provider.close()` 外抛时收尾链仍完整（时间线释放+作用域回收）；原生模式超限音频在入口被拒、**不转发进 provider**；`send_frame` 返回 False 时帧**回落抽帧单槽**不静默丢；跨项目 `status_snapshot` 不泄露他项目时间线条目；守卫回归（见下）。
+- **⚠ 审计指出的真实缺口 → 已闭合**：网关 receive 循环的 `bridge.interrupt()/send_frame()/take_audio()` 三处原本**没有 try 守卫**（而 `start()`/pump 有），provider 违约外抛会炸穿整条 WebSocket（实测抢话 cancel 直接击穿、客户端收到服务端异常）。已上报 /root，**当日落地于 commit 6832251**：interrupt 外抛→本地取消照旧回 cancel.ok 并补发 `interrupt_failed` 错误；take_audio 外抛→回落 audio_not_ready；send_frame 外抛→仅降级该帧不翻转会话模式；三处均记 `note_model_failure()`。本文件第 5 条按守卫后语义钉回归（cancel.ok 先到、interrupt_failed 随后、心跳证明会话存活）。
+- 调试记录（后人少踩）：首版含「8 轮快速开关不泄漏」用例，连败两次——共享 project 引用计数+迟到 release 的竞态（AI-F 已记录同款坑）；改独立 project 后仍依赖异步收尾时序，**与 AI-F 标注 green/red 交替的 `test_session_close_*` 同源，遂删除该重复面**——共享仓库里间歇红的测试比没有测试更糟。首版 flaky 版被收口提交 `e35ce8e` 卷入过 HEAD，本次提交即为修正。
+- 验证：本文件 5 passed 连跑两遍稳定（~2.4s）；混跑 `-k "realtime or live_vision or live_stream or voice"` = **270 passed / 0 failed**。
+- 未覆盖（如实说明）：服务重启恢复（bridge/timeline 为纯内存设计，重启即清零属预期，无媒体落盘可验）；GPU/CPU 限制不在实时链路内（归本地模型线）。R12 真机下这两项需复核。
+
+## 2026-09-29 补全桌面复验前端链路（AI-F）
+
+- 缺口：后端 `/api/chat` 在 `ui_context=desktop_visual_review` 时强制 `workflow_id`+
+  `feedback_id` 对账，但前端只有 Cockpit 产出这两个编号，`chat.ts` 的 `askGrounded` 不收、
+  FormData 不发，该分支此前只有测试在调。按真实链路逐段补齐 3 处：
+  - `frontend/src/workbench/api/chat.ts`：`askGrounded` opts 增 `workflowId`/`feedbackId`，
+    仅在 `uiContext==='desktop_visual_review'` 时 append 进 FormData（字段名对齐后端
+    `Form("workflow_id")`/`Form("feedback_id")`）；
+  - `frontend/src/workbench/components/ChatDock.vue`：`send()` 末参增
+    `reviewRef?: { workflowId?; feedbackId? }`，透传到 askGrounded opts；
+  - 同文件 `onSendChat`（`docmind:send-chat` 消费方）：`detail.uiContext` 为桌面复验时，
+    把 `detail.workflowId`/`detail.feedbackId` 作为 reviewRef 传入 send。
+- 数据流闭环：Cockpit `dispatchFeedback`（AutonomousCockpit.vue:1454-1457，编号取当前
+  workflow + record.id）→ `appEvents.emit('docmind:send-chat')` → ChatDock `onSendChat` →
+  `send(reviewRef)` → `askGrounded` FormData → 后端对账。
+- 边界：ask 页 `AskApp.vue` 的 send 不产生桌面复验反馈（该场景只在运行台 Cockpit，固定走
+  ChatDock），未改动。
+- 验证：`npm run typecheck` → 0 错误；`npm run build` → ✓ built in 7.71s；编辑器诊断 0。
+  后端契约由 `test_desktop_review_chat_requires_current_workflow_feedback` 锁定，全量 2109 passed。
+
 ## 2026-09-29 R0/R3 收口：实时信封字段完整保护（/root，已完成·勿重复）
 
 - **修复**：实时协议与 provider 事件序列化现在统一保护完整信封字段 `v/type/sent_at/sequence/captured_at/session_id`；不可信 provider payload 不能覆盖网关生成的会话、序号或采集时间。
@@ -1377,3 +1406,16 @@ git status --short
 - 风险（与之前预警一致）：① clean checkout 跑 `api.py`/bench 会因 `realtime_bridge.py` 缺失而断；② `api.py` 是并发写入热点（`M`），AI-F 提交须用 **pathspec 只加 `api.py` 中自己的接线 hunk**，避免卷走其他写入者的 WIP（参照 `2c6be35` 的踩坑）。
 - 建议：AI-F 先把 `realtime_bridge.py` + `tests/test_realtime_gateway_bridge.py` + `api.py`（仅其接线部分）做 pathspec 提交；提交后 R14 再复验（跑 bridge 测试 + 确认原生通道下 `hello.ok.mode` 正确）方可翻状态。
 - 重复完成检查：R4/R5 实现线归 AI-D、R4/R5/R10 接线归 AI-F，当前无第二人动 `realtime_bridge.py`/api.py 接线 → 无重复认领。
+
+## 2026-09-29 R14 状态更新（20:01，用户问「现在呢」）
+
+自 19:48 后 AI-F 完成**收口提交批次**（6 笔）：`503e27e`(后端与运行时，含 `realtime_bridge.py` +524 / `api.py` +1319)、`c19aacf`(前端工作台)、`e35ce8e`(测试套件，含 `test_realtime_gateway_bridge`)、`5f1209c`(HANDOFF/设计文档)、`326da8e`(基准模块与验收脚本补遗)、`02fc97b`(收口记录 + HEAD 干净检出验证)。
+
+- **R4/R5/R10 接线：现已提交 ✅**（原「未提交」旗标解除）。`realtime_bridge.py` 入库、`api.py` 接线入库、bridge 测试入库。按 R14「无记录=未完」铁律，现可翻状态为「实现完成·已提交」。
+- **R12 真机验收（R4 provider 侧）：未全绿，2/6 指标失败**（据 `docs/realtime-r12-acceptance-20260929.md`, 19:59）：
+  - 通过：首响应 3175ms、模型延迟 204ms、打断响应、断线恢复。
+  - **未通过**：持续响应 1/3 轮完整（turn-2/3 零输出）、错误率 43.5%（37/85）。
+  - 报告诚实限定为「仅 R4 provider 侧」；设备采集 + 驾驶舱体验调优属 R12 负责人范围，未覆盖。
+  - 结论：R4/R5/R10 代码交付完成，但端到端体验（持续响应稳定性、错误率）仍欠账，R12 未闭环。
+- **仍有的未提交改动**（非阻塞，疑为另一写入者/AI-F 收尾补丁）：`realtime_protocol.py`(+3)、`realtime_provider.py`(+2)、`tests/test_realtime_protocol_contract.py`(+9)、`tests/test_realtime_resource_security.py`(+54)、`verify_realtime_acceptance.py`(+23)；untracked `docs/realtime-r12-acceptance-20260929.md`（R12 证据，建议提交）。
+- 重复完成检查：R4/R5 实现 AI-D、接线 AI-F，整链已入库，无第二人重复认领；R12 验收由 AI-F 出证据、设备/UX 部分归 R12 负责人，边界清楚。
