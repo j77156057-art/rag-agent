@@ -4,38 +4,48 @@ Speaks the documented WebSocket protocol directly with ``websocket-client``
 (already vendored) instead of the DashScope SDK, so the cockpit gains no new
 dependency and no SDK version floor.
 
-Verified against the official docs (2026-09):
-  endpoint  wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=<model>
-  auth      Authorization: Bearer <DASHSCOPE_API_KEY>
+Endpoint and auth cross-checked against the official SDK source
+(``dashscope/audio/qwen_omni/omni_realtime.py``): its default is exactly
+``wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=<model>`` with the key
+in an ``Authorization: Bearer`` header, so no workspace-specific host is
+required. The SDK also sends ``X-DashScope-WorkSpace`` when one is configured;
+``DOCMIND_OMNI_WORKSPACE`` exposes the same knob here.
+
   models    qwen-omni-turbo-realtime (voice Chelsie) / qwen3.5-omni-plus-realtime
   client    session.update, input_audio_buffer.append|commit|clear,
             input_image_buffer.append, response.create
-  server    session.created|updated, input_audio_buffer.committed, response.created,
+  server    session.created|updated, response.created,
             response.audio_transcript.delta|done, response.audio.delta|done,
             response.done, conversation.item.input_audio_transcription.completed
   audio     in PCM 16 kHz mono 16-bit, out PCM 24 kHz mono 16-bit
 
 Live probe results (2026-09-29, real ``sk-ws-`` key, read-only):
 
-* **Confirmed working** — connection and auth against the default endpoint; the
-  server immediately emits ``session.created`` with ``input_audio_format:
-  "pcm16"``, ``output_audio_format: "pcm24"``, ``turn_detection.type:
-  server_vad`` (threshold 0.5), ``input_audio_transcription: {model:
-  "gummy-realtime-v1"}``. Those wire values are what this module now sends.
-* **Confirmed rejected** — ``input_audio_buffer.commit`` and ``response.cancel``
-  each make the server drop the connection (10054). Manual mode is therefore
-  unavailable on this endpoint; only server-VAD streaming works, so
-  :meth:`commit` and :meth:`interrupt` degrade to the buffer-clear path.
-* **Blocked on the account** — real speech (whisper.cpp's 16 kHz ``jfk.wav``,
-  11 s) produced zero events and the server dropped the connection about 1 s
-  into the stream, for all three framings tried: JSON ``input_audio_buffer.
-  append`` (with and without ``event_id``, field ``audio`` and ``data``) and raw
-  PCM binary frames. The same key answers fine over HTTP for ``qwen-plus`` and
-  ``qwen-omni-turbo``, so this points at the realtime service not being enabled
-  for the workspace rather than at this adapter. A workspace-specific endpoint
-  and enabling Omni Realtime in Model Studio are the next things to try (R12).
-* **Still unproven** — ``session.update`` returns no ``session.updated``, so the
-  session field spelling is inferred from the ``session.created`` echo only.
+* **Protocol confirmed correct.** A bare connection that sends *no*
+  ``session.update`` at all receives ``session.created`` echoing
+  ``input_audio_format: "pcm16"``, ``output_audio_format: "pcm24"``,
+  ``input_audio_transcription: {model: "gummy-realtime-v1"}`` and
+  ``turn_detection: {type: "server_vad", threshold: 0.5, prefix_padding_ms:
+  300, silence_duration_ms: 800, create_response: true}`` — the server's own
+  defaults already equal this module's wire values, so the earlier uncertainty
+  about field spelling is resolved. Beware: the endpoint accepts *any* model
+  name (``no-such-model-v1`` also connects and returns ``session.created``
+  verbatim), so a healthy handshake is **not** evidence that realtime is
+  enabled for the account.
+* **Account side is not enabled — this is the drop.** An idle session stays up
+  indefinitely (>10 s with nothing sent). The moment real speech flows the
+  server closes the socket ~2 s later and emits **zero** business events — no
+  ``speech_started``, no transcript, nothing. The drop is time-driven, not
+  volume-driven: 3 chunks died at 1.56 s, 5 at 2.74 s, 20 at 1.99 s. Framing
+  was ruled out — every JSON ``input_audio_buffer.append`` variant was
+  accepted; only raw binary PCM frames were rejected (3.36 s).
+* **Client events re-tested on a healthy connection.** The earlier "commit and
+  cancel drop the link" verdict was contaminated by the audio drop above. On a
+  clean session: ``response.create`` and ``input_image_buffer.append`` are
+  tolerated, while ``input_audio_buffer.commit``, ``input_audio_buffer.clear``,
+  ``response.cancel`` and ``conversation.item.create`` each close the socket
+  2.7–3.3 s later. So :meth:`commit` and :meth:`interrupt` must never reach
+  the wire, and ``interrupt`` is no longer advertised as a capability.
 """
 from __future__ import annotations
 
@@ -48,7 +58,7 @@ import uuid
 from typing import Any, Callable
 
 from agent_runtime.realtime_provider import (
-    CAP_AUDIO_IN, CAP_AUDIO_OUT, CAP_INTERRUPT, CAP_TEXT_OUT, CAP_VIDEO_IN,
+    CAP_AUDIO_IN, CAP_AUDIO_OUT, CAP_TEXT_OUT, CAP_VIDEO_IN,
     DEGRADED_SAMPLED_FRAMES, EVENT_AUDIO_DELTA, EVENT_DONE, EVENT_ERROR,
     EVENT_STATUS, EVENT_TEXT_DELTA, EVENT_TRANSCRIPT, RealtimeEvent,
     RealtimeProvider, register,
@@ -87,6 +97,8 @@ class OmniRealtimeProvider(RealtimeProvider):
         self._voice = _env("DOCMIND_OMNI_VOICE", DEFAULT_VOICE)
         self._url = _env("DOCMIND_OMNI_URL", DEFAULT_URL)
         self._vad = _env("DOCMIND_OMNI_VAD", "server_vad").lower()
+        # Optional business-space id; the SDK sends it as a header when set.
+        self._workspace = _env("DOCMIND_OMNI_WORKSPACE")
 
     # -- configuration --------------------------------------------------------
     @property
@@ -98,7 +110,11 @@ class OmniRealtimeProvider(RealtimeProvider):
         return f"{self._url}{separator}model={self._model}"
 
     def capabilities(self) -> list[str]:
-        return [CAP_AUDIO_IN, CAP_VIDEO_IN, CAP_TEXT_OUT, CAP_AUDIO_OUT, CAP_INTERRUPT]
+        # CAP_INTERRUPT is deliberately absent: the two server-side primitives
+        # for it (response.cancel, input_audio_buffer.clear) both closed the
+        # connection when probed on an otherwise healthy session, so advertising
+        # the capability would promise the UI something that breaks the stream.
+        return [CAP_AUDIO_IN, CAP_VIDEO_IN, CAP_TEXT_OUT, CAP_AUDIO_OUT]
 
     def availability(self) -> dict[str, Any]:
         if not self.api_key:
@@ -113,7 +129,9 @@ class OmniRealtimeProvider(RealtimeProvider):
                         "reason": "缺少 websocket-client 依赖", "degraded_to": DEGRADED_SAMPLED_FRAMES}
         return {"ok": True, "provider": self.name, "model": self._model,
                 "voice": self._voice, "vad": self._vad, "verified": "connect-only",
-                "note": "连接与 session.created 已真机验证；commit/cancel 与真人声音频输入均被服务端断连，疑似未开通实时多模态服务"}
+                "note": "握手与 session.created 已真机验证（服务端口径与本协议一致）；"
+                        "但真人声一进流服务端约 2 秒后即断开且零业务事件，"
+                        "疑似该账号/业务空间未开通 Omni Realtime（见模块 docstring）"}
 
     # -- lifecycle ------------------------------------------------------------
     def start(self) -> bool:
@@ -126,7 +144,11 @@ class OmniRealtimeProvider(RealtimeProvider):
         if self._running:
             return True
         try:
-            headers = [f"Authorization: Bearer {self.api_key}"]
+            # The SDK sends a UA and, when configured, the business-space id.
+            headers = [f"Authorization: Bearer {self.api_key}",
+                       "User-Agent: docmind-realtime/1.0 (+websocket-client)"]
+            if self._workspace:
+                headers.append(f"X-DashScope-WorkSpace: {self._workspace}")
             if self._ws_factory is not None:
                 self._ws = self._ws_factory(self.endpoint(), headers)
             else:
@@ -180,21 +202,28 @@ class OmniRealtimeProvider(RealtimeProvider):
     def commit(self) -> bool:
         """Manual mode is not available on this endpoint.
 
-        A live probe (2026-09-29) showed ``input_audio_buffer.commit`` makes the
-        server drop the connection, so this never reaches the wire: the session
-        stays in server-VAD mode and the server decides the turn boundary.
+        Probed on an otherwise healthy session, ``input_audio_buffer.commit``
+        closes the connection ~2.7 s later, so this never reaches the wire: the
+        session stays in server-VAD mode and the server picks the turn boundary.
         """
         self._emit(EVENT_ERROR, code="commit_unsupported",
                    message="该端点不支持手动提交（实测 input_audio_buffer.commit 会断连），请使用服务端 VAD 断句")
         return False
 
     def interrupt(self) -> bool:
+        """No safe interrupt primitive exists here either.
+
+        Both candidates were probed on a healthy session: ``response.cancel``
+        and ``input_audio_buffer.clear`` each close the connection 2.7–3.3 s
+        later. Sending either would trade a live stream for a no-op, so this
+        reports instead.
+        """
         if not self._ready():
             return False
-        # ``response.cancel`` is deliberately NOT sent: it also dropped the
-        # connection in the live probe. Clearing the input buffer is the only
-        # interrupt primitive this endpoint tolerated.
-        return self._send(self._event("input_audio_buffer.clear"))
+        self._emit(EVENT_ERROR, code="interrupt_unsupported",
+                   message="该端点无可用的打断原语（实测 response.cancel 与 "
+                           "input_audio_buffer.clear 均会断连）")
+        return False
 
     # -- protocol payloads ----------------------------------------------------
     def _session_payload(self) -> dict[str, Any]:
@@ -211,7 +240,11 @@ class OmniRealtimeProvider(RealtimeProvider):
             "input_audio_transcription": {"model": TRANSCRIPTION_MODEL},
         }
         if self._vad in ("server_vad", "semantic_vad"):
-            session["turn_detection"] = {"type": self._vad, "silence_duration_ms": 800}
+            # threshold / prefix_padding_ms are spelled out because the live
+            # session.created echo carries exactly these three knobs.
+            session["turn_detection"] = {"type": self._vad, "threshold": 0.5,
+                                         "prefix_padding_ms": 300,
+                                         "silence_duration_ms": 800}
         elif self._vad in ("", "none", "manual", "false"):
             session["turn_detection"] = None
         instructions = _env("DOCMIND_OMNI_INSTRUCTIONS")
@@ -249,7 +282,9 @@ class OmniRealtimeProvider(RealtimeProvider):
                 raw = self._ws.recv()
             except Exception:
                 if self._running:
-                    self._emit(EVENT_ERROR, code="stream_broken", retryable=True)
+                    self._emit(EVENT_ERROR, code="stream_broken", retryable=True,
+                               message="服务端关闭了连接；若发生在音频开始后约 2 秒，"
+                                       "通常是该账号/业务空间未开通 Omni Realtime")
                 self._running = False
                 return
             if raw in (None, ""):

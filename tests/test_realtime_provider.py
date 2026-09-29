@@ -21,7 +21,8 @@ from agent_runtime.realtime_omni import (
 
 _ENV_KEYS = ("DOCMIND_REALTIME_PROVIDER", "DOCMIND_OMNI_API_KEY", "DASHSCOPE_API_KEY",
              "DOCMIND_OMNI_MODEL", "DOCMIND_OMNI_VOICE", "DOCMIND_OMNI_VAD",
-             "DOCMIND_OMNI_URL", "DOCMIND_OMNI_INSTRUCTIONS")
+             "DOCMIND_OMNI_URL", "DOCMIND_OMNI_INSTRUCTIONS",
+             "DOCMIND_OMNI_WORKSPACE")
 
 
 class _FakeWS:
@@ -222,10 +223,47 @@ class OmniAdapterTests(unittest.TestCase):
         sent = [item for item in ws.sent if item["type"] == "input_image_buffer.append"][0]
         self.assertEqual(base64.b64decode(sent["image"]), b"jpegbytes")
 
-    def test_interrupt_clears_buffer(self):
+    def test_interrupt_stays_local_because_server_drops_it(self):
+        """Probed on a healthy session, clear and cancel both close the socket."""
         provider, ws = self._start()
-        self.assertTrue(provider.interrupt())
-        self.assertIn("input_audio_buffer.clear", ws.types())
+        self.assertFalse(provider.interrupt())
+        self.assertNotIn("input_audio_buffer.clear", ws.types())
+        self.assertNotIn("response.cancel", ws.types())
+        error = provider.poll(timeout=1)
+        self.assertEqual(error.payload["code"], "interrupt_unsupported")
+
+    def test_interrupt_not_advertised(self):
+        provider = OmniRealtimeProvider(project_id="prj-test")
+        self.assertNotIn(rp.CAP_INTERRUPT, provider.capabilities())
+        self.assertIn(rp.CAP_AUDIO_IN, provider.capabilities())
+
+    def test_workspace_header_and_model_query_forwarded(self):
+        os.environ["DOCMIND_OMNI_WORKSPACE"] = "ws-abc123"
+        captured: dict[str, object] = {}
+
+        def factory(url, headers):
+            captured["url"] = url
+            captured["headers"] = headers
+            return _FakeWS()
+
+        provider = OmniRealtimeProvider(project_id="prj-test", ws_factory=factory)
+        self._providers.append(provider)
+        self.assertTrue(provider.start())
+        self.assertIn("X-DashScope-WorkSpace: ws-abc123", captured["headers"])
+        self.assertIn("Authorization: Bearer test-key", captured["headers"])
+        self.assertIn("model=qwen-omni-turbo-realtime", captured["url"])
+
+    def test_no_workspace_header_when_unset(self):
+        captured: dict[str, object] = {}
+
+        def factory(url, headers):
+            captured["headers"] = headers
+            return _FakeWS()
+
+        provider = OmniRealtimeProvider(project_id="prj-test", ws_factory=factory)
+        self._providers.append(provider)
+        self.assertTrue(provider.start())
+        self.assertFalse([h for h in captured["headers"] if "WorkSpace" in h])
 
     def test_server_events_translated(self):
         events = [
