@@ -1570,3 +1570,68 @@ git status --short
 
 ### 重复完成检查（R14 红线）
 - R4/R5/R10 接线 AI-F 独占；R12 provider 侧修复由同一 lane（0db20ff）落地，无第二人认领。无重复完成。Canvas AI-G（R12）行仍标「待开始」已过时，建议更新（非本回合范围）。
+
+## 2026-09-29 R14 复审：09994cd 回合恢复 + 8cefac0 视频闸门 + R12 设备侧复核（22:24）
+
+### 审计范围（本批次新增，HEAD=84a1330）
+- `09994cd` fix: harden realtime turn recovery（realtime_bridge.recover / realtime_omni 重放缓冲+send_silence_tail+recover / api.py stream_broken 重连 / 4 个新增测试）
+- `8cefac0` fix: gate native video on audio readiness（AutonomousCockpit.vue：音频就绪闸门）
+- 复评 `docs/realtime-r12-device-acceptance-20260929.md`（设备侧未通过）与同批 `47566e8`/`fe1cfdd`/`bd416e9`/`84a1330` 配套。
+
+### 09994cd 结论：回合恢复硬化，质量良好，无阻断 bug
+**1. realtime_bridge.recover() ✅**
+```python
+def recover(self) -> bool:
+    if not self.native or self.provider is None:
+        return False
+    recover = getattr(self.provider, "recover", None)
+    return bool(recover()) if callable(recover) else False
+```
+- 仅做能力探测+委托；`getattr` 取到的是绑定方法，`recover()` 不带参调用正确。`recover()` 自身若抛异常由 api.py 调用方 `try/except` 兜成 `recovered=False`，不向上炸。`self.provider is None` / 非 native 直接 `False`，不会误操作。
+
+**2. realtime_omni.py ✅（线程安全）**
+- 重放缓冲：`self._replay_audio: deque(maxlen=MAX_REPLAY_CHUNKS=120)` + `self._replay_lock = threading.Lock()`。`send_audio` 持锁追加 `(bytes(pcm), stamp)`；`clear()` 与 `_translate` 在 EVENT_DONE 持锁清空。边界有界（120 片 ≈ 12s@100ms），不会无限增长。
+- `send_silence_tail(seconds=1.0)`：时长 clamp 到 [0,5]，步长 clamp 到 [20,500]ms；每片 `b"\x00"*(16000*2*step_ms//1000)` —— 100ms 片 = 3200 字节，与 test 断言一致；逐片 sleep 推流。数学与契约正确。
+- `recover(timeout=8.0)`：持锁取 pending → `close()` → `start()`（失败即回 False）→ `poll(0.2)` 等 `EVENT_STATUS`/`stream_broken`（后者回 False）→ 清空重放缓冲 → 重放 pending 音频。超时与失败路径完整，失败回 False 触发网关关会话。
+- **并发安全**：`recover()` 由 api.py 经 `asyncio.to_thread` 调用，调用期间主循环在该 `await` 处挂起，不会与恢复中的 `poll`/重放并发读同一 provider；恢复返回后主循环才继续读。无竞态。
+
+**3. api.py live_vision_stream（09994cd +12）✅**
+```python
+if (event.get("type") == "error"
+        and event.get("code") == "stream_broken"
+        and event.get("retryable") is True):
+    try:
+        recovered = await asyncio.to_thread(bridge.recover)
+    except Exception:
+        recovered = False
+    if not recovered:
+        return
+```
+- retryable 的 `stream_broken` 转重连/重放，WebSocket 保活；恢复失败才关会话。非阻塞（to_thread），不卡事件循环。
+- **P3（信息级，非阻断）**：`event.get("retryable") is True` 用严格同一性判断；若 provider 某天发出 `"retryable":"true"` 或 `1`，会漏判而不重连。当前 `realtime_omni._translate` 产出布尔，暂无问题；建议后续放宽成显式布尔化作为健壮性兜底。
+
+**4. 测试 ✅**
+- `tests/test_realtime_acceptance.py`（新增 74 行）：`done` 严格成功（有 transcript 无 done → 需重试）、静音尾 20 片（10 语音+10 静音）、`stream_broken` 重试不计致命，离线覆盖充分。
+- `tests/test_realtime_provider.py` `test_send_silence_tail_emits_one_second_of_vad_audio`：1.0s → 10 片 × 3200 字节，断言精确。
+
+### 8cefac0 结论：直接消除设备报告「视频先行」顺序阻塞 ✅
+- 设备报告原结论：先发视频帧再发音频 → `vendor_error: "Error append image before append audio."`，为真机闭环阻塞项。
+- `8cefac0` 在 AutonomousCockpit.vue 增加 `liveNativeAudioReady` / `liveStreamReadyForVideo` 闸门：`sendNativeAudioReady()` 先推 1 个 3200 字节静音音频块（=DashScope 要求的「先有音频 append」），置位后才放行视频；`sendLiveStreamFrame` 在 `!liveStreamReadyForVideo` 时 reschedule 不推帧；`startLiveStream`/`stopLiveVision` 复位标志。
+- 结论：从采集端根除了「视频帧先于音频」的协议违例，设备报告中的顺序阻塞在代码层已闭合。
+
+### R12 设备侧复核：代码层两条阻塞均闭合，但真机验证仍 open
+- 两条设备阻塞（①静音尾、②视频先行顺序）对应代码均已提交：①静音尾由 0db20ff（验收脚本）+ 47566e8（前端 VAD 尾）+ 09994cd（provider send_silence_tail/recover 重放）三层保障；②视频先行由 8cefac0 音频闸门消除。
+- **但** `docs/realtime-r12-device-acceptance-20260929.md` 的「设备侧未通过」结论**作为验证声明仍然成立**：本机 IAB 无可授权摄像头/麦克风/扬声器，无法真正跑通采集→上行→播放→抢话→断线恢复全链路。代码已具备，验证待真实 Windows Edge/Chrome + 设备。
+- 对 20:43 我标的 **P2 生产网关缺口（realtime_bridge.take_audio 不补静音尾/不等 speech_stopped）**：现已被前端采集端（VAD 尾 + 音频闸门）在链路源头覆盖，**降级为已解决（resolved）**，不再作为 P2 跟踪。原 20:43 该条结论作废。
+
+### 重复完成检查（R14 红线）
+- `09994cd`、`8cefac0`、`47566e8`、`fe1cfdd`、`bd416e9`、`84a1330` 全部 `j77156057-art`（AI-F lane）提交；provider 可靠性三条（/root 行）与 AI-G 设备联验职责边界清晰，无第二人认领同一处。
+- **Canvas AI-G（R12）行（line 100）已被同步更新为「provider 侧 6/6·代码三条已补齐·音频闸门已修·设备待验」**，与本复审一致；其上一段（20:43）称「仍标待开始」已过时，现确认无需再改。
+- 无重复完成。
+
+### 当前工作树并发状态（R14 仅观察）
+- `git status` 现显 `M agent_runtime/realtime_omni.py`、`M tests/test_realtime_provider.py`、`M tests/test_realtime_gateway_bridge.py`、`M frontend/src/workbench/api/chat.ts`、`M frontend/src/workbench/components/ChatDock.vue`、`M requirements.txt`、`M .github/workflows/harness.yml`、`?? .tmp/`、`?? artifacts/` —— 均属其他 lane WIP / 生成物，R14 不碰。
+- 本节仅追加，pathspec 提交 HANDOFF.md，不卷入上述漂移。
+
+### 结论
+**09994cd + 8cefac0 批次质量良好，无阻断性 bug；R12 provider/网关/前端三层可靠性代码已闭环，设备侧仅剩「缺真机」验证缺口，不阻塞代码收口。**
