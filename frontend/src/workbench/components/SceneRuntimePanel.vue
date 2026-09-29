@@ -1181,7 +1181,13 @@ onUnmounted(() => {
 /* ===== 阶段 4：常驻（docked）形态 =====
    .pb-pop 被 teleport 进主区 host（#wb-playpane-slot），去掉固定弹层的定位/尺寸/阴影，
    内联填充父容器；同时放开预览区与侧栏的固定宽度，让其自适应。 */
-.pb-pop-inline { position: static; left: auto; top: auto; transform: none; width: 100%; height: 100%; max-width: none; max-height: none; flex: 1; border: 0; border-radius: 0; box-shadow: none; }
+/* `animation: none` 是必须的，不是装饰：`.pb-pop` 上的 `animation: pb-pop-in ... both`
+   的 to 帧把 `transform: translate(-50%, -50%)` 钉住了，而**动画在层叠里压过普通声明**，
+   所以这里的 `transform: none` 本身拦不住它（`left/top: auto` 却能生效）。结果面板按静态
+   位置落位后又被 translate 拖走自身宽高的一半：实测 1993 宽 → left = 39-996 = -957，
+   1057 高 → top = 482-528 = -46，于是整个画面区被推出屏幕左侧，只剩右侧那条 Bug 列表
+   飘在幕布中间（用户报的「幕布偏左」）。 */
+.pb-pop-inline { position: static; left: auto; top: auto; transform: none; animation: none; width: 100%; height: 100%; max-width: none; max-height: none; flex: 1; border: 0; border-radius: 0; box-shadow: none; }
 .pb-pop-inline .pb-framewrap { flex: 2 1 auto; width: 100%; height: auto; min-height: 220px; }
 .pb-pop-inline .pb-side { width: clamp(260px, 26vw, 380px); }
 
