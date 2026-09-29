@@ -15,7 +15,7 @@ PROTOCOL_VERSION = 1
 MAX_PACKET_HEADER = 512
 MEDIA_TYPES = {"video.frame", "audio.chunk"}
 CONTROL_TYPES = {"hello", "heartbeat", "cancel", "session.close"}
-SERVER_TYPES = {"hello.ok", "heartbeat", "video.observation", "audio.transcript", "model.delta", "model.audio", "error", "cancel.ok", "session.closed"}
+SERVER_TYPES = {"hello.ok", "heartbeat", "video.observation", "model.observation", "audio.transcript", "model.delta", "model.audio", "error", "cancel.ok", "session.closed"}
 _ENVELOPE_KEYS = {"v", "type", "sent_at", "sequence", "captured_at", "session_id"}
 
 

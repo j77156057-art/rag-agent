@@ -67,7 +67,8 @@ return。**唯一硬约束**：`v` 必须仍为 `1`、`sent_at` 必须仍为 num
 永远不收口，界面停在"回答中"。所以 `EVENT_DONE` 被拦下时改发**一条结束标记**：
 `model.delta` + `final: true` + 空文本（:meth:`SessionBridge._end_of_turn`）。
 
-不新增事件类型（R0 的 `SERVER_TYPES` 不动），也不需要前端改一行：
+这一层仍复用 `model.delta` 的结束标记，不把 provider 的 `done` 映射成会话关闭；
+R15 的发现提醒使用独立的 `model.observation` 事件，避免触发抽帧观察的失败关闭分支。
 `frontend/src/workbench/liveStreamControl.ts` 的 `appendCaptionTurn` 对
 `final + 空文本` 的处理恰好是"当前开着助手回合就地收口，没开着就什么都不做"，
 天然幂等——重复的结束标记不会造出空气泡。
@@ -107,11 +108,13 @@ return。**唯一硬约束**：`v` 必须仍为 `1`、`sent_at` 必须仍为 num
 from __future__ import annotations
 
 import base64
+import difflib
 import threading
 import time
 from typing import Any, Callable
 
 from agent_runtime import realtime_metrics as metrics
+from agent_runtime import realtime_protocol
 from agent_runtime import realtime_provider as provider_registry
 from agent_runtime.realtime_provider import (
     DEGRADED_SAMPLED_FRAMES,
@@ -132,6 +135,38 @@ from agent_runtime.realtime_timeline import (
 
 MODE_NATIVE = "native-realtime"
 MODE_SAMPLED = "sampled-frames"
+# 触发判据是「句首口语」，不是【括号标记】。为什么：实时模型在**同一通道**里既生成音频
+# 又生成转写，标记里的话会被**念出来**（括号本身通常不发音，但「疑似异常」这几个字会），
+# 用户会听到一句机器人腔。换成自然句子后，被念出来也不突兀，而且模型更容易把自然句子
+# 放在句首（召回更稳，不必去记一个格式约定）。
+DISCOVERY_OPENINGS = (
+    "我看到画面这里有问题：",
+    "我看到画面上有个问题：",
+    "画面上有个问题：",
+)
+# 旧标记只作**兼容别名**接受：措辞刚换时，仍在跑的会话里模型可能还按老格式说，
+# 不能出现「模型报了、网关不认」的静默漏报。
+DISCOVERY_LEGACY_OPENING = "【疑似异常】"
+_DISCOVERY_ALL_OPENINGS = (*DISCOVERY_OPENINGS, DISCOVERY_LEGACY_OPENING)
+_MAX_OPENING_CHARS = max(len(item) for item in _DISCOVERY_ALL_OPENINGS)
+
+
+def _discovery_remainder(candidate: str) -> str | None:
+    """以任一触发句开头 → 返回去掉触发句后的正文；否则 None。"""
+    for opening in _DISCOVERY_ALL_OPENINGS:
+        if candidate.startswith(opening):
+            return candidate[len(opening):]
+    return None
+
+
+def _could_be_discovery_opening(candidate: str) -> bool:
+    """candidate 仍是某个触发句的前缀（分块时只拿到半句）→ 还判断不了。"""
+    return any(opening.startswith(candidate) for opening in _DISCOVERY_ALL_OPENINGS)
+
+
+MAX_DISCOVERY_CHARS = 300
+DISCOVERY_DEDUPE_WINDOW_SECONDS = 45.0
+DISCOVERY_THROTTLE_SECONDS = 2.0
 
 # 事件类型 → 时间线条目类型（落进时间线的那部分证据）。
 _TIMELINE_KIND_BY_EVENT = {
@@ -281,6 +316,10 @@ class SessionBridge:
         # 跨 `next_events` 调用存活：结束标记与被拦下的 `EVENT_DONE` 可能落在两次
         # poll 里，用局部变量会把同一轮收口两次。
         self._turn_closed = False
+        self._discovery_text = ""
+        self._discovery_prefix_state: bool | None = None
+        self._discovery_last_sent_at = 0.0
+        self._recent_discoveries: list[tuple[float, str]] = []
 
         mode = resolve_mode(provider_name)
         self.mode = MODE_NATIVE if mode["ok"] else MODE_SAMPLED
@@ -456,16 +495,87 @@ class SessionBridge:
             if kind in _GATEWAY_OWNED_WIRE_TYPES:
                 self.suppressed[kind] = self.suppressed.get(kind, 0) + 1
                 if event.kind == EVENT_DONE:
+                    # Some providers close a response with ``done`` without
+                    # repeating a final transcript delta. Flush a marked
+                    # discovery accumulated from earlier deltas before reset.
+                    observation = self._discovery_from_delta(RealtimeEvent(
+                        EVENT_TEXT_DELTA, captured_at=event.captured_at,
+                        session_id=self.session_id or "",
+                        payload={"text": "", "role": "assistant", "final": True},
+                    ))
+                    if observation:
+                        relayed.append(observation)
                     relayed.extend(self._end_of_turn())
+                    self._reset_discovery_turn()
                 continue
             # 会话身份以网关为准：客户端只知道 hello 里那个会话号，若事件里带的是适配器
             # 自造的 `rt-...`，按会话号做校验的客户端会把事件丢掉（R0 的
             # `server_event` 也声明"信封是权威，provider 载荷不得改写协议字段"）。
             self._normalize_session_id(rendered)
+            if event.kind == EVENT_TEXT_DELTA:
+                observation = self._discovery_from_delta(event)
+                if observation:
+                    relayed.append(observation)
             if kind == "model.delta" and rendered.get("final") is True:
                 self._turn_closed = True
+                self._reset_discovery_turn()
             relayed.append(rendered)
         return relayed
+
+    def _discovery_from_delta(self, event: RealtimeEvent) -> dict[str, Any] | None:
+        """Relay explicitly marked visual claims as unverified, bounded notices."""
+        if str(event.payload.get("role") or "assistant") != "assistant":
+            return None
+        delta = str(event.payload.get("text") or "")
+        # Providers commonly emit incremental text and then repeat the complete
+        # transcript in the final event. Treat that final transcript as authoritative.
+        if event.payload.get("final") is True and _discovery_remainder(delta.lstrip()) is not None:
+            self._discovery_text = delta.strip()[:MAX_DISCOVERY_CHARS + _MAX_OPENING_CHARS]
+            self._discovery_prefix_state = None
+        elif delta:
+            self._discovery_text = (self._discovery_text + delta)[-MAX_DISCOVERY_CHARS - _MAX_OPENING_CHARS:]
+        if self._discovery_prefix_state is None:
+            candidate = self._discovery_text.lstrip()
+            remainder = _discovery_remainder(candidate)
+            if remainder is not None:
+                self._discovery_prefix_state = True
+                self._discovery_text = remainder.strip()
+            elif _could_be_discovery_opening(candidate):
+                return None
+            else:
+                self._discovery_prefix_state = False
+                return None
+        elif self._discovery_prefix_state is False:
+            return None
+        elif delta and not self._discovery_text.endswith(delta):
+            self._discovery_text = (self._discovery_text + delta)[-MAX_DISCOVERY_CHARS:]
+
+        if event.payload.get("final") is not True:
+            return None
+        text = self._discovery_text.strip()[:MAX_DISCOVERY_CHARS]
+        if not text:
+            return None
+        now = self._clock()
+        self._recent_discoveries = [(stamp, previous) for stamp, previous in self._recent_discoveries
+                                    if now - stamp <= DISCOVERY_DEDUPE_WINDOW_SECONDS]
+        normalized = " ".join(text.casefold().split())
+        if any(difflib.SequenceMatcher(None, normalized, previous).ratio() >= 0.82
+               for _, previous in self._recent_discoveries):
+            return None
+        if now - self._discovery_last_sent_at < DISCOVERY_THROTTLE_SECONDS:
+            return None
+        self._discovery_last_sent_at = now
+        self._recent_discoveries.append((now, normalized))
+        self._recent_discoveries = self._recent_discoveries[-64:]
+        return realtime_protocol.server_event(
+            "model.observation", captured_at=event.captured_at,
+            session_id=self.session_id or None, source="realtime-model",
+            verified=False, text=text,
+        )
+
+    def _reset_discovery_turn(self) -> None:
+        self._discovery_text = ""
+        self._discovery_prefix_state = None
 
     def _end_of_turn(self) -> list[dict[str, Any]]:
         """被拦下的 `EVENT_DONE` 的替身：一条"这一轮说完了"的线上标记。

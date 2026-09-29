@@ -315,6 +315,74 @@ def test_provider_ready_never_leaks_a_second_hello_ok(gateway, provider):
     assert event["text"] == "原生回答"
 
 
+def test_spoken_opening_realtime_discovery_is_relayed_as_unverified_and_deduplicated(provider):
+    """触发句是**自然口语**（不是括号标记）：它会被朗读出来，标记词念着很生硬。"""
+    bridge = _bridge()
+    try:
+        provider.emit_text("我看到画面上有个问题：右侧保存按钮被错误提示遮挡", final=True)
+        events = bridge.next_events()
+        provider.emit_text("我看到画面上有个问题：右侧保存按钮被错误提示遮挡。", final=True)
+        repeated = bridge.next_events()
+    finally:
+        bridge.close()
+    discoveries = [item for item in events if item["type"] == "model.observation"]
+    assert len(discoveries) == 1
+    assert discoveries[0]["source"] == "realtime-model"
+    assert discoveries[0]["verified"] is False
+    assert discoveries[0]["text"] == "右侧保存按钮被错误提示遮挡"
+    assert all(item["type"] != "model.observation" for item in repeated)
+
+
+def test_legacy_bracket_opening_still_works_during_the_wording_change(provider):
+    """旧标记作为兼容别名保留：措辞刚换时，仍在跑的会话里模型可能还按老格式说，
+    不能出现「模型报了、网关不认」的静默漏报。"""
+    bridge = _bridge()
+    try:
+        provider.emit_text("【疑似异常】底部按钮被遮挡", final=True)
+        events = bridge.next_events()
+    finally:
+        bridge.close()
+    discoveries = [item for item in events if item["type"] == "model.observation"]
+    assert len(discoveries) == 1
+    assert discoveries[0]["text"] == "底部按钮被遮挡"
+
+
+def test_partial_opening_across_deltas_is_still_detected(provider):
+    """分块把一个触发句切成两半（语音转写是增量来的）时不能误判成普通对话。"""
+    bridge = _bridge()
+    try:
+        provider.emit_text("我看到画面", final=False)
+        assert all(item["type"] != "model.observation" for item in bridge.next_events())
+        provider.emit_text("上有个问题：左上角弹出了报错框", final=True)
+        events = bridge.next_events()
+    finally:
+        bridge.close()
+    discoveries = [item for item in events if item["type"] == "model.observation"]
+    assert len(discoveries) == 1, f"半句 + 半句必须拼出一条提醒：{events}"
+    assert discoveries[0]["text"] == "左上角弹出了报错框"
+
+
+def test_mid_sentence_opening_is_not_a_discovery(provider):
+    """触发句必须在**轮次开头**：中途冒出来的不算（否则普通对话里提一句就会误报）。"""
+    bridge = _bridge()
+    try:
+        provider.emit_text("好的，我先把当前画面看一遍。我看到画面上有个问题：右下角有红字", final=True)
+        events = bridge.next_events()
+    finally:
+        bridge.close()
+    assert all(item["type"] != "model.observation" for item in events)
+
+
+def test_unmarked_realtime_text_does_not_become_a_discovery(provider):
+    bridge = _bridge()
+    try:
+        provider.emit_text("我先看一下当前画面。", final=True)
+        events = bridge.next_events()
+    finally:
+        bridge.close()
+    assert all(item["type"] != "model.observation" for item in events)
+
+
 def test_provider_done_is_not_relayed_as_session_closed(gateway, provider):
     client, _ = gateway
     with client.websocket_connect(f"{ENDPOINT}?project_id={PROJECT_ID}") as socket:

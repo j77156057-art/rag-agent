@@ -33,7 +33,7 @@ _HARNESS = r"""
 import assert from 'node:assert';
 import { createAdaptiveSender, classifyLivePhase, LIVE_PHASE_LABELS, createInFlightLedger,
   appendCaptionTurn, closeUserTranscript, describeLiveCapabilities,
-  shouldDispatchVoiceTurn } from './liveStreamControl.js';
+  shouldDispatchVoiceTurn, sameVisualFocus } from './liveStreamControl.js';
 
 const now = () => Date.now();
 
@@ -197,6 +197,16 @@ assert.strictEqual(shouldDispatchVoiceTurn('先看左侧栏', { text: '上一句
   '距上次转交太近的连发只发一次');
 assert.strictEqual(shouldDispatchVoiceTurn('先看左侧栏', { text: '上一句', at: T - 5000 }, T), true,
   '隔开足够久就照常转交');
+
+// ---- 跨来源合并判据：抽帧告警 vs 实时模型自述是否在说同一处 -------------------
+// 两条观测链各自弹横幅时，同一个问题会弹两次；这个判据只回答"是不是同一处"。
+assert.strictEqual(sameVisualFocus('右上角有报错弹窗', '右上角出现报错弹窗，遮住了保存按钮'), true,
+  '同一处、不同说法要判为同一处');
+assert.strictEqual(sameVisualFocus('右上角有报错弹窗', '左下角按钮点不动'), false,
+  '不同位置的问题不得合并');
+assert.strictEqual(sameVisualFocus('报错', '报错弹窗'), false,
+  '字数太少不判（避免两个字随便撞上就合并）');
+assert.strictEqual(sameVisualFocus('', '右上角报错'), false, '空文本不判');
 
 assert.match(describeLiveCapabilities(['audio.in', 'text.out']), /麦克风音频输入.*文字回复/);
 assert.strictEqual(describeLiveCapabilities(undefined), '', '抽帧模式没有能力表，返回空串而不是报错');

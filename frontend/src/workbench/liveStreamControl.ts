@@ -241,6 +241,31 @@ export function shouldDispatchVoiceTurn(
   return true
 }
 
+/**
+ * 两条界面提醒是不是在说**同一处**（用于跨来源合并：抽帧告警 vs 实时模型自述）。
+ *
+ * 为什么会各弹一条：抽帧视觉模型和实时模型是两条独立的观测链，两边都发现同一个问题时，
+ * 用户会看到两条几乎一样的横幅。这里只做"是否同一处"的判断，合并展示、保留两边的原文。
+ *
+ * 判据刻意保守：按汉字二元组算重叠率（对"同一处、不同说法"宽容），但**字数太少就不判**
+ * （「报错」两个字随便都能撞上，误合并会把两处不同的问题说成一处）。
+ */
+export function sameVisualFocus(left: string, right: string, threshold = 0.5): boolean {
+  const grams = (text: string): Set<string> => {
+    const chars = String(text || '').replace(/[\s\p{P}\p{S}]/gu, '').toLowerCase()
+    const out = new Set<string>()
+    for (let i = 0; i + 1 < chars.length; i += 1) out.add(chars.slice(i, i + 2))
+    return out
+  }
+  const a = grams(left)
+  const b = grams(right)
+  const smaller = Math.min(a.size, b.size)
+  if (smaller < 3) return false
+  let shared = 0
+  for (const gram of a) if (b.has(gram)) shared += 1
+  return shared / smaller >= threshold
+}
+
 export function appendCaptionTurn(
   captions: LiveCaptionTurn[],
   wire: { type: string; text?: unknown; final?: unknown },

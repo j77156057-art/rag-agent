@@ -19,6 +19,7 @@ import { encodeVideoFrame, parseRealtimeServerEvent, realtimeHello, realtimeCanc
 import {
   classifyLivePhase, createAdaptiveSender, createInFlightLedger, LIVE_PHASE_LABELS,
   appendCaptionTurn, closeUserTranscript, describeLiveCapabilities, shouldDispatchVoiceTurn,
+  sameVisualFocus,
 } from '../liveStreamControl'
 import type { LivePhase, LiveCaptionTurn } from '../liveStreamControl'
 import {
@@ -150,7 +151,23 @@ const liveVisionFocus = ref<FocusRegion | null>(null)
 const liveVisionDraftFocus = ref<FocusRegion | null>(null)
 const liveVisionSelecting = ref(false)
 const liveVisionSnapshotUrl = ref('')
-const liveVisionAlert = ref<(VisionAnomaly & { detectedAt: string }) | null>(null)
+const liveVisionAlert = ref<(VisionAnomaly & { detectedAt: string; atMs: number }) | null>(null)
+// `frame` 是**报出这条提醒时**的那一帧快照，不是"点排查时"的当前帧：模型说的是几秒前
+// 看到的问题，用户过一会儿才点「交给 AI 排查」，那时画面可能已经变了——拿当前帧去核实
+// 等于核实错了对象。
+const liveRealtimeAlert = ref<{ text: string; detectedAt: string; frame: Blob | null; atMs: number } | null>(null)
+// 跨来源合并（在**渲染时**算，不动状态，避免两条链抢着改同一个 ref）：
+// 抽帧视觉模型与实时模型是两条独立观测链，同一个问题会被两边各报一次。近 20 秒内且判为
+// 同一处时，只渲染一条合并横幅，并保留两边的原文——合并是为了少一条重复横幅，
+// 不是为了隐藏信息。
+const mergedVisualAlert = computed(() => {
+  const vision = liveVisionAlert.value
+  const realtime = liveRealtimeAlert.value
+  if (!vision || !realtime) return null
+  if (Math.abs(realtime.atMs - vision.atMs) > 20_000) return null
+  return sameVisualFocus(realtime.text, `${vision.target}${vision.evidence}`)
+    ? { vision, realtime } : null
+})
 const liveVisionAlertImageUrl = ref('')
 const liveVisionAlertStatus = ref('')
 // R1/R6：自适应发送与实时状态。计划档位只影响采集/发送节奏，不触碰协议包字段。
@@ -804,6 +821,7 @@ function resetFocusObservation() {
   liveVisionTimeline.value = []
   pendingVisionAlert = null
   dismissVisionAlert()
+  liveRealtimeAlert.value = null
   acknowledgedVisionAlerts.clear()
   appEvents.emit('docmind:live-vision-frame', {
     projectId: getProjectId(), image: liveVisionLatestFrame, capturedAt: liveVisionLatestCapturedAt, focusImage: null, timeline: [],
@@ -832,6 +850,26 @@ function reviewVisionAlert() {
     onStatus: (status, detail) => {
       if (projectId !== getProjectId() || !liveVisionAlert.value) return
       liveVisionAlertStatus.value = status === 'processing' ? 'AI 正在核实画面…'
+        : status === 'awaiting_review' ? 'AI 已回复，请在右侧对话中查看。'
+          : detail || '暂未送达，请稍后重试。'
+    },
+  })
+}
+function reviewRealtimeAlert() {
+  const alert = liveRealtimeAlert.value
+  if (!alert) return
+  const projectId = getProjectId()
+  // 附**报警当刻**的快照；只有拿不到快照时才退回当前帧（并如实说明是"当前画面"）。
+  const frame = alert.frame || liveVisionLatestFrame
+  const frameNote = alert.frame ? '附件是报出这条提醒时的画面' : '附件是当前画面（报警时的画面已不可用）'
+  appEvents.emit('docmind:send-chat', {
+    target: 'cockpit', projectId,
+    prompt: `实时模型在画面中给出一条未核实提醒：「${alert.text}」。${frameNote}。请结合当前项目文件、运行日志和画面核实是否确有问题；先提出修改方案与验收条件，修改前等待用户确认。`,
+    images: frame ? [frame] : [],
+    uiContext: 'app_interface_inspect',
+    onStatus: (status, detail) => {
+      if (projectId !== getProjectId() || !liveRealtimeAlert.value) return
+      liveVisionAlertStatus.value = status === 'processing' ? 'AI 正在核实实时提醒…'
         : status === 'awaiting_review' ? 'AI 已回复，请在右侧对话中查看。'
           : detail || '暂未送达，请稍后重试。'
     },
@@ -1130,7 +1168,10 @@ function stopLiveVision(message = '') {
   liveVisionObservation.value = ''
   liveVisionTimeline.value = []
   pendingVisionAlert = null
-  if (!message) dismissVisionAlert()
+  if (!message) {
+    dismissVisionAlert()
+    liveRealtimeAlert.value = null
+  }
   acknowledgedVisionAlerts.clear()
   liveVisionFocus.value = null
   liveVisionDraftFocus.value = null
@@ -1274,6 +1315,20 @@ function receiveLiveStreamObservation(raw: string, ticket: number, projectId: st
     refreshLiveVisionPhase()
     return
   }
+  if (event.type === 'model.observation') {
+    if (event.source === 'realtime-model' && event.verified === false && typeof event.text === 'string') {
+      liveRealtimeAlert.value = {
+        text: event.text.slice(0, 300),
+        atMs: Date.now(),
+        detectedAt: new Date(typeof event.captured_at === 'number' ? event.captured_at : event.sent_at)
+          .toLocaleTimeString('zh-CN', { hour12: false }),
+        // 报警当刻的画面：此刻模型正看着它，快照下来供后续核实（见类型声明处的说明）。
+        frame: liveVisionLatestFrame,
+      }
+      liveVisionAlertStatus.value = ''
+    }
+    return
+  }
   if (event.type === 'heartbeat' || event.type === 'cancel.ok') return
   if (event.type === 'error') {
     const message = typeof event.message === 'string' ? event.message : '实时视觉连接发生错误。'
@@ -1319,7 +1374,7 @@ function receiveLiveStreamObservation(raw: string, ticket: number, projectId: st
     if (alertProgress.confirmed && !acknowledgedVisionAlerts.has(alertProgress.key)) {
       acknowledgedVisionAlerts.add(alertProgress.key)
       dismissVisionAlert()
-      liveVisionAlert.value = { ...alertProgress.confirmed,
+      liveVisionAlert.value = { ...alertProgress.confirmed, atMs: Date.now(),
         detectedAt: new Date(capturedAt).toLocaleTimeString('zh-CN', { hour12: false }) }
       liveVisionAlertFrame = frame.image
       liveVisionAlertImageUrl.value = URL.createObjectURL(frame.image)
@@ -1569,6 +1624,7 @@ async function sampleLiveVision(ticket: number) {
       dismissVisionAlert()
       liveVisionAlert.value = {
         ...alertProgress.confirmed,
+        atMs: Date.now(),
         detectedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
       }
       liveVisionAlertFrame = image
@@ -2158,10 +2214,18 @@ onBeforeUnmount(() => {
       </div>
     </header>
     <p v-if="error" class="acp-error acp-error-banner" role="alert">{{ error }}</p>
-    <section v-if="liveVisionAlert" class="acp-vision-alert-banner" role="alert">
+    <section v-if="mergedVisualAlert" class="acp-vision-alert-banner" role="alert">
+      <div><b>两个来源都报了这一处 · {{ mergedVisualAlert.vision.detectedAt }}</b><p>抽帧观察：{{ mergedVisualAlert.vision.target }}：{{ mergedVisualAlert.vision.evidence }}</p><p>实时模型：{{ mergedVisualAlert.realtime.text }}</p><small>两条独立观测链指向同一处；实时模型那句属自述、尚未核实。</small></div>
+      <button @click="reviewRealtimeAlert()">交给 AI 排查</button><button @click="dismissVisionAlert(); liveRealtimeAlert = null">忽略</button>
+    </section>
+    <section v-else-if="liveVisionAlert" class="acp-vision-alert-banner" role="alert">
       <img v-if="liveVisionAlertImageUrl" :src="liveVisionAlertImageUrl" alt="疑似异常出现时的画面快照">
       <div><b>AI 发现疑似界面异常 · {{ liveVisionAlert.detectedAt }}</b><p>{{ liveVisionAlert.target }}：{{ liveVisionAlert.evidence }}</p><small>{{ liveVisionAlertStatus || '已由两次画面观察复核；仍需结合项目状态确认。' }}</small></div>
       <button @click="reviewVisionAlert()">交给 AI 排查</button><button @click="dismissVisionAlert()">忽略</button>
+    </section>
+    <section v-else-if="liveRealtimeAlert" class="acp-realtime-alert-banner" role="alert">
+      <div><b>实时模型提醒 · {{ liveRealtimeAlert.detectedAt }}</b><p>{{ liveRealtimeAlert.text }}</p><small>{{ liveVisionAlertStatus || '实时模型自述，尚未核实。' }}</small></div>
+      <button @click="reviewRealtimeAlert()">交给 AI 排查</button><button @click="liveRealtimeAlert = null">忽略</button>
     </section>
     <nav class="acp-flow-rail" aria-label="自主开发流程">
       <div
@@ -2482,7 +2546,11 @@ onBeforeUnmount(() => {
 .acp-vision-alert-banner img { width: 92px; max-height: 72px; object-fit: contain; border-radius: 5px; background: #101521; }
 .acp-vision-alert-banner div { flex: 1; min-width: 0; }
 .acp-vision-alert-banner b { font-size: 12px; }.acp-vision-alert-banner p { margin: 3px 0; font-size: 11px; overflow-wrap: anywhere; }.acp-vision-alert-banner small { color: var(--text-muted); font-size: 10px; }
+.acp-realtime-alert-banner { display: flex; align-items: center; gap: 10px; margin: 12px 0; padding: 10px; border: 1px dashed rgba(83, 170, 193, .7); border-radius: 9px; background: rgba(83, 170, 193, .09); }
+.acp-realtime-alert-banner div { flex: 1; min-width: 0; }
+.acp-realtime-alert-banner b { font-size: 12px; }.acp-realtime-alert-banner p { margin: 3px 0; font-size: 11px; overflow-wrap: anywhere; }.acp-realtime-alert-banner small { color: var(--text-muted); font-size: 10px; }
 @media (max-width: 640px) { .acp-vision-alert-banner { flex-wrap: wrap; }.acp-vision-alert-banner div { flex-basis: calc(100% - 110px); } }
+@media (max-width: 640px) { .acp-realtime-alert-banner { flex-wrap: wrap; }.acp-realtime-alert-banner div { flex-basis: calc(100% - 110px); } }
 .acp-state { border: 1px solid var(--border); border-radius: 99px; padding: 5px 9px; font-size: 11px; white-space: nowrap; }
 .acp-compose { display: flex; gap: 8px; margin: 16px 0; }.acp-compose textarea { flex: 1; resize: vertical; min-width: 0; border: 1px solid var(--border); border-radius: 9px; padding: 10px; color: var(--text); background: var(--bg-raised); font: inherit; }
 button { border: 1px solid var(--border); background: var(--bg-raised); color: var(--text); border-radius: 7px; padding: 7px 10px; cursor: pointer; font: inherit; font-size: 12px; }

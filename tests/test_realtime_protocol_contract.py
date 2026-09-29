@@ -108,6 +108,12 @@ def test_every_provider_event_kind_maps_onto_a_declared_server_event():
         "R4 映射出了 R0 未声明的服务端事件")
 
 
+def test_model_observation_is_a_declared_server_event():
+    assert "model.observation" in proto.SERVER_TYPES
+    assert "model.observation" in _ts_literals(_ts_segment(
+        _ts_source(), "export type RealtimeServerEvent", "export function realtimeHello"))
+
+
 @pytest.mark.parametrize("kind", provider.EVENT_KINDS)
 def test_to_wire_output_is_a_valid_r0_server_event(kind):
     with _frozen_clock():

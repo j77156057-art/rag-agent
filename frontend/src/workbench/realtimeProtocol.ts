@@ -8,7 +8,7 @@ export type RealtimeClientControl =
 
 export type RealtimeServerEvent = {
   v: 1
-  type: 'hello.ok' | 'heartbeat' | 'video.observation' | 'audio.transcript' | 'model.delta' | 'model.audio' | 'error' | 'cancel.ok' | 'session.closed'
+  type: 'hello.ok' | 'heartbeat' | 'video.observation' | 'model.observation' | 'audio.transcript' | 'model.delta' | 'model.audio' | 'error' | 'cancel.ok' | 'session.closed'
   sent_at: number
   sequence?: number
   captured_at?: number
