@@ -1690,3 +1690,34 @@ if (event.get("type") == "error"
 
 ### 结论
 **09994cd + 8cefac0 批次质量良好，无阻断性 bug；R12 provider/网关/前端三层可靠性代码已闭环，设备侧仅剩「缺真机」验证缺口，不阻塞代码收口。**
+
+## 2026-09-29 R14 复审：d3e376c + b78bd52（provider 层音频顺序加固 + 网关 flake 修）（22:40）
+
+### 审计范围（HEAD=537d312 之后新增，现 HEAD=b78bd52）
+- `d3e376c` fix: prime omni sessions before video frames（realtime_omni.py send_frame 闸门 + close 复位 + _silence_chunk DRY；tests +53）
+- `b78bd52` fix: 首帧前先补音频（文档）+ 修掉网关测试收尾 flake（HANDOFF +42、tests/test_realtime_gateway_bridge.py -19/+56）
+
+### d3e376c 结论：媒体顺序闸门下沉到 provider 层，质量良好，无阻断 bug ✅
+- 新增 `self._audio_primed` 标志（__init__=False）；`send_audio` 发送成功后才置位（发送失败保持未置位，下一帧重试）；`close()` 复位（recover=close+start 是全新会话，约束按会话计，不清会重连后再踩坑）。状态机正确。
+- `send_frame()`：本会话未送过音频时，先经 `self.send_audio(self._silence_chunk(SILENCE_CHUNK_MS), ...)` 补一个 100ms 16kHz PCM16 静音块，**再**发图像。走 send_audio 而非自拼事件 → 同时进重放缓冲、标记由同一路径置位，与 09994cd 的 recover 重放顺序自洽。
+- `_silence_chunk(step_ms)` 抽成静态方法，与 `send_silence_tail()` 共用同一算法（100ms→3200 字节），消除两处漂移。正确。
+- **与 8cefac0 前端闸门的关系**：前端已先推 3200 字节静音块置位；provider 层是纵深防御——若前端闸门任何边角漏掉，provider 仍自补。两者不冲突、互补。
+- **P3（信息级，非阻断）**：`_audio_primed` 为裸 bool，未走 `_replay_lock`。正常路径 send_audio/send_frame/close 均在同一事件循环或 recover 的 to_thread 挂起期内串行执行，无真实并发；但为与既有加锁风格一致、防未来并发调用，建议并入 `_replay_lock` 保护（或加注释声明单线程假设）。不阻塞收口。
+- **测试**：test_realtime_provider.py 新增 4 条（首帧前补音频且顺序 audio<image、音频已先行不再塞静音、只补一次、重连后重新引导），均离线可跑、断言精确。
+
+### b78bd52 结论：flake 根因定位精准、修法不降断言强度 ✅
+- **根因（正确）**：`gateway` 夹具 `with TestClient(api.app)` 退出拆事件循环；会话拆除在服务端 handler 异步 finally 里、晚于客户端 socket 退出 → 循环一拆 finally 永不完成 → 时间线/指标作用域永不回收 → 用例只能靠运气（等 20s 也红，因为等的是一个不会来的东西）。
+- **修法两处，均未放宽断言**：①夹具在退出 client **之前**等 `active_timeline_projects()==[]`（循环还活着时同步）；②把「收尾三件事」属性挪到确定性层面——直接驱动 `SessionBridge.close()`（同步、次序在源码即 provider.close→release_timeline→drop_session），不再经 WebSocket 赌服务端 finally。
+- 经网关的收尾仍由夹具同步；R9 的 `test_provider_close_exception_...` 仍覆盖 close 抛错情形，断言面未缩。验证：该文件连跑 5 次全 27 passed（重负载 93~153s/次），全量 2129 passed / 6 skipped / 0 failed（296s，重负载首次全绿）。
+- 媒体顺序的**实现说明文档**已在 b78bd52 落进 HANDOFF（作者自述），本 R14 节为独立复核结论，二者一致。
+
+### 作者已诚实标注的未验证窗口（R14 须跟踪，不视作已闭环）
+- 作者自述：AI-G 设备对照实验是在**已建立的会话**里做的；本闸门发生在**首帧**，理论上可能早于供应商 `session.created`。若真机上首帧仍报 `vendor_error`，下一步是把首帧也闸在 provider ready 之后（provider 内跟踪 session.created），而不是继续加静音。
+- 即：**代码层顺序防御已做（前端+provider 两层），但「首帧早于 session.created」这一边角在真机尚未验证**。结合 R12 设备侧本就缺真机，此项仍属「代码具备、待真机验证」。
+
+### 重复完成检查（R14 红线）
+- `d3e376c`、`b78bd52` 均 `j77156057-art`（AI-F lane）；媒体顺序修复从前端(8cefac0)→provider(d3e376c) 同源收敛，无第二人改同一处。无重复完成。
+- Canvas AI-G（R12）行（line 100）现「音频闸门已修·设备待验」与本次复审一致，无需再改。
+
+### 结论
+**d3e376c + b78bd52 质量良好、无阻断性 bug：媒体顺序闸门已下沉到 provider 层并与前端闸门形成纵深防御；网关收尾 flake 根因精准、修法不降断言。唯一剩余风险 = 作者已标注的「首帧可能早于 session.created」边角，仍需真机验证，不阻塞代码收口。**
