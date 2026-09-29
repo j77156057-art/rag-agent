@@ -18,8 +18,9 @@ import type { VisualActionLoop, VisualActionStep } from '../visualActionLoop'
 import { encodeVideoFrame, parseRealtimeServerEvent, realtimeHello, realtimeCancel } from '../realtimeProtocol'
 import {
   classifyLivePhase, createAdaptiveSender, createInFlightLedger, LIVE_PHASE_LABELS,
+  appendCaptionTurn, describeLiveCapabilities,
 } from '../liveStreamControl'
-import type { LivePhase } from '../liveStreamControl'
+import type { LivePhase, LiveCaptionTurn } from '../liveStreamControl'
 import CockpitApprovalQueue from './CockpitApprovalQueue.vue'
 import CockpitModelBar from './CockpitModelBar.vue'
 import WorkflowCard from './WorkflowCard.vue'
@@ -128,10 +129,12 @@ const visualInspectStatus = ref('')
 const liveVisionActive = ref(false)
 const liveVisionBusy = ref(false)
 const liveVisionStatus = ref('')
-const liveVisionMode = ref<'sampled-frames' | 'native' | 'unavailable'>('sampled-frames')
+const liveVisionMode = ref<'sampled-frames' | 'native-realtime' | 'native' | 'unavailable'>('sampled-frames')
 const liveVisionModeLabel = ref('兼容抽帧')
 const liveVisionModeReason = ref('当前按最新视频帧进行视觉理解。')
 const liveVisionLimitations = ref<string[]>([])
+const liveStreamCaptions = ref<LiveCaptionTurn[]>([])
+const liveStreamCapabilities = ref('')
 const liveVisionObservation = ref('')
 const liveVisionTimeline = ref<TimedObservation[]>([])
 const liveVisionPaused = ref(false)
@@ -833,6 +836,8 @@ function stopLiveVision(message = '') {
   liveLedger.clear()
   liveAdaptive.reset()
   liveStreamLastObservationAt = 0
+  liveStreamCaptions.value = []
+  liveStreamCapabilities.value = ''
   liveVisionMetrics.value = { latencyMs: null, intervalMs: 500, dropped: 0 }
   liveVisionPhase.value = 'idle'
   liveStreamFrames.clear()
@@ -953,9 +958,22 @@ function receiveLiveStreamObservation(raw: string, ticket: number, projectId: st
     liveVisionModeReason.value = typeof event.reason === 'string' && event.reason
       ? event.reason : mode === 'native-realtime'
         ? '当前会话使用原生实时模型。' : '当前会话按最新视频帧理解。'
+    liveStreamCapabilities.value = describeLiveCapabilities(event.provider_capabilities)
+    liveStreamCaptions.value = []
     liveVisionLimitations.value = mode === 'native-realtime'
       ? ['模型连接失败时会自动降级为兼容抽帧模式。']
       : ['当前只处理最新视频帧，不提供原生音频流回复。', '理解结果可能晚于正在播放的画面。']
+    if (mode === 'sampled-frames' && typeof event.degraded_to === 'string' && event.degraded_to
+      && event.degraded_to !== 'sampled-frames') {
+      liveVisionLimitations.value = [...liveVisionLimitations.value, `原生通道未起：已回退到 ${event.degraded_to}。`]
+    }
+    return
+  }
+  if (event.type === 'model.delta' || event.type === 'audio.transcript') {
+    const next = appendCaptionTurn(liveStreamCaptions.value, event)
+    if (next !== liveStreamCaptions.value) liveStreamCaptions.value = next
+    liveStreamLastObservationAt = Date.now()
+    refreshLiveVisionPhase()
     return
   }
   if (event.type === 'heartbeat' || event.type === 'cancel.ok') return
@@ -1102,6 +1120,8 @@ async function startMediaVision(source: 'screen' | 'camera') {
     liveVisionTimeline.value = []
     liveVisionMetrics.value = { latencyMs: null, intervalMs: 500, dropped: 0 }
     liveStreamLastObservationAt = 0
+    liveStreamCaptions.value = []
+    liveStreamCapabilities.value = ''
     liveVisionPhase.value = 'connecting'
     liveVisionStatus.value = `${liveVisionSource.value}已启动，正在连接实时视觉流…`
     stream.getVideoTracks()[0]?.addEventListener('ended', () => stopLiveVision(`${liveVisionSource.value}已结束。`), { once: true })
@@ -1936,10 +1956,11 @@ onBeforeUnmount(() => {
             <video v-if="screenSharing || cameraSharing" ref="sharedVideo" class="acp-shared-video" autoplay muted playsinline aria-label="正在共享给 AI 的实时画面" />
             <div v-if="liveVisionActive && liveVisionSnapshotUrl" class="acp-focus-controls"><span>{{ liveVisionFocus ? '正在观察圈选区域' : '正在观察整个画面' }}</span><button v-if="!liveVisionSelecting" @click="beginFocusSelection()">{{ liveVisionFocus ? '重新圈选' : '圈选重点区域' }}</button><button v-if="liveVisionSelecting" @click="liveVisionSelecting = false; focusPointerCancel()">取消圈选</button><button v-if="liveVisionFocus" @click="clearFocusSelection()">恢复整屏</button></div>
             <div v-if="liveVisionActive && liveVisionSnapshotUrl" class="acp-focus-viewport"><div class="acp-focus-snapshot" :class="{ selecting: liveVisionSelecting }" @pointerdown="focusPointerDown" @pointermove="focusPointerMove" @pointerup="focusPointerUp" @pointercancel="focusPointerCancel"><img :src="liveVisionSnapshotUrl" alt="用于圈选重点区域的当前画面快照" draggable="false"><span v-if="liveVisionDraftFocus || liveVisionFocus" class="acp-focus-region" :style="focusRegionStyle(liveVisionDraftFocus || liveVisionFocus)" /></div></div>
-            <p class="acp-live-vision-mode"><b>当前模式：{{ liveVisionModeLabel }}</b> · {{ liveVisionModeReason }}<span v-if="liveVisionMode === 'sampled-frames'"> 原生实时模型可用前，系统会继续保留此兼容路径。</span></p>
+            <p class="acp-live-vision-mode"><b>当前模式：{{ liveVisionModeLabel }}</b> · {{ liveVisionModeReason }}<span v-if="liveStreamCapabilities"> · 模型能力：{{ liveStreamCapabilities }}</span><span v-if="liveVisionMode === 'sampled-frames'"> 原生实时模型可用前，系统会继续保留此兼容路径。</span></p>
             <p>{{ liveVisionStatus }}<br>{{ screenSharing || cameraSharing ? '视频持续播放并传送最新画面；当前视觉模型按帧理解，分析可能滞后于视频。' : 'AI 根据画面变化采样分析，静止画面约 20 秒复查一次。' }}</p>
             <ul v-if="liveVisionLimitations.length" class="acp-live-vision-limitations"><li v-for="item in liveVisionLimitations" :key="item">{{ item }}</li></ul>
             <ol v-if="liveVisionTimeline.length" class="acp-vision-timeline"><li v-for="(item, index) in liveVisionTimeline" :key="`${item.at}-${index}`"><time>{{ item.at }}</time><span>{{ item.observation }}</span></li></ol>
+            <ul v-if="liveStreamCaptions.length" class="acp-live-captions" aria-live="polite"><li v-for="(item, index) in liveStreamCaptions" :key="`cap-${index}`" :class="item.role === 'user' ? 'acp-caption-user' : 'acp-caption-assistant'"><b>{{ item.role === 'user' ? '你说' : 'AI' }}</b><span>{{ item.text }}</span><em v-if="!item.done">（正在回答…）</em></li></ul>
           </section>
           <details class="acp-visual-click-panel">
             <summary><b>高级：桌面控件操作</b><small>可选 · 仅操作当前项目已嵌入的窗口</small></summary>
@@ -2189,6 +2210,15 @@ button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent);
 .acp-focus-snapshot img { display: block; width: 100%; height: auto; user-select: none; }
 .acp-focus-region { position: absolute; box-sizing: border-box; border: 2px solid #26bd8b; background: rgba(38, 189, 139, .16); pointer-events: none; }
 .acp-live-vision-panel p { margin: 7px 0 0; color: var(--text-muted); font-size: 11px; }
+.acp-live-vision-mode { padding: 7px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-raised); }
+.acp-live-vision-mode b { color: var(--text); }
+.acp-live-vision-limitations { margin: 7px 0 0; padding-left: 18px; color: var(--text-muted); font-size: 10px; line-height: 1.5; }
+.acp-live-captions { margin: 9px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow: auto; }
+.acp-live-captions li { display: flex; gap: 7px; align-items: baseline; padding: 6px 8px; border-radius: 6px; background: var(--bg-raised); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.acp-live-captions b { flex: none; font-size: 10px; color: var(--text-muted); }
+.acp-live-captions em { font-style: normal; color: var(--text-muted); font-size: 10px; }
+.acp-caption-assistant { border-left: 2px solid #26bd8b; }
+.acp-caption-user { border-left: 2px solid var(--accent); }
 .acp-live-vision-panel pre { margin: 9px 0 0; padding: 9px; max-height: 210px; overflow: auto; white-space: pre-wrap; font: inherit; font-size: 11px; line-height: 1.6; color: var(--text); background: var(--bg-raised); border-radius: 6px; }
 .acp-vision-timeline { margin: 9px 0 0; padding: 0 0 0 20px; max-height: 230px; overflow: auto; color: var(--text); font-size: 11px; line-height: 1.6; }
 .acp-vision-timeline li { padding: 5px 0; overflow-wrap: anywhere; }

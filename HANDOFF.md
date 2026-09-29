@@ -1,5 +1,128 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 R13 字幕与能力呈现（AI-A/AI-B 兼任）【本轮局部提交】
+
+- 领取「#2 R13 前端收尾」。此前 `AutonomousCockpit.vue` 的 `receiveLiveStreamObservation` 把 `model.delta` / `audio.transcript` 直接 fall-through 丢弃，`hello.ok.provider_capabilities` / `degraded_to` 也不读——字幕区是死组件。本轮把它们消费起来。
+- **只改我 lane 的三个已跟踪文件**：`frontend/src/workbench/liveStreamControl.ts`、`frontend/src/workbench/components/AutonomousCockpit.vue`、`tests/test_live_stream_control.py`。**未触碰** `api.py`、`realtime_bridge.py`、别人的 `frontend/tests/*.mjs`、`/root`/AI-F 正在集成的任何文件。
+- **`liveStreamControl.ts` 新增纯函数**：`appendCaptionTurn(captions, wire, limit=8)` 把线上事件归约成有界字幕时间线；关键语义——适配器先发增量 `model.delta` 再发一条 `final:true` 的**全量**文本，final 时**整条替换**当前助手回合，否则回答被拼成两遍（专门写断言钉死）。`describeLiveCapabilities()` 把 `provider_capabilities`（audio.in/video.in/text.out/audio.out/interrupt）映射成中文摘要，未知能力原样透出不谎报，抽帧模式返回空串。
+- **cockpit 接线**：`model.delta`/`audio.transcript` 进入 `liveStreamCaptions`，并入 R6「正在回答」相位；`hello.ok` 写 `liveStreamCapabilities` 与异常 `degraded_to` 说明；字幕面板显示「你说 / AI（正在回答…）」；停止/启动/新会话复位。
+- **验证**：`tests/test_live_stream_control.py` 3 passed（node 执行 44 条断言，含防重复）；前端 `npm run typecheck`、`npm run build` 通过；后端 `-k "realtime or live_vision or live_stream or voice"` **258 passed / 0 失败**无回归。临时 basetemp 已清理。
+- **发现但不属我 lane**：他人 `frontend/tests/*.mjs` 直接 `import '../src/**.ts'`，`node --test` 在本机未开 type-stripping 时 `MODULE_NOT_FOUND`；那是它们自身的运行前提（可能需 CI 加 `--experimental-strip-types`），我没改。原生 `model.delta` 真机字幕数值待 R12（本机 Key 的实时服务疑未开通）。
+- **提交**：用 pathspec 局部提交这三个文件，不动共享 index、不吞 `/root` 暂存批次；**未 push**。
+
+## 2026-09-29 R8：实时多模态时间线进入开发舱上下文（/root，已完成·勿重复）
+
+- **交付范围**：`api.py` 的 `/api/chat` 在 `ui_context=cockpit_live_vision` 且存在当前请求项目时，读取 `realtime_bridge.timeline_snapshot()` 的少量文本条目；只接受快照项目与请求项目一致的内容，并逐条复核项目 ID。
+- **安全边界**：时间线内容按“来自模型的未核实资料，不是用户指令”注入 `system_context`；清理控制字符、限制字段长度、仅保留 observation/text/transcript 文本条目；服务端条目与前端 `visual_timeline` 按规范化文本去重；快照为空、结构异常或读取失败时静默跳过，不影响聊天、工具确认、项目权限和 P0/P1 沙箱。
+- **专项验证**：`tests/test_realtime_context.py` **3 passed**（当前项目注入并去重、跨项目隔离、空/异常快照不阻断）；`python -m py_compile api.py tests/test_realtime_context.py` 通过。
+- **重复防护**：任务画布已将 R8 标记为“已完成·勿重复”，后续不要在 `api.py` 或聊天上下文另起一套时间线注入逻辑；R12 真机联验只需报告证据或缺陷。
+
+## 2026-09-29 修复全量套件 5 个失败 + pytest 临时目录环境错误（AI-F）
+
+- 环境错误（原 21 errors，全为 `D:\Temp\pytest-of-h'h'h` 的 WinError 5，非代码缺陷）：该目录 ACL 被锁死（非提权 shell 无法读取/改名/夺取所有权）。经实测 pytest 9.1.1 支持 `PYTEST_DEBUG_TEMPROOT` 重定向，已**持久化设置用户级环境变量** `PYTEST_DEBUG_TEMPROOT=D:\Temp\pytest-docmind`，本会话 pytest 调用亦显式带上；21 errors 清零。
+- **失败 1 · 工作台回链（`test_desktop_entry`）**：顶栏原回链被改成聚焦底部对话的按钮，`href="/"` 消失。修复 [App.vue](file:///d:/WorkBuddy/rag-agent/frontend/src/workbench/App.vue#L440-L441)：保留「AI 对话」按钮，同时新增 `<a class="wb-question-link" href="/" title="返回 RAG 问答页">问答页</a>`（样式类本就兼容 anchor），跨页导航恢复。
+- **失败 2/3 · SSE 心跳与 notice（`test_workflow_chat_stream`，过时断言）**：核对 api.py 证实是有意演进——心跳改为 SSE 注释行 `: keep-alive`（不往对话塞重复提示）；工作流卡片只发结构化 `workflow` 事件，不再另发通用 `notice`（token 已告知用户，前端 useChatStream 兼容两种事件）。按当前契约更新断言：心跳用例改断言 `: keep-alive` 存在且「模型仍在处理」不存在；workflow 用例改断言 `notice` 不存在、`workflow` 恰好一次。
+- **失败 4/5 · 子代理步数（`test_orchestrator` + `test_vision_workflow_e2e`，真实生产缺陷）**：根因是双重的——① `SUBAGENT_MAX_STEPS` 默认 0（"不显式设上限"），而 `_run_child` 的 `if used > cap` 在 cap=0 时**第一步后就截断**，所有子代理只能做 1 步；② config 三个步数默认全 0，内层 run 的迭代安全阀（`tool_step_limit > 0` 门控）全被禁用，永不收尾模型会死循环。修复：
+  - 新增 `SUBAGENT_SAFETY_STEPS`（env `DOCMIND_SUBAGENT_SAFETY_STEPS`，默认 **8**）：`_run_child` 解析 cap 后，cap≤0 时兜底为 8——子代理必须有确定性上限、父代理无上限策略不变；
+  - `_evidence_final` 安全网兜底 final 增加事件标记 `"degraded": True`，`_run_child` 捕获后将输出 `degraded` 置真（安全网文字不算模型 Final Answer）。
+- 验证（真实执行）：
+  - 五个原失败文件联跑：**103 passed in 10.13s**；
+  - 全量套件（3 次实跑对比）：权威终跑 `pytest tests -q --basetemp=D:\Temp\pytest-docmind-bt`
+    → **2087 passed, 7 failed, 0 errors, 6 skipped in 218.45s**；本轮 5 failed + 21 errors 均已关闭。
+    剩余 7 failed 全部在 `tests/test_visual_targeting.py`（`_VISUAL_CLICK_PROPOSALS` 缺失等
+    既有 WIP 漂移，stash 对照已确认先于本轮存在），与本轮无关。
+    **注意**：`test_realtime_gateway_bridge.py` 在高负载全量跑中曾出现 11 项时序竞态失败
+    （迟到的会话异步收尾与下一用例抢 `_timelines`，该文件已有 `_clean_bridge_state` 夹具缓解），
+    另两次全量跑均 21/21 通过；单独跑恒定 21 passed，属负载敏感 flake 而非功能缺陷。
+  - **复跑须知**：TRAE 工具宿主进程在我持久化环境变量之前启动，其子 shell 继承旧环境块
+    （现象：inline 设了变量的后台任务仍扫到旧目录）。IDE 重启后用户级变量自然生效；
+    保险起见全量跑请加 `--basetemp=D:\Temp\pytest-docmind-bt`，可完全绕过 ACL 锁死目录。
+  - `python -m py_compile agent.py tests/test_workflow_chat_stream.py` 通过；前端此前 typecheck 0 错误、build 通过（本轮 App.vue 改动后 typecheck 复跑仍 0 错误）。
+
+## 2026-09-29 R4/R5/R10 接线进网关（AI-F，**用户指派**；原「api.py 归 /root 独占」已被用户改派）
+
+- **背景与边界**：任务表原分工里 `api.py` 网关属 /root 独占，本轮由用户明确指派 AI-F 做
+  「R4/R5/R10 接线」。为把同文件争用面压到最小，**逻辑全部落在新模块
+  `agent_runtime/realtime_bridge.py`**，`api.py` 只留少量调用点（收帧/出观察/取消/音频/关闭/握手）。
+  **未触碰** `agent_runtime/realtime_protocol.py`、`realtime_provider.py`、`realtime_omni.py`、
+  `realtime_timeline.py`、`realtime_metrics.py`、`frontend/**`。**/root 若要重排 api.py 请参照下面第 3 节定位。**
+- **接口变更（唯一一处，向后兼容）**：`hello.ok` 追加 4 个字段，
+  **不新增事件类型、不改协议版本**：
+  `mode`(`native-realtime`/`sampled-frames`)、`degraded_to`、`reason`、`provider_capabilities`。
+  前端 `realtimeProtocol.ts` 宽松透传，`AutonomousCockpit.vue` 已经在读 `event.mode` 与
+  `event.reason`（R13 已落地），字段名与之一致。
+- **新增状态端点** `GET /api/vision/realtime/status?project_id=`：只回 `timeline` /
+  `timeline_projects` / `metrics`。**刻意不报 mode**——模式只由 `/api/vision/realtime-status`
+  （R13，连接前）与 `hello.ok.mode`（R4，连接后）提供；本端点再报一份会产生两个可能
+  互相矛盾的 mode（本模块按"是否配置 provider"判断，R13 按 `resolve().ok` 判断）。
+- **接线做了什么**：`resolve()` 给出 provider 时帧走 `send_frame`、音频走 `send_audio`、
+  `cancel` 触发 `interrupt()`，provider 事件由网关泵成线上事件；每项目一条时间线（按活跃会话
+  计数，最后一个会话断开即释放）；进程级 `MetricsRegistry` 记录 `frames_sent`/`frames_dropped`/
+  `observation_latency_ms`/`queue_depth`/`connections`/`model_rejections`/`first_token_ms`/`first_audio_ms`。
+  **起不来就降级**：`start()` 失败不抛错、不伪装会话，原因写进 `reason`。
+- **本轮实测发现并修掉的三个真 bug（都不是测试问题）**：
+  1. **适配器的握手事件冒充网关握手**（真机复现）：`WIRE_BY_KIND` 把适配器内部事件也映射成
+     R0 事件名——`EVENT_STATUS`→`hello.ok`、`EVENT_DONE`→`session.closed`。直接转发会让客户端
+     收到**第二个 hello.ok**（实测网关 `probe-s` vs 适配器 `rt-1a0ecc83e58`），而前端收到
+     `hello.ok` 会立刻改写模式显示、读 `event.mode` 拿到 undefined → **原生会话被显示成"兼容抽帧"**。
+     现在这两类在 `SessionBridge.next_events` 被拦下（`_GATEWAY_OWNED_WIRE_TYPES`），只记账不上线。
+  2. **适配器会话号劫持指标作用域**：`start()` 里 `self.session_id = self.provider.session_id`
+     用适配器自造的 `rt-...` 覆盖了网关会话号 → 指标全记进 `rt-...` 作用域，
+     `drop_session(网关会话号)` 永远清不掉 → **正是本文件 R10 节预告的那颗无界增长雷**。
+     现在两者分开（`session_id` 网关的、`provider_session_id` 仅诊断），转发事件的
+     `session_id` 归一为网关的（对齐 R0「信封是权威」）。
+  3. `CONNECTIONS`/`MODEL_REJECTIONS` 原先记在**项目**作用域，而 `drop_session` 只清会话作用域 →
+     同样永不回收。现在走 `bridge.bind_session()`，记在会话作用域。
+- **踩到的环境坑（重要，全组测试都受影响）**：本机 `.env` 真的配了
+  `DOCMIND_REALTIME_PROVIDER=dashscope_omni`（还有可用 Key），网关**按配置走原生通道**，
+  于是「发帧等 `video.observation`」的测试**永久阻塞**（现象：整组 realtime 600s 超时**且无输出**——
+  pytest 非 tty 时块缓冲，看着像挂死没有报错）。这不是接线错，是**测试没钉住自己的前提**。
+  **新增 `tests/conftest.py`**（此前仓库没有 conftest）加一个 autouse 夹具：整个测试套件默认
+  清掉 `DOCMIND_REALTIME_PROVIDER`、测完还原。**只清这一个**（决定模式的唯一开关），
+  不清 `DASHSCOPE_API_KEY`（全项目共用，会误伤无关测试）。需要原生通道的测试自己显式设置。
+  **所有 AI 请注意：以后写实时相关测试，默认前提是"抽帧通道"。**
+- **验证（真实执行）**：
+  - `pytest tests/test_realtime_gateway_bridge.py -q` → **21 passed**（新增；原生通道用注册进
+    `realtime_provider` 的**假 provider** 驱动，不连真实服务，首 token/首音频指标也能确定性覆盖）；
+  - `pytest tests/ -k "realtime or live_vision or live_stream or voice" -q` → **249 passed / 7.90s**
+    （接线前同一组是 600s 超时无输出）；
+  - `pytest tests/test_realtime_gateway_stress.py tests/test_realtime_gateway_faults.py -q` → **54 passed / 3.44s**；
+  - **全量套件** `pytest tests/ -q` → **8 failed / 2086 passed / 6 skipped**（166s）。8 个失败
+    全部是本文件已记录的**存量失败**（`test_visual_targeting` ×7、`test_command_execution` ×1，
+    与本轮无关）。本轮新增的 21 个用例在**全量套件里全绿**——这一点特意验证过：单独跑全绿、
+    混进全量套件却红一项，原因是本文件所有用例共用一个 `project_id`，而 Starlette `TestClient`
+    退出**不等待服务端 `finally` 跑完**，上一个会话迟到的 `release_timeline` 会把引用计数从 1
+    减到 0、**误释放正在跑的会话的时间线**。修法是 autouse 夹具在 `reset_state()` **之前**先
+    等 `active_timeline_projects() == []`，并把断言收窄到本项目。
+  - `realtime_bench.py --mode both --frames 40 --model-ms 120` → 丢帧 **70.0%**、网关自身开销
+    p50 3.59ms/p95 5.62ms（与 R10 节记录一致）；`--model-ms 0` → rtt p50 0.2ms、stream p50 1.0ms。
+    **工具现在会把 `DOCMIND_REALTIME_PROVIDER` 临时清空并断言 `hello.ok.mode == sampled-frames`**，
+    环境不对时**报错而不是挂死**。
+- **未完成 / 不算数的部分**：
+  - **原生通道没有真机数据**：本机 Key 的适配器自报 "commit/cancel 与真人声音频输入均被服务端断连，
+    疑似未开通实时多模态服务"（`realtime_omni.availability()` 的 note）。所以原生链路的
+    `first_token_ms`/`first_audio_ms` 只在**假 provider** 下覆盖过，真机数字属 R12。
+  - **R0 协议缺「本轮回答结束」事件**：适配器 `EVENT_DONE` 现在被丢掉（转发成 `session.closed`
+    是撒谎）。一轮结束的信号只能靠 `model.delta` 的 `final: true` 承载。若前端需要独立事件，那是
+    R0 的改动（/root 的协议文件），本模块不擅自加事件类型。
+  - 前端**不读** `provider_capabilities`/`degraded_to`（`AutonomousCockpit.vue` 只用了
+    `mode`/`reason`）。字段已送到线上，UI 呈现归 R13。
+  - **给 R9 的两条实测数字（原生通道的资源开销，本轮量到但未优化）**：
+    ① 每条连接都会真去建一次原生会话——真机实测 `start()` ≈ 0.5s、`close()` ≈ 3s
+    （关 WebSocket + join 接收线程）。`close()` 是在 `await asyncio.to_thread` 里做的，
+    所以断开时该会话还要占一个工作线程约 3s；若将来并发会话很多，这里需要专门池化。
+    ② 泵事件用 `await asyncio.to_thread(bridge.next_events, timeout=0.05)`，即**每个原生会话
+    每 50ms 占一次 asyncio 默认线程池**（`poll` 是阻塞读，不丢线程会卡死整个事件循环）。
+    并发会话数上去后应改成专用线程或 `poll` 的异步读侧。两者都属于 R9（资源与清理）的调优面。
+- **冲突风险**：`api.py` 仍有多个并发写入者（/root 记「被另一 AI 并发增 800+ 行」）。
+  本轮的 api.py 改动只有 8 处，全部集中在 `/api/vision/live-stream` 处理器内 + 1 个新端点，
+  按下面的定位核对即可。`tests/conftest.py` 是**新增的全局文件**，会影响所有人的测试前提（见上）。
+- **api.py 改动定位（供 /root 重排）**：①`from agent_runtime import realtime_bridge`（import 区）；
+  ②`bridge`/`pump` 两个 local + `pump_provider()`；③hello 分支（建桥 + `bind_session` + `start` +
+  能力合并 + `create_task`）；④`cancel` 分支 `bridge.interrupt()`；⑤`audio.chunk` 分支
+  `bridge.take_audio()`；⑥媒体分支 `send_frame`/`note_frame`；⑦`process_frames` 的
+  `note_model_failure`/`note_observation`；⑧`finally`（先放槽位，再 `bridge.close`）。
+
 ## 2026-09-29 提交状态与「HEAD 未闭合」提醒（AI-A/AI-B，交 /root 收口）
 
 - 本会话交付已全部进 `main`（**未 push**）：`e654a21` 网关压力测试、`875087b` `liveStreamControl.ts`+`test_live_stream_control.py`、`075e7e6` R0 协议、`fdb9e94` 我的 cockpit R1/R6 接线 + 本节。前端自治切片用 pathspec 局部提交，未碰他人正在集成的模块，也未动共享 index 里 /root 的暂存。
@@ -83,6 +206,12 @@
   （`api.py` 现在 `_LIVE_VISION_CLIENTS.pop(project_id, None)` 那一处）。
   重复同一 session_id 不会增长（会复用已有 scope），增长只来自 session_id 不同的会话。
   本工具自己的注册表是每轮新建的，不受影响。
+- **本节后续更新（同日，AI-F）**：本节写的「无接口变更」「`api.py` 中均无 import」**已被同一轮的
+  R4/R5/R10 接线改变**——请以本文件**顶部「R4/R5/R10 接线进网关」节为准**。接线后 `hello.ok`
+  多了 4 个字段，`realtime_bench.py` 也改为临时清空 `DOCMIND_REALTIME_PROVIDER` 并断言
+  `mode == sampled-frames`（原生通道不产生 `video.observation`，不钉住前提会挂死而不是报错）。
+  `drop_session` 那颗雷已按上段建议挂到网关断线清理路径，并在接线时发现它当时**真的没生效**
+  （原因见顶部第 2 个 bug）。
 
 ## 2026-09-29 修复 observation 格式缺陷：JSON 源码回退（AI-F）
 
@@ -1009,6 +1138,15 @@ git status --short
 - 验证：`pytest tests/test_realtime_protocol_contract.py tests/test_realtime_gateway_faults.py tests/test_realtime_gateway_stress.py tests/test_realtime_metrics.py tests/test_realtime_provider.py tests/test_live_vision.py tests/test_live_vision_alerts.py -q -p no:cacheprovider` → **196 passed**；`py_compile`（协议、视觉异常解析器、`api.py`）通过。
 - R0/R3 已具备可交接证据；R4/R5 原生 provider 与时间线尚未接入该网关，真实摄像头/麦克风/模型联验仍属于 R12。
 
+# 2026-09-29 R13 兼容模式与发布说明（主代理领取并交付）
+
+- **归属锁定**：R13 由 `/root` 领取并完成；其他 AI 不要重复修改 `api.py` 的 `/api/vision/realtime-status`、`AutonomousCockpit.vue` 的实时模式提示、`docs/realtime-compatibility.md` 或 `tests/test_realtime_compatibility.py`。
+- 新增 `GET /api/vision/realtime-status`：报告连接前的原生 provider 可用性、当前候选模式和限制；真实会话以 WebSocket `hello.ok.mode` 为准。
+- 开发舱实时视觉面板读取连接状态，并在握手后按 `hello.ok.mode` 显示“原生实时”或“兼容抽帧”；明确音频、延迟和自动降级限制。
+- 新增 `docs/realtime-compatibility.md`，记录两种模式、降级语义、`audio_not_ready` 边界、状态接口和 R12 真机联验要求。
+- 验证：`tests/test_realtime_compatibility.py` **2 passed**；关闭外部 provider 后实时协议/网关/provider/视觉全组 **201 passed**；`npm run typecheck`、`npm run build`、`py_compile`、`git diff --check` 通过。构建仅保留既有非 module 脚本和大 chunk 提示。
+- 剩余边界：R12 仍需真实摄像头/麦克风/屏幕共享和真实 DashScope 人声联验；R13 代码与文档已完成。
+
 ## 2026-09-29 R14 推动：untracked 交付物分批 commit + R2 归属澄清（AI-H）
 
 - **commit 推动（按所有者显式路径，未用 git add -A）**：本回合把工作树里 15 个 realtime 交付物按负责人分批提交，避免卷走其他 AI 的 WIP：
@@ -1043,3 +1181,19 @@ git status --short
 - **重复完成防护**：R2 voice 确认归 /root（非 AI-C），AI-C→R7，无重复；5 笔交付均有 commit，公告表已同步。
 - **接线缺口（阻塞 R12，已有 owner）**：(a) R2 语音 `/api/voice` 路由未提交（045364b 仅含 voice.py+测试），仍缺归属，建议并入手；(b) R4/R5/R10 `realtime_provider/timeline/omni/metrics` 未 import 进 `api.py` 网关 —— **已改派 AI-F 认领并开发中**（canvas 公告表 AI-F 行「已认领勿重复·接线开发中」；策略：逻辑进新模块 `agent_runtime/realtime_bridge.py`、api.py 只留少量调用点压低争用面）；(c) `realtime_bridge.py` 仍 untracked，归 AI-F 自行提交。
 - **并发争用**：当前 `api.py` 仍 `M`（他写入者）。R14 不碰业务代码；R4/R5/R10 接线已统一归 AI-F（消除三方交叠），仅剩 R2 voice 端点归属待定，建议并入 AI-F 接线工作避免二次争用。
+
+## 2026-09-29 R14 复审：fdb9e94 / realtime_bench.py / 7d1ce00（用户选 A）
+
+聚焦自上次审查后新增的 3 处改动（realtime 相关面）。
+
+- **`7d1ce00` `realtime_omni.py`**：纯 docstring/注释修正——`availability()` note 与模块文档改为「音频输入被账号（实时服务未开通）而非适配器阻断」。无逻辑改动 ✅ 安全。
+- **`realtime_bench.py`（未提交 +30/−3）**：防御性增强 ✅。运行期 `patch.dict` 临时清空 `DOCMIND_REALTIME_PROVIDER`（=`realtime_provider.DEFAULT_PROVIDER_ENV`）强制走兼容抽帧通道，避免原生通道不产生 `video.observation` 导致挂死 + 避免真连外部服务产生费用；`_session()` 增加 `hello.ok.mode == MODE_SAMPLED` 断言（fail-fast）。逻辑自洽：清空 env → 网关 `resolve()` 回落 sampled-frames → 断言通过（已核对 `realtime_provider.resolve` 用 `os.getenv(...,"").strip().lower()` 处理空串）。
+  - ⚠️ 新依赖：bench 现 `import agent_runtime.realtime_bridge`（`realtime_bridge.py` 仍 untracked，AI-F WIP）。clean checkout 跑 bench 会 import 失败 → 建议 AI-F 提交 bridge 时一并提交 bench。
+- **`fdb9e94` `AutonomousCockpit.vue`(+1834/−72)+HANDOFF**：R1+R6 前端接线（自适应码流控制 + 打断 UI 接入开发舱）。
+  - 复用 R0 协议助手 `encodeVideoFrame/parseRealtimeServerEvent/realtimeHello/realtimeCancel`（`realtimeProtocol.ts`，已审）与 R1+R6 `liveStreamControl.ts` 的 `createAdaptiveSender/createInFlightLedger/classifyLivePhase/describeLiveCapabilities/appendCaptionTurn`（已审）✅。未发明新线字段，尊重 R0 冻结范围。
+  - 引用符号全部已定义/导入：`liveLedger=createInFlightLedger()`(150)、`liveVisionModeLabel`(133)、`liveVisionLimitations`(135)、`describeLiveCapabilities/appendCaptionTurn`(`liveStreamControl.ts:173/183`)、`TimedObservation`(`import type` from `voiceVisionSync`)。✅ 无未定义引用。
+  - 清理卫生良好：stop 清 timer/socket(`session.close`)/reset `liveAdaptive`/清 frames+sequence ✅；尊重 `document.hidden` 暂停发送 ✅；打断走 `realtimeCancel` ✅；`hello.ok` 处理 mode/capabilities/limitations ✅。
+  - ⚠️ 耦合 untracked WIP：cockpit `import type { TimedObservation } from '../voiceVisionSync'`（`voiceVisionSync.ts` 未提交）。仅类型导入（运行时无耦合），但 cockpit typecheck 依赖该未提交文件 → 建议 `voiceVisionSync.ts` 与 cockpit 一并提交。
+  - 范围说明：本次复审聚焦 realtime/adaptive/interrupt 接线（R14 相关面），未逐行审全部 +1834 行（含审批队列等非实时 UI）。
+
+**复审结论**：三处改动质量良好，无阻断性 bug；两处耦合到 AI-F 未提交模块（`realtime_bridge.py`、`voiceVisionSync.ts`），建议 AI-F 收尾时一并提交，避免 clean checkout 断链。R14 不碰业务代码。

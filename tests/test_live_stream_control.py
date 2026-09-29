@@ -31,7 +31,8 @@ pytestmark = pytest.mark.skipif(
 
 _HARNESS = """\
 import assert from 'node:assert';
-import { createAdaptiveSender, classifyLivePhase, LIVE_PHASE_LABELS, createInFlightLedger } from './liveStreamControl.js';
+import { createAdaptiveSender, classifyLivePhase, LIVE_PHASE_LABELS, createInFlightLedger,
+  appendCaptionTurn, describeLiveCapabilities } from './liveStreamControl.js';
 
 const now = () => Date.now();
 
@@ -110,7 +111,45 @@ assert.strictEqual(ledger.onObserved(9, t0), null, '未登记序号不得编造�
 ledger.onSent(4, now(), now()); ledger.clear();
 assert.strictEqual(ledger.pendingCount(), 0, 'clear 后不得残留（会话重连卫生）');
 
-console.log('OK ' + JSON.stringify({ checks: 28 }));
+// ---- 字幕归约（R13：model.delta / audio.transcript） -------------------------
+let caps = appendCaptionTurn([], { type: 'audio.transcript', text: '这里的按钮不对' });
+assert.strictEqual(caps.length, 1);
+assert.strictEqual(caps[0].role, 'user');
+assert.strictEqual(caps[0].done, true, '用户转写天然是完整句');
+
+caps = appendCaptionTurn(caps, { type: 'model.delta', text: '我看' });
+caps = appendCaptionTurn(caps, { type: 'model.delta', text: '一下' });
+assert.strictEqual(caps.length, 2, '增量应并入同一助手回合');
+assert.strictEqual(caps[1].text, '我看一下');
+assert.strictEqual(caps[1].done, false);
+
+// 适配器先发增量 .delta、再发一条全量 .done：final 必须整条替换，拼起来会重复一遍
+caps = appendCaptionTurn(caps, { type: 'model.delta', text: '我看一下，按钮确实越界了', final: true });
+assert.strictEqual(caps[1].text, '我看一下，按钮确实越界了', 'final 全量替换失败，回答会被拼成两遍');
+assert.strictEqual(caps[1].done, true);
+
+caps = appendCaptionTurn(caps, { type: 'model.delta', text: '下一轮' });
+assert.strictEqual(caps.length, 3, 'final 之后的新 delta 必须开新回合');
+
+let c2 = appendCaptionTurn([], { type: 'model.delta', text: '半句' });
+c2 = appendCaptionTurn(c2, { type: 'model.delta', final: true });
+assert.strictEqual(c2[0].text, '半句', 'final 无全量文本时用已累积文本收尾');
+assert.strictEqual(c2[0].done, true);
+
+assert.strictEqual(appendCaptionTurn(caps, { type: 'model.delta', text: '   ' }), caps, '空增量不记账');
+assert.strictEqual(appendCaptionTurn(caps, { type: 'video.observation', text: 'x' }), caps, '无关事件不得进入字幕流');
+
+let many = [];
+for (let i = 0; i < 20; i++) many = appendCaptionTurn(many, { type: 'audio.transcript', text: 'u' + i });
+assert.strictEqual(many.length, 8, '字幕窗口必须有界');
+assert.strictEqual(many[many.length - 1].text, 'u19');
+
+assert.match(describeLiveCapabilities(['audio.in', 'text.out']), /麦克风音频输入.*文字回复/);
+assert.strictEqual(describeLiveCapabilities(undefined), '', '抽帧模式没有能力表，返回空串而不是报错');
+assert.strictEqual(describeLiveCapabilities([]), '');
+assert.match(describeLiveCapabilities(['weird.cap']), /weird\.cap/, '未知能力原样透出，不谎报');
+
+console.log('OK ' + JSON.stringify({ checks: 44 }));
 """
 
 
@@ -155,4 +194,8 @@ def test_cockpit_wiring_uses_the_control_module():
     assert "createAdaptiveSender" in source and "liveAdaptive.plan()" in source
     assert "classifyLivePhase" in source and "LIVE_PHASE_LABELS" in source
     assert "realtimeCancel" in source, "打断按钮必须通过 R0 的 cancel 控制包实现"
+    assert "appendCaptionTurn" in source and "model.delta" in source and "audio.transcript" in source, \
+        "cockpit 必须消费 R4 的回答流/转写事件，否则字幕区是死组件"
+    assert "describeLiveCapabilities" in source and "provider_capabilities" in source, \
+        "hello.ok 送到的模型能力必须在 UI 呈现（R13 验收：界面说明当前模式和限制）"
     assert "1280 / video.videoWidth, 720" not in source, "固定 1280/720 采集应已被自适应档位取代"

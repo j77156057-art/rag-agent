@@ -161,3 +161,48 @@ export function createInFlightLedger(): InFlightLedger {
     clear() { frames.clear() },
   }
 }
+
+export interface LiveCaptionTurn { role: 'user' | 'assistant'; text: string; done: boolean }
+
+const CAPABILITY_LABELS: Record<string, string> = {
+  'audio.in': '麦克风音频输入', 'video.in': '视频帧输入', 'text.out': '文字回复',
+  'audio.out': '语音回复', interrupt: '可打断',
+}
+
+/** provider_capabilities 的中文一行摘要；没有能力信息时返回空串（抽帧模式）。 */
+export function describeLiveCapabilities(caps: unknown): string {
+  if (!Array.isArray(caps) || caps.length === 0) return ''
+  return caps.map(item => CAPABILITY_LABELS[String(item)] || String(item)).join(' · ')
+}
+
+/**
+ * 把 model.delta / audio.transcript 线上事件归约成有界字幕时间线。
+ * 关键语义：适配器先发增量 .delta，再发一条 final 的全量文本——final 时必须
+ * **整条替换**当前助手回合，否则回答会被拼接成两遍。
+ */
+export function appendCaptionTurn(
+  captions: LiveCaptionTurn[],
+  wire: { type: string; text?: unknown; final?: unknown },
+  limit = 8,
+): LiveCaptionTurn[] {
+  const text = typeof wire.text === 'string' ? wire.text.trim() : ''
+  if (wire.type === 'audio.transcript') {
+    if (!text) return captions
+    const spoken: LiveCaptionTurn = { role: 'user', text, done: true }
+    return [...captions, spoken].slice(-limit)
+  }
+  if (wire.type !== 'model.delta') return captions
+  const last = captions[captions.length - 1]
+  const streaming = last && last.role === 'assistant' && !last.done ? last : null
+  if (wire.final === true) {
+    const finalText = text || (streaming ? streaming.text : '')
+    if (!finalText) return captions
+    const closed: LiveCaptionTurn = { role: 'assistant', text: finalText, done: true }
+    return (streaming ? [...captions.slice(0, -1), closed] : [...captions, closed]).slice(-limit)
+  }
+  if (!text) return captions
+  const open: LiveCaptionTurn = streaming
+    ? { role: 'assistant', text: streaming.text + text, done: false }
+    : { role: 'assistant', text, done: false }
+  return [...(streaming ? captions.slice(0, -1) : captions), open].slice(-limit)
+}
