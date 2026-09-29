@@ -32,7 +32,8 @@ pytestmark = pytest.mark.skipif(
 _HARNESS = r"""
 import assert from 'node:assert';
 import { createAdaptiveSender, classifyLivePhase, LIVE_PHASE_LABELS, createInFlightLedger,
-  appendCaptionTurn, closeUserTranscript, describeLiveCapabilities } from './liveStreamControl.js';
+  appendCaptionTurn, closeUserTranscript, describeLiveCapabilities,
+  shouldDispatchVoiceTurn } from './liveStreamControl.js';
 
 const now = () => Date.now();
 
@@ -169,6 +170,34 @@ let bounded = [];
 for (let i = 0; i < 12; i++) bounded = closeUserTranscript(bounded, 'u' + i, false);
 assert.strictEqual(bounded.length, 8, '用户字幕窗口同样有界');
 
+// ---- 语音轮次的噪音门控：误识别/旁音不许起 Agent 轮（全是硬条件，不猜意图）--------
+const T = 1_000_000;
+assert.strictEqual(shouldDispatchVoiceTurn('帮我把按钮往右挪一点', {}, T), true, '正常指令必须转交');
+
+// 语气词与空串：去掉标点和语气词后什么都不剩
+assert.strictEqual(shouldDispatchVoiceTurn('嗯', {}, T), false, '单字语气词不转交');
+assert.strictEqual(shouldDispatchVoiceTurn('啊？', {}, T), false, '语气词加问号不转交');
+assert.strictEqual(shouldDispatchVoiceTurn('。。。', {}, T), false, '纯标点不转交');
+assert.strictEqual(shouldDispatchVoiceTurn('   ', {}, T), false, '空白不转交');
+assert.strictEqual(shouldDispatchVoiceTurn('嗯嗯啊啊', {}, T), false, '纯语气词串不转交');
+
+// 但语气词**开头的正常句子**必须照常转交（别把「嗯，帮我改一下」误杀）
+assert.strictEqual(shouldDispatchVoiceTurn('嗯，帮我改一下这个按钮', {}, T), true, '带内容的句子要转交');
+assert.strictEqual(shouldDispatchVoiceTurn('改', {}, T), true, '单字实义指令（改/停/继续）不能误杀');
+
+// 同一句话重复（含标点差异）：误识别常吐两遍
+assert.strictEqual(shouldDispatchVoiceTurn('你好。', { text: '你好', at: T - 5000 }, T), false,
+  '同句（仅标点不同）不得重复转交');
+assert.strictEqual(shouldDispatchVoiceTurn('你好', { text: '你好', at: T - 5000 }, T), false);
+assert.strictEqual(shouldDispatchVoiceTurn('换个说法', { text: '你好', at: T - 5000 }, T), true,
+  '换了内容就要转交');
+
+// 连发保护：同一句被切成两段会连着来
+assert.strictEqual(shouldDispatchVoiceTurn('先看左侧栏', { text: '上一句', at: T - 300 }, T), false,
+  '距上次转交太近的连发只发一次');
+assert.strictEqual(shouldDispatchVoiceTurn('先看左侧栏', { text: '上一句', at: T - 5000 }, T), true,
+  '隔开足够久就照常转交');
+
 assert.match(describeLiveCapabilities(['audio.in', 'text.out']), /麦克风音频输入.*文字回复/);
 assert.strictEqual(describeLiveCapabilities(undefined), '', '抽帧模式没有能力表，返回空串而不是报错');
 assert.strictEqual(describeLiveCapabilities([]), '');
@@ -237,8 +266,10 @@ def test_cockpit_wiring_uses_the_control_module():
         "model.audio 必须按 wire 格式解码，未知编码不得静默播放"
     assert "sendNativeAudioReady" in source and "liveStreamReadyForVideo" in source, \
         "native provider 要求先有音频：视频发送必须等待音频就绪闸门"
-    assert "sendVoiceTurnToAgent" in source and "【语音指令】" in source, \
-        "语音转写必须转交主 Agent：实时模型没有工具通道，改文件只能由主 Agent 执行"
+    assert "sendVoiceTurnToAgent" in source and "shouldDispatchVoiceTurn" in source, \
+        "语音转写必须转交主 Agent，且先过噪音门控：实时模型没有工具通道，改文件只能由主 Agent 执行"
+    assert "cockpit_voice_turn" in source, \
+        "语音轮次要带自己的 uiContext（框架说明走系统上下文，不作为用户消息展示）"
     assert "closeUserTranscript" in source and "if (!next) return" in source, \
         "转交必须与字幕记账走同一条判定：重放（null）时既不上字幕也不转交"
     assert "1280 / video.videoWidth, 720" not in source, "固定 1280/720 采集应已被自适应档位取代"

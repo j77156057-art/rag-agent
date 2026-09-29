@@ -10,14 +10,21 @@ export const aiApi = {
   askGrounded(
     question: string,
     h: SseStreamHandlers,
-    opts: { web?: boolean; thinking?: boolean | null; images?: Blob[]; sessionId?: string; uiContext?: ChatUiContext; visualTimeline?: { at: string; observation: string }[] } = {},
+    opts: { web?: boolean; thinking?: boolean | null; images?: Blob[]; sessionId?: string; uiContext?: ChatUiContext; visualTimeline?: { at: string; observation: string }[]; workflowId?: string; feedbackId?: string } = {},
   ): Promise<void> {
     const fd = new FormData()
     fd.append('question', question)
     fd.append('session_id', opts.sessionId || getSessionId())
     if (opts.uiContext) fd.append('ui_context', opts.uiContext)
-    if (opts.uiContext === 'cockpit_live_vision' && opts.visualTimeline?.length) {
+    // 语音轮次同样要看画面（「边看边聊」），所以与 cockpit_live_vision 一样带上时间线。
+    if ((opts.uiContext === 'cockpit_live_vision' || opts.uiContext === 'cockpit_voice_turn')
+      && opts.visualTimeline?.length) {
       fd.append('visual_timeline', JSON.stringify(opts.visualTimeline.slice(-5)))
+    }
+    // 桌面视觉复验：后端只在 ui_context=desktop_visual_review 时读取这两个编号对账。
+    if (opts.uiContext === 'desktop_visual_review') {
+      if (opts.workflowId) fd.append('workflow_id', opts.workflowId)
+      if (opts.feedbackId) fd.append('feedback_id', opts.feedbackId)
     }
     fd.append('web_mode', opts.web ? '1' : '0')
     if (opts.thinking === true) fd.append('thinking_mode', '1')

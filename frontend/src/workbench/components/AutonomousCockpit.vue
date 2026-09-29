@@ -18,7 +18,7 @@ import type { VisualActionLoop, VisualActionStep } from '../visualActionLoop'
 import { encodeVideoFrame, parseRealtimeServerEvent, realtimeHello, realtimeCancel } from '../realtimeProtocol'
 import {
   classifyLivePhase, createAdaptiveSender, createInFlightLedger, LIVE_PHASE_LABELS,
-  appendCaptionTurn, closeUserTranscript, describeLiveCapabilities,
+  appendCaptionTurn, closeUserTranscript, describeLiveCapabilities, shouldDispatchVoiceTurn,
 } from '../liveStreamControl'
 import type { LivePhase, LiveCaptionTurn } from '../liveStreamControl'
 import {
@@ -236,17 +236,28 @@ function appendLiveCaption(event: ReturnType<typeof parseRealtimeServerEvent>) {
   const next = closeUserTranscript(liveStreamCaptions.value, finalText, hadDraft)
   if (!next) return
   liveStreamCaptions.value = next
+  // 噪音门控：误识别与旁音不起 Agent 轮。挡下的回合在状态栏明说，不静默吞掉。
+  const now = Date.now()
+  if (!shouldDispatchVoiceTurn(finalText, lastVoiceDispatch, now)) {
+    liveVisionStatus.value = `「${finalText}」没有转交（像语气词或重复语音）；要执行就直接说一遍完整的意思。`
+    return
+  }
+  lastVoiceDispatch = { text: finalText, at: now }
   sendVoiceTurnToAgent(finalText)
 }
 /**
- * 语音指令转交主 Agent（A 档：**全部转交**）。
+ * 语音指令转交主 Agent（A 档：默认全部转交，但噪音挡在门外）。
  *
  * 为什么必须在我们这侧做：实时模型**没有工具通道**（网关只转发音频/视频/文本事件），
  * 它自己永远改不了文件。所以「接收到指令就让主 Agent 开始改」只能由我们把这条转写
  * 当成一条对话消息派进开发舱对话台——主 Agent 有工具、有工作流和审批门，由它判断该不该动手。
  *
- * 不传 uiContext：让对话台按既有规则自动选 cockpit_live_vision（附带实时观察时间线），
- * 当前画面也由对话台自动附上，这就是「边看边聊」的落地路径。
+ * 两条刻意的约定：
+ * - **prompt 只放用户原话**：框架说明一律走 uiContext（后端转成 system_context，不作为
+ *   用户消息展示）。先前把「【语音指令】…（来自开发舱实时语音…）」拼进 prompt，结果这段
+ *   内部说明以**用户自己的话**的形式出现在对话流里。
+ * - **uiContext = cockpit_voice_turn**：后端据此附加语音轮次的回答约束（最多两三句、
+ *   不罗列能力、闲聊时不提议改动），并且仍然附带实时观察时间线。
  */
 function sendVoiceTurnToAgent(text: string) {
   const projectId = getProjectId()
@@ -254,7 +265,8 @@ function sendVoiceTurnToAgent(text: string) {
   appEvents.emit('docmind:send-chat', {
     target: 'cockpit',
     projectId,
-    prompt: `【语音指令】${text}\n（来自开发舱实时语音；用户此刻正看着当前画面。）`,
+    prompt: text,
+    uiContext: 'cockpit_voice_turn',
     onStatus: (status, detail) => {
       // 对话台正忙/有待审的门时，这条语音指令不会自动重试——必须让用户知道它没送到。
       if (status === 'pending') {
@@ -263,6 +275,9 @@ function sendVoiceTurnToAgent(text: string) {
     },
   })
 }
+
+/** 最近一次真正转交过的语音（噪音门控用：同句不重发、连发只发一次）。 */
+let lastVoiceDispatch: { text: string; at: number } = { text: '', at: 0 }
 async function refreshLiveVisionMode() {
   try {
     const result = await visionApi.realtimeStatus()

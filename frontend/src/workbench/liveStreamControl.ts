@@ -209,6 +209,38 @@ export function closeUserTranscript(
   return [...captions, spoken].slice(-limit)
 }
 
+/** 只留「有内容」的字：去掉空白/标点/符号，再去掉纯语气词。 */
+function voiceContent(text: string): string {
+  return text
+    .replace(/[\s\p{P}\p{S}]/gu, '')
+    .replace(/[嗯啊哦呃唉诶呀哈哎唔喔噢嘛么]+/gu, '')
+}
+
+/**
+ * 一条语音转写值不值得**转交主 Agent**（A 档是「全部转交」，但噪音必须挡在门外）。
+ *
+ * 为什么需要这道门：实测误识别与旁音照样会起一整轮 Agent（`不如自己喝。`、`什么金？`
+ * 各起了一轮，7~27s，Agent 还得先猜用户想说什么）。下面三条都是**硬条件**，不猜意图——
+ * 猜意图要么靠关键词（脆），要么靠模型配合（不可靠）。被挡下的回合由调用方在状态栏明说，
+ * 不静默吞掉。
+ */
+export function shouldDispatchVoiceTurn(
+  text: string,
+  previous: { text?: string; at?: number } = {},
+  now = Date.now(),
+  minGapMs = 1200,
+): boolean {
+  const trimmed = String(text || '').trim()
+  // 1) 去掉标点与语气词后什么都不剩 → 这不是一句话（「嗯」「啊？」「。。。」）。
+  if (!voiceContent(trimmed)) return false
+  // 2) 与上一条**同一句话**（忽略标点差异）→ 误识别常把同一句吐两遍，别转交两次。
+  const prev = String(previous.text || '')
+  if (prev && voiceContent(prev) === voiceContent(trimmed)) return false
+  // 3) 距上次转交太近 → 同一句被切成两段会连着来；这一条挡的是连发，不是短句。
+  if (typeof previous.at === 'number' && previous.at > 0 && now - previous.at < minGapMs) return false
+  return true
+}
+
 export function appendCaptionTurn(
   captions: LiveCaptionTurn[],
   wire: { type: string; text?: unknown; final?: unknown },

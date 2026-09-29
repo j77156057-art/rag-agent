@@ -6,7 +6,8 @@ export type FeedbackDeliveryStatus = 'processing' | 'awaiting_review' | 'pending
  *  - app_interface_inspect：应用自己发起的「浏览当前界面」，整条 prompt 都是内部指令，
  *    不作为用户消息展示，由后端转入 system_context；
  *  - desktop_visual_review：用户确认桌面点击后的视觉复验反馈，携带 workflowId/feedbackId 供后端对账。 */
-export type ChatUiContext = 'web_preview_feedback' | 'app_interface_inspect' | 'cockpit_live_vision' | 'desktop_visual_review'
+export type ChatUiContext = 'web_preview_feedback' | 'app_interface_inspect' | 'cockpit_live_vision'
+  | 'desktop_visual_review' | 'cockpit_voice_turn'
 
 export interface PreviewFeedbackRequest {
   prompt: string

@@ -1,5 +1,19 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-30 Vibecoding 能力补全 Wave10：连接器工具一等公民化（本会话，不占 R 槽位）
+
+- **补什么**：调外部 MCP 工具原本只有一条间接路——`dev_list_connector_tools` 先查、再 `dev_mcp_call(server, tool, json)`。模型看不见真实工具名与 schema，只能靠名字猜参数，连接器一多选择质量就掉。现在打了指纹的连接器工具会作为 `mcp__<server>__<tool>` 直接进本轮工具表。
+- **产物**：新模块 `agent_runtime/mcp_bridge.py`；`agent.py` 在 `Agent.__init__` 里 `self.tools` 定型之后调 `mcp_bridge.attach(...)`（紧接「工具权威绑在实例上」那条评论之后，并保留同样的语义）；`tests/test_mcp_inline_tools.py` **34 项**。
+- **默认零行为变化（这条最要紧）**：只有连接器配置里显式写了 `inline_tools: true` 的服务才会被投影；没打标记的**连 `tools/list` 握手都不发**（用例断言 `list_calls == []`）。总开关 `DOCMIND_MCP_INLINE=0` 可一键关掉，`status()`/`reset_cache()` 供排查。默认预设（godot/unity/unreal 等）都没打标记，所以装上这版以后所有会话的工具表长度不变。
+- **上限**：单服务 `PER_SERVER=12`、总量 `TOTAL=24`、描述 `DESC_LIMIT=700` 字符；超限时在 notes 里指回 `dev_mcp_call`。理由写进注释：无界膨胀的 prompt 比没有工具更糟。
+- **缓存**：`list_tools` 是真正的握手，每次构造 Agent 都问一遍会拖慢回合，所以按 `(root, 配置指纹)` 缓存，TTL 默认 300s（`DOCMIND_MCP_INLINE_TTL`），`refresh=True` 立刻生效。**改了配置能立刻看见**：指纹只哈希「谁打了 inline_tools / 是否启用 / transport / 是否声明只读」，加一个内联连接器会让指纹变化并重新握手（有用例）。
+- **保守的能力标记**：`capability=NETWORK`（这样网络超时钩子与租约门继续生效）、`side_effect=MUTATING`、`parallel_safe=False`——连接器可能改外部世界，不能假设幂等；服务声明 `inline_read_only: true` 才降级为 PURE+parallel_safe。**HTTP 传输的投影标成 `group="web"`**，于是「联网开关」关掉时这些工具一起消失（`_web_blocked` 的既有语义），stdio 的不动。
+- **不做跨连接器回退**：故意用 `mcp_client.call_tool` 而不是 `call_tool_with_fallback`——后者可能把一次有副作用的调用改投到别的连接器上重复执行。宁可响亮失败。
+- **入参约定**：仍然是工作台统一的单字符串入参。JSON 对象直接转发；schema 里只有一个字符串字段（**必填或可选都算**——harness 自己的 server 把 `input` 声明成可选，只认必填会把 `dev_glob *.vue` 判成参数错，这是真跑出来的 bug）时裸文本当该字段；其余情况回一条带字段清单的说明而不是硬猜。异常/失败/空返回都转成文本，绝不抛出打断回合。
+- **端到端证明（真进程，不是 mock）**：把 Wave9 那个 server 当连接器接进来——`mcp__docmind__dev_glob("*.vue")` 返回命中 `demo.vue`，`mcp__docmind__read_file("../outside.txt")` 返回「拒绝访问：不在代码根目录内」，**路径沙箱跨两次进程边界仍然成立**。过程中还逼出一个真设计缺陷：调用时重新读全局 `code_root` 会让工具作用在错误项目上，现在 root 在投影时就绑进闭包。
+- **验证**：`tests/test_mcp_inline_tools.py` **34 passed**；**全量 2337 passed / 6 skipped / 0 failed**；`tests/test_native_tools.py` 的注册表/模式数量守恒未被破坏（投影只进实例，不进全局 `TOOLS`，用例专门钉住 `mcp__demo__search not in agent.TOOLS`）。
+- **未做**：前端连接器面板还没有 `inline_tools` 开关（现在要手写进项目状态的 `mcp.json`），也没有 per-tool 勾选（只有整服务级 + `inline_read_only` 声明）；MCP 的 `outputSchema`/结构化结果没利用，只回文本；resources/prompts 侧没接；未与 `mcp_autoconnect` 的自动发现串联（自动发现的连接器仍需人工打标记才内联，这是有意的审批边界）。
+
 ## 2026-09-30 Vibecoding 能力补全 Wave9：harness 自己成为 MCP server（本会话，不占 R 槽位）
 
 - **补什么**：harness 原本只有 MCP **client**（`mcp_client.py`）——DocMind 有 90 多个工具，但同一仓库里并肩干活的其他 AI 一个都调不到，只能靠公告表和 markdown 互相转述。现在它们能直接调。
@@ -123,6 +137,43 @@
 - 结论：**闸门确实在抑制这个错误，且该错误可稳定复现**——不是偶发，也不是探测方式测不出来。AI-G 设备报告里那条 P1 阻塞（`docs/realtime-r12-device-acceptance-20260929.md`）在代码层面已被解除，**现在 R12 只剩"必须有真实摄像头/麦克风"这一条环境阻塞**。
 - 建议收口时把「绕过闸门必须仍能复现原错误」写成回归用例，否则这个闸门以后被误删没人会发现。
 - 另注：本地较 `origin/main` 多 8 个他人提交尚未推送（远端仍停在 `8f32730`），我没有代推别人的 WIP。
+
+## 2026-09-30 语音轮次：噪音门控 + 框架说明移出用户消息 + 回答形态约束（AI-F，用户「按你的建议」）
+
+用户贴了实时语音的完整对话记录，据此发现 A 档（全部转交）的三个具体缺陷，按建议先修 1+3 再修 2：
+
+**1. 噪音也起 Agent 轮（最伤）** —— 记录里 `【语音指令】不如自己喝。`、`【语音指令】什么金？`
+（都是误识别/旁音）各起了一整轮 Agent（19s / 7.2s，Agent 还得先猜用户想说什么，甚至去读
+`project.godot`）。修法：`liveStreamControl.shouldDispatchVoiceTurn()` 三道**硬条件**，不猜意图
+（关键词太脆、靠模型配合不可靠）：
+- 去掉标点与语气词后什么都不剩 → 不转交（`嗯` / `啊？` / `。。。`），但「嗯，帮我改一下」照常转交，`改`/`停` 这类单字实义指令**不误杀**；
+- 与上一条**同句**（忽略标点差异）→ 不重复转交（误识别常吐两遍）；
+- 距上次转交 <1.2s 的连发 → 只转交一次（同一句被切成两段）。
+被挡下的回合在状态栏明说（「「嗯」没有转交（像语气词或重复语音）」），**不静默吞掉**。
+
+**2a. 框架说明泄漏成用户消息** —— 先前把「【语音指令】…（来自开发舱实时语音…）」拼进 prompt，
+于是这段内部说明以**用户自己的话**的形式出现在对话流里。现在 prompt **只放用户原话**，框架走
+新的 `ui_context=cockpit_voice_turn`（后端转成 system_context，不作为用户消息展示）。
+
+**2b. 回答形态没约束** —— 记录里一句「你好」换来一整段能力菜单（「我可以帮你：看代码／查问题／
+改代码…想从哪一项开始？」），而用户是**听**语音的，长菜单既没用又和语音回复重复。修法：后端为
+`cockpit_voice_turn` 追加指引——最多两三句、口语化、不要罗列能力清单、不要复述指引、**闲聊时
+不要提议改动项目**、只在明确要求改/修/建时才提方案并等审批、转写明显是旁音时问清即可不要猜着动手。
+同时该上下文**照旧注入实时观察时间线**（「边看边聊」不丢），`chat.ts` 的 `visual_timeline` 条件同步放宽。
+
+**验证**：新增 `tests/test_voice_turn_context.py`（3 条：框架进 system_context 而 question 就是用户
+原话、语音轮次仍带时间线且标未核实、别的上下文不被套上语音约束）；`test_live_stream_control.py`
+node 断言扩到门控的**两个方向**（该转的交、不该转的不交，含「语气词开头的正常句子」与「单字实义
+指令」两个边界）；前端 `npm run build`（含 typecheck）通过；全量套件 **2337 passed / 6 skipped /
+0 failed**。上下文里 `agent.py` 有别的 lane 的在飞改动，我只提交了自己这几个文件。
+
+**本次未处理（如实说明）**：记录里还有两处属别的 lane —— ①英文思维链（`▾ 深度思考 The user's
+voice input is…`）直接展示在语音回合里，语音场景不该展开推理，且不该是英文；②回合两次出现
+「模型输出尚未结束，正在继续执行。」后没有下文（Agent 的收尾/流式）。另有 6：短句 STT 质量差
+（`不如自己喝`/`什么金？`）属 R12 真机侧，它是第 1 条的放大器。
+
+**顺带观察（别人的 lane，未动）**：全量套件曾出现 3 条 `test_mcp_inline_tools` 失败（单跑 31 passed，
+该文件干净且非我改动），下一次全量跑即消失——又是一个混跑红，报因不明，留给对应 lane。
 
 ## 2026-09-30 修「幕布偏左」：docked 面板被入场动画的 transform 拖出屏幕（AI-F，用户指派）
 

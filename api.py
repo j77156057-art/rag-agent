@@ -2244,7 +2244,19 @@ async def chat(
         )
     if desktop_review_hint:
         hints.append(desktop_review_hint)
-    if ui_context == "cockpit_live_vision" and _ctx_project_id():
+    # 语音轮次走这条：用户的**原话**才是可见消息，这段说明只进系统上下文。
+    # 它同时承担「别把语音轮次当打字轮次回答」的约束（实测：一句「你好」换来一整段
+    # 能力清单，用户是听语音的，长菜单既没用又和语音回复重复）。
+    if ui_context == "cockpit_voice_turn":
+        hints.append(
+            "【开发舱实时语音 · 内部指引】这条消息是用户**说出来的**（语音转写，可能有误识别），"
+            "用户此刻正看着实时画面。回答要求：最多两三句、口语化；不要罗列能力清单、不要复述"
+            "本条指引、不要把它当用户的话。用户只是闲聊、寒暄或提问时直接回答即可，**不要提议"
+            "改动项目**；只有用户明确要求改/修/重建时才提出方案与验收条件，并照旧等待审批。"
+            "若转写明显是旁音、串音或不成句（例如答非所问的短句），用一句话问清就够，"
+            "不要猜着动手，也不要因此调用工具。"
+        )
+    if ui_context in ("cockpit_live_vision", "cockpit_voice_turn") and _ctx_project_id():
         timeline_hint = _realtime_timeline_hint(_ctx_project_id(), visual_timeline)
         if timeline_hint:
             hints.append(timeline_hint)
