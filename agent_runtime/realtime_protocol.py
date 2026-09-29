@@ -16,6 +16,7 @@ MAX_PACKET_HEADER = 512
 MEDIA_TYPES = {"video.frame", "audio.chunk"}
 CONTROL_TYPES = {"hello", "heartbeat", "cancel", "session.close"}
 SERVER_TYPES = {"hello.ok", "heartbeat", "video.observation", "audio.transcript", "model.delta", "model.audio", "error", "cancel.ok", "session.closed"}
+_ENVELOPE_KEYS = {"v", "type", "sent_at", "sequence", "captured_at", "session_id"}
 
 
 def _finite_timestamp(value: Any) -> int | None:
@@ -73,7 +74,7 @@ def server_event(event_type: str, *, sequence: int | None = None, captured_at: i
     # The wire envelope is authoritative.  Provider payloads are untrusted and
     # must not be able to rewrite the protocol version, event type, or clock.
     event.update({key: value for key, value in payload.items()
-                  if key not in {"v", "type", "sent_at"}})
+                  if key not in _ENVELOPE_KEYS})
     return event
 
 

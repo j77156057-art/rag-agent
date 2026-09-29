@@ -96,7 +96,7 @@ class RealtimeEvent:
         if self.session_id:
             event["session_id"] = self.session_id
         for key, value in self.payload.items():
-            if key not in ("v", "type", "sent_at"):
+            if key not in {"v", "type", "sent_at", "sequence", "captured_at", "session_id"}:
                 event[key] = value
         return event
 

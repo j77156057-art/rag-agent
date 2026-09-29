@@ -126,9 +126,16 @@ def test_to_wire_output_is_a_valid_r0_server_event(kind):
 
 def test_to_wire_never_lets_a_payload_clobber_the_envelope():
     event = provider.RealtimeEvent(kind=provider.EVENT_ERROR,
-                                   payload={"v": 99, "type": "evil", "sent_at": 1})
+                                   sequence=7, captured_at=_FROZEN_MS,
+                                   session_id="trusted",
+                                   payload={"v": 99, "type": "evil", "sent_at": 1,
+                                            "sequence": 999, "captured_at": 1,
+                                            "session_id": "evil"})
     wire = event.to_wire(sent_at=_FROZEN_MS)
     assert wire["v"] == 1 and wire["type"] == "error" and wire["sent_at"] == _FROZEN_MS
+    assert wire["sequence"] == 7
+    assert wire["captured_at"] == _FROZEN_MS
+    assert wire["session_id"] == "trusted"
 
 
 # ---- 二进制媒体包 ------------------------------------------------------------
