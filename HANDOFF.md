@@ -1454,3 +1454,34 @@ git status --short
   - 结论：R4/R5/R10 代码交付完成，但端到端体验（持续响应稳定性、错误率）仍欠账，R12 未闭环。
 - **仍有的未提交改动**（非阻塞，疑为另一写入者/AI-F 收尾补丁）：`realtime_protocol.py`(+3)、`realtime_provider.py`(+2)、`tests/test_realtime_protocol_contract.py`(+9)、`tests/test_realtime_resource_security.py`(+54)、`verify_realtime_acceptance.py`(+23)；untracked `docs/realtime-r12-acceptance-20260929.md`（R12 证据，建议提交）。
 - 重复完成检查：R4/R5 实现 AI-D、接线 AI-F，整链已入库，无第二人重复认领；R12 验收由 AI-F 出证据、设备/UX 部分归 R12 负责人，边界清楚。
+
+## 2026-09-29 R14 代码审查结论（20:26，收口批次 + R9 守卫 + 三项用户指派修复）
+
+本轮 R14 审查覆盖 HEAD=`ef9f0ed` 之前的实时链路新提交代码，结论：**无阻断性 bug**。
+
+### 审查范围与逐项结论
+- **`agent_runtime/realtime_bridge.py`（503e27e，R4/R5/R10 接线层，525 行）✅**
+  - `api.py` 的 14 个调用点与 `realtime_bridge` 公开签名完全对齐（`SessionBridge(project_id)` / `bind_session` / `provider` / `start` / `capabilities` / `native` / `hello_fields` / `next_events(timeout=)` / `take_audio` / `send_frame` / `note_frame` / `note_observation` / `interrupt` / `note_model_failure` / `close`，及模块级 `timeline_snapshot` / `status_snapshot`），无签名不匹配类 bug。
+  - 网关自有事件（`hello.ok` / `session.closed`）在 `next_events` 内按线上事件名拦下（记账不转发）；`EVENT_DONE` 改为补发 `model.delta + final:true + 空文本` 收口标记，与前端 `appendCaptionTurn` 幂等语义一致。
+  - 音频 `bytes` → base64 在 `wire_events` 统一处理，杜绝 `send_json` 抛 `TypeError`。
+  - 指标作用域按**网关 `session_id`** 记账（非适配器 `rt-...`），`close()` 走 `drop_session` 回收；时间线在最后会话断开时 `release_timeline` 释放 —— HANDOFF 记录的「无界增长雷」已堵死。
+  - **线程安全已具备**：`MetricsRegistry` / `RealtimeTimeline` 所有写路径均持锁（`threading.RLock` / `Lock`），`pump_provider` 经 `asyncio.to_thread` 与事件循环并发写指标/时间线不冲突。
+- **`api.py` `live_vision_stream` 网关接线（503e27e，2549–2814）✅**：双通道（原生/抽帧）逻辑正确；网关自有事件不二次下发；`hello.ok` 模式字段随握手上报。
+- **`6832251`（R9）三处 provider 转发守卫 ✅**：`interrupt()` / `take_audio()` / `send_frame()` 补 try/except，按语义兜底（cancel 仍回 `cancel.ok` + 报 `interrupt_failed`；音频外抛落回 `audio_not_ready`；视频外抛只降级单帧不翻模式），不动成功路径。验证充分：桥测试 27 passed（新增 3 条各覆盖一处），且反向验证（去守卫 → 3 条全红）。
+- **三项用户指派修复（已提交）✅**：视觉点击 `/api/vision/locate-click`(2919) + `/api/vision/execute-click`(2985)；`/api/chat` 复验轮(2039–2118，反馈须属本项目、原文不进 system_context)；`EVENT_DONE` 缺口（`realtime_bridge._end_of_turn`）。均落在提交代码中。
+
+### 观察项（非阻断）
+- **P3（信息级）**：`take_audio` 在 `provider.send_audio` 返回前先写 `KIND_TRANSCRIPT` 时间线条目；若 `send_audio` 返回 False，时间线会多记一个「被拒音频分片」（api.py 随后回 `audio_not_ready`）。仅日志轻微过度，不影响线上。
+
+### 后续提交（自 20:01 的 `02fc97b` 之后，HEAD 已推进到 `ef9f0ed`）
+- `6832251` 之前已审；新增 `5a89f8d`(仅 HANDOFF +42)、`d923445`(api.py cancel 次序 + 测试收口，即此前标的 10/5 未提交漂移已入库；`test_realtime_resource_security.py` 作者 WIP 一并收口)、`ef9f0ed`(仅 HANDOFF +35)。均为测试/文档/api.py cancel 次序，无新增业务逻辑风险。
+
+### Canvas 公告表
+- AI-F 行（line 98）阶段字段已由「接线完成·三项修复完成·已收口提交」改为 **「R4/R5/R10 接线：实现完成·已提交·三项修复完成·已收口提交」**，显式点明状态（canvas 由 canvas 工具管理，不在 git 内）。
+
+### 未提交 / 未闭环（R14 仅跟踪，不碰业务代码）
+- 工作树未提交（属其他 lane）：`realtime_protocol.py` / `realtime_provider.py`（R0 独占）、`chat.ts` / `ChatDock.vue`（前端）、`test_realtime_protocol_contract.py` / `verify_realtime_acceptance.py` / `web/index.html`。
+- `docs/realtime-r12-acceptance-20260929.md` 仍 untracked：R12 真机验收 4/6 通过、2 项失败（持续响应 1/3、错误率 43.5%）——仍 open，依赖账号开通实时多模态服务。
+
+### 重复完成检查（R14 红线）
+- R4/R5/R10 接线 = AI-F 独占（`realtime_bridge.py` + `api.py` 接线），无第二人动同一处；R2 voice 已澄清归 /root（AI-C 转 R7）。整链已入库，无重复认领、无重复完成。
