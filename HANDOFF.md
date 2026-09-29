@@ -1,5 +1,20 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-29 Vibecoding 能力补全 Wave2：`dev_lanes` 认领登记表（本会话，不占 R 槽位）
+
+- **动机（本会话实测的摩擦）**：多人同树靠公告表和 markdown 排他，会**朝两个方向过期**——表上写 0% 而实现早已进树（R2/R7 就是这样），或者两个会话同时领同一块；我这半小时里 HANDOFF 本身被别的 lane 改了两次（`file has been modified since read`），而别人的收口提交会把谁的半成品卷进 HEAD 全靠运气。本波把「谁在动哪些文件」变成机器可查的**带 TTL 租约**。
+- **产物**：
+  - 新模块 `agent_runtime/lanes.py`：`claim / status / release / heartbeat / check / open_worktree / close_worktree` + `render()`。
+  - `tools.py`：单个 `dev_lanes` 工具（`action:` 分派，避免把 7 个动作刷进工具目录）+ TOOLS 注册。
+  - `agent.py`：系统提示工具目录补上 `dev_lanes` 一行。
+  - `tests/test_lanes_registry.py`：**34 项**（unittest 风格，两个 CI 步骤都会收）。
+- **规则**：排他按「最长无通配目录前缀」保守判定，`frontend/src` 与 `frontend/src-extra` **不算**冲突，`*.vue` 这类无目录前缀的模式等于占下全仓（会提示收窄）；`fnmatch` 的 `*` 跨 `/`，所以认领只会变宽不会变窄——对排他是安全方向。冲突**当场拒绝并列出对方 lane/owner/pattern**，正好是本项目「把问题清单发给 owner」的协议形状；明知无重复可 `force: true` 共管并在提示里留痕。TTL 默认 120 分钟（夹到 5..1440），过期即视为放弃、可被他人接管，`heartbeat` 只允许 owner 自己续租。重复 claim 同一 lane = 覆盖范围 + 续租。
+- **worktree 是可选动作而不是前提**：`open` 在**项目状态目录**下开通独立 checkout（不落在 git 工作树内，`_worktree_base`），有同名 `lane-<name>` 分支就 attach，否则 `--detach`（绝不凭空占用分支、绝不 `--force`）；`close` 默认**拒绝删除有未提交改动的 worktree**，确认丢弃才 `discard: true`，且收回 worktree 不会顺手释放认领。认领表本身只写 `lanes.json`，不碰 git 历史。
+- **护栏**：跨进程互斥用 `mkdir` 原子锁（Windows/POSIX 都原子），>3s 竞争直接抛错让调用方重试，>60s 的陈锁自动破；写盘走临时文件 + `os.replace`；`lanes.json` 损坏时另存 `lanes.corrupt-*.ts` 并重建空表而不是崩；lane 名白名单正则、禁 `..`；`owner/note/base_ref/paths` 一律拒绝以 `-`/`=` 开头或含控制字符；`_GIT_ALLOWED` 只留 `rev-parse|status|worktree`（`commit` 实测被拒，有回归用例钉住）。
+- **验证**：`tests/test_lanes_registry.py` **34 passed**；**全量 pytest 2202 passed / 6 skipped / 0 failed（255s）**。中途一次全量出现 4 项失败全部落在 `tests/test_review_app.py`——该文件**从未入库**（`git ls-files` 无记录）且跑完即消失，属他人 WIP/服务重启，与本波无关，如实记录以免后人误判。
+- **未做（如实说明）**：① `run_command` 的 cwd **没有**自动切到 lane worktree——那要改命令执行主路径，风险面太大，当前由工具把 worktree 路径回给 Agent 自己用；② 认领表只在 DocMind 侧，其他 AI（Cursor/Qoder 会话）要享受它得靠 Wave9 的 MCP server 出口或直接用这个工具；③ 未接 `git worktree prune` 的自愈，目录被手工删掉时 `close` 会清登记但不会跑 prune。
+- **下一波（勿重复领）**：Wave3 TS/Vue tree-sitter 精确引用、Wave4 `dev_diagnostics`、Wave5 `dev_patch`/`dev_move`、Wave6 `dev_serve`/浏览器观测、Wave7 媒体夹具、Wave8 vitest、Wave9 MCP server、Wave10 MCP 工具一等公民、Wave11 dev lane 评测、Wave12 `dev_propose`/`dev_ci_status`。
+
 ## 2026-09-29 23:08 R12 provider 侧复跑验收（AI-B/AI-A 兼任）【本次两份报告已提交】
 
 - 用户指令"进行 R12 真机检验"。在**本沙箱**用真实 Key + `qwen3.8-omni-flash-realtime`（音色 Jennifer）复跑 `verify_realtime_acceptance.py`，样本 `D:\Temp\docmind_jfk_sample.wav`（已存在，无需下载；**沙箱访问 raw.githubusercontent/github.com 仍被重置**，所以 push 依旧只能用户本机做）。

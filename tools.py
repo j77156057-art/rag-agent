@@ -4931,6 +4931,81 @@ def dev_git_log(arg):
     return code_intel.render_git_log(res)
 
 
+def dev_lanes(arg):
+    """多人同仓协作的认领登记表：谁在动哪些文件，冲突当场发现，过期自动可被接手。
+
+    输入（多行 keyed）：
+      action: claim|status|release|heartbeat|check|open|close   # 必填
+      lane: AI-A                       # 认领人标识（除 status 外必填）
+      owner: 本会话简称                 # 谁署名，默认与 lane 同名
+      paths: frontend/src/workbench/** # claim 必填；逗号或换行分隔多个模式
+      ttl_minutes: 120                 # 租约时长，5..1440
+      note: 正在接 R2 的播放队列         # 给别的 lane 看的说明
+      path: agent.py                   # check 用：问这一个文件现在归谁
+      exclude_lane: AI-A               # check 时排除自己
+      base_ref: HEAD                   # open 用：worktree 的起点
+      discard: true                    # close 用：确认丢弃 worktree 里未提交的改动
+      force: true                      # claim 用：明知冲突仍要共管（需在 HANDOFF 说明）
+
+    开工前先 `action: status` 看别人在动哪块；动某文件前 `action: check` 问一句归属；
+    领到任务就 `claim`，做完 `release`。长任务定期 `heartbeat` 续租，过期即视为放弃。
+    需要物理隔离（别人收口提交不会把你的半成品卷进去）时 `open` 开通独立 worktree。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    keys = ["action", "lane", "owner", "paths", "ttl_minutes", "note", "path",
+            "exclude_lane", "base_ref", "discard", "force", "timeout"]
+    fields = _parse_keyed(arg, keys)
+    bare = [ln.strip() for ln in (arg or "").splitlines()
+            if ln.strip() and not re.match(r"^\s*(" + "|".join(keys) + r")\s*[:：]", ln)]
+    def _one(key):
+        """单值字段只取第一行：`action: check` 后面还能接着写裸路径。"""
+        return (fields.get(key) or "").splitlines()[0].strip() if fields.get(key) else ""
+
+    action = _one("action").lower()
+
+    def _truthy(v):
+        return str(v or "").strip().lower() in ("1", "true", "yes", "y", "on", "是")
+
+    try:
+        timeout = int(str(_one("timeout") or "60").strip())
+    except (TypeError, ValueError):
+        timeout = 60
+    from agent_runtime import lanes
+    try:
+        if action == "claim":
+            raw_paths = fields.get("paths") or ""
+            paths = _split_path_list(raw_paths) if raw_paths else bare
+            res = lanes.claim(root, _one("lane"), paths,
+                              owner=_one("owner"),
+                              ttl_minutes=_one("ttl_minutes"),
+                              note=(fields.get("note") or "").strip(),
+                              force=_truthy(_one("force")))
+        elif action == "status":
+            res = lanes.status(root)
+        elif action == "check":
+            target = _one("path") or (bare[0] if bare else "")
+            res = lanes.check(root, target, exclude_lane=_one("exclude_lane"))
+        elif action in ("heartbeat", "release"):
+            getter = lanes.heartbeat if action == "heartbeat" else lanes.release
+            res = getter(root, _one("lane"), owner=_one("owner"))
+        elif action == "open":
+            res = lanes.open_worktree(root, _one("lane"),
+                                      base_ref=_one("base_ref"), timeout=timeout)
+        elif action == "close":
+            res = lanes.close_worktree(root, _one("lane"),
+                                       discard=_truthy(_one("discard")), timeout=timeout)
+        else:
+            return ("dev_lanes 需要 action，取值：" + "、".join(lanes.ACTIONS)
+                    + "。例如 `action: status` 看现在谁在动哪些文件。")
+    except TimeoutError as exc:
+        return f"dev_lanes({action}) 未完成：{exc}"
+    except ValueError as exc:
+        return f"dev_lanes({action}) 未完成：项目状态路径不可用（{exc}）"
+    return lanes.render(res)
+
+
 def dev_find_references(arg):
     """重构前定位符号的全部引用点（重命名/删函数/改签名前必用）。
 
@@ -6548,6 +6623,10 @@ TOOLS = {
     "dev_git_log": {
         "description": "【只读】看提交历史：谁在什么时候改了什么、某个文件被哪些提交动过、某条 lane 最近在干什么。与 dev_git_diff 的分工——diff 回答「还没提交的改动」，log 回答「已经进历史的那些」；判断重复劳动、确认某改动是否已入库、找回被覆盖前的实现都必须用它。输入（全部可选）：paths: <文件或目录，逗号/换行分隔>、limit: <条数，默认 20，上限 200>、since: <日期，如 2026-09-25>、until: <日期>、author: <作者名片段>、at: <某个提交，如 HEAD 或 b78bd52，也可 a..b>、files: true（每条附带改动文件清单）、timeout: <秒，上限 60>；直接把路径当输入也可以。只走 rev-parse/status/diff/log 四个只读子命令，绝不写入、绝不提交；取值里以 `-` 或 `=` 开头、含控制字符的一律拒绝（防参数注入）。返回 `hash 日期 作者 标题` 流水并标注当前 HEAD。",
         "func": dev_git_log,
+    },
+    "dev_lanes": {
+        "description": "多人同仓协作的【认领登记表】（带 TTL 的租约）：谁在动哪些文件，冲突当场发现，过期自动可被接手。开工前先 `action: status` 看别的 lane 在动哪块，避免重复造轮子；动某个文件前 `action: check` + `path: <相对路径>` 问一句归属；领到任务 `action: claim` + `lane: AI-A` + `paths: frontend/src/workbench/**, tests/test_live_*.py`（+ 可选 `owner:`、`ttl_minutes:` 默认 120、`note:` 给别人看的说明）；做完 `action: release`，长任务定期 `action: heartbeat` 续租。需要物理隔离（别人收口提交不会把你的半成品卷进 HEAD）时 `action: open`（开通独立 worktree 并把路径回给你，之后的读写与 run_command 都用它），收回用 `action: close`（默认拒绝删除有未提交改动的 worktree，确认丢弃才加 `discard: true`）。排他按目录前缀保守判定：`*.vue` 这种无目录前缀的模式等于占下全仓，会与其他 lane 冲突，请用 `frontend/src/**/*.vue` 收窄。明知无重复但要共管时加 `force: true`，并在 HANDOFF 说明。所有写入只落在项目状态目录，不碰 git 历史。",
+        "func": dev_lanes,
     },
     "dev_find_references": {
         "description": "重构前定位符号的全部引用点（重命名/删函数/改签名/搬文件前必用）。Python 走 ast 精确匹配——注释与字符串里的同名文本【不会】被误报；其它语言走词边界正则并跳过纯注释行。输入：symbol: <符号名>（必填），可选 scope: <限定目录或文件>、kind: def|ref|all（默认 all）、limit: <条数上限，默认 80>；直接把符号名当输入也可以。返回定义处与引用处（file:行号 + 代码行，按文件聚合计数）。命中过多时请用 scope 缩小范围。",
