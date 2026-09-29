@@ -5045,6 +5045,68 @@ def dev_diagnostics(arg):
     return diagnostics.render(res)
 
 
+def dev_patch(arg):
+    """把一段 unified diff 原子地打到代码库里：全成才打，任一文件对不上就一个都不改。
+
+    输入就是 diff 正文（`--- a/路径` / `+++ b/路径` / `@@ -l,c +l,c @@` / 空格、+、- 行）。
+    首行可以加 `dry_run: true` 只做校验与语法检查、不写盘——大补丁先空跑一次。
+    规则：路径必须是代码根目录内的相对路径（带 a/ b/ 前缀会被去掉）；上下文与
+    被删行必须逐字相等（不做模糊匹配，宁可报错也不改错地方）；行号偏了但上下文
+    一致时会自动对齐并在结果里说明；.py 打完还会过一遍语法检查；删除文件一律拒绝。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    text = (arg or "").replace("\r\n", "\n")
+    first, sep, rest = text.partition("\n")
+    dry_run = False
+    if re.match(r"^\s*dry_run\s*[:：]", first):
+        dry_run = first.split(":", 1)[-1].strip().strip("：").lower() in ("1", "true", "yes", "y", "on", "是")
+        text = rest
+    from agent_runtime import patch_apply
+    try:
+        res = patch_apply.apply_patch(root, text, dry_run=dry_run)
+    except Exception as exc:  # noqa: BLE001
+        return f"dev_patch 无法运行：{type(exc).__name__}: {str(exc)[:200]}"
+    return patch_apply.render_patch(res)
+
+
+def dev_move(arg):
+    """移动/重命名代码库内的单个文件：被 git 跟踪的走 `git mv`（保历史与 blame），未跟踪的退回文件系统移动。
+
+    输入（两行）：
+      from: pkg/old_name.py
+      to:   pkg/sub/new_name.py
+    只做移动：不覆盖已存在的目标、不删目录、不越界。注意 run_command 只拦【历史类】
+    git 子命令，`git mv` 本来就能跑——这个工具的价值是把移动约束成安全路径。移动后请用 dev_find_references / grep 检查旧路径的
+    import 与引用，再用 dev_diagnostics 确认没有打断。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    keys = ["from", "to", "src", "dst", "timeout"]
+    fields = _parse_keyed(arg, keys)
+
+    def _one(key):
+        value = fields.get(key) or ""
+        return value.splitlines()[0].strip() if value else ""
+
+    src = _one("from") or _one("src")
+    dst = _one("to") or _one("dst")
+    try:
+        timeout = int(_one("timeout") or "30")
+    except (TypeError, ValueError):
+        timeout = 30
+    if not src or not dst:
+        return "dev_move 需要两行：`from: <旧路径>` 与 `to: <新路径>`（相对代码根目录）。"
+    from agent_runtime import patch_apply
+    try:
+        res = patch_apply.move_path(root, src, dst, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        return f"dev_move 无法运行：{type(exc).__name__}: {str(exc)[:200]}"
+    return patch_apply.render_move(res)
+
+
 def dev_find_references(arg):
     """重构前定位符号的全部引用点（重命名/删函数/改签名前必用）。
 
@@ -6672,6 +6734,14 @@ TOOLS = {
     "dev_diagnostics": {
         "description": "拿【结构化诊断】而不是「过/不过」加一坨尾部日志：Python 走 ruff、前端走 `npm run typecheck`（vue-tsc），输出归一成 文件:行:列 + 规则号 + 说明 + 严重度。改完一段代码、跑测试之前先调用它，比 self_verify 更早发现问题；重命名/搬文件之后用它确认没留下未定义引用。输入：target: <文件或目录，逗号/换行分隔，留空=按 scope 扫整个代码根目录>、scope: auto|py|frontend|all（auto 按扩展名选引擎）、rules: <ruff 规则覆盖，默认只查会咬人的 E9,F401,F811,F821,F822,F841,E722；要风格全检写 rules: ALL 或 rules: E,W,F>、timeout: <秒，上限 300>、config: <项目内 ruff 配置文件>；直接把路径当输入也可以。只读：从不传 --fix，从不写文件。工具没装时会【明确说「未安装」并给出安装命令】，绝不把「没跑成」报成「没问题」；输出被截断导致解析不出条目时同样如实报，不会谎称干净。前端诊断需要在 frontend/ 里有 typecheck 脚本且能找到 npm（可用 DOCMIND_NPM_BIN 指定）。",
         "func": dev_diagnostics,
+    },
+    "dev_patch": {
+        "description": "把一段【unified diff】原子地打到代码库里：全成才打，任一文件对不上就一个都不改、树上不留半成品。输入就是 diff 正文（`--- a/路径`、`+++ b/路径`、`@@ -起行数,行数 +起行数,行数 @@`、空格/`+`/`-` 行），首行可加 `dry_run: true` 只做校验与语法检查不写盘（大补丁先空跑一次）。护栏：路径必须是代码根目录内的相对路径（`a/`、`b/` 前缀会自动去掉，`../` 与绝对路径拒绝）；上下文行与被删行必须逐字相等——【不做模糊匹配】，宁可报错也不改错地方；声明行号偏了但上下文一致时会自动对齐并在结果里说明落到了第几行；.py 打完还会过一遍 ast 语法检查，语法不过直接整体拒绝；删除文件一律不让补丁做（会用带确认的删除工具）。一次最多 20 个文件、单文件 200KB。改多处调用点、落地外部评审意见、回滚某段改动时优先用它，比连续多次 apply_edit 安全。",
+        "func": dev_patch,
+    },
+    "dev_move": {
+        "description": "移动/重命名代码库内的【单个文件】：被 git 跟踪的走 `git mv`（保留历史与 blame，git 会显示为 R），未被跟踪的退回文件系统移动。输入两行：`from: <旧路径>`、`to: <新路径>`（相对代码根目录），可选 `timeout: <秒>`。只做移动：目标已存在一律拒绝不覆盖、不删目录、不越界、单文件 200KB 上限。注意 `run_command` 只拦【历史类】git 子命令（commit/push/reset/checkout/worktree 等），`git mv` 本来就能跑——这个工具的价值是把移动约束成安全路径（越界拒绝、不覆盖、强制回归提示），而不是绕过禁令。移动之后必须用 dev_find_references / grep 检查旧路径的 import 与引用，再用 dev_diagnostics 确认没打断。",
+        "func": dev_move,
     },
     "dev_find_references": {
         "description": "重构前定位符号的全部引用点（重命名/删函数/改签名/搬文件前必用）。Python 走 ast 精确匹配——注释与字符串里的同名文本【不会】被误报；TS/TSX/JS/JSX/Vue 走 tree-sitter 语法匹配，注释、字符串字面量与对象字面量的键都不算引用，Vue 会解析 <script> 块并把行号映射回文件真实行（模板里的同名文本用词边界正则补充，并在 notes 说明）；其他语言走词边界正则并跳过纯注释行。语法包缺失时自动回退正则，不会静默丢结果。输入：symbol: <符号名>（必填），可选 scope: <限定目录或文件>、kind: def|ref|all（默认 all）、limit: <条数上限，默认 80>；直接把符号名当输入也可以。返回定义处与引用处（file:行号 + 代码行，按文件聚合计数），低置信的字符串/键名单列。命中过多时请用 scope 缩小范围。",

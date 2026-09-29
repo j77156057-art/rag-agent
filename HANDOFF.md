@@ -1,5 +1,17 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-09-30 Vibecoding 能力补全 Wave5：`dev_patch` + `dev_move`（本会话，不占 R 槽位）
+
+- **补什么**：跨文件重构此前只有 `dev_apply_edits`（手写 old_text 块）；从 `dev_git_diff`、评审意见或别处拿到的**真 unified diff 没有入口**。`dev_patch` 补上，并且强制**全成或全不成**。
+- **产物**：新模块 `agent_runtime/patch_apply.py`（解析 + 应用 + 移动 + 渲染）；`tools.py` 的 `dev_patch`/`dev_move` + TOOLS 注册；`agent.py` 工具目录两行；`tests/test_dev_patch_move.py` **35 项**。
+- **匹配策略**：上下文与被删行**逐字相等**才算命中，不做模糊匹配——宁可整体报错也不改错地方；声明行号偏了但上下文一致时按距离由近到远自动对齐，并在 notes 里说明「实际落在第 N 行」。`@@` 纯新增（无上下文）就插在声明位置。
+- **原子性（最重要的一条）**：所有文件先在内存里算完 + 过 `.py` 的 ast 语法检查，全部通过才逐个 `os.replace`；任一环节失败 → **一个字节都不写**，错误信息带上「补丁要的开头」与「文件实际那里是什么」的对照，方便直接改补丁。写盘途中失败会回滚已替换的文件（备份在内存里）。`test_multi_file_patch_is_atomic` 钉死：第二个文件对不上时第一个文件必须原样。
+- **护栏**：路径必须落在代码根目录内（`a/`、`b/` 前缀自动去掉；`../`、绝对路径、盘符一律拒绝）；`+++ /dev/null` 的**删除操作一律拒绝**（删除要走带确认的删除工具，不许借补丁发生）；一次 ≤20 个文件；新建文件沿用 `create_file` 的 200KB 约定；**修改已有文件放宽到 4MB**——真代码上发现的：`agent.py` 与 `HANDOFF.md` 都超过 200KB，原来的统一上限会把合法 git diff 整体拒掉（尺寸风险在补丁大小而不是文件大小，故补丁正文另有 4MB 上限）；`.py` 打完必过语法检查。
+- **`dev_move`**：被 git 跟踪的走 `git mv`（历史与 blame 延续，`--follow` 能追到改名前那笔——有用例验证），未跟踪的退回文件系统移动并**如实说明 git 会看成删除+新增**；目标已存在一律拒绝不覆盖；不删目录；移动后强制提示「用 dev_find_references / grep 检查旧路径 import，再用 dev_diagnostics 确认」。
+- **纠正一条我自己说错的 policy 描述（重要）**：我之前几轮说过「`tools.py` 的 `_GIT_WRITE_SUBCMDS` 把所有 git 写子命令封死」——**不准确**。那个集合只封【历史类】：`commit/push/merge/rebase/revert/reset/clean/checkout/switch/apply/cherry-pick/stash/am/update-ref/worktree`，而 `git mv`/`git add`/`git rm`/`git branch` 本来就能通过 `run_command` 跑。所以 `dev_move` 不是「开了个例外」，而是**把已经能跑的操作收进有护栏的通道**；同理 `dev_lanes open` 用的 `git worktree` 是被封的，但它走的是 `process_runner` 直接调用（参数由代码拼、用户文本永不成为独立 argv），不是绕过 `run_command` 的检查。TOOLS 描述与 `agent.py` 提示里那句话都已改正。
+- **验证**：`tests/test_dev_patch_move.py` **35 passed**；`test_native_tools`/`test_agent_code_tools`/`test_self_verify` 合跑 **103 passed**；**真代码回环**：把本会话 5 个提交（`4f1133b`/`d70cf9d`/`baac05a`/`2764092`/`3dcbb2b`）的 `git diff <base> <commit>` 在各自的基线副本上重放，25 个文件（含新建文件与 `.py/.md/.yml`）**逐字节一致、0 处不匹配**。全量 pytest 见下方补记。
+- **未做**：不支持 rename 语义（`rename from/to` 行被忽略，请改用 `dev_move`）；不支持二进制补丁（明确拒绝）；`git apply --check` 那种「索引模式补丁」不支持；`dev_patch` 与 `dev_git_diff` 之间没有「只重跑失败 hunk」的增量修复回路。
+
 ## 2026-09-30 Vibecoding 能力补全 Wave4：`dev_diagnostics` 结构化诊断（本会话，不占 R 槽位）
 
 - **补什么**：`self_verify` 只回「过 / 不过」+ 尾部日志，Agent 拿到一坨文本要么瞎猜要么重跑。本波把 ruff（Python）与 `npm run typecheck`（vue-tsc，前端）的输出归一成 **文件:行:列 + 规则号 + 严重度**。
