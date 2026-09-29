@@ -44,3 +44,9 @@ ruff>=0.16,<1
 # MCP SDK: client side plus `agent_runtime.mcp_server`, which re-publishes the
 # harness's own read-only tools to the other agents working this repo.
 mcp>=2,<3
+# 浏览器型 MCP 的注册/取密（`mcp_autoconnect.browser_register`）惰性 import 它，用
+# launch_persistent_context 驱动真实 Edge。缺失时该能力降级到 L2，只在 missing 里记一行。
+playwright>=1.40,<2
+# 真实画面验收（`agent_runtime.visual_acceptance`）的 CDP 控制通道。缺失时明确报
+# 「浏览器控制依赖 websocket-client 未安装」，而不是假装验收通过。
+websocket-client>=1.7,<2
