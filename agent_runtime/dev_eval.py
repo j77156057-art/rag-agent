@@ -30,6 +30,7 @@ import time
 from typing import Any, Callable, Mapping
 
 import config
+import temp_state
 
 
 def _check(name: str, ok: Any, detail: Any = "") -> dict[str, Any]:
@@ -493,6 +494,9 @@ def evaluate_case(case: Mapping[str, Any]) -> dict[str, Any]:
     report: dict[str, Any] = {"id": cid, "checks": [], "skipped": "", "passed": False}
     root = tempfile.mkdtemp(prefix="docmind_deveval_")
     state = tempfile.mkdtemp(prefix="docmind_deveval_state_")
+    # finally 里已经会删这两个目录；标归属是为了被硬杀时下一个进程能扫掉（实测留了 121 个）。
+    temp_state.claim(root)
+    temp_state.claim(state)
     import tools as tools_module
     prev_root = tools_module.get_runtime("code_root")
     prev_state = config.STATE_ROOT

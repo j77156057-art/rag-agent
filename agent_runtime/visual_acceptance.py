@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -24,6 +25,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .dev_server import loopback_url
+import temp_state
 import urllib.request
 
 
@@ -73,8 +75,6 @@ _BASE_FLAGS = ("--headless=new", "--disable-gpu", "--no-first-run",
                "--remote-allow-origins=*")
 _MAX_EXTRA_FLAGS = 32
 _PROFILE_PREFIX = "docmind-visual-preview-"
-# 单次回环最长几十秒，但同事的会话是并发的，阈值必须远大于一次运行才不至于删到活的。
-_PROFILE_MAX_AGE_SECONDS = 6 * 3600
 
 
 class _JobBasicLimits(ctypes.Structure):
@@ -117,94 +117,278 @@ _KILL_ON_JOB_CLOSE = 0x2000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 
 
+_KERNEL32 = None
+
+
 def _kernel32():
-    """显式声明每个入口的 restype/argtypes。
+    """取一个只归本模块用的 kernel32，并把原型声明齐。
 
-    不写的话 ctypes 默认按 C int 传参，x64 上句柄会被截成 32 位——表现为赋值偶尔失败，
-    而失败被下面那个 best-effort 分支吃掉，比直接崩更难查。
+    两个坑：① 不写 restype/argtypes 时 ctypes 按 C int 传参，x64 上句柄会被截成 32 位，
+    表现为赋值偶发失败，而失败又被下面那个 best-effort 分支吃掉，比直接崩更难查。
+    ② 必须用 `WinDLL` 新建实例，不能拿 `ctypes.windll.kernel32`——后者是进程级共享缓存，
+    在它上面设 argtypes 等于改掉同进程里所有其他调用方看到的原型。
     """
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
-    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
-    kernel32.SetInformationJobObject.argtypes = (ctypes.c_void_p, ctypes.c_int,
-                                                 ctypes.c_void_p, ctypes.c_ulong)
-    kernel32.SetInformationJobObject.restype = ctypes.c_int
-    kernel32.AssignProcessToJobObject.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
-    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
-    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-    kernel32.CloseHandle.restype = ctypes.c_int
-    return kernel32
+    global _KERNEL32
+    if _KERNEL32 is None:
+        # use_last_error=True：CreateProcessW / UpdateProcThreadAttribute 失败时要把
+        # GetLastError 报出来，否则"绑定失败"和"平台不适用"就长得一模一样。
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.SetInformationJobObject.argtypes = (ctypes.c_void_p, ctypes.c_int,
+                                                    ctypes.c_void_p, ctypes.c_ulong)
+        kernel32.SetInformationJobObject.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+        kernel32.GetExitCodeProcess.restype = ctypes.c_int
+        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+        kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+        kernel32.TerminateProcess.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        kernel32.TerminateProcess.restype = ctypes.c_int
+        kernel32.IsProcessInJob.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int))
+        kernel32.IsProcessInJob.restype = ctypes.c_int
+        kernel32.InitializeProcThreadAttributeList.argtypes = (
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_size_t))
+        kernel32.InitializeProcThreadAttributeList.restype = ctypes.c_int
+        kernel32.UpdateProcThreadAttribute.argtypes = (
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_void_p,
+            ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p)
+        kernel32.UpdateProcThreadAttribute.restype = ctypes.c_int
+        kernel32.DeleteProcThreadAttributeList.argtypes = (ctypes.c_void_p,)
+        kernel32.CreateProcessW.argtypes = (
+            ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_wchar_p,
+            ctypes.c_void_p, ctypes.c_void_p)
+        kernel32.CreateProcessW.restype = ctypes.c_int
+        _KERNEL32 = kernel32
+    return _KERNEL32
 
 
-def _reap_with_parent(process) -> Any:
-    """把浏览器绑进 kill-on-close 的作业对象，交回作业句柄；不适用时回 None。
+_EXT_FLAG = 0x00080000                    # EXTENDED_STARTUPINFO_PRESENT：漏了它属性列表被静默忽略
+_JOB_LIST_ATTRIBUTE = 0x0002000D          # PROC_THREAD_ATTRIBUTE_JOB_LIST
+_WAIT_OBJECT_0 = 0x0
+_WAIT_TIMEOUT = 0x102
 
-    finally 里的 taskkill 只有父进程【正常退出】才跑得到。实测 44 套孤儿全都在
-    `parent=GONE` 状态——Agent 会话被硬杀或重启时 finally 根本不执行，headless Edge 却
-    一直活着，462 个进程把 CPU 顶到 99°C。作业对象把这层保证交给操作系统：句柄随进程
-    关闭，整棵树跟着没。
+
+class _StartupInfoW(ctypes.Structure):
+    _fields_ = [("cb", ctypes.c_uint32), ("lpReserved", ctypes.c_wchar_p),
+                ("lpDesktop", ctypes.c_wchar_p), ("lpTitle", ctypes.c_wchar_p),
+                ("dwX", ctypes.c_uint32), ("dwY", ctypes.c_uint32),
+                ("dwXSize", ctypes.c_uint32), ("dwYSize", ctypes.c_uint32),
+                ("dwXCountChars", ctypes.c_uint32), ("dwYCountChars", ctypes.c_uint32),
+                ("dwFillAttribute", ctypes.c_uint32), ("dwFlags", ctypes.c_uint32),
+                ("wShowWindow", ctypes.c_uint16), ("cbReserved2", ctypes.c_uint16),
+                ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+                ("hStdInput", ctypes.c_void_p), ("hStdOutput", ctypes.c_void_p),
+                ("hStdError", ctypes.c_void_p)]
+
+
+class _StartupInfoExW(ctypes.Structure):
+    _fields_ = [("StartupInfo", _StartupInfoW), ("lpAttributeList", ctypes.c_void_p)]
+
+
+class _ProcessInformation(ctypes.Structure):
+    _fields_ = [("hProcess", ctypes.c_void_p), ("hThread", ctypes.c_void_p),
+                ("dwProcessId", ctypes.c_uint32), ("dwThreadId", ctypes.c_uint32)]
+
+
+class BrowserSpawnError(VisualAcceptanceError):
+    """浏览器进程没能被创建在作业对象里——此时不存在任何回收保证，必须响亮失败。"""
+
+
+class _BrowserProcess:
+    """`CreateProcessW` 起浏览器后交回的句柄对象，只暴露调用点真正用到的三个动作。
+
+    形状刻意贴着 `subprocess.Popen`（`pid` / `poll()` / `wait(timeout=)` / `kill()`），
+    这样既有调用方与打 `wait` 补丁的测试不用改。
+    """
+
+    def __init__(self, pid: int, handle: Any):
+        self.pid = pid
+        self._handle = handle
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        kernel32 = _kernel32()
+        if kernel32.WaitForSingleObject(self._handle, 0) != _WAIT_OBJECT_0:
+            return None
+        code = ctypes.c_ulong()
+        kernel32.GetExitCodeProcess(self._handle, ctypes.byref(code))
+        self.returncode = int(code.value)
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        millis = 0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))
+        kernel32 = _kernel32()
+        if kernel32.WaitForSingleObject(self._handle, millis) == _WAIT_TIMEOUT:
+            raise subprocess.TimeoutExpired(cmd="browser", timeout=timeout)
+        return self.poll() or 0
+
+    def kill(self) -> None:
+        _kernel32().TerminateProcess(self._handle, 1)
+
+
+def _make_job() -> Any:
+    kernel32 = _kernel32()
+    handle = kernel32.CreateJobObjectW(None, None)
+    if not handle:
+        return None
+    limits = _JobExtendedLimits()
+    limits.BasicLimitInformation.LimitFlags = _KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(
+            handle, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits), ctypes.sizeof(limits)):
+        kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
+def _in_job(handle: Any, job: Any) -> bool:
+    flag = ctypes.c_int(0)
+    if not _kernel32().IsProcessInJob(handle, job, ctypes.byref(flag)):
+        return False
+    return bool(flag.value)
+
+
+def spawn_browser_in_job(argv: list[str], creationflags: int = 0):
+    """让浏览器【一出生】就在 kill-on-close 作业对象里。
+
+    返回 `(process, job, error)`。原先的实现是 `Popen` 之后再 `AssignProcessToJobObject`，
+    实测超过约 150ms 就永久失败（`ERROR_ACCESS_DENIED`，Chromium 已建好自己的作业对象），
+    而失败被当成「平台不适用」静默吞掉——CPU 饱和时（也就是 99°C 那次）必输。用
+    `PROC_THREAD_ATTRIBUTE_JOB_LIST` 让进程出生即在作业对象里，窗口归零。
+
+    非 Windows 回退到 `subprocess.Popen`，job 为 None：那边本来就没有作业对象可用。
     """
     if os.name != "nt":
-        return None
-    handle = None
-    try:
-        kernel32 = _kernel32()
-        handle = kernel32.CreateJobObjectW(None, None)
-        if not handle:
-            return None
-        limits = _JobExtendedLimits()
-        limits.BasicLimitInformation.LimitFlags = _KILL_ON_JOB_CLOSE
-        if not kernel32.SetInformationJobObject(
-                handle, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-                ctypes.byref(limits), ctypes.sizeof(limits)):
-            raise OSError("SetInformationJobObject rejected")
-        # 必须在子进程已经创建、但还没派生渲染进程之前绑上；靠 Chromium 自己在浏览器
-        # 进程消失时终止其余进程来覆盖绑定时机之外的那几个。
-        if not kernel32.AssignProcessToJobObject(handle, process._handle):
-            raise OSError("AssignProcessToJobObject rejected")
-        return handle
-    except OSError:
-        if handle:
-            try:
-                _kernel32().CloseHandle(handle)
-            except OSError:
-                pass
-        return None
+        process = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, creationflags=creationflags)
+        return process, None, ""
+    kernel32 = _kernel32()
+    job = _make_job()
+    if not job:
+        return None, None, "CreateJobObjectW/SetInformationJobObject failed gle=%d" % ctypes.get_last_error()
+    size = ctypes.c_size_t(0)
+    kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+    attribute = (ctypes.c_byte * size.value)()
+    if not kernel32.InitializeProcThreadAttributeList(attribute, 1, 0, ctypes.byref(size)):
+        kernel32.CloseHandle(job)
+        return None, None, "InitializeProcThreadAttributeList failed gle=%d" % ctypes.get_last_error()
+    jobs = (ctypes.c_void_p * 1)(job)
+    if not kernel32.UpdateProcThreadAttribute(attribute, 0, _JOB_LIST_ATTRIBUTE,
+                                              jobs, ctypes.sizeof(jobs), None, None):
+        kernel32.DeleteProcThreadAttributeList(attribute)
+        kernel32.CloseHandle(job)
+        return None, None, "UpdateProcThreadAttribute failed gle=%d" % ctypes.get_last_error()
+    info = _StartupInfoExW()
+    info.StartupInfo.cb = ctypes.sizeof(_StartupInfoExW)
+    info.lpAttributeList = ctypes.cast(attribute, ctypes.c_void_p)
+    out = _ProcessInformation()
+    cmdline = subprocess.list2cmdline(argv)
+    ok = kernel32.CreateProcessW(None, cmdline, None, None, False,
+                                 creationflags | _EXT_FLAG, None, None,
+                                 ctypes.byref(info), ctypes.byref(out))
+    error = "" if ok else "CreateProcessW failed gle=%d" % ctypes.get_last_error()
+    kernel32.DeleteProcThreadAttributeList(attribute)
+    if not ok:
+        kernel32.CloseHandle(job)
+        return None, None, error
+    kernel32.CloseHandle(out.hThread)
+    process = _BrowserProcess(int(out.dwProcessId), out.hProcess)
+    # 出生即在内是这套机制唯一的不变量；漏掉 EXTENDED_STARTUPINFO_PRESENT 时
+    # CreateProcessW 会「成功」但属性被整个忽略，所以这里必须当场断言。
+    if not _in_job(out.hProcess, job):
+        process.kill()
+        kernel32.CloseHandle(out.hProcess)
+        kernel32.CloseHandle(job)
+        return None, None, "browser was not born inside the job object"
+    return process, job, ""
 
 
-def _close_reaper(job: Any) -> None:
+def _close_reaper(job: Any) -> bool:
+    """关掉作业句柄 = 让操作系统收走整棵树。返回是否真的关上了。
+
+    实测这一步是同步的：关句柄后的下一条语句就用 ctypes 逐个查已知 pid，16 个全部已没。
+    （曾经加过 `TerminateJobObject`，理由是「只关句柄要等 0.2~2.5 秒」——那是用
+    PowerShell 计数测出来的开销，不是异步延迟；去掉后微秒级探针仍然测不出差别，所以撤掉，
+    不给不会发生的场景留兜底。）作业句柄不可继承，没有第二个句柄会把树留住。
+    """
     if job is None:
-        return
+        return False
     try:
-        _kernel32().CloseHandle(job)
+        return bool(_kernel32().CloseHandle(job))
     except OSError:
-        pass
+        return False
 
 
 def _release_profile(profile) -> bool:
     """删掉 profile，扛住 Edge 退出前那段文件锁；返回是否真的删干净了。
 
-    正常退出路径实测 10/10 次都留下目录：`process.wait(3)` 一超时我们就开始删，而 Edge
-    还锁着自己的文件。`ignore_cleanup_errors=True` 只是不抛异常，不等于删掉了，且
-    `TemporaryDirectory.cleanup()` 只执行一次，重试只能自己做。删不净的由
-    `sweep_stale_profiles` 兜底。
+    正常退出路径实测也会留下目录：`process.wait(3)` 一超时我们就开始删，而 Edge 还锁着
+    自己的文件。`ignore_cleanup_errors=True` 只是不抛异常，不等于删掉了。必须自己带
+    退避重试 —— `TemporaryDirectory.cleanup()` 本身不会等，试一次失败就交差（实测 3.13
+    上它可以再调，但没有任何等待，所以拿它当重试等于原地空转）。删不净的由
+    `sweep_stale_profiles` 按归属 PID 兜底。
     """
-    path = profile.name
+    path = profile if isinstance(profile, str) else profile.name
     for _ in range(20):
         shutil.rmtree(path, ignore_errors=True)
         if not os.path.isdir(path):
             return True
         time.sleep(0.15)
-    profile.cleanup()
+    cleanup = getattr(profile, "cleanup", None)
+    if cleanup is not None:
+        cleanup()
     return not os.path.isdir(path)
 
 
-def sweep_stale_profiles(directory: str | Path) -> list[str]:
-    """回收硬杀父进程留下的旧 profile 目录，返回被删掉的路径。
+# 存活判断只在 `temp_state` 里实现一份：本模块的 profile 回收和它的测试状态回收面对的是
+# 同一个问题（归属 PID 还在不在），两份实现迟早会漂移——这次评审就抓到过同包内两套作业
+# 对象实现漂移的先例。
+_pid_alive = temp_state.pid_alive
 
-    与 `_reap_with_parent` 同一个成因：`finally` 里的 `profile.cleanup()` 也只跑得到正常
-    退出，实测一夜留下 41 个目录、8.3 GB。只认我们自己的前缀、且必须老到远超一次运行，
-    并发同事正在用的目录不会被碰。
+
+def _claim_profile(path: str) -> None:
+    """把归属 PID 写进 profile，作为 sweep 唯一认账的「这个目录还有人用」证据。"""
+    temp_state.claim(path)
+
+
+def _browser_still_listening(profile_dir: str | Path) -> bool:
+    """这个 profile 对应的浏览器是否还活着 —— 直接证据，不靠归属标记推断。
+
+    headless Edge 会把 CDP 端口写进 `DevToolsActivePort` 第一行。端口能连上就是在用；
+    连不上说明浏览器已经没了（端口被别的进程复用只会让我们保守地跳过删除，方向是安全的）。
+    读不到文件也当作活着：改动前启动的会话没有 `.docmind-owner`，光靠 PID 判据永远回收不了。
+    """
+    try:
+        line = (Path(profile_dir) / "DevToolsActivePort").read_text(encoding="utf-8")
+        port = int(line.splitlines()[0].strip())
+    except (OSError, ValueError, IndexError):
+        return True
+    if not 0 < port < 65536:
+        return True
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def sweep_stale_profiles(directory: str | Path) -> list[str]:
+    """回收【浏览器已经没了】的 profile 目录，返回真正删掉的路径。
+
+    这里曾经用「目录 mtime 超过 6 小时」当判据，是错的：Windows 上往已存在的子目录反复
+    写文件并不会推进父目录的 mtime，而 Edge 平时正是往 Default\\Cache\\ 里写。实测一个
+    **正在使用**的 profile 被这样判定为「7 小时没动过」，222 个文件被删到 95 个，而函数
+    返回空列表——报「没什么可清理」的同时损坏了别人正在跑的会话，是最难归因的一类故障。
+
+    现在两条例据都要成立才动手：归属 PID 已经没了（或压根没有标记），且 CDP 端口已经连不上。
+    任一条判断不了就跳过 —— 宁可漏下几十 MB，不可删掉别人正在用的浏览器。
     """
     parent = Path(str(directory or ""))
     removed: list[str] = []
@@ -212,12 +396,16 @@ def sweep_stale_profiles(directory: str | Path) -> list[str]:
         entries = list(os.scandir(parent))
     except OSError:
         return removed
-    deadline = time.time() - _PROFILE_MAX_AGE_SECONDS
     for entry in entries:
         if not entry.name.startswith(_PROFILE_PREFIX):
             continue
         try:
-            if not entry.is_dir() or entry.stat().st_mtime >= deadline:
+            if not entry.is_dir():
+                continue
+            pid = temp_state.owner_of(Path(entry.path))   # None = 没标记：改动前的会话或别人建的
+            if pid is not None and _pid_alive(pid):
+                continue
+            if _browser_still_listening(entry.path):
                 continue
             shutil.rmtree(entry.path, ignore_errors=True)
             # 用 path 而不是 entry 复查：DirEntry 会缓存 stat，删完再问它仍然说「在」。
@@ -226,7 +414,6 @@ def sweep_stale_profiles(directory: str | Path) -> list[str]:
         except OSError:
             continue
     return removed
-
 
 
 def sanitize_flags(flags: Any) -> list[str]:
@@ -277,17 +464,17 @@ def stop_static(server: Any, thread: Any) -> None:
 
 
 @contextlib.contextmanager
-def browser_session(timeout: float = 25.0, extra_flags: Any = ()):
+def browser_session(timeout: float = 25.0, extra_flags: Any = (),
+                    cleanup: dict | None = None):
     """起一个带 CDP 的真实浏览器，交回 `_DevTools`；退出时进程与 profile 一定收干净。
 
     拆出来是因为媒体夹具需要在同一批启动参数上追加假设备开关——两条启动路径各自演化
     迟早会出现「预览能过、媒体过不了」这种无法解释的差集。
 
-    **新建任何"要看一眼界面"的脚本都必须走这里，不要引 playwright。** playwright 启动的
-    浏览器拿不到进程句柄，绑不了 kill-on-close 的作业对象（`_reap_with_parent`），父进程被
-    硬杀（会话重启、工具超时）时必然留下孤儿 headless 进程与 `playwright_chromiumdev_profile-*`
-    目录——实测几百个 msedge 把 CPU 顶到 99°C。这条路径由作业对象 + 显式 taskkill /T /F +
-    profile 重试回收 + 启动前 sweep 四道兜住。
+    **新建任何"要看一眼界面"的脚本都必须走这里，不要引 playwright，也不要自己 Popen
+    浏览器。** 浏览器由 `spawn_browser_in_job` 创建在 kill-on-close 作业对象里（出生即在，
+    没有事后补绑的窗口）；父进程被硬杀时由操作系统收走整棵树。传 `cleanup` 字典可以拿到
+    收尾各步的成败，调用方据此决定要不要把偏离报给操作者。
     """
     edge = _edge_binary()
     try:
@@ -298,16 +485,17 @@ def browser_session(timeout: float = 25.0, extra_flags: Any = ()):
     sweep_stale_profiles(tempfile.gettempdir())
     profile = tempfile.TemporaryDirectory(prefix=_PROFILE_PREFIX,
                                           ignore_cleanup_errors=True)
+    _claim_profile(profile.name)
     process = None
     connection = None
     job = None
     try:
         creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        process = subprocess.Popen([edge, *_BASE_FLAGS, *flags,
-                                    "--user-data-dir=%s" % profile.name, "about:blank"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   creationflags=creation)
-        job = _reap_with_parent(process)
+        process, job, spawn_error = spawn_browser_in_job(
+            [edge, *_BASE_FLAGS, *flags, "--user-data-dir=%s" % profile.name, "about:blank"],
+            creation)
+        if process is None:
+            raise BrowserSpawnError("浏览器未能创建在回收作业对象里：%s" % spawn_error)
         active = Path(profile.name) / "DevToolsActivePort"
         deadline = time.monotonic() + min(15.0, max(3.0, float(timeout) / 2))
         while not active.exists() and time.monotonic() < deadline:
@@ -335,6 +523,11 @@ def browser_session(timeout: float = 25.0, extra_flags: Any = ()):
                 connection.close()
             except Exception:
                 pass
+        # 实测：Popen/CreateProcessW 拿到的那个 msedge.exe 是 launcher，200ms 内就以退出码 0
+        # 自己走了，真正在跑的是继承作业对象的浏览器进程。所以 taskkill 打在一个不存在的
+        # pid 上（rc=128「没有找到进程」），从来杀不掉任何东西；作业对象是唯一在干活的
+        # 机制，因此先解绑它。taskkill 只留作非 nt 回退路径上的尽力一试。
+        job_closed = _close_reaper(job)
         if process is not None:
             try:
                 if os.name == "nt":
@@ -349,11 +542,11 @@ def browser_session(timeout: float = 25.0, extra_flags: Any = ()):
                     process.kill()
                 except Exception:
                     pass
-        # 顺序要紧：先让上面那条显式关闭跑完，再解绑作业。提前关句柄会当场杀掉浏览器，
-        # 把「谁关的、为什么关」这条排查线索抹掉。
-        _close_reaper(job)
-        job = None
-        _release_profile(profile)
+        released = _release_profile(profile)
+        if cleanup is not None:
+            cleanup.update({"spawned": process is not None,
+                            "job_closed": bool(job_closed),
+                            "profile_released": bool(released)})
 
 
 _MAX_CONSOLE = 30
@@ -543,8 +736,10 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
     if not target:
         # 已经指定了本机 URL 就直接打那个服务，不再多起一个静态站
         server, server_thread = serve_static(root_path)
+    cleanup: dict[str, Any] = {}
+    result: dict[str, Any] = {}
     try:
-        with browser_session(timeout, extra_flags) as devtools:
+        with browser_session(timeout, extra_flags, cleanup=cleanup) as devtools:
             devtools.call("Emulation.setDeviceMetricsOverride", {
                 "width": width, "height": height, "deviceScaleFactor": 1,
                 "mobile": False,
@@ -582,7 +777,7 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
                 "no_console_errors": not console_errors,
                 "no_failed_requests": not devtools.failed_requests,
             }
-            return {
+            result = {
                 "ok": all(checks.values()), "passed": all(checks.values()),
                 "checks": checks, "title": title, "body_excerpt": body_text,
                 "runtime_errors": devtools.runtime_errors,
@@ -607,6 +802,11 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
                                  "failed_requests": str(len(devtools.failed_requests))},
                 }],
             }
+        # 收尾偏离才出声：正常路径不往每次预览的输出里加噪音；但「没起成/没关掉/没删净」
+        # 必须能被操作者看见——静默泄漏正是 462 个进程攒到 99°C 的成因。
+        if cleanup and not all(cleanup.values()):
+            result["cleanup"] = dict(cleanup)
+        return result
     except VisualAcceptanceError:
         raise
     except Exception as exc:

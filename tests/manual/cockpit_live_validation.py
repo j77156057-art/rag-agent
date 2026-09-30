@@ -29,8 +29,11 @@ from pathlib import Path
 import websocket
 
 REPO = Path(__file__).resolve().parents[2]
-EDGE = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
 sys.path.insert(0, str(REPO))
+
+from agent_runtime import visual_acceptance as visual  # noqa: E402
+
+_CREATION = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
@@ -54,10 +57,17 @@ class ProjectBrowser:
         self.url = f"http://127.0.0.1:{self.server.server_port}/index.html"
         self.profile = tempfile.TemporaryDirectory(prefix="docmind-live-preview-", ignore_cleanup_errors=True)
         self.process = self.connection = None
+        self.job = None
         self.sequence = self.capture_count = 0
         self.errors = []
         try:
-            self.process = subprocess.Popen([str(EDGE), "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", "--remote-allow-origins=*", f"--user-data-dir={self.profile.name}", "about:blank"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            self.process, self.job, spawn_error = visual.spawn_browser_in_job(
+                [visual._edge_binary(), *visual._BASE_FLAGS,
+                 f"--user-data-dir={self.profile.name}", "about:blank"], _CREATION)
+            if self.process is None:
+                # 出生即在内是唯一的回收保证；拿不到作业对象就别继续，否则这场校验
+                # 跑完会在盘上留一整棵无人认领的浏览器进程树。
+                raise visual.VisualAcceptanceError("浏览器未能创建在回收作业对象里：%s" % spawn_error)
             active = Path(self.profile.name) / "DevToolsActivePort"
             for _ in range(100):
                 if active.exists():
@@ -135,17 +145,39 @@ class ProjectBrowser:
             return {"checks": checks, "metrics": metrics, "screenshot": str(path), "image": base64.b64encode(raw).decode(), "passed": all(checks.values())}
 
     def close(self):
-        if self.connection:
-            self.connection.close()
-            self.connection = None
-        if self.process:
-            subprocess.run(["taskkill", "/PID", str(self.process.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-            self.process.wait(timeout=10)
-            self.process = None
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2)
-        self.profile.cleanup()
+        """每一步单独尽力，任何一步失败都不能把后面的步骤跳掉。
+
+        原来 `process.wait(timeout=10)` 一超时就把服务停止与 profile 回收整个跳过,而那
+        恰好是这里要防的泄漏本身。解绑作业排在显式关闭之后:先让 taskkill 跑完,线索还
+        在;真没关掉,解绑本身就是兜底。
+        """
+        try:
+            if self.connection:
+                self.connection.close()
+                self.connection = None
+        except Exception:
+            pass
+        # 先解绑作业：实测 launcher 进程 200ms 内自行退出，taskkill 打在不存在的 pid 上
+        # （rc=128），从来杀不掉任何东西，作业对象才是唯一在干活的机制。
+        if self.job is not None:
+            visual._close_reaper(self.job)
+            self.job = None
+        try:
+            if self.process:
+                subprocess.run(["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=_CREATION, timeout=10)
+                self.process.wait(timeout=10)
+                self.process = None
+        except Exception:
+            pass
+        try:
+            self.server.shutdown()
+            self.server.server_close()
+            self.thread.join(timeout=2)
+        except Exception:
+            pass
+        visual._release_profile(self.profile)
 
 
 def main():

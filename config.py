@@ -1,4 +1,5 @@
 """DocMind 配置中心：从 .env 读取，集中管理模型 / 路径 / 参数。"""
+import atexit
 import json
 import contextvars
 import os
@@ -8,6 +9,8 @@ from datetime import datetime
 import tempfile
 
 from dotenv import load_dotenv
+
+import temp_state
 
 load_dotenv()
 
@@ -73,6 +76,14 @@ _TEST_STATE_ISOLATED = bool(
 )
 if _TEST_STATE_ISOLATED:
     STATE_ROOT = tempfile.mkdtemp(prefix="docmind_test_state_")
+    # 每个测试进程留一个：实测攒到 1,794 个目录 / 239 MB / 1.9 万个文件（里面是 .chroma
+    # 与 sqlite）。正常退出靠 atexit 自己删；被硬杀留下的由下一个进程扫掉——判据是归属
+    # PID，不是目录 mtime（Windows 上往子目录写文件不推进父目录 mtime，用它误删过正在
+    # 使用的浏览器 profile）。显式设了 DOCMIND_STATE_ROOT 的走不到这里，绝不会被删。
+    temp_state.claim(STATE_ROOT)
+    atexit.register(temp_state.release, STATE_ROOT)
+    temp_state.sweep_orphans(tempfile.gettempdir(),
+                             ("docmind_test_state_", "docmind_deveval_"))
 
 
 def state_path(env_name, default):
