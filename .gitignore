@@ -40,6 +40,11 @@ git_report.txt
 .docmind_model_context.json
 .docmind_state.json.bak-*
 
+# 仓库内临时区：探针脚本、pytest basetemp、量盒子的中间产物都落在这里。
+# 实测 7.4 MB / 372 个文件，且未忽略时任何一次 `git add -A` 都会把它们扫进版本库——
+# 共用工作树上这已经发生过（一条 lane 的批量 add 把另一条 lane 的在制品一起暂存了）。
+.tmp/
+
 # ===== 前端工程（Node 依赖与构建产物）=====
 frontend/node_modules/
 web/assets/
