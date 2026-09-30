@@ -1136,5 +1136,37 @@ class ToolResultCoercionTests(_TmpProject):
         self.assertEqual(mcp_autoconnect._as_text(_Nasty()), "")
 
 
+class ContextDirReclaimTests(unittest.TestCase):
+    """`_new_context_dir` 的接线本身要能红。
+
+    回收函数自己有测试，但「创建目录之前确实调了它」没有——有人把它改回裸
+    `tempfile.mkdtemp` 的话，2,109 个 `docmind_ac_*` 空壳会重新攒起来而没有任何测试变红。
+    """
+
+    def test_new_context_dir_sweeps_before_creating_and_returns_a_usable_dir(self):
+        seen = {}
+
+        def fake_sweep(directory, prefixes, min_age_seconds=7200.0):
+            seen["directory"] = directory
+            seen["prefixes"] = tuple(prefixes)
+            return []
+
+        with patch("temp_state.sweep_stale_orphans", side_effect=fake_sweep) as swept:
+            created = mcp_autoconnect._new_context_dir()
+        self.assertEqual(swept.call_count, 1, "创建上下文目录前必须先回收旧壳")
+        self.assertTrue(os.path.isdir(created), "返回的目录必须已经可用")
+        self.assertTrue(os.path.basename(created).startswith("docmind_ac_"))
+        self.assertIn("docmind_ac_", seen["prefixes"],
+                      "回收必须覆盖我们自己那一家族：%r" % (seen["prefixes"],))
+
+    def test_download_cache_is_never_in_the_sweep_prefixes(self):
+        """`playwright-download-*` 是浏览器下载缓存：本机 CDN 拉不到 chromium，删了要不回来。"""
+        with patch("temp_state.sweep_stale_orphans", return_value=[]) as swept:
+            mcp_autoconnect._new_context_dir()
+        prefixes = tuple(swept.call_args[0][1])
+        self.assertFalse([p for p in prefixes if "download" in p],
+                         "回收前缀里出现了下载缓存：%r" % (prefixes,))
+
+
 if __name__ == "__main__":
     unittest.main()

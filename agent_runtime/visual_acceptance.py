@@ -815,5 +815,7 @@ def capture_project_preview(root: str | Path, *, entry: str = "", evidence_dir: 
         stop_static(server, server_thread)
 
 
-__all__ = ["VisualAcceptanceError", "browser_session", "capture_project_preview",
-           "preview_target", "sanitize_flags", "serve_static", "stop_static"]
+__all__ = ["BrowserSpawnError", "VisualAcceptanceError", "browser_session",
+           "capture_project_preview", "preview_target", "sanitize_flags",
+           "serve_static", "spawn_browser_in_job", "stop_static",
+           "sweep_stale_profiles"]

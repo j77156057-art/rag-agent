@@ -310,7 +310,7 @@ voice input is…`）直接展示在语音回合里，语音场景不该展开�
 ## 2026-09-30 修「幕布偏左」：docked 面板被入场动画的 transform 拖出屏幕（AI-F，用户指派）
 
 - **现象（用户报）**：开发舱 → 引擎画面/场景，面板内容整体偏左，画面区大半在屏外，只剩右侧 Bug 列表飘在幕布中间。
-- **定位手段**：装了 playwright，但它下载 chromium 的 CDN 在这台机器上**拿不到**（下了几分钟 0 字节），改用**系统已装的 Edge**（`channel="msedge"`）驱动，零下载。探针 `.tmp/probe_layout.py` 会把候选容器的 `getBoundingClientRect` + computed style + 舞台子树「标签/类名/盒子」清单落盘到 `.tmp/layout.json`，并截图 `.tmp/shot_layout.png` —— 这类「看着不对但说不出哪里」的问题，量盒子比猜 CSS 快得多。
+- **定位手段**：装了 playwright，但它下载 chromium 的 CDN 在这台机器上**拿不到**（下了几分钟 0 字节），改用**系统已装的 Edge**（`channel="msedge"`）驱动，零下载。探针 `tests/manual/probe_layout.py` 会把候选容器的 `getBoundingClientRect` + computed style + 舞台子树「标签/类名/盒子」清单落盘到 `.tmp/layout.json`，并截图 `.tmp/shot_layout.png` —— 这类「看着不对但说不出哪里」的问题，量盒子比猜 CSS 快得多。
 - **根因（不是居中问题，是层叠问题）**：`.pb-pop` 自己身上挂了入场动画，且 `fill-mode: both`：
   `@keyframes pb-pop-in { to { transform: translate(-50%,-50%) scale(1) } }`。
   **CSS 动画在层叠里压过普通声明**，所以 docked 形态 `.pb-pop-inline` 里的 `transform: none` **根本没生效**（而同一规则里的 `left/top: auto` 生效了）。面板按静态位置落位后又被 translate 拖走自身宽高的一半：实测 1993 宽 → `left = 39-996 = -957`，1057 高 → `top = 482-528 = -46`。两个数字与实测**逐位吻合**，坐实根因。
@@ -324,7 +324,7 @@ voice input is…`）直接展示在语音回合里，语音场景不该展开�
   | Bug 侧栏 `.pb-side` | `x=656`（飘在幕布中间） | `x=1652`（回到右列） |
 
   截图亦确认面板铺满幕布、左上工具栏恢复。前端 `npm run build`（含 typecheck）通过；`test_live_stream_control` / `test_live_audio_control` / `test_desktop_entry` / `test_live_vision_alerts` **17 passed**。
-- **环境改动（告知）**：`.venv` 里装了 `playwright`（38 MB，pip 可通）；**chromium 本体没下**（CDN 被挡），走系统 Edge。想复用就 `python -B .tmp/probe_layout.py [宽] [高]`。
+- **环境改动（告知）**：`.venv` 里装了 `playwright`（38 MB，pip 可通）；**chromium 本体没下**（CDN 被挡），走系统 Edge。想复用就 `python -B tests/manual/probe_layout.py [宽] [高]`。
 - 归 AI-B lane 的文件（`SceneRuntimePanel.vue`），我只改了那一处声明。
 
 ## 2026-09-29 语音指令转交主 Agent（A 档：全部转交）+ 语音前端人设（AI-F，用户指派「A. 全部转交」）

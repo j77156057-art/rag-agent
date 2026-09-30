@@ -29,6 +29,7 @@ from typing import Any, Callable, Optional
 import mcp_client
 import secrets_store
 import project_state
+import temp_state
 from textutil import as_text as _as_text
 from mcp_server_index import match_curated_server, curated_entry_to_config
 import mcp_registry
@@ -494,6 +495,21 @@ def _new_task_id() -> str:
     return f"ac_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
 
 
+def _new_context_dir() -> str:
+    """建一个持久上下文目录，顺手回收被硬杀留下的空壳。
+
+    `launch_persistent_context` 用的是调用方自持的 `user_data_dir`，playwright 故意不删，
+    所以只有我们能删。实测这台机器上攒了 2,109 个 `docmind_ac_*` 与 22 个
+    `playwright_chromiumdev_profile-*`（后者 247 MB）。回收判据是「改名探针」而不是年龄：
+    活的 Chromium 一直开着 profile 里的 lockfile，Windows 上那会让目录改不了名。
+    刻意不碰 `playwright-download-*`——那是浏览器下载缓存，本机 CDN 拉不到 chromium。
+    """
+    temp_state.sweep_stale_orphans(tempfile.gettempdir(),
+                                   ("docmind_ac_", "playwright_chromiumdev_profile-",
+                                    "playwright-artifacts-"))
+    return tempfile.mkdtemp(prefix="docmind_ac_")
+
+
 def _launch_edge(context_dir: str) -> tuple[Any, Any]:
     """持久上下文：复用系统 Edge（channel='msedge'），保 cookie/login 跨人工步与崩溃。
 
@@ -719,7 +735,7 @@ def _l2_result(note: str, url: str, *, provider: str = "",
                adapter: Optional[dict[str, Any]] = None, root: str = "") -> dict[str, Any]:
     """L2 降级：不起浏览器，登记会话并返回官方 URL，由前端弹 L2 引导。"""
     task_id = _new_task_id()
-    context_dir = tempfile.mkdtemp(prefix="docmind_ac_")
+    context_dir = _new_context_dir()
     secret_provider = (adapter or {}).get("secret_provider", provider)
     _persist_session(task_id, "L2", url, context_dir, status="waiting_user",
                      provider=secret_provider, step="l2", root=root)
@@ -823,7 +839,7 @@ def browser_register(root: str, key: str, cand: dict[str, Any], provider: str) -
                           provider=provider, adapter=adapter, root=root)
 
     task_id = _new_task_id()
-    context_dir = tempfile.mkdtemp(prefix="docmind_ac_")
+    context_dir = _new_context_dir()
     secret_provider = adapter.get("secret_provider", provider)
     user_prompt = adapter.get("user_prompt", DEFAULT_USER_PROMPT)
 

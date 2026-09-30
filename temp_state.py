@@ -15,6 +15,7 @@ from __future__ import annotations
 import ctypes
 import os
 import shutil
+import time
 from pathlib import Path
 
 OWNER_FILE = ".docmind-owner"
@@ -125,4 +126,50 @@ def release(path: str | Path) -> bool:
     return not os.path.isdir(target)
 
 
-__all__ = ["claim", "owner_of", "pid_alive", "release", "sweep_orphans"]
+def sweep_stale_orphans(directory: str | Path, prefixes: tuple[str, ...],
+                        min_age_seconds: float = 7200.0) -> list[str]:
+    """回收【我们插不上归属标记】的第三方目录，主判据是 Windows 的重命名探针。
+
+    用于 playwright 那一类：`launch_persistent_context` 用的是调用方自持的
+    `user_data_dir`，playwright 故意不删，而我们又没法往它的创建路径里塞标记。
+
+    判据为什么是改名而不是时间：活的 Chromium 一直开着 profile 里的 `lockfile`（不带
+    FILE_SHARE_DELETE），Windows 上只要有文件被这样打开，其所在目录就改不了名。改名成功
+    即证明「此刻无人持有」，比任何年龄阈值都硬。`min_age_seconds` 只是给刚建好、还没来得及
+    打开文件的目录留一段余量，不是主判据。
+
+    刻意不收的：`playwright-download-*` 是 playwright 的浏览器下载缓存，这台机器的 CDN
+    拉不到 chromium，删了就要不回来——调用方给前缀时请自己排除。
+    """
+    parent = Path(str(directory or ""))
+    removed: list[str] = []
+    now = time.time()
+    try:
+        entries = list(os.scandir(parent))
+    except OSError:
+        return removed
+    for entry in entries:
+        if not entry.name.startswith(prefixes):
+            continue
+        try:
+            if not entry.is_dir() or now - entry.stat().st_mtime < min_age_seconds:
+                continue
+        except OSError:
+            continue
+        probe = entry.path + ".stale-probe"
+        try:
+            os.rename(entry.path, probe)
+        except OSError:
+            continue               # 改名失败 = 有人正开着里面的东西，或 ACL 不允许：都不硬来
+        shutil.rmtree(probe, ignore_errors=True)
+        if os.path.isdir(probe):
+            try:
+                os.rename(probe, entry.path)   # 删不干净就放回去，别把目录弄成凭空消失
+            except OSError:
+                continue
+        removed.append(entry.path)
+    return removed
+
+
+__all__ = ["claim", "owner_of", "pid_alive", "release", "sweep_orphans",
+           "sweep_stale_orphans"]
