@@ -1,5 +1,19 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-10-02 Vibecoding 能力补全 Wave14：`dev_headcheck` —— 把 HEAD 挂成干净检出验自洽（本会话，不占 R 槽位）
+
+- **补什么**：一条**在工作树里永远看不见**的错。共享工作树里多个 AI 同时改同一批文件，只要发生 ① 漏 `git add`，或 ② `git commit -- <路径>` 绕过索引把别人的 WIP 一起提交掉（本仓 2026-10-01 真发生过，见上一节披露），结果都是"引用新模块的 import 进了 HEAD，新模块本身还在磁盘上未跟踪"。于是**在这个工作树里跑测试永远是绿的**，而 CI、别人的 `git worktree add`、任何 clone 都会在第一批 `import agent` 上红。缺的不是测试，是"只有已提交内容"这个视角。
+- **产物**：`agent_runtime/head_check.py`（工具 `dev_headcheck`）、`tests/test_head_check.py` **26 项**、`tools.py` 的实现 + TOOLS 注册、`agent.py` 提示目录 1 行、`mcp_server.py` 归入 WRITE_TOOLS（会建/删临时检出并执行提交里的代码）、门禁加 1 题（题集 19→20，基线已刷）。
+- **它做什么**：`rev-parse` 把 `ref: HEAD` **先钉成 sha**（HEAD 在共享工作树里会被别人推着走，验过的和报告里的必须是同一个提交）→ `git worktree add --detach` 到项目状态目录（仓外）→ 在**那棵树**里用 `sys.executable -c` 真 import `config,tools,agent`（cwd 决定 `sys.path[0]`，所以 import 的是提交里的代码，不是工作树的）→ 收回检出 + `worktree prune`。
+- **失败要归因，两种红不是一回事**：缺的模块【在磁盘上但不在提交里】= 别人未提交的新文件被提交引用（本地能跑、单独检出必红）；【两边都不在】= 漏提交/改名/本该进 requirements。还会报**是谁引用的**：`agent.py:55（import agent_runtime.run_budget）`。
+- **引用点的取法是被实测纠正过的**：第一版用一条"File 行后面跟一句 import"的正则整段搜，结果报的是 `<string>:3`——它匹配到的是 importlib 自己的帧，不是仓里那行。改成**逐帧解析**（traceback 帧头缩进 2 格、源码行缩进 4 格，body 只收 4 格那些行），再从最深的帧往前找与被缺模块匹配的那条。这条修正在测试里留着对应的两个用例。
+- **自查**：变异电池 **14/14 全数抓红**（`.tmp/mut_head_check.py`，只在 `.tmp` 副本上变异）。其中两条是电池跑出来才暴露的**测试自己没牙**：① `ref` 形状校验——删掉校验后 8 个非法 ref 仍然全被拒（git 自己就报错），断言只看 `ok=False` 等于没测；改成断言**拒绝理由**必须是"形状不被接受"。② `--detach`——改成 `git worktree add <path> <sha>` 是等价变异（git 对非分支名本来就会 detach），抓不到；真正的风险是换成 `-b <name>` 会**在共享仓里凭空占一个分支名**，所以补了"分支表/HEAD/工作树/`worktree list` 四项都不许变"的用例，那条变异当场被抓住。
+- **另有三条守卫是照着这次事故设计的**：空 `modules` 列表不许当通过（`all([])` 是 True）、子进程回 `{"ok": "truthy字符串"}` 不许当通过（只认 `is True`）、**没有本工具的归属标记就绝不 `worktree remove --force`**（绝不动别人的检出）。每条都有对应用例，且都在电池里被拆过。
+- **验证**：`tests/test_head_check.py` **26 项**（含真 git 仓现场）；相邻套件 `test_head_check` + `test_voice_loop` + `test_media_fixture` + `test_page_action` + `test_frontend_node_tests` + `test_dev_eval` + `test_native_tools` 一起 **205 passed / 89 subtests**；门禁 **20/20** 且与基线持平；工具走文本协议真跑：默认 `【通过】HEAD=0dbaf51`、`ref: HEAD~1 / modules: config, tools` 正确回显钉住的 sha、`timeout: abc` 与 `timeout: 9999` 与 `ref: --help` 全部按形状拒绝。
+- **这条工具第一次真跑就抓到了它自己诞生的原因**：在本仓 HEAD 上跑出 `agent → ModuleNotFoundError: agent_runtime.run_budget`，归因 `在提交里=False，在磁盘上=True`，引用点 `agent.py:55`——就是上一节披露的那次误收。随后另一条 lane 依披露提交了那 4 个模块（`0dbaf51`），现在同一条检查报【通过】。
+- **边界（不许越界宣称）**：它验的是【能不能跑起来】，不验行为对不对；默认只 import 三个入口，**入口之外的深层 import 要靠 import 链真的走到才会暴露**（比如某个只在子命令里才 import 的模块它看不见）；不跑测试、不装依赖、不验 `requirements.txt` 完整性；临时检出落在项目状态目录，崩在半路仍可能留目录（有归属标记，下次不会误删）。
+
+
 ## 2026-10-02 披露：我的提交 `b828d10` 把别人在途的 WIP 一起提交了，并让 HEAD 变得 import 不了
 
 - **事实**：`b828d10`（我那条语音行为回路的提交）在 `tools.py` 里带了 **272 行**、在 `agent.py` 里带了 **312 行**，其中属于我的只有 **39 行 + 2 行**；剩下的 ~457 行是另一条 lane 未提交的 step-budget / capacity / web-research WIP，被挂在**我的提交信息**下入库了。
@@ -25,6 +39,7 @@
 - **其中至少一条是「非确定性」而不是「还没做完」**：`RunChildStepCapTests.test_request_above_hard_cap_is_clamped` 期望 12，实测值在两次运行间从 **10 变成 11**。同一份代码两次给出不同数字 ⇒ 这些断言依赖全局/顺序状态，不能只当 WIP 未收尾。
 - **最小且不改历史的收尾路径（供决策，本轮未执行）**：把那 4 个未跟踪文件纳入版本库即可让 HEAD 自洽 —— **纯新增、无内容改动、`git reset` 可回退**。但这等于把别人 lane 的在途文件挂到我的提交下，**正是 `b828d10` 的错法**，所以需要 owner / 用户明确授权；授权前我不代提交。
 - **用户决定与执行（本会话）**：授权「我把这 4 个文件入库」，且顺序为**先修 HEAD 再 push**。已执行：只 `git add` 这 4 个明确路径 → **裸 `git commit`（不带 pathspec）** → 再用**新的**干净 worktree 复验 `import agent` 与 `compileall`，两个视图都通。性质是**修复不是认领**：文件内容一字未改，只是把 HEAD 已经在 import 的东西纳入版本库；`git reset` 可回退。另复核过 `capacity.py` 的两条依赖（`gpu_coordinator` 已跟踪且为函数内 `try`、`config` 已跟踪），**没有**引入新的未跟踪依赖；同时确认 `dependency_bootstrap.py` / `head_check.py` 这两个未跟踪模块**未被已提交代码引用**，故不在本次修复范围。
+- **R14 补充（推送后实测，供其他 lane 别重复诊断）**：11 个提交已推成功（逐对象 `MATCH`，远端 `main` = `0dbaf51` = 本地 HEAD）。CI run `36903320740`：`postgres tests` **success**；`sqlite tests` 仅 `Run pytest-style lane` 一步红，而**需要 import agent 的门槛步骤（`Compile runtime` / `workflow_eval` / `dev_eval` / `retrieval_eval`）全部通过** ⇒ `b828d10` 引入的「缺模块导致干净检出 import 失败」已消除。剩下的 `tests/test_mcp_discovery.py::test_github_routing_offline_injected`（`1 failed, 308 passed`）是**既有**红，不是本轮引入：该文件未被本地改动、也不在本次 11 个提交的 diff 里，本地 Windows 上单跑 **1 passed**，且上一次 CI（`36713588669`，09-30）**同一测试同一失败**。`ok` 由 `bool(candidates)` 得出 ⇒ Linux runner 上候选为空；模块内无平台分支，根因未定位（本地无法复现 Linux）。
 
 ## 2026-10-01 Vibecoding 能力补全 Wave8（后半·选项3）：语音接线的浏览器行为回路 `dev_media action: voice`（本会话，不占 R 槽位）
 
