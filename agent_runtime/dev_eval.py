@@ -446,6 +446,53 @@ def _case_page_action_refuses_and_never_claims_success(root: str, run: Callable[
     ]
 
 
+def _case_headcheck_catches_an_untracked_reference(root: str, run: Callable[..., dict]) -> list[dict]:
+    """HEAD 自检：同一份代码，差一个 `git add`，判红→判绿。
+
+    这题的存在理由就是本仓 2026-10-01 那次：pathspec 提交绕过索引，引用未入库模块的
+    import 进了 HEAD，工作树里跑测试永远绿，单独检出 HEAD 必红。
+    """
+    from agent_runtime import head_check
+
+    repo = Path(root) / "hchk"
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(str(repo), "init", "-q")
+    repo.joinpath("good.py").write_text("VALUE = 1\n", encoding="utf-8", newline="\n")
+    repo.joinpath("entry.py").write_text("import good\nimport helper_missing\nTOP = good.VALUE\n",
+                                         encoding="utf-8", newline="\n")
+    repo.joinpath("helper_missing.py").write_text("SEEN = []\n", encoding="utf-8", newline="\n")
+    _git(str(repo), "add", "good.py", "entry.py")
+    _git(str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+         "commit", "-q", "-m", "引用了一个还没入库的文件")
+    broken = head_check.check(str(repo), modules=("entry",), timeout=60)
+    failure = (broken.get("failures") or [{}])[0]
+    stranger = repo / "someone-elses-checkout"
+    stranger.mkdir(exist_ok=True)
+    refused = head_check.remove_worktree(str(repo), stranger)
+    empty_list = head_check.check(str(repo), modules=(), timeout=60)
+    _git(str(repo), "add", "helper_missing.py")
+    _git(str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+         "commit", "-q", "-m", "把被引用的文件也提交掉")
+    fixed = head_check.check(str(repo), modules=("entry",), timeout=60)
+    leftovers = list(head_check.worktree_base(str(repo)).glob("*")) if \
+        head_check.worktree_base(str(repo)).is_dir() else []
+    return [_check("broken_head_is_red", not broken["ok"], broken.get("error", "")),
+            _check("untracked_reference_is_named",
+                   failure.get("missing") == "helper_missing"
+                   and failure.get("in_commit") is False and failure.get("on_disk") is True,
+                   failure),
+            _check("importer_points_at_the_real_line",
+                   failure.get("importer") == "entry.py" and failure.get("importer_line") == 2,
+                   {"importer": failure.get("importer"), "line": failure.get("importer_line")}),
+            _check("committing_the_file_turns_it_green", fixed["ok"], fixed.get("failures")),
+            _check("nothing_attempted_is_not_green", not empty_list["ok"], empty_list["checks"]),
+            _check("foreign_checkout_is_never_removed",
+                   not refused["ok"] and stranger.exists(), refused),
+            _check("no_checkout_left_behind", not leftovers, [str(p) for p in leftovers]),
+            _check("option_like_ref_refused", not head_check.resolve_ref(str(repo), "--help")["ok"],
+                   "把 git 选项当 ref 收了")]
+
+
 def _case_voice_glue_would_catch_unconditional_pumping(root: str, run: Callable[..., dict]) -> list[dict]:
     """语音行为回路的护栏在【没有浏览器】时也必须可验：胶水调用与判定表。"""
     from agent_runtime import voice_loop
@@ -621,6 +668,12 @@ DEV_DATASET: tuple[dict[str, Any], ...] = (
         "direct": _case_page_action_refuses_and_never_claims_success,
         "uses": ["dev_page_action"],
         "note": "点了没生效绝不能报成功：歧义/隐藏/禁用不派发，报错优先于 DOM 变化",
+    },
+    {
+        "id": "headcheck-catches-untracked-reference", "fixture": "plain",
+        "direct": _case_headcheck_catches_an_untracked_reference,
+        "uses": ["dev_headcheck"],
+        "note": "提交引用了没入库的文件时，只有干净检出能发现；工作树里跑永远绿",
     },
     {
         "id": "voice-glue-catches-unconditional-pumping", "fixture": "plain",

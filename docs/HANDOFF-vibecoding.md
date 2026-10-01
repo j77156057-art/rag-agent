@@ -1,6 +1,6 @@
 # HANDOFF · Vibecoding 能力补全（harness 侧）
 
-> 状态：**Wave1–8（含语音行为回路）、9–13 已入库**。
+> 状态：**Wave1–8、9–14 已入库**（Wave14 = `dev_headcheck`，提交自洽检查）。
 > 发出人：本会话（用户直接指派，不占 R0–R15 槽位）。最后更新：2026-10-01。
 >
 > **这份文档是什么**：让没跟过这个过程的人（或另一个 AI）能直接接手**操作**这套 harness 的
@@ -28,9 +28,10 @@
 | 验语音/摄像头 | `dev_media`（`build` / `run` / `voice`）| 假设备喂合成媒体；门限行为见 §5.3 |
 | 静态检查 | `dev_diagnostics`（ruff + vue-tsc）| 退出码非 0 却解析不出发现时**报错误不报干净** |
 | 交付 | `dev_propose`（补丁+草稿，写进状态目录）/ `dev_ci_status`（只读 GET）| 不 add/commit/push；CI 读不到就明说 |
+| 提交自洽 | `dev_headcheck`（把 HEAD 挂成干净检出真 import 一遍）| 只读 + `worktree --detach`；抓的是"工作树能跑、单独检出必红"，见 §5.4 |
 | 多人防撞 | `dev_lanes`（TTL 认领登记表 + 可选 worktree）| 冲突默认拒绝，`force: true` 才共管 |
 | 对外出口 | `mcp_server`（harness 自己是 MCP server）/ `mcp_bridge`（连接器工具一等公民化）| 默认只读；写要 `--allow-writes`；`run_command` 等永不暴露 |
-| 能力回归 | `dev_eval`（19 题门禁 + 基线 + CI 步骤）| 测的是 harness，不是模型智商 |
+| 能力回归 | `dev_eval`（20 题门禁 + 基线 + CI 步骤）| 测的是 harness，不是模型智商 |
 
 ## 2. 环境事实（会咬人，先读）
 
@@ -54,7 +55,8 @@
     --baseline .github/dev-eval-baseline.json --json
 # 本程序新增的四套回归（138 项，其中少量需要 Edge / node）
 .venv/Scripts/python.exe -m pytest tests/test_media_fixture.py tests/test_page_action.py \
-    tests/test_voice_loop.py tests/test_frontend_node_tests.py -q --basetemp=.tmp/pt-manual
+    tests/test_voice_loop.py tests/test_frontend_node_tests.py tests/test_head_check.py \
+    -q --basetemp=.tmp/pt-manual
 # 前端行为测试（29 项：node:test 跑生产 .ts）
 cd frontend && npm run test:node
 ```
@@ -72,7 +74,7 @@ cd frontend && npm run test:node
    git 只读 + `git mv` 一处例外、命令黑名单与 `run_command` 共用。守它：`tests/test_safety_*.py`、
    `tests/test_mcp_server_expose.py`、`tests/test_page_action.py` 里的注入/越界用例。
 
-## 5. 三条"真回路"能力现在能证明什么（也说不清什么）
+## 5. 四条"真回路"能力现在能证明什么（也说不清什么）
 
 ### 5.1 `dev_page_action`（Wave13）
 真实 CDP `Input.*`：`click` / `type` / `press` / `wait` / `read` / `locate`。会话持有浏览器
@@ -115,6 +117,28 @@ cd frontend && npm run test:node
   `hello.ok` 后的标记片和第一片语音撞同一个序号，`sequence_monotonic` 当场变红。
 - 边界：`.vue` 的接线是**转写**的、不是 import 的；真网关（`api.py` + DashScope）仍归 R12 人跑。
 
+### 5.4 `dev_headcheck`（Wave14）：把 HEAD 挂成干净检出真 import 一遍
+共享工作树里有一类错**在工作树里永远看不见**：提交引用了没入库的文件（漏 `git add`，
+或 `git commit -- <路径>` 绕过索引把别人的 WIP 一起提交掉）。本地测试全绿，CI / 别人的
+`git worktree add` / 任何 clone 第一批 `import agent` 就红。所以必须回到"只有已提交内容"
+的那棵树上跑。
+- `ref` **先钉成 sha** 再用（HEAD 会被别人推着走，验过的和报告里的必须是同一个提交）；
+  `git worktree add --detach` 到项目状态目录（仓外）；在**那棵树**里用 `sys.executable -c`
+  真 import `config,tools,agent`；用完 `worktree remove` + `prune`。
+- 失败归因分两种：**在磁盘但不在提交** = 别人未提交的新文件被提交引用（本仓 2026-10-01
+  的 `agent_runtime/run_budget.py` 就是这个形状，第一次真跑就抓到了）；**两边都不在** =
+  漏提交/改名/本该进 requirements。同时回引用点 `agent.py:55（import …）`。
+- 三条由事故直接决定的守卫：空 `modules` 不许当通过（`all([])` 是 True）、子进程回
+  `{"ok": "truthy字符串"}` 不许当通过（只认 `is True`）、**没有本工具的归属标记就绝不
+  `worktree remove --force`**（不拆别人的检出）。变异电池 **14/14 抓红**。
+- 电池暴露的两个"测试自己没牙"值得记住：① 非法 `ref` 只断言"被拒"是废话——删掉形状校验后
+  git 自己也会报错，8 个用例照样全绿；改成断言**拒绝理由**必须是"形状不被接受"才有牙。
+  ② 去掉 `--detach` 是**等价变异**（git 对非分支名本来就 detach），真正的风险是写成
+  `-b <name>` 会在共享仓凭空占分支；补了"分支表 / HEAD / 工作树 / `worktree list` 都不许变"
+  之后那条变异当场被抓住。
+- 用法：**每次 commit 之后、push 之前跑一次**。边界：只验"能不能跑起来"，默认三个入口之外的
+  深层 import 要靠 import 链真的走到才暴露；不跑测试、不装依赖、不验 requirements 完整性。
+
 ## 6. 已知缺口与建议下一步
 
 | # | 缺口 | 实测依据 | 建议 |
@@ -139,6 +163,8 @@ cd frontend && npm run test:node
    提交后的两道自检：`git show --stat` 看共享文件行数有没有超过自己的 hunk；
    `git worktree add --detach <tmp> HEAD` 里 `import agent` 一次，确认 HEAD 自洽。
    对暂存版本还要 `git show :./<path>` + `ast.parse`（半截 hunk 最容易留下语法残骸）。
+   现在这一步有机械替代：**提交完直接跑 `dev_headcheck`**——它把新 HEAD 挂成干净检出真
+   import 一遍，误收 WIP / 漏 `git add` 当场报"在磁盘但不在提交"，不用手工挂 worktree。
 3. 判定某条红是不是自己造成的：把 HEAD 挂成干净 worktree（`git worktree add --detach`）跑同一批
    文件。**本会话两次这样验**：12 条红在我的提交上 183/183 全过 → 归属明确。用完 `git worktree remove`
    之后必须再 `rmdir` 空壳目录（Windows 上会被自己的 cwd 占住）。
@@ -152,12 +178,13 @@ cd frontend && npm run test:node
 
 `code_intel.py`(扩展) · `ts_index.py` · `diagnostics.py` · `patch_apply.py` · `lanes.py` ·
 `dev_server.py` · `mcp_server.py` · `mcp_bridge.py` · `dev_eval.py` · `proposal.py` · `ci_status.py` ·
-`media_fixture.py` · `page_action.py` · `voice_loop.py` ·
+`media_fixture.py` · `page_action.py` · `voice_loop.py` · `head_check.py` ·
 `visual_acceptance.py`（被抽出 `browser_session` / `serve_static` / `stop_static` / `sanitize_flags`，
 并被别的 lane 加了作业对象回收）· 测试：`test_dev_glob_git_log` / `test_lanes_registry` /
 `test_ts_index` / `test_dev_diagnostics` / `test_dev_patch_move` / `test_mcp_server_expose` /
 `test_mcp_inline_tools` / `test_dev_serve_preview` / `test_dev_eval` / `test_dev_propose_ci` /
-`test_media_fixture` / `test_page_action` / `test_voice_loop` / `test_frontend_node_tests` ·
+`test_media_fixture` / `test_page_action` / `test_voice_loop` / `test_frontend_node_tests` /
+`test_head_check` ·
 前端：`frontend/tests/liveAudioControl.test.mjs`（+ `test:node` 脚本与 CI 步骤）。
 
 ## 9. 事故与教训（避免重蹈）
@@ -179,12 +206,10 @@ cd frontend && npm run test:node
 
 ## 10. 本会话未结事项
 
-1. **HEAD 目前是坏的（就一条 import）**：`b828d10` 把别人未跟踪的 `agent_runtime/run_budget.py`
-   的引用扫进了 `agent.py:55`，干净检出 `import agent` → `ModuleNotFoundError`。
-   三条路，按用户口径排序：① 那条 lane 把 `run_budget.py` / `capacity.py` 及其测试提交掉，HEAD
-   自愈；② 本会话 `git reset --mixed HEAD~1` 后按 hunk 重提（改写本地历史，需要用户点头；
-   未 push、`b828d10` 在 reflog 可回）；③ 维持现状，只依赖"工作树里那些模块还在磁盘上"。
-   细节与复现见 `HANDOFF.md` 顶部那节披露。
+1. **HEAD 已自愈（2026-10-02）**：`b828d10` 误收导致的"引用未跟踪模块"由那条 lane 用
+   `0dbaf51 chore: 把 HEAD 已依赖但未跟踪的 4 个模块入库` 修好；本会话新加的 `dev_headcheck`
+   第一次真跑抓到的正是这个，现在同一条检查报【通过】。误收本身仍按用户口径**保留不改历史**，
+   披露与复现见 `HANDOFF.md` 那节。
 2. **`voice_loop` 已入库**：独立审计 11 条里 8 条成立并改掉，变异电池 16/16 抓红
    （其中"开麦时归零序号"是真机跑出来的真 bug）。剩下的只是**边界**：`.vue` 接线层
    没有组件级守卫（按选项3 的决定不做 vitest），真网关与听感归 R12。

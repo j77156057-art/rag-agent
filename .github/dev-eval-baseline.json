@@ -1,8 +1,8 @@
 {
  "schema_version": 1,
- "total": 19,
- "scored": 19,
- "passed": 19,
+ "total": 20,
+ "scored": 20,
+ "passed": 20,
  "skipped": [],
  "results": [
   {
@@ -109,6 +109,12 @@
   },
   {
    "id": "page-action-refuses-and-never-claims-success",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "headcheck-catches-untracked-reference",
    "passed": true,
    "skipped": "",
    "failed_checks": []

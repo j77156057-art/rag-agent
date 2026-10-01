@@ -6485,6 +6485,49 @@ def dev_page_action(arg=""):
     return ToolResult(True, text, data={"images": [image], "image_sources": [shot]})
 
 
+def dev_headcheck(arg=""):
+    """把【提交本身】挂成干净检出跑一遍 import——专抓"工作树能跑、单独检出必红"。
+
+    输入（多行 keyed）：
+      ref: HEAD                  # 任何能解析成提交的写法；先钉成 sha 再验
+      modules: agent, tools      # 逗号/换行分隔；默认 config,tools,agent
+      timeout: 120               # 单步（建检出 / import 一个模块）的秒数上限
+    它为什么要独立存在：本仓 2026-10-01 出过一次 `git commit -- <路径>` 绕过索引，
+    把别人未提交的 WIP 一起提交掉——引用那新文件的 import 进了 HEAD，新文件本身没进。
+    于是【在这个工作树里跑测试永远是绿的】，只有单独检出 HEAD 才 ModuleNotFoundError，
+    CI 和别人的 worktree 全红。工作树里跑不出这种错，所以只能回到"只有已提交内容"的树上跑。
+    失败会归因：缺的模块【在磁盘上但不在提交里】= 别人未提交的新文件被提交引用；
+    【两边都不在】= 漏提交、改名，或它本该是第三方依赖。检出用完一定收回，且没有本工具的
+    归属标记就绝不删（不拆别人的检出）。
+    边界：这验的是【能不能跑起来】，不验行为对不对；入口之外的深层 import 要靠 import 链
+    真的走到才暴露。真跑测试仍是 run_command / CI 的活。
+    """
+    from agent_runtime import head_check
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    fields = _parse_keyed(arg or "", ["ref", "modules", "timeout"])
+
+    def _one(key, default=""):
+        value = (fields.get(key) or "").strip()
+        return value.splitlines()[0].strip() if value else default
+
+    names = [item.strip() for item in re.split(r"[,\s]+", _one("modules")) if item.strip()]
+    try:
+        timeout = float(_one("timeout") or 120)
+    except (TypeError, ValueError):
+        return "timeout 必须是秒数。"
+    if not 5 <= timeout <= 600:
+        return "timeout 只能在 5~600 秒之间。"
+    try:
+        report = head_check.check(root, ref=_one("ref", "HEAD"),
+                                  modules=tuple(names) if names else None,
+                                  timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 - 自检失败必须报原因，不能报通过
+        return "dev_headcheck 失败：%s: %s" % (type(exc).__name__, str(exc)[:240])
+    return head_check.render(report)
+
+
 def _screenshot_data_url(relative: str, root: str):
     """把页面动作留下的截图读成 data URL；越界路径或不实图像直接放弃附图。"""
     base = os.path.realpath(root)
@@ -7253,6 +7296,24 @@ TOOLS = {
             "页面里的按钮可能真的会改你的项目或发请求——那是你的开发服务，不是沙箱里的玩具。"
         ),
         "func": dev_page_action,
+    },
+    "dev_headcheck": {
+        "description": (
+            "把【提交本身】挂成一份干净检出，在那棵树里真 import 入口模块——用来抓一种"
+            "在工作树里永远看不见的错：提交引用了没入库的文件。共享工作树里多个 AI 同时改"
+            "同一批文件，一次 `git commit -- <路径>`（它会绕过索引）或一次漏 `git add`，都会让"
+            "引用新模块的 import 进了 HEAD、新模块本身还在磁盘上未跟踪：这里测试全绿，"
+            "但 CI、别人的 `git worktree add`、任何 clone 都会在第一批 import 上红。\n"
+            "输入 keyed 多行：`ref: HEAD`（任何能解析成提交的写法，先钉成 sha 再验，"
+            "报告里回显这个 sha）、`modules: agent, tools`（默认 config,tools,agent）、"
+            "`timeout: 120`。只读 + `worktree add --detach/remove`：不占分支、不动索引、"
+            "不碰你的工作树；临时检出用完就收回，且没有本工具的归属标记就绝不删别人的目录。\n"
+            "失败会归因，两种红不一样：缺的模块【在磁盘上但不在提交里】= 别人未提交的新文件"
+            "被提交引用（先去把那个文件提交掉，或把引用摘出来）；【两边都不在】= 漏提交、改名，"
+            "或它本该在 requirements 里。边界：这验的是【能不能跑起来】，不验行为对不对——"
+            "真跑测试仍是 run_command 与 CI 的活。提交完之后、推之前跑一次，比事后 debug 便宜。\n"
+        ),
+        "func": dev_headcheck,
     },
     "dev_media": {
         "description": (
