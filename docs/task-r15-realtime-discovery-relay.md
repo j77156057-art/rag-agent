@@ -19,8 +19,16 @@
 - **网关侧复核**：回流事件由 `SessionBridge.next_events` 构造，`session_id` 用网关自己的
   （不过 `_normalize_session_id`、也不带适配器会话号）；`text` 截 300 字；相似度 0.82 / 45s 去重；
   2s 节流；`EVENT_DONE` 分支额外补一次 flush（应对适配器只发 `done`、不复述全文的情况）。
-- **仍未提交**：R15 全部改动（协议、`realtime_bridge.py`、`AutonomousCockpit.vue`、两个测试文件）在
-  工作区里都还是未提交状态，提交切分由作者/集成方决定。
+- ~~**仍未提交**~~ **已入库（2026-10-01 复核更正）**：R15 全部改动落在 `d542509`
+  （`realtime_protocol.py`、`realtime_bridge.py`、`realtime_omni.py`、`AutonomousCockpit.vue`、
+  `liveStreamControl.ts`、`realtimeProtocol.ts`、`tests/test_realtime_gateway_bridge.py`、
+  `tests/test_realtime_protocol_contract.py`、`tests/test_live_stream_control.py`、本文件，10 文件 +332 行）；
+  其后 `1661d28` 又补 3 条测试。
+  复核证据：`git status --porcelain` 对上述路径无输出；`git grep -c "model.observation" HEAD` 命中
+  protocol 1 / bridge 2 / AutonomousCockpit.vue 1 / test_realtime_gateway_bridge 7。
+- **测试计数更正**：复跑 `pytest tests/test_realtime_gateway_bridge.py tests/test_realtime_protocol_contract.py
+  tests/test_realtime_provider.py tests/test_realtime_resource_security.py` → **130 passed**（103s）。
+  本文件下文早先记录的 127 已被 `1661d28` 追平超越。
 
 **一条调优提醒（给 R15-3）**：触发要求触发句出现在**助手轮次的最开头**，因此模型若说「好的。我看到画面上有个问题：…」
 这类会**漏报**。量命中率时请把这一档算进去；若要提高召回，可放宽到「轮次内首次出现」，代价是误报面变大。
