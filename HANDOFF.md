@@ -16,6 +16,15 @@
 - **给所有 lane 的规矩（我这次没守住的那条）**：hunk 级暂存之后**必须用裸 `git commit`**（提交索引），`git commit -- <路径>` 是"按工作树提交这些文件"的意思，不是作用域工具。提交完立刻 `git show --stat` 看共享文件的行数有没有超过自己的 hunk；再多做一步：`git worktree add --detach <tmp> HEAD` 里 `import agent` 一次，确认 HEAD 自洽。
 
 
+### R14 独立复核（本会话，只读复现，未代改/代提交任何 lane 的文件）
+
+- **不是转述，是自己挂干净 worktree 复现的**：`git worktree add --detach /d/Temp/dm-headcheck HEAD` → 该检出里 `agent_runtime/run_budget.py` **不存在**，`import agent` 报 `ModuleNotFoundError: No module named 'agent_runtime.run_budget'`。作者结论成立。（`agent.py:55` 是**模块级**裸 import，不是函数内的惰性 import，所以拦不住；`:75`/`:159` 的 `capacity` 才是函数内的。）探针 worktree 已 `git worktree remove --force` + `prune`，`git worktree list` 只剩主树。
+- **补一条作者没写、但会直接挡 push 的后果**：`harness.yml` 在干净 runner（`actions/checkout@v4`）上跑的**每一个**门槛步骤都要 import 到 agent —— `compileall agent_runtime`、`workflow_eval`、`dev_eval`、`retrieval_eval`、`unittest` 主步骤、pytest lane、`test_game_workflow_e2e` 那步。所以「HEAD 不自洽」不只是别人 `git worktree add` 的冷门视图：**这 9 个提交一 push，CI 会整片红**。顺序上应当先让 HEAD 自洽，再 push。
+- **补一条时间事实**：那 4 个未跟踪文件最后修改停在 **10-01 04:24–04:30**（复核时约 21 小时无改动），所以「等 owner 自己提交」并不是「马上就好」。
+- **同一时点的工作树实测（`unittest discover -s tests`）**：**2322 项 → 9 failures + 4 errors + 10 skipped**。红点全部落在未提交的在途改动上，没有一项来自已提交内容：`test_workflow_step_budget.py`（`M`）6 项、`tests.test_agent` 1F+1E、`test_agent_capacity.py`（`??`）1E、`test_game_workflow` 2E、`test_orchestrator` 1F。
+- **其中至少一条是「非确定性」而不是「还没做完」**：`RunChildStepCapTests.test_request_above_hard_cap_is_clamped` 期望 12，实测值在两次运行间从 **10 变成 11**。同一份代码两次给出不同数字 ⇒ 这些断言依赖全局/顺序状态，不能只当 WIP 未收尾。
+- **最小且不改历史的收尾路径（供决策，本轮未执行）**：把那 4 个未跟踪文件纳入版本库即可让 HEAD 自洽 —— **纯新增、无内容改动、`git reset` 可回退**。但这等于把别人 lane 的在途文件挂到我的提交下，**正是 `b828d10` 的错法**，所以需要 owner / 用户明确授权；授权前我不代提交。
+
 ## 2026-10-01 Vibecoding 能力补全 Wave8（后半·选项3）：语音接线的浏览器行为回路 `dev_media action: voice`（本会话，不占 R 槽位）
 
 - **补什么**：Wave7 的探针页面**刻意不接能量门**（逐帧无条件推流），所以它只能证明"采集→WS→R0 线上"，证不了 9/29 那次真机事故的那半条契约——**静音期不发流、说完再推满 1 秒、推完真的停下来**。这一条原来落在"要装 vitest 才能做"的账上；装过一次并量化了代价（`vitest@2 + @vue/test-utils + jsdom` = **1 critical + 3 moderate + 1 high** dev 公告，critical 是 Vitest UI server 任意文件读；vitest 3 链要 vite 6/7 而本树是 vite 5），**已回退**，按用户选的选项3 改成用真浏览器验行为。
