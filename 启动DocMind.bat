@@ -33,6 +33,21 @@ echo   DocMind - current source version
 echo ============================================
 echo Stopping an older packaged DocMind instance if one is still running...
 taskkill /IM DocMind.exe /F >nul 2>&1
+
+REM The desktop window serves the BUILT frontend (web\assets\*). If that output
+REM is missing the page loads with a blank body, so build it before starting.
+dir /b "web\assets\*.js" >nul 2>&1
+if not errorlevel 1 goto run_source_ready
+echo [DocMind] Built frontend not found - building it now (first run may take a minute)...
+where npm >nul 2>&1
+if errorlevel 1 goto run_need_node
+pushd "frontend"
+call npm run build
+set "DOCMIND_BUILD=%ERRORLEVEL%"
+popd
+if not "%DOCMIND_BUILD%"=="0" goto run_build_failed
+
+:run_source_ready
 echo Starting the current repository version...
 "%DOCMIND_PYTHON%" "%DOCMIND_ENTRY%"
 set "DOCMIND_EXIT=%ERRORLEVEL%"
@@ -40,6 +55,24 @@ echo.
 echo DocMind exited with code %DOCMIND_EXIT%.
 pause
 exit /b %DOCMIND_EXIT%
+
+:run_need_node
+echo.
+echo [ERROR] Node.js / npm was not found on PATH, so the frontend could not be built.
+echo Install Node.js from https://nodejs.org/ and run this launcher again,
+echo or build it once manually:
+echo     cd frontend
+echo     npm install
+echo     npm run build
+pause
+exit /b 1
+
+:run_build_failed
+echo.
+echo [ERROR] Frontend build failed with exit code %DOCMIND_BUILD%. See the errors above.
+echo Fix them, then run this launcher again.
+pause
+exit /b %DOCMIND_BUILD%
 
 :run_packaged
 echo ============================================

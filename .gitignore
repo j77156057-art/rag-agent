@@ -49,6 +49,7 @@ git_report.txt
 frontend/node_modules/
 web/assets/
 web/workbench.html
+web/index.html
 
 # ===== 系统 / 编辑器 =====
 .DS_Store
