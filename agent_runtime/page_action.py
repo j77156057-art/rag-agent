@@ -1,0 +1,777 @@
+"""页面交互原语：让 Agent 真的点得动、填得动本机网页，而不是靠猜。
+
+vibecoding 的循环到这里只有一半：`preview_project` 能【看】（截图 + console + 失败请求），
+但没有任何输入原语，所以「点一下才复现」的 bug 只能靠模型想象。本模块补另一半：
+真实浏览器里的 click / type / press / wait / read / locate，走 CDP `Input.*`，页面拿到的
+是原生事件（Vue/React 的 `input`/`click` 监听会正常触发）。
+
+## 为什么要"会话"
+
+一次 `open` 之后浏览器必须活着：否则每个动作都重新起一个 Edge（2~4s），而且页面状态会丢
+（表单填了下一步就没了）。会话持有 `visual_acceptance.browser_session()` —— **不自己 Popen、
+不引 playwright**：浏览器必须出生在 kill-on-close 作业对象里（见 HANDOFF 的 99°C 漏浏览器
+事故），父进程被硬杀时由操作系统收走整棵树。空闲会话按 TTL 在下次调用时回收，进程退出时
+`atexit` 再兜一道，绝不把 headless Edge 漏在机器上。
+
+## 每个动作都要留下可复核的证据
+
+「点了但没生效」和「报对了其实没跑」是同一类事故，所以：
+
+* 定位只认 CSS 选择器或可见文本；命中的元素会被记在页面里的 `window.__docmindTarget`，
+  后续动作直接作用在**那一个**元素上，不再用"重新猜一个选择器"的方式二次定位。
+* **多个命中默认拒绝**（要点第几个就显式给 `nth`）；零面积/隐藏/禁用/中心不在视口内的元素
+  直接拒——不替用户点一个看不见的东西。
+* 动作前记一组信号（DOM 变更计数、console 错误数、失败请求数、运行时异常数、地址与标题），
+  动作后比对，得出 `changed` / `navigated` / `error_seen` / `no_change`。没变化就如实说
+  没变化，绝不写「成功」。
+* 等待条件超时 = 未通过，并附上当时看到的状态。
+
+## 边界
+
+* 只允许【本机回环】地址；这不是上网浏览器。
+* 不暴露任意 JS 执行入口（那等于把沙箱交出去）：所有页面脚本都是本文件里的固定常量，参数
+  以 JSON 字面量传入，绝不拼接。
+* 页面上的按钮可能真的会改你的项目或发请求——那是你的开发服务，不是沙箱里的玩具。
+"""
+from __future__ import annotations
+
+import atexit
+import base64
+import contextlib
+import json
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+from agent_runtime import visual_acceptance as visual
+
+MAX_SESSIONS = 3
+IDLE_TTL_SECONDS = 600.0
+MAX_WAIT = 30.0
+MAX_VALUE_CHARS = 4_000
+MAX_READ_CHARS = 4_000
+MAX_CANDIDATES = 8
+MAX_SETTLE = 5.0
+
+#: 按键名 → (key, code, windowsVirtualKeyCode, 文本)。只认这张表，不接受任意键序列或组合键注入。
+KEYS: dict[str, tuple[str, str, int, str]] = {
+    "enter": ("Enter", "Enter", 13, "\r"), "tab": ("Tab", "Tab", 9, "\t"),
+    "escape": ("Escape", "Escape", 27, ""), "esc": ("Escape", "Escape", 27, ""),
+    "backspace": ("Backspace", "Backspace", 8, ""), "delete": ("Delete", "Delete", 46, ""),
+    "arrowup": ("ArrowUp", "ArrowUp", 38, ""), "arrowdown": ("ArrowDown", "ArrowDown", 40, ""),
+    "arrowleft": ("ArrowLeft", "ArrowLeft", 37, ""), "arrowright": ("ArrowRight", "ArrowRight", 39, ""),
+    "home": ("Home", "Home", 36, ""), "end": ("End", "End", 35, ""),
+    "pageup": ("PageUp", "PageUp", 33, ""), "pagedown": ("PageDown", "PageDown", 34, ""),
+    "space": (" ", "Space", 32, " "),
+}
+
+WAIT_STATES = ("present", "absent", "visible", "hidden", "text")
+READ_MODES = ("text", "value", "attr", "html", "count")
+
+
+class PageActionError(RuntimeError):
+    """页面动作无法安全执行，或无法证实它执行了。"""
+
+
+# ---- 页面脚本（固定常量；参数用 JSON 字面量传入，绝不拼接用户输入） --------------
+
+PROBE_JS = r"""() => {
+  const state = window.__docmindPage;
+  if (!state || state.doc !== document) {
+    const fresh = {doc: document, mutations: 0, observer: false};
+    window.__docmindPage = fresh;
+    try {
+      new MutationObserver((records) => { fresh.mutations += records.length; })
+        .observe(document.documentElement,
+                 {subtree: true, childList: true, attributes: true, characterData: true});
+      fresh.observer = true;
+    } catch (err) { /* 装不上观察器时 changed 判定退回地址/标题，但必须让调用方知道降级了 */ }
+  }
+  return {mutations: window.__docmindPage.mutations,
+          observer: !!window.__docmindPage.observer};
+}"""
+
+# 解析定位 → 把选中的那一个记进 window.__docmindTarget，供后续动作直接使用。
+RESOLVE_JS = r"""(spec) => {
+  const list = [];
+  const seen = new Set();
+  const push = (el, how) => {
+    if (!el || seen.has(el) || list.length >= 64) return;
+    seen.add(el);
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    list.push({
+      el: el, how: how, tag: el.tagName.toLowerCase(),
+      text: ((el.innerText !== undefined ? el.innerText : (el.textContent || '')) + ' '
+             + (el.value || '') + ' ' + (el.getAttribute('aria-label') || '')).trim().slice(0, 120),
+      id: el.id || '', testid: el.getAttribute('data-testid') || '',
+      disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+      x: Math.round(rect.x), y: Math.round(rect.y),
+      w: Math.round(rect.width), h: Math.round(rect.height),
+      visible: rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden'
+               && style.display !== 'none' && Number(style.opacity) !== 0,
+    });
+  };
+  window.__docmindTarget = null;
+  if (spec.selector) {
+    document.querySelectorAll(spec.selector).forEach((el) => push(el, 'selector'));
+  } else {
+    const needle = spec.text.toLowerCase();
+    const scopeNodes = spec.scope ? Array.from(document.querySelectorAll(spec.scope)) : [document];
+    const texts = [];
+    for (const host of scopeNodes) {
+      (host || document).querySelectorAll(
+        'a,button,input,textarea,select,label,[role=button],[onclick],[tabindex]:not([tabindex="-1"])')
+        .forEach((el) => {
+          const own = ((el.innerText || el.textContent || '') + ' ' + (el.value || '') + ' '
+                       + (el.getAttribute('aria-label') || '') + ' '
+                       + (el.getAttribute('placeholder') || '')).trim().toLowerCase();
+          if (own.includes(needle)) texts.push([el, own]);
+        });
+      if (texts.length) break;
+    }
+    // 两级匹配：先要"整串相等"，只有它歧义/落空时才退到子串。
+    // 单级子串会把「加一」匹配到「吃掉加一按钮」，然后点错东西还报生效。
+    const exact = texts.filter(([, own]) => own === needle);
+    (exact.length ? exact : texts).forEach(([el]) => push(el, exact.length ? 'text-exact' : 'text-part'));
+  }
+  const chosen = spec.nth < list.length ? list[spec.nth] : null;
+  if (chosen && (list.length === 1 || spec.nth !== null)) {
+    window.__docmindTarget = chosen.el;
+    chosen.el.scrollIntoView({block: 'center', inline: 'center'});
+    const after = chosen.el.getBoundingClientRect();
+    chosen.x = Math.round(after.x); chosen.y = Math.round(after.y);
+  }
+  return {count: list.length, nth: spec.nth,
+          matched: chosen ? (({el, ...rest}) => rest)(chosen) : null,
+          candidates: list.slice(0, 8).map(({el, ...rest}) => rest),
+          view: {width: window.innerWidth, height: window.innerHeight},
+          href: location.href, title: document.title || '', ready: document.readyState};
+}"""
+
+TARGET_JS = r"""(spec) => {
+  const el = window.__docmindTarget;
+  if (!el || !document.contains(el)) return {ok: false, reason: 'element-gone'};
+  el.focus && el.focus();
+  if (spec.select) {
+    if ('setSelectionRange' in el) { try { el.select(); } catch (err) {} }
+  }
+  if (spec.replace && typeof el.value === 'string') {
+    el.value = '';
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+  }
+  const rect = el.getBoundingClientRect();
+  return {ok: true, tag: el.tagName.toLowerCase(), focused: document.activeElement === el,
+          value: typeof el.value === 'string' ? el.value.slice(0, 200) : '',
+          x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2)};
+}"""
+
+INSPECT_JS = r"""(spec) => {
+  const pick = () => {
+    if (spec.target === 'held' && window.__docmindTarget && document.contains(window.__docmindTarget))
+      return window.__docmindTarget;
+    const list = spec.selector ? Array.from(document.querySelectorAll(spec.selector)) : [];
+    return list.length > (spec.nth || 0) ? list[spec.nth || 0] : null;
+  };
+  const el = pick();
+  const list = spec.selector ? Array.from(document.querySelectorAll(spec.selector)) : [];
+  const out = {count: list.length, href: location.href, title: document.title || ''};
+  if (!el) { out.found = false; return out; }
+  out.found = true;
+  out.tag = el.tagName.toLowerCase();
+  const rect = el.getBoundingClientRect();
+  out.visible = rect.width > 0 && rect.height > 0
+                && getComputedStyle(el).visibility !== 'hidden';
+  out.disabled = !!el.disabled;
+  if (spec.mode === 'attr') out.text = String(el.getAttribute(spec.attr || '') ?? '');
+  else if (spec.mode === 'value') out.text = typeof el.value === 'string' ? el.value : '';
+  else if (spec.mode === 'html') out.text = el.innerHTML || '';
+  else if (spec.mode === 'count') out.text = String(list.length);
+  else out.text = (el.innerText !== undefined ? el.innerText : (el.textContent || '')) || '';
+  out.text = String(out.text).slice(0, 4000);
+  return out;
+}"""
+
+
+def _evaluate(devtools: Any, source: str, spec: dict[str, Any]) -> Any:
+    return devtools.evaluate("(%s)(%s)" % (source, json.dumps(spec or {}, ensure_ascii=True)))
+
+
+def _target_spec(selector: Any = "", text: Any = "", nth: Any = 0, scope: Any = "") -> dict[str, Any]:
+    selector = str(selector or "").strip()
+    text = str(text or "").strip()
+    scope = str(scope or "").strip()
+    if selector and text:
+        raise PageActionError("selector 与 text 二选一，不能同时给（两个定位互相矛盾时要点哪个不明确）。")
+    if not selector and not text:
+        raise PageActionError("定位需要 selector: <CSS> 或 text: <可见文字> 之一。")
+    if selector.startswith(("<", "javascript:", "@")):
+        raise PageActionError("selector 看起来不是 CSS 选择器：%r" % selector[:60])
+    if len(selector) > 400 or len(scope) > 400:
+        raise PageActionError("选择器太长（上限 400 字符）。")
+    if len(text) > 200:
+        raise PageActionError("text 太长（上限 200 字符）。")
+    if nth in ("", None):
+        nth = 0
+    try:
+        index = int(nth)
+    except (TypeError, ValueError):
+        raise PageActionError("nth 必须是整数序号。") from None
+    if not 0 <= index <= 99:
+        raise PageActionError("nth 超出范围（0~99）。")
+    return {"selector": selector, "text": text, "nth": index, "scope": scope}
+
+
+def _describe(found: dict[str, Any], spec: dict[str, Any]) -> str:
+    rows = found.get("candidates") or []
+    lines = ["定位 %r 未执行：%s（命中 %s 个）" % (spec.get("selector") or spec.get("text"),
+                                                 found.get("reason") or "原因未知",
+                                                 found.get("count"))]
+    for index, row in enumerate(rows[:MAX_CANDIDATES]):
+        lines.append("  [%d] <%s> %r %sx%s @%s,%s 可见=%s 禁用=%s" % (
+            index, row.get("tag"), str(row.get("text"))[:40], row.get("w"), row.get("h"),
+            row.get("x"), row.get("y"), row.get("visible"), row.get("disabled")))
+    if (found.get("count") or 0) > 1:
+        lines.append("多个命中时用 nth: <序号> 指定要哪一个。")
+    return "\n".join(lines)
+
+
+def _resolve(devtools: Any, spec: dict[str, Any]) -> dict[str, Any]:
+    """定位并把元素交给页面记账；任何歧义或不可见都在这里拒掉，错误信息带候选清单。"""
+    found = _evaluate(devtools, RESOLVE_JS, spec) or {}
+    count = int(found.get("count") or 0)
+    if not count:
+        found["reason"] = "没有找到匹配元素"
+        raise PageActionError(_describe(found, spec))
+    if count > 1 and spec["nth"] == 0:
+        found["reason"] = "命中多个，未指定 nth"
+        raise PageActionError(_describe(found, spec))
+    matched = found.get("matched")
+    if not matched:
+        found["reason"] = "nth 超出命中数量（0~%d）" % (count - 1)
+        raise PageActionError(_describe(found, spec))
+    if not matched.get("visible"):
+        found["reason"] = "元素不可见（零面积或 hidden）"
+        raise PageActionError(_describe(found, spec))
+    if matched.get("disabled"):
+        found["reason"] = "元素处于禁用状态"
+        raise PageActionError(_describe(found, spec))
+    view = found.get("view") or {}
+    center_x = int(matched["x"]) + int(matched["w"]) // 2
+    center_y = int(matched["y"]) + int(matched["h"]) // 2
+    if not (0 <= center_x <= int(view.get("width") or 0)) or \
+            not (0 <= center_y <= int(view.get("height") or 0)):
+        found["reason"] = "元素中心不在视口内（%d,%d / 视口 %sx%s）" % (
+            center_x, center_y, view.get("width"), view.get("height"))
+        raise PageActionError(_describe(found, spec))
+    found["center"] = [center_x, center_y]
+    return found
+
+
+# ---- 会话持有 -------------------------------------------------------------------
+
+class _Session:
+    def __init__(self, page_id: str, stack: contextlib.ExitStack, devtools: Any, root: Path,
+                 url: str, cleanup: dict, server: Any, thread: Any) -> None:
+        self.id = page_id
+        self.stack = stack
+        self.devtools = devtools
+        self.root = root
+        self.url = url
+        self.cleanup = cleanup
+        self.server = server
+        self.thread = thread
+        self.last_used = time.monotonic()
+        self.opened_at = time.monotonic()
+        self.counter = 0
+
+    def close(self) -> dict[str, Any]:
+        # cleanup 是 browser_session 在 finally 里填的：必须等 stack.close() 之后再取快照，
+        # 先拷就永远是个空字典，「作业对象已解绑」这条凭据会退化成一句空话。
+        with contextlib.suppress(Exception):
+            self.stack.close()        # browser_session 的 finally：作业对象解绑 + profile 回收
+        report = dict(self.cleanup)
+        if self.server is not None:
+            visual.stop_static(self.server, self.thread)
+            self.server = self.thread = None
+        report.setdefault("spawned", True)
+        return report
+
+
+_sessions: dict[str, _Session] = {}
+_reservations = 0          # 正在启动、还没登记的会话数：没有它就会同时放行多个浏览器
+_lock = threading.RLock()
+atexit.register(lambda: close_all())
+
+
+def _sweep() -> list[_Session]:
+    """挑出空闲会话并除名，但【不在锁里】关浏览器。
+
+    `stack.close()` 会等作业对象解绑与 profile 回收（可达数秒），抱着全局锁做这件事会把
+    别的调用一起拖住。返回的会话由调用方在锁外关闭。
+    """
+    now = time.monotonic()
+    with _lock:
+        dead = [pid for pid, row in list(_sessions.items())
+                if now - row.last_used > IDLE_TTL_SECONDS]
+        return [_sessions.pop(pid) for pid in dead if pid in _sessions]
+
+
+def close_all() -> int:
+    with _lock:
+        rows = list(_sessions.values())
+        _sessions.clear()
+    for row in rows:
+        row.close()
+    return len(rows)
+
+
+def live_pages() -> list[dict[str, Any]]:
+    with _lock:
+        return [{"page": pid, "url": row.url, "actions": row.counter,
+                 "idle_seconds": round(time.monotonic() - row.last_used, 1),
+                 "age_seconds": round(time.monotonic() - row.opened_at, 1)}
+                for pid, row in _sessions.items()]
+
+
+def _get(page_id: str) -> _Session:
+    for stale in _sweep():
+        stale.close()
+    pid = str(page_id or "").strip()
+    if not pid:
+        raise PageActionError("缺少 page: <会话 id>（先 action: open）。")
+    with _lock:
+        row = _sessions.get(pid)
+        if row is not None:
+            row.last_used = time.monotonic()
+    if row is None:
+        raise PageActionError("找不到会话 %r：可能已超时回收或进程重启，请重新 open。" % pid)
+    return row
+
+
+# ---- 信号与生效判定 -------------------------------------------------------------
+
+def _probe(devtools: Any) -> dict[str, Any]:
+    raw = _evaluate(devtools, PROBE_JS, {})
+    if isinstance(raw, dict):
+        return {"mutations": int(raw.get("mutations") or 0), "observer": bool(raw.get("observer"))}
+    return {"mutations": int(raw or 0), "observer": False}
+
+
+def _signals(devtools: Any, page: dict[str, Any]) -> dict[str, Any]:
+    """取一组可比对的计数。用去重【前】的事件计数：列表会去重，同一个报错每次动作都复现时
+    列表长度差恒为 0，于是「动作后一直报错」会被看成没报错——那正是要防的假干净。"""
+    return {"mutations": _probe(devtools)["mutations"],
+            "console": int(getattr(devtools, "error_events", 0) or 0),
+            "failed": int(getattr(devtools, "failure_events", 0) or 0),
+            "runtime": int(getattr(devtools, "runtime_events", 0) or 0),
+            "href": page.get("href"), "title": page.get("title")}
+
+
+def _current(devtools: Any) -> dict[str, Any]:
+    """读页面此刻的地址与标题。动作前的快照必须真读——硬编码空标题会让"什么都没变"
+    被比对成"标题变了"，从而把 no_change 误报成生效。"""
+    return _evaluate(devtools, INSPECT_JS, {"selector": "html", "mode": "count"}) or {}
+
+
+def _loopback(href: Any) -> bool:
+    from agent_runtime import dev_server
+    _url, error = dev_server.loopback_url(str(href or ""))
+    return not error
+
+
+def _verdict(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    delta = {key: int(after[key]) - int(before[key])
+             for key in ("mutations", "console", "failed", "runtime")}
+    navigated = str(after.get("href") or "") != str(before.get("href") or "")
+    retitled = str(after.get("title") or "") != str(before.get("title") or "")
+    # 换文档时 PROBE_JS 会重装观察器，计数从 0 重新开始 → 差值为负。这不是"少了几个变更"，
+    # 而是页面重载了：如实单独判，不把负数喂给模型当证据。
+    reloaded = int(after["mutations"]) < int(before["mutations"])
+    if delta["console"] > 0 or delta["failed"] > 0 or delta["runtime"] > 0:
+        verdict = "error_seen"
+    elif navigated:
+        verdict = "navigated"
+    elif reloaded:
+        verdict = "reloaded"
+    elif delta["mutations"] > 0 or retitled:
+        verdict = "changed"
+    else:
+        verdict = "no_change"
+    if reloaded:
+        delta["mutations"] = 0
+    return {"verdict": verdict, "delta": delta, "navigated": navigated}
+
+
+def _capture(row: _Session, action: str) -> str:
+    directory = row.root / ".docmind" / "page-action" / time.strftime("%Y%m%d-%H%M%S")
+    directory.mkdir(parents=True, exist_ok=True)
+    encoded = str((row.devtools.call("Page.captureScreenshot", {"format": "png"}) or {}).get("data") or "")
+    if not encoded:
+        return ""
+    path = directory / ("%s-%d.png" % (action, row.counter))
+    path.write_bytes(base64.b64decode(encoded))
+    return path.relative_to(row.root).as_posix()
+
+
+def _finish(row: _Session, action: str, before: dict[str, Any], *, settle_ms: float,
+            screenshot: bool, matched: dict[str, Any], **extra) -> dict[str, Any]:
+    settle = max(0.1, min(MAX_SETTLE, float(settle_ms or 600) / 1000.0))
+    row.devtools.drain(settle)
+    page = _current(row.devtools)
+    after = _signals(row.devtools, page)
+    effect = _verdict(before, after)
+    verdict = effect["verdict"]
+    delta = effect["delta"]
+    # 只有真的观察到变化才算成功。`no_change` 交给结构化消费方就是"成功"，那正是本仓库
+    # 反复付学费的假干净：点了没生效必须让 ok 也是 False。
+    ok = verdict in ("changed", "navigated", "reloaded")
+    left_loopback = not _loopback(page.get("href"))
+    if left_loopback or verdict == "error_seen":
+        ok = False
+    console_new = [item for item in row.devtools.console if item.get("level") == "error"]
+    if delta["console"] <= 0:
+        console_new = []
+    failed_new = list(row.devtools.failed_requests) if delta["failed"] > 0 else []
+    result = {"action": action, "page": row.id, "effect": verdict, "delta": delta, "ok": ok,
+              "element": matched, "left_loopback": left_loopback,
+              "url": page.get("href"), "title": page.get("title"),
+              "screenshot": _capture(row, action) if screenshot else "",
+              "console_errors": console_new[-3:], "failed_requests": failed_new[-3:]}
+    result.update(extra)
+    return result
+
+
+def _settle_ms(raw: Any) -> float:
+    try:
+        value = float(raw if raw not in ("", None) else 600)
+    except (TypeError, ValueError):
+        raise PageActionError("settle 必须是毫秒数。") from None
+    if not 0 <= value <= MAX_SETTLE * 1000:
+        raise PageActionError("settle 超出范围（0~%d 毫秒）。" % int(MAX_SETTLE * 1000))
+    return value
+
+
+# ---- 对外动作 -------------------------------------------------------------------
+
+def open_page(root: str | Path, *, url: str = "", entry: str = "", timeout: float = 25.0,
+              flags: Any = ()) -> dict[str, Any]:
+    """打开一个页面并持有会话。`url` 只允许本机回环；不给 url 就用项目里的 HTML 入口起临时静态站。"""
+    global _reservations
+    base = Path(root).resolve()
+    if not base.is_dir():
+        raise PageActionError("当前项目目录不存在。")
+    for stale in _sweep():
+        stale.close()
+    with _lock:
+        # 名额必须在【启动之前】占住：只看已登记会话的话，两个并发 open 各自看到 2/3
+        # 就会一起起浏览器，上限形同虚设。
+        if len(_sessions) + _reservations >= MAX_SESSIONS:
+            raise PageActionError(
+                "同时最多持有 %d 个页面会话（每个都是一整个浏览器进程）。先 action: close 回收，"
+                "当前在会话：%s。" % (MAX_SESSIONS, ", ".join(row["page"] for row in live_pages())))
+        _reservations += 1
+    cleanup: dict[str, Any] = {}
+    stack = contextlib.ExitStack()
+    page_id = uuid.uuid4().hex[:8]
+    server = thread = None
+    try:
+        target, entry_path = visual.preview_target(base, entry, url)
+        if not target:
+            server, thread = visual.serve_static(base)
+            target = "http://127.0.0.1:%d/%s" % (server.server_port,
+                                                 entry_path.relative_to(base).as_posix())
+        devtools = stack.enter_context(contextlib.contextmanager(_session_gen)(
+            timeout, visual.sanitize_flags(flags), cleanup))
+        page_url = "%s%sdocmind=%d" % (target, "&" if "?" in target else "?", time.time_ns())
+        devtools.call("Page.navigate", {"url": page_url})
+        devtools.evaluate(
+            "(async()=>{for(let n=0;n<120;n++){if(document.readyState==='complete')return true;"
+            "await new Promise(r=>setTimeout(r,50))}throw Error('页面加载超时')})()")
+        devtools.drain(0.5)
+        probe = _probe(devtools)
+        page = _evaluate(devtools, INSPECT_JS, {"selector": "html", "mode": "count"}) or {}
+    except Exception:
+        with contextlib.suppress(Exception):
+            stack.close()
+        if server is not None:
+            visual.stop_static(server, thread)
+        with _lock:
+            _reservations -= 1
+        raise
+    row = _Session(page_id, stack, devtools, base, page_url, cleanup, server, thread)
+    with _lock:
+        # 登记与释放在同一个锁里做完：中间留空隙的话，并发 open 会短暂看到"既没会话也没名额"
+        # 然后又多起一个浏览器。
+        _sessions[page_id] = row
+        _reservations -= 1
+    console_errors = [item for item in devtools.console if item["level"] == "error"]
+    return {"action": "open", "page": page_id, "url": page_url, "href": page.get("href"),
+            "title": page.get("title"), "ready": page.get("ready"),
+            "elements": page.get("count"), "mutation_observer": bool(probe["observer"]),
+            "console_errors": console_errors, "runtime_errors": list(devtools.runtime_errors),
+            "failed_requests": list(devtools.failed_requests)}
+
+
+def _session_gen(timeout: float, flags: list[str], cleanup: dict):
+    """把唯一的浏览器启动通道变成可持有的生成器——启动路径仍然只有一条。"""
+    with visual.browser_session(timeout, flags, cleanup=cleanup) as devtools:
+        yield devtools
+
+
+def click(root: str | Path, *, page: str = "", selector: str = "", text: str = "", nth: int = 0,
+          scope: str = "", settle: float = 600, screenshot: bool = True) -> dict[str, Any]:
+    """真实点击：定位 → 滚进视口 → CDP 鼠标按下/抬起 → 比对是否真的发生了变化。"""
+    row = _get(page)
+    spec = _target_spec(selector, text, nth, scope)
+    row.counter += 1
+    found = _resolve(row.devtools, spec)
+    matched = found["matched"]
+    center_x, center_y = found["center"]
+    before = _signals(row.devtools, found)
+    for params in ({"type": "mouseMoved", "x": center_x, "y": center_y, "buttons": 0},
+                   {"type": "mousePressed", "x": center_x, "y": center_y, "button": "left",
+                    "clickCount": 1, "buttons": 1},
+                   {"type": "mouseReleased", "x": center_x, "y": center_y, "button": "left",
+                    "clickCount": 1, "buttons": 0}):
+        row.devtools.call("Input.dispatchMouseEvent", params)
+    return _finish(row, "click", before, settle_ms=settle, screenshot=screenshot,
+                   matched=matched, at=[center_x, center_y])
+
+
+def type_text(root: str | Path, *, page: str = "", value: str = "", selector: str = "",
+              text: str = "", nth: int = 0, scope: str = "", replace: bool = True,
+              settle: float = 600, screenshot: bool = False) -> dict[str, Any]:
+    """往【刚才定位到的那个】元素里插文本：走 `Input.insertText`，Vue/React 的 input 监听会收到。"""
+    row = _get(page)
+    payload = str(value if value is not None else "")
+    if len(payload) > MAX_VALUE_CHARS:
+        raise PageActionError("输入内容超过 %s 字符上限。" % MAX_VALUE_CHARS)
+    spec = _target_spec(selector, text, nth, scope)
+    row.counter += 1
+    found = _resolve(row.devtools, spec)
+    matched = found["matched"]
+    before = _signals(row.devtools, found)
+    held = _evaluate(row.devtools, TARGET_JS, {"replace": bool(replace), "select": bool(replace)}) or {}
+    if not held.get("ok"):
+        raise PageActionError("元素在定位之后消失了（%s），没有输入任何内容。" % held.get("reason"))
+    if payload:
+        row.devtools.call("Input.insertText", {"text": payload})
+    # 回读要按元素实际承载内容的方式取：`<input>` 的 innerText 恒为空，只看 text 就等于
+    # "插了字却没法证实插进去了"。value 优先，落空才退回可见文本。
+    read = _evaluate(row.devtools, INSPECT_JS, {"target": "held", "mode": "value"}) or {}
+    seen = str(read.get("text") or "")
+    if not seen.strip():
+        read = _evaluate(row.devtools, INSPECT_JS, {"target": "held", "mode": "text"}) or {}
+        seen = str(read.get("text") or "")
+    return _finish(row, "type", before, settle_ms=settle, screenshot=screenshot,
+                   matched=matched, focused=bool(held.get("focused")),
+                   value_seen=seen[:200], value_landed=payload in seen)
+
+
+def press_key(root: str | Path, *, page: str = "", key: str = "", selector: str = "",
+              settle: float = 600, screenshot: bool = False) -> dict[str, Any]:
+    """按一个键（只认固定键表）。给了 selector 就先把焦点放到那个元素上。"""
+    row = _get(page)
+    name = str(key or "").strip().lower()
+    if name not in KEYS:
+        raise PageActionError("按键 %r 不在支持列表里。支持：%s；组合键请改用 click 或 type。"
+                              % (key, "/".join(sorted(set(KEYS)))))
+    logical, code, vk, typed = KEYS[name]
+    matched: dict[str, Any] = {"tag": "document", "text": logical}
+    if str(selector or "").strip():
+        found = _resolve(row.devtools, _target_spec(selector, "", 0, ""))
+        matched = found["matched"]
+        held = _evaluate(row.devtools, TARGET_JS, {"replace": False, "select": False}) or {}
+        if not held.get("ok"):
+            raise PageActionError("元素在定位之后消失了（%s），没有按键。" % held.get("reason"))
+    row.counter += 1
+    before = _signals(row.devtools, _current(row.devtools))
+    base = {"key": logical, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+    row.devtools.call("Input.dispatchKeyEvent", {**base, "type": "keyDown", "text": typed})
+    row.devtools.call("Input.dispatchKeyEvent", {**base, "type": "keyUp"})
+    return _finish(row, "press", before, settle_ms=settle, screenshot=screenshot,
+                   matched=matched, key=logical)
+
+
+def wait_for(root: str | Path, *, page: str = "", selector: str = "", state: str = "present",
+             value: str = "", timeout: float = 4.0) -> dict[str, Any]:
+    """等一个条件成立。超时就是未通过，并附上当时看到的状态与新出现的报错。"""
+    row = _get(page)
+    kind = str(state or "present").strip().lower()
+    if kind not in WAIT_STATES:
+        raise PageActionError("state 只支持 %s，收到 %r。" % ("|".join(WAIT_STATES), state))
+    css = str(selector or "").strip()
+    if not css and kind != "text":
+        raise PageActionError("%s 需要 selector: <CSS>。" % kind)
+    if len(css) > 400:
+        raise PageActionError("选择器太长（上限 400 字符）。")
+    try:
+        budget = max(0.1, min(MAX_WAIT, float(timeout if timeout not in ("", None) else 4.0)))
+    except (TypeError, ValueError):
+        raise PageActionError("timeout 必须是秒数。") from None
+    started = time.monotonic()
+    deadline = started + budget
+    seen: dict[str, Any] = {}
+    spec = {"selector": css, "mode": "text" if kind == "text" else "count", "attr": ""}
+    while True:
+        seen = _evaluate(row.devtools, INSPECT_JS, spec) or {}
+        count = int(seen.get("count") or 0)
+        hit = ((kind == "present" and count >= 1)
+               or (kind == "absent" and count == 0)
+               or (kind == "visible" and count >= 1 and bool(seen.get("visible")))
+               or (kind == "hidden" and (count == 0 or not seen.get("visible")))
+               or (kind == "text" and str(value or "") in str(seen.get("text") or "")))
+        if hit:
+            return {"action": "wait", "page": row.id, "ok": True, "state": kind,
+                    "waited_ms": round((time.monotonic() - started) * 1000),
+                    "seen": {key: seen.get(key) for key in ("count", "found", "visible", "text")},
+                    "url": seen.get("href")}
+        if time.monotonic() >= deadline:
+            row.devtools.drain(0.3)
+            return {"action": "wait", "page": row.id, "ok": False, "state": kind,
+                    "timed_out": True, "waited_ms": round((time.monotonic() - started) * 1000),
+                    "wanted": str(value or css)[:200],
+                    "seen": {key: seen.get(key) for key in ("count", "found", "visible", "text")},
+                    "console_errors": [item for item in row.devtools.console
+                                       if item["level"] == "error"],
+                    "failed_requests": list(row.devtools.failed_requests)}
+        time.sleep(0.1)
+
+
+def read_page(root: str | Path, *, page: str = "", selector: str = "", mode: str = "text",
+              attr: str = "", nth: int = 0, held: bool = False) -> dict[str, Any]:
+    row = _get(page)
+    kind = str(mode or "text").strip().lower()
+    if kind not in READ_MODES:
+        raise PageActionError("mode 只支持 %s，收到 %r。" % ("|".join(READ_MODES), mode))
+    if kind == "attr" and not str(attr or "").strip():
+        raise PageActionError("mode: attr 需要 attr: <属性名>。")
+    if len(str(attr or "")) > 60:
+        raise PageActionError("属性名太长。")
+    css = str(selector or "").strip() or "html"
+    index = 0 if held else _target_spec(css, "", nth, "")["nth"]
+    out = _evaluate(row.devtools, INSPECT_JS,
+                    {"selector": "" if held else css,
+                     "target": "held" if held else "", "mode": kind, "attr": str(attr or "").strip(),
+                     "nth": index}) or {}
+    text = str(out.get("text") or "")
+    return {"action": "read", "page": row.id, "ok": True, "mode": kind, "count": out.get("count"),
+            "found": out.get("found"), "visible": out.get("visible"), "tag": out.get("tag"),
+            "title": out.get("title"), "url": out.get("href"), "text": text[:MAX_READ_CHARS],
+            "truncated": len(text) > MAX_READ_CHARS}
+
+
+def locate(root: str | Path, *, page: str = "", selector: str = "", text: str = "",
+           nth: int = 0, scope: str = "") -> dict[str, Any]:
+    """只看不动：这个定位会命中什么、可不可见、中心在哪个坐标。歧义也照样列出来。"""
+    row = _get(page)
+    spec = _target_spec(selector, text, nth, scope)
+    found = dict(_evaluate(row.devtools, RESOLVE_JS, spec) or {})
+    found["ambiguous"] = int(found.get("count") or 0) > 1 and spec["nth"] == 0
+    return {"action": "locate", "page": row.id, "ok": True, **found}
+
+
+def close_page(page: str = "") -> dict[str, Any]:
+    pid = str(page or "").strip()
+    with _lock:
+        row = _sessions.pop(pid, None)
+    if row is None:
+        return {"action": "close", "ok": False, "page": pid, "error": "找不到会话（可能已回收）。",
+                "live": live_pages()}
+    report = row.close()
+    reaped = report.get("job_closed") is True and report.get("profile_released") is True
+    return {"action": "close", "page": pid, "ok": reaped, "cleanup": report, "live": live_pages()}
+
+
+def render(result: dict[str, Any]) -> str:
+    action = str(result.get("action") or "")
+    if action == "open":
+        lines = ["页面会话已打开：page=%s" % result.get("page"),
+                 "地址：%s" % result.get("url"), "标题：%s" % result.get("title")]
+        if result.get("console_errors"):
+            lines.append("打开时就有 %d 条 console 错误（先按报错修，别继续点）：%s" % (
+                len(result["console_errors"]),
+                " / ".join(str(item.get("text"))[:120] for item in result["console_errors"][:3])))
+        if result.get("failed_requests"):
+            lines.append("打开时就有 %d 个失败请求：%s" % (
+                len(result["failed_requests"]),
+                " / ".join(str(item.get("url"))[:80] for item in result["failed_requests"][:3])))
+        lines.append("后续动作都带 page: %s；用完 action: close 回收。" % result.get("page"))
+        return "\n".join(lines)
+    if action == "wait":
+        return "等待 %s %s（等了 %sms）；当时看到 %s。" % (
+            result.get("state"), "成立" if result.get("ok") else "【未成立：超时】",
+            result.get("waited_ms"), json.dumps(result.get("seen"), ensure_ascii=False)[:240])
+    if action == "read":
+        return "读取 %s：命中 %s 个，%s%s" % (
+            result.get("mode"), result.get("count"),
+            json.dumps(result.get("text"), ensure_ascii=False),
+            "（已截断）" if result.get("truncated") else "")
+    if action == "locate":
+        lines = ["定位命中 %s 个%s（视口 %s）：" % (
+            result.get("count"), "【歧义：未指定 nth】" if result.get("ambiguous") else "",
+            json.dumps(result.get("view"), ensure_ascii=False))]
+        for index, row in enumerate(result.get("candidates") or []):
+            lines.append("  [%d] <%s> %r %sx%s @%s,%s 可见=%s 禁用=%s" % (
+                index, row.get("tag"), str(row.get("text"))[:40], row.get("w"), row.get("h"),
+                row.get("x"), row.get("y"), row.get("visible"), row.get("disabled")))
+        return "\n".join(lines)
+    if action == "close":
+        cleanup = result.get("cleanup") or {}
+        if not result.get("ok"):
+            if result.get("error"):
+                return "会话 %s 【没有回收到东西】：%s；仍在会话：%s。" % (
+                    result.get("page"), result["error"],
+                    ", ".join(row["page"] for row in result.get("live") or []) or "无")
+            return "会话 %s 收尾【不完整】：作业对象解绑=%s，profile 回收=%s——浏览器可能还活着，" \
+                   "请检查 msedge 进程。" % (result.get("page"), cleanup.get("job_closed"),
+                                          cleanup.get("profile_released"))
+        return "会话 %s 已回收（作业对象解绑=True，profile 回收=True）；仍在会话：%s。" % (
+            result.get("page"), ", ".join(row["page"] for row in result.get("live") or []) or "无")
+    if action == "list":
+        rows = result.get("live") or []
+        if not rows:
+            return "在途页面会话 0 个。"
+        lines = ["在途页面会话 %d 个：" % len(rows)]
+        for row in rows:
+            lines.append("  %s  idle %ss  动作 %s 次  %s" % (
+                row["page"], row["idle_seconds"], row["actions"], str(row["url"])[:90]))
+        return "\n".join(lines)
+    element = result.get("element") or {}
+    delta = result.get("delta") or {}
+    outcome = {"changed": "生效（DOM 变了）", "navigated": "生效（页面跳转了）",
+               "reloaded": "生效（文档被重新加载）",
+               "error_seen": "【未通过】动作后出现新报错", "no_change": "【没有观察到变化】"} \
+        .get(result.get("effect"), str(result.get("effect")))
+    lines = ["%s：%s —— DOM %+d，console %+d，失败请求 %+d；当前地址 %s。" % (
+        action, outcome, delta.get("mutations", 0), delta.get("console", 0),
+        delta.get("failed", 0), str(result.get("url"))[:120])]
+    lines.append("作用元素：<%s> %r %sx%s%s" % (
+        element.get("tag"), str(element.get("text"))[:40], element.get("w"), element.get("h"),
+        "  中心=%s" % result.get("at") if result.get("at") else ""))
+    if result.get("screenshot"):
+        lines.append("截图：%s" % result["screenshot"])
+    if result.get("value_seen") is not None:
+        lines.append("元素里现在是 %r（%s）" % (str(result.get("value_seen"))[:60],
+                                          "内容对得上" if result.get("value_landed")
+                                          else "【没有看到预期的文本】"))
+    for item in (result.get("console_errors") or [])[:3]:
+        lines.append("新 console 错误：%s" % str(item.get("text"))[:200])
+    for item in (result.get("failed_requests") or [])[:3]:
+        lines.append("新失败请求：%s（%s）" % (str(item.get("url"))[:120], item.get("kind")))
+    if result.get("left_loopback"):
+        lines.append("【已离开本机】当前地址不是回环地址：%s——这个会话不再受"
+                     "「只访问本机」约束，请 close 后重新 open 本机地址。" % str(result.get("url"))[:120])
+    if result.get("effect") == "no_change":
+        lines.append("没有观察到任何变化：可能点到的不是你要的控件，或这个控件本来就不改 DOM（"
+                     "这时用 read/locate 取具体状态再判断，不要当成成功）。")
+    return "\n".join(lines)
+
+
+__all__ = ["IDLE_TTL_SECONDS", "KEYS", "MAX_SESSIONS", "PageActionError", "click", "close_all",
+           "close_page", "live_pages", "locate", "open_page", "press_key", "read_page", "render",
+           "type_text", "wait_for"]

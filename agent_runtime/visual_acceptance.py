@@ -435,7 +435,10 @@ def sanitize_flags(flags: Any) -> list[str]:
         if any(ch in text for ch in ("\n", "\r", "\x00")):
             raise VisualAcceptanceError("浏览器启动参数含有非法字符：%r" % text[:60])
         name = text.partition("=")[0]
-        if any(name.startswith(blocked) for blocked in denied):
+        # Chromium 在 Windows 上的开关名不区分大小写，所以黑名单必须按小写比：
+        # 只比原文的话 `--User-Data-Dir=...` 就能绕出去改写浏览器的数据目录。
+        lowered = name.lower()
+        if any(lowered.startswith(blocked) for blocked in denied):
             raise VisualAcceptanceError("浏览器启动参数不允许：%s" % name)
         accepted.append(text)
     if len(accepted) > _MAX_EXTRA_FLAGS:
@@ -565,11 +568,18 @@ class _DevTools:
         self.runtime_errors = runtime_errors if runtime_errors is not None else []
         self.console: list[dict[str, Any]] = []
         self.failed_requests: list[dict[str, Any]] = []
+        # 去重【前】的事件计数。列表会去重也会截断，所以「这次动作有没有新报错」不能看列表
+        # 长度——同一个错误每次动作都复现时，长度差恒为 0，就会把失败的动作报成成功。
+        self.error_events = 0
+        self.failure_events = 0
+        self.runtime_events = 0
         self._requests: dict[str, str] = {}
 
     def _record_console(self, level: str, text: str) -> None:
         if "favicon.ico" in str(text).lower():
             return
+        if level == "error":
+            self.error_events += 1
         entry = {"level": level, "text": str(text)[:300]}
         if entry not in self.console and len(self.console) < _MAX_CONSOLE:
             self.console.append(entry)
@@ -577,6 +587,7 @@ class _DevTools:
     def _record_failure(self, kind: str, url: str, detail: str) -> None:
         if str(url).split("?")[0].rstrip("/").lower().endswith(_IGNORED_REQUEST_SUFFIX):
             return
+        self.failure_events += 1
         # Chrome reports an HTTP failure twice: once as the status and once as an
         # aborted load. Keep the status, drop the redundant abort noise.
         if kind == "network" and "ERR_ABORTED" in str(detail):
@@ -592,6 +603,7 @@ class _DevTools:
         method = str(message.get("method") or "")
         params = message.get("params") or {}
         if method == "Runtime.exceptionThrown":
+            self.runtime_events += 1
             details = params.get("exceptionDetails") or {}
             text = str(details.get("text") or details.get("exception", {}).get("description") or "runtime error")
             if text not in self.runtime_errors:

@@ -6174,6 +6174,119 @@ def dev_media(arg=""):
         return "dev_media 失败：%s: %s" % (type(exc).__name__, str(exc)[:240])
 
 
+def dev_page_action(arg=""):
+    """在本机网页里真的做动作并回报是否真的生效：点、填、按键、等、读。
+
+    输入（多行 keyed）：
+      action: open|click|type|press|wait|read|locate|list|close
+      page: <会话 id>                # open 之外必填；open 的返回里就有
+      url: http://127.0.0.1:5173/    # open 用；只允许本机回环
+      entry: index.html              # open 的另一种：项目里的静态入口，临时起静态站
+      selector: button.submit        # 定位一：CSS
+      text: 保存                     # 定位二：可见文字（整串相等优先，落空才退到包含）
+      nth: 0                         # 命中多个时【必须】显式指定要点第几个
+      scope: .panel                  # 可选，限定 text 定位的搜索范围
+      value: 要输入的文本            # type
+      key: Enter                     # press；只支持固定键表，组合键请改用 click/type
+      state: present|absent|visible|hidden|text   # wait
+      mode: text|value|attr|html|count            # read
+      attr: href                    # read 的 mode: attr
+      timeout: 4                    # wait 的等待秒数
+      settle: 600                   # 动作后观察多久（毫秒，上限 5000）
+      screenshot: true|false        # click/shot 是否需要截图
+    动作后会给 effect：changed / navigated / reloaded / error_seen / no_change，并附 DOM 变更、
+    新 console 错误、新失败请求的计数。`no_change` 就是「没观察到变化」，不要当成功；
+    隐藏/禁用/歧义元素一律拒绝执行。用完必须 action: close 回收（同时最多 3 个会话）。
+    """
+    root = _get_code_root()
+    if not root:
+        return "尚未配置代码库根目录，请先用 /api/ingest_code 指定代码目录。"
+    keys = ["action", "page", "url", "entry", "selector", "text", "nth", "scope", "value",
+            "key", "state", "mode", "attr", "timeout", "settle", "screenshot"]
+    fields = _parse_keyed(arg or "", keys)
+
+    def _one(key, default=""):
+        value = fields.get(key)
+        if value is None:
+            return default
+        text = str(value)
+        return text.splitlines()[0].strip() if text.strip() and "\n" not in text.strip() else text.strip()
+
+    def _flag(key, default):
+        text = _one(key, "").strip().lower()
+        if not text:
+            return default
+        return text in _BOOL_WORDS
+
+    action = (_one("action") or "open").lower()
+    from agent_runtime import page_action
+    try:
+        if action == "open":
+            result = page_action.open_page(root, url=_one("url"), entry=_one("entry"))
+        elif action == "click":
+            result = page_action.click(root, page=_one("page"), selector=_one("selector"),
+                                       text=_one("text"), nth=_one("nth", 0), scope=_one("scope"),
+                                       settle=_one("settle", 600),
+                                       screenshot=_flag("screenshot", True))
+        elif action == "type":
+            result = page_action.type_text(root, page=_one("page"), value=fields.get("value") or "",
+                                           selector=_one("selector"), text=_one("text"),
+                                           nth=_one("nth", 0), scope=_one("scope"),
+                                           replace=_flag("replace", True),
+                                           settle=_one("settle", 600),
+                                           screenshot=_flag("screenshot", False))
+        elif action == "press":
+            result = page_action.press_key(root, page=_one("page"), key=_one("key"),
+                                           selector=_one("selector"), settle=_one("settle", 600),
+                                           screenshot=_flag("screenshot", False))
+        elif action == "wait":
+            result = page_action.wait_for(root, page=_one("page"), selector=_one("selector"),
+                                          state=_one("state", "present"), value=_one("value"),
+                                          timeout=_one("timeout", 4))
+        elif action == "read":
+            result = page_action.read_page(root, page=_one("page"), selector=_one("selector"),
+                                           mode=_one("mode", "text"), attr=_one("attr"),
+                                           nth=_one("nth", 0))
+        elif action == "locate":
+            result = page_action.locate(root, page=_one("page"), selector=_one("selector"),
+                                        text=_one("text"), nth=_one("nth", 0), scope=_one("scope"))
+        elif action in ("list", "status"):
+            result = {"action": "list", "live": page_action.live_pages()}
+        elif action == "close":
+            result = page_action.close_page(_one("page"))
+        else:
+            return ("dev_page_action 不支持 action: %s（可用：open|click|type|press|wait|read|"
+                    "locate|list|close）。" % action)
+    except page_action.PageActionError as exc:
+        return str(exc)
+    except Exception as exc:  # noqa: BLE001
+        name = type(exc).__name__
+        if name == "VisualAcceptanceError":
+            return "页面动作无法执行：%s" % str(exc)[:300]
+        return "dev_page_action 失败：%s: %s" % (name, str(exc)[:240])
+    text = page_action.render(result)
+    shot = str(result.get("screenshot") or "")
+    if not shot or not result.get("ok"):
+        return text
+    image = _screenshot_data_url(shot, root)
+    if not image:
+        return text
+    return ToolResult(True, text, data={"images": [image], "image_sources": [shot]})
+
+
+def _screenshot_data_url(relative: str, root: str):
+    """把页面动作留下的截图读成 data URL；越界路径或不实图像直接放弃附图。"""
+    base = os.path.realpath(root)
+    path = os.path.realpath(os.path.join(base, *str(relative).replace("\\", "/").split("/")))
+    if path != base and not path.startswith(base + os.sep):
+        return None
+    try:
+        with open(path, "rb") as handle:
+            return _encode_observation_image(handle.read())
+    except OSError:
+        return None
+
+
 def preview_project(arg=""):
     """在正式开发舱中捕获当前项目的真实网页画面。
 
@@ -6911,6 +7024,24 @@ TOOLS = {
             "用完必须 `action: stop` 回收（后台任务额度有限，上限 8 个）。"
         ),
         "func": dev_serve,
+    },
+    "dev_page_action": {
+        "description": (
+            "在本机网页里【真的做动作】：点、填、按键、等条件、读状态。harness 原来只能看画面"
+            "（preview_project），所以「点一下才复现」的 bug 只能靠猜——本工具补的就是这一半。\n"
+            "输入 keyed 多行：`action: open|click|type|press|wait|read|locate|list|close`、"
+            "`page: <会话 id>`（open 之外必填）、`url: http://127.0.0.1:5173/` 或 `entry: index.html`、"
+            "`selector:`/`text:`/`nth:` 定位、`value:` 文本、`key: Enter`、`state: present|absent|visible|hidden|text`、"
+            "`mode: text|value|attr|html|count`、`settle: 600`、`screenshot: true|false`。\n"
+            "**每个动作都回报是否真的生效**：effect 取 `changed`/`navigated`/`reloaded`/`error_seen`/`no_change`，"
+            "并附 DOM 变更、新 console 错误、新失败请求的计数。`no_change` 就是没观察到变化，"
+            "不要当成成功；`error_seen` 要按报错修。隐藏、禁用、或命中多个却没给 `nth` 的元素一律拒绝执行，"
+            "并把候选清单原样回给你——点错东西还报生效，是最贵的一类假干净。\n"
+            "只允许本机回环地址；不接受任意 JS 执行；按键只认固定键表。会话持有真实浏览器，"
+            "同时最多 3 个，用完必须 `action: close`（回收会回报作业对象与临时目录是否真的释放）。\n"
+            "页面里的按钮可能真的会改你的项目或发请求——那是你的开发服务，不是沙箱里的玩具。"
+        ),
+        "func": dev_page_action,
     },
     "dev_media": {
         "description": (

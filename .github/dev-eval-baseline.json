@@ -1,8 +1,8 @@
 {
  "schema_version": 1,
- "total": 17,
- "scored": 17,
- "passed": 17,
+ "total": 18,
+ "scored": 18,
+ "passed": 18,
  "skipped": [],
  "results": [
   {
@@ -103,6 +103,12 @@
   },
   {
    "id": "media-fixture-closes-without-a-device",
+   "passed": true,
+   "skipped": "",
+   "failed_checks": []
+  },
+  {
+   "id": "page-action-refuses-and-never-claims-success",
    "passed": true,
    "skipped": "",
    "failed_checks": []

@@ -1,5 +1,27 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-10-01 Vibecoding 能力补全 Wave13：页面交互原语 `dev_page_action`（本会话，不占 R 槽位）
+
+- **补什么**：vibecoding 循环缺的下半身。测得当时 101 个工具里**没有任何输入原语**（`click`/`type`/`press`/`wait` 零命中），`preview_project` 只能看画面——于是「点一下才复现」的 bug 只能靠模型想象。现在有了真实浏览器里的 click / type / press / wait / read / locate，走 CDP `Input.*`，页面收到的是原生事件（Vue/React 的 `input`/`click` 监听会真的触发）。
+- **产物**：`agent_runtime/page_action.py`（工具 `dev_page_action`）、`tools.py` 的实现 + `_screenshot_data_url` + TOOLS 注册、`agent.py` 提示目录 1 行、`mcp_server.py` 归入 WRITE_TOOLS、`tests/test_page_action.py` **43 项**、门禁加 1 题（题集 17→18，基线已刷）。
+- **启动路径只有一条**：会话持有的是 `visual_acceptance.browser_session()`（Wave7 抽出来的那个），**不自己 Popen、不引 playwright**——仓库已有硬规矩：浏览器必须出生在 kill-on-close 作业对象里（99°C 漏浏览器事故）。会话上限 3、空闲按 TTL 在下次调用时回收、进程退出 `atexit` 兜底；`close` 回报**真实**回收证据（`job_closed`/`profile_released`）。
+- **每个动作都留可复核证据**：动作前后比对 MutationObserver 计数、console 错误数、失败请求数、运行时异常数、地址与标题，得出 `changed`/`navigated`/`reloaded`/`error_seen`/`no_change`；`error_seen` 判未通过，`no_change` 明确写「没有观察到变化，不要当成功」并提示改用 read/locate 取具体状态。
+- **拒绝在派发之前**：命中多个却没给 `nth`、元素不可见、禁用、中心不在视口外——一律拒绝执行并**回候选清单**（含 tag/文本/尺寸/坐标/可见性），且断言「一个鼠标事件都没派发」。这是刻意的：点错东西还报生效是最贵的一类假干净。
+- **测量才发现的两个真问题**（不是想出来的）：① 文本定位单级子串会把「加一」命中到「吃掉加一按钮」——改成**整串相等优先，落空才退到包含**，用例把这条钉住；② 页面导航会让 MutationObserver 重装、计数从 0 开始，差值变负数 —— 单独判成 `reloaded` 并把负值钳 0，不把「-7 次变更」这种证据喂给模型。
+- **自查（review）这一轮真找到的东西**——先独立审（另一个 agent 读 diff 报问题），再逐条对着代码核实，最后用变异测试证明每条护栏真的有牙：
+  - **HIGH：`press_key` 永远报不出 `no_change`**。动作前的快照是硬编码的 `{"href": row.url, "title": ""}`，而 `row.url` 停在 open 那一刻、标题恒为空 → 任何一次按键都会被比对成「标题变了/跳转了」，把没生效说成生效。改成动作前真读页面（`_current`）。
+  - **HIGH：`no_change` 的 `ok` 是 True**。文字措辞诚实，但结构化消费方（MCP、工作流门）读的是 `ok` 字段——「点了没反应」在它们眼里就是成功。现在 `ok` 只在 `changed/navigated/reloaded` 时为真。
+  - **MEDIUM：去重把重复报错藏了**。`_DevTools.console` 会去重也会截断，同一条报错每次动作都复现时长度差恒为 0 → 一直报错的页面被判成没问题。给 `_DevTools` 加了去重**前**的事件计数（`error_events`/`failure_events`/`runtime_events`），判定改用计数。
+  - **MEDIUM：只在 open 时校验回环不够**。页内跳转/重定向能把浏览器带到外网机器。现在每个动作后复查 `href`，离开回环就 `left_loopback` + `ok=False` + 明说「请 close 后重新 open 本机地址」。
+  - **MEDIUM：`type` 的证据读错字段**。读的是 `innerText`，而 `<input>` 的 innerText 恒为空——等于「插了字却无法证实插进去了」。改成 `value` 优先、空了才退回文本，并回 `value_landed`。
+  - **LOW 三条**：`probe_installed` 恒为真（`int(x) >= 0`）→ 换成观察器是否真装上的 `mutation_observer`；会话上限只数已登记会话，两个并发 open 会各自看到 2/3 然后一起起浏览器 → 改成启动前先占名额（`_reservations`，失败路径必须归还）；`_sweep` 抱着全局锁关浏览器（taskkill + profile 回收可达数秒）→ 改成只在锁内除名、锁外回收。另：`read_page` 校验用 `"html"` 却用空串查询，空选择器的读取永远 found=false；`sanitize_flags` 黑名单原先大小写敏感，`--User-Data-Dir=` 就能绕过（Chromium 开关名不区分大小写）。
+  - **变异测试 12 条全数被抓红**（歧义拒绝、隐藏拒绝、去重前计数、no_change 不算成功、离开本机要失败、名额预占、参数当字面量传、按键前真快照、导航后计数钳零、输入回读落点、回收证据在关栈之后取、黑名单大小写）。跑法见 `.tmp/w13_mutation.py`（临时脚本，不入库）。**其中一条是变异跑出来才看见的真 bug**：把 `preview_target` 挪到 try 之外的那版实现里，非回环地址抛错会漏还名额——所以 `test_open_refuses_a_non_loopback_url...` 现在还会断言 `_reservations` 归零。
+  - **测试自己的两处空转**也修了：`test_error_seen_is_the_only_not_ok_verdict` 只断言字符串互不相等（恒真，什么都没测），换成用假页面走完整动作的 `ok` 语义表；假页面原先对 `value`/`text` 两种读取模式回同一个值，导致「读错字段」这条变异测不出来，改成按模式分别回话。
+- **注入面**：页面脚本全是模块里的固定常量，参数以 JSON 字面量传入（`(js)(json)`）；不向模型暴露任意 JS 执行；selector 形状、长度、nth 范围、value 长度都有上限；只允许回环地址；截图读回时校验真实路径仍在项目内。用例包含带引号的注入载荷与 `@import`/`javascript:` 形态的选择器。
+- **验证**：`tests/test_page_action.py` **49 项**（含 7 项真实浏览器 e2e：点击真的把「计数 0」变成「计数 1」、输入真的触发页面监听、导航判成 navigated、报错按钮判成 error_seen、隐藏/禁用/歧义全被拒且一个鼠标事件都没派发、close 后 `live_pages()` 为空且 msedge 进程数不变）；与视觉验收相关的 7 个套件一起 **187 passed / 82 subtests**（`test_media_fixture`、`test_dev_serve_preview`、`test_visual_acceptance_runtime`、`test_visual_console_signals`、`test_native_tools`、`test_mcp_server_expose` 全绿，说明 `_DevTools` 加计数没有回退既有验收行为）；门禁 **18/18** 且与基线持平无回退；`dev_page_action` 走文本协议真跑一遍 open→click→read→type→wait→locate→坏按钮→list→close 全对，截图作为图像附上；**变异测试 12/12 抓红**。
+- **未做**：没有 drag/hover/scroll/select-file/对话框处理；`settle` 是「动作后观察多久」而不是条件等待（真正的条件等待只在 `wait` 里）；iframe 与 Shadow DOM 里的元素定位不到；一 session 一个浏览器，不共享登录态也不复用系统浏览器 profile；`dev_serve` 端口被抢仍不自动重试；前端仍**没有 eslint 配置**，`dev_diagnostics` 前端只有 typecheck 一条腿。
+
+
 ## 2026-09-30 漏浏览器（99°C）事故的第二半：回收必须「归属可证」，不能靠时间和事后补绑（本会话，不占 R 槽位）
 
 - **触发**：用户报「cpu 突然99度」。实测 462 个 `msedge.exe` / 19.1 GB RAM / 100% CPU（内核态 49%）/ 内存只剩 2.5 GB / pagefile 已用 13 GB；Ryzen 9955HX Tjmax 95°C，早就在硬降频。全部是 `browser_session()` 起的 headless Edge：父 Python 被硬杀（会话重启、工具超时）时 `finally` 跑不到，一次留 16 个进程 + 一套 profile，一夜攒 40 多套。第一半（作业对象 + 重试删除 + sweep）由另一条 lane 连我的改动一起提交成 `1bb0725`；**这一节是它留下的三个洞，提交在 `4ea51ce`**。

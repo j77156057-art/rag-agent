@@ -27,7 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import config
 import temp_state
@@ -347,6 +347,105 @@ def _case_media_fixture_closes_without_a_device(root: str, run: Callable[..., di
             _check("junk_is_a_violation_not_a_drop", garbage_ok, report["violations"])]
 
 
+def _case_page_action_refuses_and_never_claims_success(root: str, run: Callable[..., dict]) -> list[dict]:
+    """交互原语最贵的错是「点了但没生效却报成功」。这条不启动浏览器也要把护栏钉住。"""
+    import json as _json
+
+    from agent_runtime import page_action
+
+    class _Stub:
+        def __init__(self, resolve):
+            self.resolve = resolve
+            self.console, self.failed_requests, self.runtime_errors = [], [], []
+            self.events: list[tuple[str, dict]] = []
+
+        def call(self, method, params=None):
+            self.events.append((method, params or {}))
+            return {"data": ""}
+
+        def evaluate(self, expression):
+            if "MutationObserver" in expression:
+                return 0
+            if "__docmindTarget = null" in expression:
+                return dict(self.resolve)
+            return {"count": 1, "found": True, "visible": True, "text": "x",
+                    "href": "http://127.0.0.1:1/", "title": "t"}
+
+        def drain(self, seconds=0.5, **_kwargs):
+            pass
+
+    class _Stack:
+        """替会话占位的空栈：门禁只验护栏，不需要真的收浏览器。"""
+
+        def close(self):
+            return None
+
+    def session(resolve):
+        holder = _Stack()
+        row = page_action._Session("eval%03d" % len(page_action._sessions), holder, _Stub(resolve),
+                                   Path(root), "http://127.0.0.1:1/", {}, None, None)
+        with page_action._lock:
+            page_action._sessions[row.id] = row
+        return row, holder
+
+    geometry = {"tag": "button", "text": "保存", "visible": True, "disabled": False,
+                "x": 10, "y": 10, "w": 40, "h": 20, "id": "save"}
+    ambiguous = {"count": 2, "nth": 0, "matched": geometry, "view": {"width": 900, "height": 500},
+                 "href": "http://127.0.0.1:1/", "title": "t", "candidates": [geometry, geometry]}
+    hidden = {"count": 1, "nth": 0, "matched": {**geometry, "visible": False},
+              "view": {"width": 900, "height": 500}, "href": "http://127.0.0.1:1/", "title": "t",
+              "candidates": [{**geometry, "visible": False}]}
+    results = []
+    for label, shape, word in (("ambiguous", ambiguous, "命中多个"), ("hidden", hidden, "不可见")):
+        row, holder = session(shape)
+        refused, message = False, ""
+        try:
+            page_action.click(root, page=row.id, selector="#save")
+        except page_action.PageActionError as exc:
+            refused, message = True, str(exc)
+        finally:
+            dispatched = bool(row.devtools.events)
+            page_action._sessions.pop(row.id, None)
+            try:
+                holder.close()
+            except Exception:  # noqa: BLE001 - 替身栈，收尾失败不影响判定
+                pass
+        results.append(_check("%s_refused" % label, refused and word in message, message[:160]))
+        results.append(_check("%s_dispatched_nothing" % label, not dispatched,
+                              "定位没成立却还是派发了事件"))
+    missing = run("dev_page_action", "action: click\nselector: #save")["text"]
+    bad = run("dev_page_action", "action: teleport")["text"]
+    expression_probe = []
+
+    def capture(expression):
+        expression_probe.append(expression)
+        return None
+
+    stub = _Stub(ambiguous)
+    stub.evaluate = capture
+    page_action._evaluate(stub, page_action.RESOLVE_JS,
+                          {"selector": "", "text": 'a");window.pwned=1;//', "nth": 0, "scope": ""})
+    prefix = "(" + page_action.RESOLVE_JS + ")("
+    payload = expression_probe[0][len(prefix):-1] if expression_probe else "{}"
+    try:
+        escaped = _json.loads(payload).get("text") == 'a");window.pwned=1;//'
+    except ValueError:
+        escaped = False
+    before = {"mutations": 10, "console": 0, "failed": 0, "runtime": 0,
+              "href": "http://127.0.0.1:1/", "title": "t"}
+    error_seen = page_action._verdict(before, {**before, "mutations": 30, "console": 1})
+    still = page_action._verdict(before, dict(before))
+    return results + [
+        _check("needs_a_session", "page" in missing and ("缺少" in missing or "找不到" in missing),
+               missing[:160]),
+        _check("unknown_action_is_text", "不支持" in bad, bad[:160]),
+        _check("arguments_travel_as_literals", escaped and expression_probe[0].count("window.pwned") == 1,
+               (expression_probe[0][:160] if expression_probe else "没有生成表达式")),
+        _check("errors_outrank_dom_changes", error_seen["verdict"] == "error_seen", error_seen),
+        _check("no_change_is_not_success", still["verdict"] == "no_change", still),
+    ]
+
+
 DEV_DATASET: tuple[dict[str, Any], ...] = (
     {
         "id": "lookup-by-filename", "fixture": "ts-refs",
@@ -470,6 +569,12 @@ DEV_DATASET: tuple[dict[str, Any], ...] = (
         "direct": _case_media_fixture_closes_without_a_device,
         "uses": ["dev_media"],
         "note": "语音回路不再依赖真麦克风：夹具、包形、静音尾都算得出来",
+    },
+    {
+        "id": "page-action-refuses-and-never-claims-success", "fixture": "plain",
+        "direct": _case_page_action_refuses_and_never_claims_success,
+        "uses": ["dev_page_action"],
+        "note": "点了没生效绝不能报成功：歧义/隐藏/禁用不派发，报错优先于 DOM 变化",
     },
 )
 

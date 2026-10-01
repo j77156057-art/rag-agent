@@ -529,6 +529,14 @@ class FlagSanitizerTests(unittest.TestCase):
                 with self.assertRaises(visual.VisualAcceptanceError):
                     visual.sanitize_flags([bad])
 
+    def test_the_deny_list_is_case_insensitive_like_the_browser(self):
+        # Chromium 在 Windows 上的开关名不区分大小写：只比原文的话换个大小写就绕过去了。
+        for sneaky in ("--User-Data-Dir=D:\\evil", "--LOAD-EXTENSION=/tmp/x",
+                       "--INSPECT=9229", "--Remote-Debugging-Pipe"):
+            with self.subTest(sneaky=sneaky):
+                with self.assertRaises(visual.VisualAcceptanceError):
+                    visual.sanitize_flags([sneaky])
+
     def test_flag_count_is_bounded(self):
         with self.assertRaises(visual.VisualAcceptanceError):
             visual.sanitize_flags(["--flag-%d=%s" % (i, "v") for i in range(200)])
