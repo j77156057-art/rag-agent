@@ -24,6 +24,7 @@
 - **同一时点的工作树实测（`unittest discover -s tests`）**：**2322 项 → 9 failures + 4 errors + 10 skipped**。红点全部落在未提交的在途改动上，没有一项来自已提交内容：`test_workflow_step_budget.py`（`M`）6 项、`tests.test_agent` 1F+1E、`test_agent_capacity.py`（`??`）1E、`test_game_workflow` 2E、`test_orchestrator` 1F。
 - **其中至少一条是「非确定性」而不是「还没做完」**：`RunChildStepCapTests.test_request_above_hard_cap_is_clamped` 期望 12，实测值在两次运行间从 **10 变成 11**。同一份代码两次给出不同数字 ⇒ 这些断言依赖全局/顺序状态，不能只当 WIP 未收尾。
 - **最小且不改历史的收尾路径（供决策，本轮未执行）**：把那 4 个未跟踪文件纳入版本库即可让 HEAD 自洽 —— **纯新增、无内容改动、`git reset` 可回退**。但这等于把别人 lane 的在途文件挂到我的提交下，**正是 `b828d10` 的错法**，所以需要 owner / 用户明确授权；授权前我不代提交。
+- **用户决定与执行（本会话）**：授权「我把这 4 个文件入库」，且顺序为**先修 HEAD 再 push**。已执行：只 `git add` 这 4 个明确路径 → **裸 `git commit`（不带 pathspec）** → 再用**新的**干净 worktree 复验 `import agent` 与 `compileall`，两个视图都通。性质是**修复不是认领**：文件内容一字未改，只是把 HEAD 已经在 import 的东西纳入版本库；`git reset` 可回退。另复核过 `capacity.py` 的两条依赖（`gpu_coordinator` 已跟踪且为函数内 `try`、`config` 已跟踪），**没有**引入新的未跟踪依赖；同时确认 `dependency_bootstrap.py` / `head_check.py` 这两个未跟踪模块**未被已提交代码引用**，故不在本次修复范围。
 
 ## 2026-10-01 Vibecoding 能力补全 Wave8（后半·选项3）：语音接线的浏览器行为回路 `dev_media action: voice`（本会话，不占 R 槽位）
 
