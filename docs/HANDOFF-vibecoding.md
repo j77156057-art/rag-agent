@@ -130,10 +130,15 @@ cd frontend && npm run test:node
 ## 7. 共享工作树里的提交规范（实测有效的那套）
 
 1. 只提交自己的路径：`git add <新文件>` + `git commit -- <只属于我的路径>`；**永远不要** `git add -A`。
-2. 若自己改的文件**同时含别人的在途改动**（本会话实测：`tools.py` 13 个 hunk 里 2 个是我的、
-   `agent.py` 33 个里 1 个），按 hunk 暂存：`git diff` 拆 hunk → 只留自己的 → `git apply --cached` →
-   裸 `git commit`。提交前 `git diff --cached --stat` 核对行数，并对暂存版本做
-   `git show :./<path>` + `ast.parse`（半截 hunk 最容易留下语法残骸）。
+2. 若自己改的文件**同时含别人的在途改动**（本会话实测：`tools.py` 16 个 hunk 里 5 个是我的、
+   `agent.py` 34 个里 1 个），按 hunk 暂存：`git diff` 拆 hunk → 只留自己的 → `git apply --cached` →
+   **裸 `git commit`（不带 pathspec！）**。`git commit -- <路径>` 会**绕过索引**，按这些路径的
+   工作树内容临时建索引再提交——本会话就这么把别人 ~457 行在途 WIP 挂进我的提交（`b828d10`），
+   而且因为扫进去的只有"引用未跟踪模块的那几行 import"，**HEAD 单独检出会 `import agent` 失败**
+   （干净 worktree 实测：`ModuleNotFoundError: agent_runtime.run_budget`）。
+   提交后的两道自检：`git show --stat` 看共享文件行数有没有超过自己的 hunk；
+   `git worktree add --detach <tmp> HEAD` 里 `import agent` 一次，确认 HEAD 自洽。
+   对暂存版本还要 `git show :./<path>` + `ast.parse`（半截 hunk 最容易留下语法残骸）。
 3. 判定某条红是不是自己造成的：把 HEAD 挂成干净 worktree（`git worktree add --detach`）跑同一批
    文件。**本会话两次这样验**：12 条红在我的提交上 183/183 全过 → 归属明确。用完 `git worktree remove`
    之后必须再 `rmdir` 空壳目录（Windows 上会被自己的 cwd 占住）。
@@ -166,14 +171,24 @@ cd frontend && npm run test:node
 - **本会话我自己犯的 4 个错**（都留下了对应测试）：① 原地改生产文件做变异测试 → 还原撞上
   `OSError 22`，文件短暂留在变异态；② 把 `dev_media` 的异常文案合并成一句，打断既有断言；
   ③ 现场测试的浏览器探针写错模块别名被宽 `except` 吞掉 → **整类静默跳过**；④ `preview_target`
-  抛错时会话名额没归还（变异测试跑出来的真 bug）。
+  抛错时会话名额没归还（变异测试跑出来的真 bug）；⑤ **`git commit -- <路径>` 绕过索引**：hunk
+  级暂存和 `git diff --cached --stat` 核对都做对了，最后一步用 pathspec 提交，仍把别人 ~457 行
+  在途 WIP 挂进 `b828d10`，且扫进去的 import 引用了未跟踪模块 → **HEAD 单独检出 `import agent`
+  失败**（干净 worktree 实测）。流程教训：hunk 暂存之后只能裸 `git commit`，且提交后要
+  `git show --stat` + 在干净 worktree 里 import 一次。
 
 ## 10. 本会话未结事项
 
-1. **`voice_loop` 已入库**：独立审计 11 条里 8 条成立并改掉，变异电池 16/16 抓红
+1. **HEAD 目前是坏的（就一条 import）**：`b828d10` 把别人未跟踪的 `agent_runtime/run_budget.py`
+   的引用扫进了 `agent.py:55`，干净检出 `import agent` → `ModuleNotFoundError`。
+   三条路，按用户口径排序：① 那条 lane 把 `run_budget.py` / `capacity.py` 及其测试提交掉，HEAD
+   自愈；② 本会话 `git reset --mixed HEAD~1` 后按 hunk 重提（改写本地历史，需要用户点头；
+   未 push、`b828d10` 在 reflog 可回）；③ 维持现状，只依赖"工作树里那些模块还在磁盘上"。
+   细节与复现见 `HANDOFF.md` 顶部那节披露。
+2. **`voice_loop` 已入库**：独立审计 11 条里 8 条成立并改掉，变异电池 16/16 抓红
    （其中"开麦时归零序号"是真机跑出来的真 bug）。剩下的只是**边界**：`.vue` 接线层
    没有组件级守卫（按选项3 的决定不做 vitest），真网关与听感归 R12。
-2. 全量最后一次：**2569 passed / 12 failed**，12 条已用干净 worktree 证明全部来自
+3. 全量最后一次：**2569 passed / 12 failed**，12 条已用干净 worktree 证明全部来自
    另一条 lane 未提交的 step-budget / capacity / game_workflow WIP（本程序不代修、不代提交）。
-3. 需要人做的两件：**push**（或 `git bundle` 离线备份），以及在配好 DashScope 的机器上跑一次
+4. 需要人做的两件：**push**（或 `git bundle` 离线备份），以及在配好 DashScope 的机器上跑一次
    真网关回路，把结果回写本文件 §5.3 与 §6#3。

@@ -1,5 +1,21 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-10-02 披露：我的提交 `b828d10` 把别人在途的 WIP 一起提交了，并让 HEAD 变得 import 不了
+
+- **事实**：`b828d10`（我那条语音行为回路的提交）在 `tools.py` 里带了 **272 行**、在 `agent.py` 里带了 **312 行**，其中属于我的只有 **39 行 + 2 行**；剩下的 ~457 行是另一条 lane 未提交的 step-budget / capacity / web-research WIP，被挂在**我的提交信息**下入库了。
+- **根因（这次是流程错，不是判断错）**：我**先**按 hunk 只暂存了自己的改动，并用 `git diff --cached --stat` 核对过行数就是 39/2 —— 暂存这一步是对的。错在最后一条命令用了 `git commit -- <我的 8 个路径>`：**pathspec 形式的 commit 会绕过索引**，它从 HEAD + 这些路径的**工作树内容**临时建一个索引，于是我把刚核对过的 hunk 子集整个丢掉了。`git show --stat` 一跑就露馅了。
+- **可复核的后果（实测，不是推理）**：把 HEAD 挂成干净 worktree（`git worktree add --detach`）后 `import agent` 直接失败——
+  `agent.py:55 from agent_runtime.run_budget import RunBudget → ModuleNotFoundError: No module named 'agent_runtime.run_budget'`，
+  因为 `agent_runtime/run_budget.py` 与 `agent_runtime/capacity.py` **至今还是未跟踪文件**，被扫进 HEAD 的只有【引用它们的那几行】。
+  逐条比过：`git show 59fddb5:agent.py`、`git show 40ae86d:agent.py` 里这条 import 出现 **0 次**，`b828d10` 里 **1 次** —— 是我的提交引入的。
+  任何从干净检出跑起来的消费方（CI、别人 `git worktree add`、`git clone`）都会在第一批 `import agent` 的测试上红，包括我自己的 `tests/test_voice_loop.py::ToolSurfaceTests`。
+- **当前工作树没事**：那几个模块还在磁盘上（未跟踪），所以**在这个工作树里**跑一切正常。坏的只是"单独检出 HEAD"这一种视图。
+- **归属**：未跟踪的 `agent_runtime/run_budget.py` / `capacity.py` / `tests/test_run_budget.py` / `tests/test_agent_capacity.py`，加上 `tools.py` 里 `web_search`/`_custom_fetch` 那些 hunk，属于**另一条 lane**（就是之前那 12 条红的 owner）。我没有代改、也没有代提交他们的模块。
+- **用户决定**：保留 `b828d10`、如实披露，**不改历史**。若要干净收尾，一条命令就够（需要 owner 与本会话同意，因为是历史改写、且尚未 push、`b828d10` 在 reflog 里随时能回来）：
+  `git reset --mixed HEAD~1` → 重跑 `.tmp/stage_hunks.py`（tools.py 5 段 / agent.py 1 段）→ `git add` 我独占的 6 个文件 → **不带 pathspec** 的 `git commit`。
+- **给所有 lane 的规矩（我这次没守住的那条）**：hunk 级暂存之后**必须用裸 `git commit`**（提交索引），`git commit -- <路径>` 是"按工作树提交这些文件"的意思，不是作用域工具。提交完立刻 `git show --stat` 看共享文件的行数有没有超过自己的 hunk；再多做一步：`git worktree add --detach <tmp> HEAD` 里 `import agent` 一次，确认 HEAD 自洽。
+
+
 ## 2026-10-01 Vibecoding 能力补全 Wave8（后半·选项3）：语音接线的浏览器行为回路 `dev_media action: voice`（本会话，不占 R 槽位）
 
 - **补什么**：Wave7 的探针页面**刻意不接能量门**（逐帧无条件推流），所以它只能证明"采集→WS→R0 线上"，证不了 9/29 那次真机事故的那半条契约——**静音期不发流、说完再推满 1 秒、推完真的停下来**。这一条原来落在"要装 vitest 才能做"的账上；装过一次并量化了代价（`vitest@2 + @vue/test-utils + jsdom` = **1 critical + 3 moderate + 1 high** dev 公告，critical 是 Vitest UI server 任意文件读；vitest 3 链要 vite 6/7 而本树是 vite 5），**已回退**，按用户选的选项3 改成用真浏览器验行为。
