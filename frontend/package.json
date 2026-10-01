@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "npm run typecheck && vite build",
     "preview": "vite preview",
+    "test:node": "node --test \"tests/*.test.mjs\"",
     "typecheck": "vue-tsc --noEmit && tsc --noEmit -p tsconfig.node.json"
   },
   "dependencies": {

@@ -1,5 +1,17 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-10-01 Vibecoding 能力补全 Wave8（前半）：前端行为测试接进守卫（本会话，不占 R 槽位）
+
+- **补什么**：不是"缺测试"，是**测试写了却从来没跑过**。`frontend/tests/` 里躺着 5 个 `node:test` 文件、12 项断言，跑的是 `src/workbench/` 的真逻辑（异常提醒的确认链、选区映射、编码噪声是否反复叫视觉模型、视觉动作环的恢复与项目隔离、语音与帧的配对），但 `frontend/package.json` 没有 test 脚本、CI 里没有对应步骤——全仓引用它们的只有 HANDOFF 和 memory。所以这 12 项对回归的贡献一直是 **0**。
+- **产物**：`frontend/package.json` 加 `test:node` 脚本、`.github/workflows/harness.yml` 加「Run frontend behaviour tests (node:test)」步骤（sqlite job，`npm ci` 之后，零额外安装）、`tests/test_frontend_node_tests.py` **5 项**守卫。没有新增任何依赖，lockfile 一行没动。
+- **这一波真正的价值在那条 Python 守卫，不在 CI 步骤**。测出来的陷阱：`node --test` **匹配到 0 个文件时退出码仍是 0、`# tests 0`**，`test.skip` 同样不影响退出码——所以任何「跑一下看退出码」的接法都会把「用例被删/被改名/被 skip」显示成全绿。守卫的判定核心因此是**计数比对**：先从源码正则数出声明了多少个 `test(`/`it(`，再要求 node 实跑的 `# tests` 等于它，且 `skipped == 0`、`fail == 0`。声明数是算出来的，加用例不需要改守卫，删用例会立刻红。
+- **变异测试证明它有牙**（三连，脚本 `.tmp/w8_mutation.py`）：① 基线绿 → ② 往生产用例文件注入一个 `test.skip(...)`，守卫变红 → ③ 同样的注入、只把守卫里那两行计数断言删掉，又变绿。三条同时成立才说明红来自计数而不是巧合。
+- **另外两条顺手钉住的**：① 用例必须真的 import 生产模块（`../src/workbench/<name>.ts` 存在性逐个断言），防止以后有人把测试改成测副本；② `test.skip` 之类静默失效的场景外，还把"glob 空匹配对 node 是绿的"这个事实本身写成一条断言（`returncode == 0` 且 `tests == 0`），以后谁想把守卫简化成只看退出码会撞上它。
+- **版本形状是测出来的不是猜的**：`node --test tests`（目录形式）在本地 node 24 是**失败**的；`node --test "tests/*.test.mjs"`（node 自己 glob）与显式文件列表都行。Python 守卫用**显式相对路径**（`tests/x.test.mjs`）——cmd 不展开通配符，而裸文件名 node 会当模块去找并报找不到（这条我第一次跑守卫就红了，是我自己的 bug）。类型剥离：用例直接 import `.ts`，node 22.6~22.17 需要 `--experimental-strip-types`，22.18+ 与 23+ 默认开；CI 钉的是 `"22"` 落哪个补丁号不由我们定，所以守卫里 major==22 一律带开关（实测 node 24 带这个开关照样 12/12 过）。
+- **验证**：`tests/test_frontend_node_tests.py` 5 passed；`npm run test:node` 12 passed / 0 failed；变异三连成立；`harness.yml` 用 yaml 解析验证过（20 个步骤，新步骤在 `Build workbench frontend` 之后）。守卫用 `unittest.TestCase`，所以它会进 CI 的 `unittest discover` 主步骤，不依赖 pytest lane。
+- **未做（Wave8 后半）**：**vitest + `@vue/test-utils`** 才是 `.vue` 接线层的守卫。它要装 devDeps 并改动 `frontend/package-lock.json`（现在这两个文件是干净的，但前端 lane 有 20+ 个未提交的 `frontend/src/**` 文件），且 `.vue` 组件测试会直接踩在他们的在途改动上。`liveAudioControl.ts` 的能量门限 `createVoiceGate` 目前仍只有 Python 侧的 node harness 覆盖，前端接线（`AutonomousCockpit.vue` 的 `startLiveMic`/`handleLiveAudioFrame`）零守卫。另：仓库里没有任何 eslint 配置，所以前端 lint 维度仍是空的。
+
+
 ## 2026-10-01 Vibecoding 能力补全 Wave13：页面交互原语 `dev_page_action`（本会话，不占 R 槽位）
 
 - **补什么**：vibecoding 循环缺的下半身。测得当时 101 个工具里**没有任何输入原语**（`click`/`type`/`press`/`wait` 零命中），`preview_project` 只能看画面——于是「点一下才复现」的 bug 只能靠模型想象。现在有了真实浏览器里的 click / type / press / wait / read / locate，走 CDP `Input.*`，页面收到的是原生事件（Vue/React 的 `input`/`click` 监听会真的触发）。

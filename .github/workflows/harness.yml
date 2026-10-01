@@ -58,6 +58,13 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Run frontend behaviour tests (node:test)
+        if: matrix.backend == 'sqlite'
+        working-directory: frontend
+        # 这些用例早就存在但一直没人跑（package.json 里没有 test 入口）。计数级的
+        # 「声明了多少 vs 真跑了多少」判定在 tests/test_frontend_node_tests.py 里，
+        # 会随 pytest lane 一起跑——这里只负责人类可读的那份日志。
+        run: npm run test:node
       - name: Compile runtime
         run: python -m compileall -q agent_runtime api_routes
       - name: Verify Postgres driver and pool API
