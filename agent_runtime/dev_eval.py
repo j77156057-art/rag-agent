@@ -446,6 +446,52 @@ def _case_page_action_refuses_and_never_claims_success(root: str, run: Callable[
     ]
 
 
+def _case_voice_glue_would_catch_unconditional_pumping(root: str, run: Callable[..., dict]) -> list[dict]:
+    """语音行为回路的护栏在【没有浏览器】时也必须可验：胶水调用与判定表。"""
+    from agent_runtime import voice_loop
+
+    page = voice_loop.voice_page_script("ws://127.0.0.1:9/live")
+    missing = [name for name in voice_loop.GLUE_CALLS if name not in page]
+
+    def rows(labels):
+        out, at = [], 0.0
+        for index, label in enumerate(labels):
+            out.append({"kind": "audio", "label": label, "bytes": 3_200, "sequence": index + 1,
+                        "rms": 0.28 if label == "T" else 0.0, "at": round(at, 3),
+                        "gap": 0.1 if index else 0.0})
+            at += 0.1
+        return out
+
+    pumped = rows(["T"] * 8 + ["."] * 40 + ["T"] * 8)     # 逐帧无条件推流的样子
+    sent = [{"type": "hello.ok"}, {"type": "model.delta", "final": True}]
+    control = [{"type": "hello"}, {"type": "cancel"}]
+    state = {"mic": "on", "helloOk": True, "errors": [],
+             "serverEvents": ["hello.ok", "model.delta"]}
+    pumped_verdict = voice_loop.verdict(pumped, control, sent, state=state, violations=[])
+    # 尾后真的停了 2.7 秒：间隔要落在【尾后第一片】上（gaps[after]），
+    # 写在尾巴里（gaps[after-1]）量到的是 100ms，永远看不出流有没有停。
+    resumed = rows(["."] + ["T"] * 7 + ["q"] * 3 + ["."] * 12 + ["T"] * 3)
+    resumed[23]["gap"] = 2.7
+    proper_verdict = voice_loop.verdict(resumed, control, sent, state=state, violations=[])
+    # 截断在尾巴中间、又没有继续观察够：无门限页面也不许冒充"停下来了"
+    truncated = rows(["T"] * 8 + ["."] * 15)[:20]
+    truncated_verdict = voice_loop.verdict(truncated, control, sent, state=state, violations=[])
+    try:
+        voice_loop.voice_page_script("http://example.com:9/live")
+        shape = "接受"
+    except voice_loop.VoiceLoopError:
+        shape = "拒绝"
+    return [_check("glue_calls_production", not missing, "胶水缺生产调用：%s" % missing),
+            _check("tail_rules_transcribed", "signal.state === 'tail'" in page
+                   and "new Uint8Array(3200)" in page, "tail 零值替换或 audio-ready 标记没照抄"),
+            _check("unconditional_pumping_fails", not pumped_verdict["passed"],
+                   pumped_verdict["checks"]),
+            _check("truncated_always_pumping_fails", not truncated_verdict["passed"],
+                   truncated_verdict["checks"]),
+            _check("a_faithful_shape_passes", proper_verdict["passed"], proper_verdict["checks"]),
+            _check("non_loopback_ws_%s" % shape, shape == "拒绝", shape)]
+
+
 DEV_DATASET: tuple[dict[str, Any], ...] = (
     {
         "id": "lookup-by-filename", "fixture": "ts-refs",
@@ -575,6 +621,12 @@ DEV_DATASET: tuple[dict[str, Any], ...] = (
         "direct": _case_page_action_refuses_and_never_claims_success,
         "uses": ["dev_page_action"],
         "note": "点了没生效绝不能报成功：歧义/隐藏/禁用不派发，报错优先于 DOM 变化",
+    },
+    {
+        "id": "voice-glue-catches-unconditional-pumping", "fixture": "plain",
+        "direct": _case_voice_glue_would_catch_unconditional_pumping,
+        "uses": ["dev_media"],
+        "note": "语音接线行为回路：逐帧无条件推流必须判未通过，不能只会报绿",
     },
 )
 

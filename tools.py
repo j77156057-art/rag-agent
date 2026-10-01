@@ -20,6 +20,7 @@ import urllib.parse
 import datetime
 import hashlib
 import html as html_lib
+from html.parser import HTMLParser
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 import mcp_client
@@ -1686,13 +1687,13 @@ def web_search(query, _allow_aux=True):
     if site == "github.com" and not _in_unit_test:
         result = _github_search(q)
         if not result.startswith("GitHub API 暂不可用"):
-            return result
+            return _filter_search_results(q, result)
         # API 被限流时继续给出普通站点结果，不把一次 API 失败当成整个搜索失败。
         specialized_error = result
     if site == "bilibili.com" and not _in_unit_test:
         result = _bilibili_search(q)
         if not result.startswith("B 站专用搜索暂不可用"):
-            return result
+            return _filter_search_results(q, result)
         # B 站接口被验证码拦截时走 DDG/百度/Bing 的 site: 回退。
         specialized_error = result
     if site:
@@ -1700,17 +1701,20 @@ def web_search(query, _allow_aux=True):
     q = _search_recency_query(q)
     provider = get_web_search_provider()
     # 来源扇出和排序策略变更后必须换缓存命名空间，避免旧的 Bing 单源摘要继续生效。
-    cache_key = _web_cache_key(f"search:v4:{provider}:{_allow_aux}:{_search_result_limit()}", q)
+    cache_key = _web_cache_key(f"search:v6:{provider}:{_allow_aux}:{_search_result_limit()}", q)
     if _search_cache_enabled():
         cached = _web_cache_read(cache_key)
         if cached:
-            return cached + "\n（缓存结果）"
+            cached_result = cached if provider == "builtin_auto" else _filter_search_results(q, cached)
+            return cached_result + "\n（缓存结果）"
     if provider in ("builtin_auto", "ddg", "bing", "baidu"):
         result = _builtin_search(provider, q, include_aux=(not site and _allow_aux))
     else:
         result = _api_web_search(provider, q)
     if specialized_error and not any(result.startswith(m) for m in _SEARCH_EMPTY_MARKERS):
         result = specialized_error + "\n\n通用搜索回退结果：\n" + result
+    if provider != "builtin_auto":
+        result = _filter_search_results(q, result)
     if _search_cache_enabled() and not any(result.startswith(m) for m in _SEARCH_EMPTY_MARKERS):
         _web_cache_write(cache_key, result)
     return result
@@ -1775,6 +1779,9 @@ def web_search_batch(arg):
             diagnostics.append(f"{query}：{raw}")
             continue
         for row in rows:
+            if not _query_relevant(query, row.get("title", "") + " " + row.get("snippet", ""),
+                                   row.get("title", ""), row.get("url", "")):
+                continue
             haystack = (row.get("url", "") + " " + row.get("title", "") + " " + row.get("snippet", "")).lower()
             if any(item in haystack for item in excludes):
                 continue
@@ -1790,7 +1797,9 @@ def web_search_batch(arg):
             if old is None or candidate["rank"] > old["rank"]:
                 unique[key] = candidate
     if not unique:
-        return "\n".join(diagnostics) if diagnostics else "搜索未返回结果。"
+        if diagnostics:
+            return "\n".join(diagnostics)
+        return "搜索结果相关性不足：批量候选均未达到查询主题匹配阈值。请改写查询或拆分主题。"
     lines = [f"批量搜索结果（{len(queries)} 个查询并行，已跨查询去重）："]
     for row in sorted(unique.values(), key=lambda item: item["rank"], reverse=True)[:_search_result_limit()]:
         snippet = row.get("snippet", "")[:120]
@@ -1844,7 +1853,20 @@ def _builtin_search(provider, q, include_aux=False):
             return result
         # 同一轮不再串行重试已请求过的后端，避免全失败时多等几十秒。
         if result.startswith("搜索结果相关性不足"):
+            if pending:
+                result += "\n未完成来源：" + "、".join(pending) + "。"
             return result
+        failure_details = [f"{name}：{results[name]}" for name in selected
+                           if name in results and not _formatted_search_rows(results[name])]
+        if failure_details:
+            all_unreachable = (not pending and len(failure_details) == len(selected) and all(
+                str(results[name]).startswith("搜索失败") for name in selected
+            ))
+            summary = ("搜索失败：所有搜索来源均不可达或超时。来源诊断：" if all_unreachable else
+                       "搜索失败：没有来源返回可用候选（可能是空结果、网络故障或超时）。来源诊断：")
+            return (summary
+                    + "；".join(failure_details[:6])
+                    + ("；未完成来源：" + "、".join(pending) if pending else ""))
         last = next((results[name] for name in reversed(selected) if name in results), "搜索失败：检索超时，尚无候选。")
         if last.startswith("搜索失败"):
             return last + "（所选后端均不可达或超时，可换关键词或配置搜索 API）"
@@ -1899,6 +1921,94 @@ def _search_terms(query):
             if term not in {"official", "docs", "documentation", "推荐", "今天", "如何", "怎么", "最新"}]
 
 
+def _query_relevant(query, text, title="", url=""):
+    """Conservative lexical relevance gate shared by search, research, and batch paths."""
+    terms = _search_terms(query)
+    if len(terms) <= 1:
+        return True
+    normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(text or "").lower())
+    matched = sum(term in normalized for term in terms)
+    if re.search(r"[\u4e00-\u9fff]", query):
+        required = 1 if len(terms) <= 4 else max(2, min(3, (len(terms) * 3 + 9) // 10))
+        if matched >= required:
+            content_match = True
+        else:
+            query_text = re.sub(r"\b(?:site|after|before):\S+", " ", str(query or ""), flags=re.I).lower()
+            phrases = re.findall(r"[\u4e00-\u9fff]{3,}", query_text)
+            content_match = any(phrase[i:i + 3] in normalized
+                                for phrase in phrases for i in range(len(phrase) - 2))
+    else:
+        required = max(2, (len(terms) * 3 + 9) // 10)
+        content_match = matched >= required
+    if not content_match:
+        return False
+    if title or url:
+        try:
+            path = urllib.parse.urlparse(url).path
+        except Exception:
+            path = ""
+        anchor_text = re.sub(r"[^\w\u4e00-\u9fff]+", "", (str(title) + " " + path).lower())
+        anchor_matches = sum(term in anchor_text for term in terms)
+        anchor_required = 1 if len(terms) <= 2 else max(2, min(3, (len(terms) + 3) // 4))
+        if anchor_matches < anchor_required:
+            return False
+    return True
+
+
+def _search_excerpt(query, snippet, limit=180):
+    text = re.sub(r"\s+", " ", str(snippet or "")).strip()
+    if len(text) <= limit:
+        return text
+    terms = _search_terms(query)
+    positions = [text.lower().find(term.lower()) for term in terms]
+    positions = [position for position in positions if position >= 0]
+    if positions:
+        start = max(0, min(positions) - 32)
+        if max(positions) >= start + limit:
+            start = max(0, max(positions) - limit + 32)
+    else:
+        start = 0
+    excerpt = text[start:start + limit]
+    return ("…" if start else "") + excerpt + ("…" if start + limit < len(text) else "")
+
+
+def _search_source_status(raw):
+    value = str(raw or "").strip()
+    if value.startswith("搜索失败"):
+        return "请求失败"
+    if value.startswith(("搜索未返回结果", "B 站搜索未返回结果")):
+        return "无候选"
+    if value.startswith("搜索结果相关性不足"):
+        return "低相关"
+    return "未返回结构化候选"
+
+
+def _filter_search_results(query, raw):
+    """Filter formatted candidates consistently, preserving a compact rejection diagnosis."""
+    rows = _formatted_search_rows(raw)
+    if not rows:
+        return raw
+    kept = [row for row in rows
+            if _query_relevant(query, row.get("title", "") + " " + row.get("snippet", ""),
+                               row.get("title", ""), row.get("url", ""))]
+    if not kept:
+        examples = "；".join(row.get("title", "")[:80] for row in rows[:3])
+        return (f"搜索结果相关性不足：{len(rows)} 条候选均未达到查询主题匹配阈值。"
+                f"候选标题：{examples or '（无标题）'}。请改写查询或更换来源。")
+    if len(kept) == len(rows):
+        return raw
+    lines_raw = str(raw).splitlines()
+    first_result = next((i for i, line in enumerate(lines_raw)
+                         if line.lstrip().startswith("· ")), len(lines_raw))
+    header = next((line.strip() for line in lines_raw[:first_result] if line.strip()), "")
+    lines = [header] if header else []
+    lines.extend(_format_search_result(row.get("title", ""), row.get("snippet", ""),
+                                       row.get("url", "")) for row in kept)
+    if len(kept) < len(rows):
+        lines.append(f"相关性筛选：保留 {len(kept)}/{len(rows)} 条候选，过滤 {len(rows) - len(kept)} 条。")
+    return "\n".join(lines)
+
+
 def _merge_builtin_results(query, named_results):
     """合并自动模式候选，去重并把真正相关的结果排在前面。"""
     terms = _search_terms(query)
@@ -1939,17 +2049,22 @@ def _merge_builtin_results(query, named_results):
     if not unique:
         return diagnostics[0] if diagnostics else ""
     ranked = sorted(unique.values(), key=lambda row: row["rank"], reverse=True)
-    # 多关键词问题仅命中一个泛词不能算有效搜索，例如 scene tree 只搜到引擎首页。
-    if len(terms) >= 2:
-        minimum = 2 if sum(bool(re.fullmatch(r"[a-z][a-z0-9_-]*", term)) for term in terms) >= 2 else 1
-        ranked = [row for row in ranked if row["matched"] >= minimum]
-        if not ranked:
-            return "搜索结果相关性不足：候选只匹配泛词，尚未找到查询细节的证据。请缩小关键词、限定具体站点或换搜索服务商；不得据此给出结论。"
+    candidate_count = len(ranked)
+    ranked = [row for row in ranked
+              if _query_relevant(query, row.get("title", "") + " " + row.get("snippet", ""),
+                                 row.get("title", ""), row.get("url", ""))]
+    if not ranked:
+        source_names = "、".join(dict.fromkeys(row.get("backend", "") for row in unique.values()))
+        source_statuses = [f"{name}={_search_source_status(raw)}"
+                           for name, raw in named_results if not _formatted_search_rows(raw)]
+        status_detail = "；来源状态：" + "、".join(source_statuses) if source_statuses else ""
+        return (f"搜索结果相关性不足：{candidate_count} 条候选均未达到查询主题匹配阈值。"
+                f"候选来源：{source_names or '未知'}{status_detail}；不得据此给出结论。")
     rows = ranked[:_search_result_limit()]
     sources = "、".join(name for name, raw in named_results if _formatted_search_rows(raw))
     lines = [f"聚合搜索结果（{len(rows)} 条候选；来源：{sources}；已去重排序，尚未核对正文）："]
     for row in rows:
-        snippet = row.get("snippet", "")[:120]
+        snippet = _search_excerpt(query, row.get("snippet", ""))
         source = row.get("backend", "")
         if source:
             snippet = (snippet + "（来源：%s）" % source).strip()
@@ -2589,6 +2704,92 @@ def _custom_fetch(url, key, api_url):
         return f"网页读取失败：{type(e).__name__}: {e}"
 
 
+class _ReadableHTMLParser(HTMLParser):
+    """Extract visible page text, preferring article/main regions over page chrome."""
+    _SKIP_TAGS = {"head", "script", "style", "noscript", "svg", "nav", "footer", "aside",
+                  "form", "button", "select", "textarea", "template"}
+    _VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+                  "meta", "param", "source", "track", "wbr"}
+    _BLOCK_TAGS = {"address", "article", "blockquote", "br", "dd", "div", "dl", "dt", "header", "h1",
+                   "h2", "h3", "h4", "h5", "h6", "li", "main", "ol", "p", "pre", "section",
+                   "table", "td", "th", "tr", "ul"}
+    _NOISE_RE = re.compile(
+        r"(?:^|[\s_-])(?:navigation|navbar|header|footer|sidebar|menu|breadcrumb|cookie|consent|"
+        r"advert|ads|promo|related|comments|social|share)(?:$|[\s_-])", re.I)
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []
+        self.body_parts = []
+        self.primary_parts = []
+
+    def _in_primary(self):
+        return any(item[2] for item in self.stack)
+
+    @staticmethod
+    def _append(parts, text):
+        if text:
+            parts.append(text)
+
+    def handle_starttag(self, tag, attrs):
+        attributes = {str(key).lower(): str(value or "") for key, value in attrs}
+        marker = " ".join((attributes.get("id", ""), attributes.get("class", ""),
+                           attributes.get("role", ""), attributes.get("aria-label", "")))
+        inherited_skip = any(item[1] for item in self.stack)
+        inside_primary = self._in_primary()
+        skip = (inherited_skip or tag in self._SKIP_TAGS
+                or (tag == "header" and not inside_primary)
+                or attributes.get("role", "").lower() in {
+                    "navigation", "complementary", "contentinfo", "search"}
+                or bool(self._NOISE_RE.search(marker)))
+        primary = not skip and (tag in {"main", "article"} or attributes.get("role", "").lower() == "main")
+        if tag not in self._VOID_TAGS:
+            self.stack.append((tag, skip, primary))
+        if tag in self._BLOCK_TAGS:
+            self._append(self.body_parts, "\n")
+            if not skip and self._in_primary():
+                self._append(self.primary_parts, "\n")
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in self._VOID_TAGS:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag:
+                del self.stack[index:]
+                break
+        if tag in self._BLOCK_TAGS:
+            self._append(self.body_parts, "\n")
+            if self._in_primary():
+                self._append(self.primary_parts, "\n")
+
+    def handle_data(self, data):
+        if any(item[1] for item in self.stack):
+            return
+        self._append(self.body_parts, data)
+        if self._in_primary():
+            self._append(self.primary_parts, data)
+
+    @staticmethod
+    def _normalize(parts):
+        lines = [re.sub(r"\s+", " ", line).strip()
+                 for line in "".join(parts).splitlines()]
+        return "\n".join(line for line in lines if line)
+
+    def text(self):
+        primary = self._normalize(self.primary_parts)
+        return primary if len(primary) >= 120 else self._normalize(self.body_parts)
+
+
+def _extract_readable_text(raw):
+    parser = _ReadableHTMLParser()
+    parser.feed(raw or "")
+    parser.close()
+    return parser.text()
+
+
 def _fetch_page(url, *, image_budget=0, query_hint=""):
     """原 urllib 直抓 HTML 并清理的实现（builtin 服务商）。
 
@@ -2605,10 +2806,8 @@ def _fetch_page(url, *, image_budget=0, query_hint=""):
         if 'html' not in content_type.lower() and '<html' not in raw[:500].lower():
             return f"来源：{final_url}\n内容类型：{content_type or '未知'}\n网页正文读取器仅支持 HTML 页面。"
         title = re.search(r'<title[^>]*>(.*?)</title>', raw, re.I|re.S)
-        text = re.sub(r'<(script|style|noscript)[^>]*>.*?</\1>', ' ', raw, flags=re.I|re.S)
-        text = re.sub(r'<[^>]+>', ' ', text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        clean_title = re.sub(r'<[^>]+>', '', title.group(1)).strip() if title else '未知'
+        text = _extract_readable_text(raw)
+        clean_title = html_lib.unescape(re.sub(r'<[^>]+>', '', title.group(1))).strip() if title else '未知'
         clipped = len(text) > 8000
         body = f"来源：{final_url}\n标题：{clean_title}\n正文：{text[:8000]}" + ("\n[正文已截断]" if clipped else "")
         if image_budget and _web_images_enabled():
@@ -2631,7 +2830,7 @@ def web_research(query):
     默认读取 5 个候选正文，可用 DOCMIND_WEB_RESEARCH_MAX_SOURCES 调整（1~8）。
     多轮不同查询由 Agent 决定，避免单次搜索样本不足就贸然下结论。
     """
-    results = as_text(web_search(query))
+    results = _filter_search_results(query, as_text(web_search(query)))
     urls = re.findall(r'https?://[^\s)]+', results)
     if not urls:
         return results
@@ -6122,7 +6321,7 @@ def dev_media(arg=""):
     """把合成的麦克风/摄像头内容注入真实浏览器：不用设备也能验语音回路。
 
     输入（多行 keyed）：
-      action: build|run            # 默认 run
+      action: build|run|voice      # 默认 run
       script: sil:0.3 talk:0.7 sil:1.3   # sil=精确静音 quiet=低于门限 talk=440Hz 0.4 幅度
       video: 6                     # 可选，>0 时同时伪造摄像头并推这么多帧
       out: fixtures/audio          # 可选，产物落在项目里的位置；默认 .docmind/media-fixture/<时间戳>
@@ -6132,7 +6331,13 @@ def dev_media(arg=""):
     R0 协议逐包判定（包形 16k mono 100ms、内容对得上夹具、说完仍有 ≥10 片静音尾、静音尾
     让服务端收口、音频包先于视频包）。build：只出夹具文件与 `flags:` 参数，把它交给
     `preview_project` 就能让【项目自己的页面】在假设备上跑。
-    判定说清边界：这条回路验的是采集→协议线上；能量 VAD 门限本身不在这里跑。
+    voice：语音接线的行为回路——用前端自带的 esbuild 把生产模块 `liveAudioControl.ts` /
+    `realtimeProtocol.ts` 编成 ESM 给页面 import（不是抄一份逻辑），胶水照抄开发舱的
+    `handleLiveAudioFrame`/`sendNativeAudioReady`/`startLiveMic`，然后用假麦克风 + 真点击
+    （连接/开麦/AI 开始说话）跑一遍。它能验 run 验不到的那一半：静音期门不开就一个包都不发、
+    说完必须再推 ≥10 片静音然后【真的停下来】、AI 说话时开口要发出 cancel。
+    判定说清边界：run 验的是采集→协议线上；voice 验的是生产函数被这样接起来时的行为，
+    `.vue` 里的接线本身不是 import 出来的；能量 VAD 门限逻辑归前端 node:test 用例。
     """
     root = _get_code_root()
     if not root:
@@ -6145,7 +6350,7 @@ def dev_media(arg=""):
         return value.splitlines()[0].strip() if value else default
 
     action = (_one("action") or "run").lower()
-    from agent_runtime import media_fixture
+    from agent_runtime import media_fixture, page_action, voice_loop
     try:
         frames = int(_one("video") or 0)
     except (TypeError, ValueError):
@@ -6155,21 +6360,27 @@ def dev_media(arg=""):
     except (TypeError, ValueError):
         tail = media_fixture.TAIL_CHUNKS
     try:
+        wait = float(_one("wait") or 0)
+    except (TypeError, ValueError):
+        wait = 0.0
+    try:
         if action == "build":
             fixtures = media_fixture.build_fixtures(root, script=_one("script"),
                                                     video_frames=frames, out=_one("out"))
             return media_fixture.render_fixtures(fixtures)
+        if action == "voice":
+            report = voice_loop.run_voice_loop(root, script=_one("script"), wait=wait,
+                                               tail_min=tail)
+            return voice_loop.render(report)
         if action != "run":
-            return "dev_media 只支持 action: build|run，收到 %r。" % action
-        try:
-            wait = float(_one("wait") or 0)
-        except (TypeError, ValueError):
-            wait = 0.0
+            return "dev_media 只支持 action: build|run|voice，收到 %r。" % action
         report = media_fixture.run_media_loop(root, script=_one("script"), video_frames=frames,
                                               wait=wait, tail_chunks=tail, out=_one("out"))
         return media_fixture.render(report)
     except media_fixture.MediaFixtureError as exc:
         return "媒体夹具无法构造：%s" % str(exc)[:300]
+    except (voice_loop.VoiceLoopError, page_action.PageActionError) as exc:
+        return "媒体回路未能开始：%s" % str(exc)[:300]
     except Exception as exc:  # noqa: BLE001
         return "dev_media 失败：%s: %s" % (type(exc).__name__, str(exc)[:240])
 
@@ -7049,15 +7260,20 @@ TOOLS = {
             "喂进【真实浏览器】的采集链路，再用回环 WS 探针按 R0 线上协议逐包判定。"
             "R12 的语音回路原来只能在真机上有人说话才验得到，这一条把它变成可以不插电、"
             "不装 Playwright、 CI 里也能跑的检查。\n"
-            "输入 keyed 多行：`action: build|run`（默认 run）、"
+            "输入 keyed 多行：`action: build|run|voice`（默认 run）、"
             "`script: sil:0.3 talk:0.7 sil:1.3`（sil=精确静音 quiet=低于门限 talk=440Hz 0.4 幅度）、"
             "`video: 6`（>0 时同时伪造摄像头并推这么多帧）、`out: fixtures/audio`（产物落项目里的位置，"
             "默认写进已 gitignore 的 .docmind/media-fixture/<时间戳>）、`wait: 10`、`tail: 10`。\n"
             "run 判定的是线上可观测的事实：片形是不是 16k mono 100ms（3200 字节）、内容对不对得上夹具、"
             "说完之后是否仍推 ≥10 片静音尾、静音尾有没有让服务端收口、音频包是否先于视频包。"
             "畸形包会记成协议违规而不是被丢掉；浏览器不可用时如实报未通过，绝不报通过。\n"
-            "能量 VAD 门限本身【不在这条回路里跑】（探针页面刻意不接门限，逐帧无条件推流），"
-            "本工具只断言夹具的逐帧能量确实跨过 startRms/endRms。\n"
+            "run 那条回路【不接能量门】（探针页面逐帧无条件推流，为了内容对齐确定），"
+            "它只断言夹具的逐帧能量确实跨过 startRms/endRms。要看门限与接线的行为就用 "
+            "`action: voice`：用前端自带的 esbuild 把生产模块 `liveAudioControl.ts`/`realtimeProtocol.ts`"
+            "编成 ESM 给页面 import（不是抄一份逻辑），胶水照抄开发舱的 `handleLiveAudioFrame`/"
+            "`sendNativeAudioReady`，再用假麦克风 + 真点击跑一遍，断言：静音期门不开就一个包都不发、"
+            "说完再推 ≥10 片然后【真的停下来】、AI 说话时开口发出 cancel、片形仍是 3200 字节"
+            "（顺带证明浏览器里那次 48k→16k 重采样真的做了）。\n"
             "action: build 只出夹具与假设备启动参数，把那些参数逐行放进 `preview_project` 的 `flags:`，"
             "就能让项目自己的页面（比如开发舱的语音回路）在假设备上跑。"
         ),

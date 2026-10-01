@@ -1,0 +1,179 @@
+# HANDOFF · Vibecoding 能力补全（harness 侧）
+
+> 状态：**Wave1–8（含语音行为回路）、9–13 已入库**。
+> 发出人：本会话（用户直接指派，不占 R0–R15 槽位）。最后更新：2026-10-01。
+>
+> **这份文档是什么**：让没跟过这个过程的人（或另一个 AI）能直接接手**操作**这套 harness 的
+> 开发闭环，并知道每条能力的**边界在哪里**、**被哪条测试守着**、**哪些还只是本地提交**。
+> 它不复述 `HANDOFF.md` 的流水（那是 135 段的按日追加日志，含其它 lane 的内容）。
+>
+> **这份文档不是什么**：不是架构说明（看 `docs/agent-architecture-review.md`）、不是实时链路
+> （R 系列）的任务表（看 `docs/realtime-*.md` 与 `HANDOFF.md` 的 R 段）。
+
+---
+
+## 1. 一分钟版：闭环每一段的入口
+
+"vibecoding" 指的是让 Agent 自己完成 **找 → 读 → 改 → 跑 → 看 → 交** 这一圈。以前它缺腿，
+现在每一段都有明确入口（工具名即 `tools.py::TOOLS` 的键）：
+
+| 环节 | 入口 | 一句话边界 |
+|---|---|---|
+| 找文件 | `dev_glob` | 按名字/通配找，不用一层层 `list_dir` |
+| 读代码 | `dev_find_references` / `python_exec` | TS/JS/Vue 走 tree-sitter，注释与字符串不误报 |
+| 问历史 | `dev_git_log` / `dev_git_diff` | **只读**白名单：`rev-parse/status/diff/log` |
+| 改代码 | `dev_patch`（原子统一差异）/ `dev_move`（走 `git mv`） | 全有或全无；拒绝在补丁里删文件 |
+| 跑起来 | `dev_serve`（起/停本机 dev server）| 只允许回环；命令过同一道黑名单 |
+| 看结果 | `preview_project`（截图 + console + 失败请求）/ `dev_page_action`（点/填/按键/等待）| **no_change 不是成功**；只回环 |
+| 验语音/摄像头 | `dev_media`（`build` / `run` / `voice`）| 假设备喂合成媒体；门限行为见 §5.3 |
+| 静态检查 | `dev_diagnostics`（ruff + vue-tsc）| 退出码非 0 却解析不出发现时**报错误不报干净** |
+| 交付 | `dev_propose`（补丁+草稿，写进状态目录）/ `dev_ci_status`（只读 GET）| 不 add/commit/push；CI 读不到就明说 |
+| 多人防撞 | `dev_lanes`（TTL 认领登记表 + 可选 worktree）| 冲突默认拒绝，`force: true` 才共管 |
+| 对外出口 | `mcp_server`（harness 自己是 MCP server）/ `mcp_bridge`（连接器工具一等公民化）| 默认只读；写要 `--allow-writes`；`run_command` 等永不暴露 |
+| 能力回归 | `dev_eval`（19 题门禁 + 基线 + CI 步骤）| 测的是 harness，不是模型智商 |
+
+## 2. 环境事实（会咬人，先读）
+
+- **解释器**：`.venv/Scripts/python.exe`。仓库脚本都按"从项目根目录运行"写。
+- **pytest 必须带项目内 basetemp**：`--basetemp=.tmp/pt-xxx`。用户名含引号会让默认 `pytest-of-*` 目录 `PermissionError`。
+- **推送被沙箱拦**：`git ls-remote` 可通，`git push` 到 github:443 不通。**所有提交都只在本地**，
+  需要人在自己机器上推。要离线备份用 `git bundle`。
+- **共享工作树**：多个 AI 同时在改同一棵树（实测一次全量里 12 条红全来自别人未提交的 WIP）。
+  规矩见 §7。
+- **前端工具链**：node 24（本机）/ CI node "22"；`frontend/node_modules` 里有 esbuild 0.21.5 与
+  vue-tsc，`npm run test:node` 走 node 的类型剥离。**没有 vitest**（见 §6）。
+- **浏览器**：真实 Edge（`_edge_binary()` 找 `msedge.exe`，可用 `DOCMIND_EDGE_BIN` 覆盖）。
+  任何"看一眼界面"的代码**必须**走 `visual_acceptance.browser_session()`：它把浏览器生在
+  kill-on-close 作业对象里（99°C 漏浏览器事故的修法，见 §9），**禁止自己 Popen、禁止 playwright**。
+
+## 3. 怎么自己复跑验证
+
+```bash
+# 能力门禁（19 题，不联网、不需要浏览器；含基线对比）
+.venv/Scripts/python.exe -m agent_runtime.dev_eval --self-check \
+    --baseline .github/dev-eval-baseline.json --json
+# 本程序新增的四套回归（138 项，其中少量需要 Edge / node）
+.venv/Scripts/python.exe -m pytest tests/test_media_fixture.py tests/test_page_action.py \
+    tests/test_voice_loop.py tests/test_frontend_node_tests.py -q --basetemp=.tmp/pt-manual
+# 前端行为测试（29 项：node:test 跑生产 .ts）
+cd frontend && npm run test:node
+```
+
+## 4. 三条不可退让的不变量（以及守住它们的测试）
+
+1. **新工具必须注册在三处**：实现 + `TOOLS` + `agent.py` 的提示目录。少第三处，模型就调不到。
+   守它的测试：`tests/test_native_tools.py`（registry/schema 数量一致）、各波自带的
+   "registered in all three places" 用例。
+2. **绝不报"干净/通过"给没真跑成的检查**（仓库里叫"假干净"，是最贵的一类）。已修过的形态：
+   ruff 输出被截断→看起来 0 发现；`node --test` 空 glob→退出码 0；console 列表去重→重复报错
+   看不见；`close` 找不到会话→仍打印"已回收"。守它：`tests/test_page_action.py`、
+   `tests/test_frontend_node_tests.py`、`tests/test_media_fixture.py`。
+3. **网络与命令的边界是白名单，不是"看起来危险就拦"**：浏览器只回环、MCP/页面只回环、
+   git 只读 + `git mv` 一处例外、命令黑名单与 `run_command` 共用。守它：`tests/test_safety_*.py`、
+   `tests/test_mcp_server_expose.py`、`tests/test_page_action.py` 里的注入/越界用例。
+
+## 5. 三条"真回路"能力现在能证明什么（也说不清什么）
+
+### 5.1 `dev_page_action`（Wave13）
+真实 CDP `Input.*`：`click` / `type` / `press` / `wait` / `read` / `locate`。会话持有浏览器
+（上限 3、空闲 TTL 回收、`atexit` 兜底），`close` 回报**真实**回收证据。
+- 断言的是"有没有真的发生"：`changed / navigated / reloaded / error_seen / no_change`，
+  后两者一律 `ok=False`。
+- 派发之前先拒：歧义（多命中没给 `nth`）、不可见、禁用、中心不在视口——**一个鼠标事件都不发**，
+  并回候选清单。
+- 不做：drag/hover/scroll/文件选择/对话框；iframe 与 Shadow DOM 定位不到；不共享登录态；
+  每个动作后是"观察多久"（`settle`）而不是条件等待（那要用 `wait`）。
+
+### 5.2 `dev_media action: run`（Wave7）
+合成 WAV/Y4M 经 Chromium 假设备开关喂进真实 `getUserMedia`，回环 WS 探针按
+`realtime_protocol.parse_binary_packet` 逐包判定，畸形包记成协议违规而不是丢掉。
+- 实测锚点：440Hz、幅度 0.4 的正弦回到线上 RMS=0.2828（=0.4/√2），静音段**精确 0.0**，
+  假设备会**循环播放**文件（所以 pattern 匹配用循环窗口）。
+- 边界：探针页面**刻意不接能量门**，逐帧无条件推流；它证明"采集→WS→R0 线上"，不证明门限。
+
+### 5.3 `dev_media action: voice`（Wave8 后半）
+不装 vitest 的前提下验**接线行为**：用前端自带 esbuild 把生产模块编成 ESM 给页面 import
+（**不是抄一份逻辑**），胶水照抄 `AutonomousCockpit.vue` 的 `handleLiveAudioFrame` /
+`sendNativeAudioReady` / `startLiveMic`，再用假麦克风 + 真点击跑。
+- 能量门限逻辑本身归 `frontend/tests/liveAudioControl.test.mjs`（node:test，17 项，已入库）。
+- 实测形状（2026-10-01）：`lead=.×1（audio-ready 标记）+ T×7 + q×3 + .×12`，
+  **尾后 2.69 秒不再发包**（证明不是无条件泵），抢话发出 cancel，探针按尾收口。
+- 反证已跑：纯静音脚本 → 只有 hello.ok 后生产必发的**那 1 片** audio-ready 标记，
+  零片响亮语音、永不收口 → 判定未通过。
+- 一条实测事实要记住：`quiet` 段在**文件里** RMS≈0.0057 < `startRms` 0.02，但经浏览器 AEC/NS
+  后能量被抬到足以开门 —— "低于门限"只对生成文件成立，别拿它在回路上断言"绝不开门"。
+- 自查（独立审 + 逐条核实 + 变异电池 **16/16 抓红**）改掉的真问题：
+  ① **截断在静音尾中间的无条件推流页面会全项通过** —— "尾后没再发包"以前只看列表末尾，
+  现在必须"尾部之后又继续观察够 `RESUME_GAP_SECONDS`"才算 `stopped=yes`（`tail_stats`
+  返回三态 `yes/no/not_observed`）；
+  ② `sequence_monotonic` 对**单包**和**非整数 sequence** 都返回过 True（等于没判）；
+  ③ 只看探针自己发的 `model.delta final` —— 现在页面 `serverEvents` 里必须也有它；
+  ④ `connections` 从没进判定（开两条连接=重复起流）；
+  ⑤ console 错误/失败请求没进 `no_page_errors`；⑥ `render()` 打印的是常量阈值而不是
+  实际用的阈值；⑦ esbuild 返回 0 但产物是旧的/0 字节仍算编译成功（现在先删旧产物、再验长度）；
+  ⑧ 胶水页在 `startMic` 里归零 `sequence`，与生产不一致 —— **真机跑出来才看见**：
+  `hello.ok` 后的标记片和第一片语音撞同一个序号，`sequence_monotonic` 当场变红。
+- 边界：`.vue` 的接线是**转写**的、不是 import 的；真网关（`api.py` + DashScope）仍归 R12 人跑。
+
+## 6. 已知缺口与建议下一步
+
+| # | 缺口 | 实测依据 | 建议 |
+|---|---|---|---|
+| 1 | `.vue` 接线层无组件级守卫 | 装了 vitest@2 + @vue/test-utils + jsdom 后量化：**1 critical + 3 moderate + 1 high** dev 公告（critical=Vitest UI 任意文件读）；vitest 3 要 vite 6/7 而本树 vite 5 | 已回退安装。**推荐**：行为用 §5.3/§5.1 覆盖；要组件级断言再接受 dev-only 公告并禁用 UI |
+| 2 | 没有"跑测试→读失败→只重跑失败"的结构化工具，也没有覆盖率入口 | `tools.py` 里 `pytest`/`coverage` 零命中；全量 2569 项、一次 5–15 分钟 | 加一个解析 pytest 失败摘要 + 只跑相关子集的工具 |
+| 3 | 交付环"真网络"从未验证 | CI 新增的 pytest lane 与 dev_eval 门**从未在 GitHub 真跑过**（ubuntu 行为未证），沙箱 push 不通 | 人 push 一次，把首跑结果记回本文件 |
+| 4 | `dev_serve` 端口被抢不自动重试 | Wave6 未做项 | 就绪失败时换端口重试一次 |
+| 5 | 前端无 eslint 配置 | `frontend/` 无 eslint.config/.eslintrc | 先做配置决策，否则 `dev_diagnostics` 前端只有 typecheck 一条腿 |
+| 6 | 连接器 UI 未接 `inline_tools` 开关 | Wave10 未做项 | 小改，UI 侧 |
+| 7 | 一条计时断言只有 0.12s 余量 | `tests/test_orchestrator.py` 的 `elapsed < 0.32`，负载高时必红（属别人文件，未代改） | 改成相对余量（sleep 拉到 1.0s、断言 <1.6s） |
+
+## 7. 共享工作树里的提交规范（实测有效的那套）
+
+1. 只提交自己的路径：`git add <新文件>` + `git commit -- <只属于我的路径>`；**永远不要** `git add -A`。
+2. 若自己改的文件**同时含别人的在途改动**（本会话实测：`tools.py` 13 个 hunk 里 2 个是我的、
+   `agent.py` 33 个里 1 个），按 hunk 暂存：`git diff` 拆 hunk → 只留自己的 → `git apply --cached` →
+   裸 `git commit`。提交前 `git diff --cached --stat` 核对行数，并对暂存版本做
+   `git show :./<path>` + `ast.parse`（半截 hunk 最容易留下语法残骸）。
+3. 判定某条红是不是自己造成的：把 HEAD 挂成干净 worktree（`git worktree add --detach`）跑同一批
+   文件。**本会话两次这样验**：12 条红在我的提交上 183/183 全过 → 归属明确。用完 `git worktree remove`
+   之后必须再 `rmdir` 空壳目录（Windows 上会被自己的 cwd 占住）。
+4. `HANDOFF.md` 整文件提交**可能带走别人未入库的段落**（本会话实测：我的 `7965eb8` 扫进过一段
+   别人的 R15 说明）。提交前**立刻**重新 `git diff -- HANDOFF.md` 看 hunk 数，事后 `git show --stat`
+   复核并如实披露。
+5. 不推。不代别人提交。跨进程写回有锁竞争时**不要原地改被 watcher 监听的源文件**（做变异测试时在
+   `.tmp` 副本上做，见 §9）。
+
+## 8. 文件地图（本程序新增，均在 `agent_runtime/` 除注明外）
+
+`code_intel.py`(扩展) · `ts_index.py` · `diagnostics.py` · `patch_apply.py` · `lanes.py` ·
+`dev_server.py` · `mcp_server.py` · `mcp_bridge.py` · `dev_eval.py` · `proposal.py` · `ci_status.py` ·
+`media_fixture.py` · `page_action.py` · `voice_loop.py` ·
+`visual_acceptance.py`（被抽出 `browser_session` / `serve_static` / `stop_static` / `sanitize_flags`，
+并被别的 lane 加了作业对象回收）· 测试：`test_dev_glob_git_log` / `test_lanes_registry` /
+`test_ts_index` / `test_dev_diagnostics` / `test_dev_patch_move` / `test_mcp_server_expose` /
+`test_mcp_inline_tools` / `test_dev_serve_preview` / `test_dev_eval` / `test_dev_propose_ci` /
+`test_media_fixture` / `test_page_action` / `test_voice_loop` / `test_frontend_node_tests` ·
+前端：`frontend/tests/liveAudioControl.test.mjs`（+ `test:node` 脚本与 CI 步骤）。
+
+## 9. 事故与教训（避免重蹈）
+
+- **99°C 漏浏览器**（2026-09-30 之前）：会话被硬杀时 `finally` 不执行，每次留下 ~15 个 headless
+  Edge + profile，隔夜累积 462 进程 / 19GB。修法是"生在作业对象里"，不是事后补绑。任何新增的
+  "起浏览器"代码都必须走 `browser_session()`。
+- **假干净三连**（同一程序里反复出现）：CI 用 `unittest discover` 静默跳过 22 个 pytest 风格文件；
+  ruff 输出截断被当成 0 发现；`node --test` 空 glob 退出码 0。**加一条测试/门禁时先做变异测试**：
+  把它故意改坏，看有没有用例会红；不红就是装饰。
+- **本会话我自己犯的 4 个错**（都留下了对应测试）：① 原地改生产文件做变异测试 → 还原撞上
+  `OSError 22`，文件短暂留在变异态；② 把 `dev_media` 的异常文案合并成一句，打断既有断言；
+  ③ 现场测试的浏览器探针写错模块别名被宽 `except` 吞掉 → **整类静默跳过**；④ `preview_target`
+  抛错时会话名额没归还（变异测试跑出来的真 bug）。
+
+## 10. 本会话未结事项
+
+1. **`voice_loop` 已入库**：独立审计 11 条里 8 条成立并改掉，变异电池 16/16 抓红
+   （其中"开麦时归零序号"是真机跑出来的真 bug）。剩下的只是**边界**：`.vue` 接线层
+   没有组件级守卫（按选项3 的决定不做 vitest），真网关与听感归 R12。
+2. 全量最后一次：**2569 passed / 12 failed**，12 条已用干净 worktree 证明全部来自
+   另一条 lane 未提交的 step-budget / capacity / game_workflow WIP（本程序不代修、不代提交）。
+3. 需要人做的两件：**push**（或 `git bundle` 离线备份），以及在配好 DashScope 的机器上跑一次
+   真网关回路，把结果回写本文件 §5.3 与 §6#3。

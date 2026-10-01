@@ -1,5 +1,18 @@
 # DocMind · MCP 自动连接模块 接手 handoff
 
+## 2026-10-01 Vibecoding 能力补全 Wave8（后半·选项3）：语音接线的浏览器行为回路 `dev_media action: voice`（本会话，不占 R 槽位）
+
+- **补什么**：Wave7 的探针页面**刻意不接能量门**（逐帧无条件推流），所以它只能证明"采集→WS→R0 线上"，证不了 9/29 那次真机事故的那半条契约——**静音期不发流、说完再推满 1 秒、推完真的停下来**。这一条原来落在"要装 vitest 才能做"的账上；装过一次并量化了代价（`vitest@2 + @vue/test-utils + jsdom` = **1 critical + 3 moderate + 1 high** dev 公告，critical 是 Vitest UI server 任意文件读；vitest 3 链要 vite 6/7 而本树是 vite 5），**已回退**，按用户选的选项3 改成用真浏览器验行为。
+- **产物**：`agent_runtime/voice_loop.py`（工具入口 `dev_media(action: voice)`）、`tests/test_voice_loop.py` **42 项**（含 4 项真浏览器现场）、门禁加 1 题（题集 18→19，基线已刷）、`tools.py`/`agent.py` 相应两行。零新依赖：编译用的是**前端自带的 esbuild**（`node_modules/esbuild/bin/esbuild --bundle`），页面 import 的是编译后的**生产模块本体**（`liveAudioControl.ts` / `realtimeProtocol.ts`），不是我抄的逻辑副本。
+- **胶水是逐段转写的**：`sendLiveAudioChunk` / `sendNativeAudioReady` / `handleLiveAudioFrame` / `startMic` / `stopMic` 对着 `AutonomousCockpit.vue` 抄了调用、顺序、tail 期零值替换、`pump.pending()`、`bufferedAmount > 500000` 背压丢弃、`hello.ok` 之后发标记片、`stopLiveMic` 的 `gate.reset(); pump.reset()`。`GLUE_CALLS` 十个生产符号在 **import 之后的函数体里**必须都能找到——只看"名字出现过"是废话（import 行本身就写着它们）。
+- **判定是 14 条，每条都必须能红**（这是这一波的真正产物；`passed = all(checks)`）：静音期漏流、尾长不足 1 秒、**尾长超上限=无条件泵**、**尾后有没有真的停**、序号单调、片形 3200 字节、协议违规、抢话发 cancel、收口事件**页面也收到**、单连接、console/失败请求、mic 起来、hello.ok 回来。`render()` 打印的是**本次实际用的阈值**（`result["thresholds"]`），不是常量。
+- **独立审计（另一个 agent 读 diff）报了 11 条，逐条核实后 8 条成立并改掉**，其中三条是"看起来在守其实没守"：① **截断在静音尾中间的、完全没接门限的无条件推流页面 → 全项通过**（旧代码把"撞列表末尾"当成"停下来了"；现在 `tail_stats` 返回三态 `yes/no/not_observed`，必须**尾后又继续观察够 `RESUME_GAP_SECONDS`** 才算停，`run_voice_loop` 因此在最后一个包之后仍多观察 0.7 秒）；② `sequence_monotonic` 对**单包**和**非整数 sequence** 返回 True；③ `connections` 从没进判定（开两条连接=重复起流）；另 ④ console 错误与失败请求没进 `no_page_errors`，⑤ 收口只信探针自己发的 `model.delta final`、不信页面收到没，⑥ `build_bundle` 不删旧产物、返回 0 但产物是空文件也算成功，⑦ `render()` 打印常量阈值。
+- **变异电池 16/16 全部抓红**（脚本 `.tmp/mut_voice_loop.py`，只在 `.tmp` 副本上变异，不碰工作树）：尾内间隔当尾后、截断当停止、单包算单调、字符串序号蒙混、多连接算一条、探针说收口就算收口、console/失败请求不进判定、上限不判、静音漏流不判、GLUE_CALLS 退回整页找名字、render 打印常量、开麦时归零序号、旧产物不删、空产物算成功、点击文案写成元组。**其中"开麦时归零序号"这一条是真 bug 而不是假想**：现场跑 `sequence_monotonic` 当场变红——生产是在**新建 socket** 时归零 `liveAudioSequence`（`AutonomousCockpit.vue:1433`），我在 `startMic` 里归零，于是 `hello.ok` 后的 audio-ready 标记片和第一片语音撞了同一个序号。现已把序号归零放回 `connect()`，并加了一条无浏览器就能守的文案/序号测试（`click_labels()`）。
+- **反证的形状变了，实测才知道**：纯静音脚本**不再是 0 个包**——生产在 `hello.ok` 之后必发 1 片 100ms 静音标记，所以正确断言是"≤1 片、且没有响亮片、且不收口"。相应把 `allowed_leading` 定成与 `barge_in` 无关的 1。
+- **验证**：`tests/test_voice_loop.py` **39 passed**；与相邻套件（`test_media_fixture` / `test_page_action` / `test_frontend_node_tests`）一起 **152 passed / 70 subtests**，现场 4 项真跑（真点击、真 `getUserMedia`、真 esbuild）；门禁 **19/19** 且与基线持平无回退；跑完现场检查 msedge：15 个进程全是别人的（8 个属于 `codex-model-probe`、5 个是用户自己的 Edge），我的 1 个残留 profile 目录已按"无存活属主"确认后删除。
+- **边界（不许越界宣称）**：`.vue` 的接线本身仍然是**转写**的、不是 import 的，组件级守卫这半没做（按用户选项3 的决定不做 vitest）；真网关（`api.py` + DashScope）与听感仍归 R12 人跑；`quiet` 段经浏览器 AEC/NS 后能量会被抬到能开门，所以"低于门限"只对生成的文件成立，不能拿它在回路上断言"绝不开门"。
+
+
 ## 2026-10-01 Vibecoding 能力补全 Wave8（前半）：前端行为测试接进守卫（本会话，不占 R 槽位）
 
 - **补什么**：不是"缺测试"，是**测试写了却从来没跑过**。`frontend/tests/` 里躺着 5 个 `node:test` 文件、12 项断言，跑的是 `src/workbench/` 的真逻辑（异常提醒的确认链、选区映射、编码噪声是否反复叫视觉模型、视觉动作环的恢复与项目隔离、语音与帧的配对），但 `frontend/package.json` 没有 test 脚本、CI 里没有对应步骤——全仓引用它们的只有 HANDOFF 和 memory。所以这 12 项对回归的贡献一直是 **0**。

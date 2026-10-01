@@ -25,12 +25,14 @@ from config import (
     PROMPT_TOKEN_BUDGET,
     COMPACT_KEEP_RATIO,
     COMPACT_TRIGGER_RATIO,
+    LLM_MAX_TOKENS,
     get_runtime,
 )
 from llm import LLMClient, args_to_input
 from tools import (TOOLS, tool_schemas, self_verify,
                    set_session_web_enabled, _session_web_enabled,
-                   set_session_vision_mode, _session_vision_mode)
+                   set_session_vision_mode, _session_vision_mode,
+                   _query_relevant)
 import agent_trace as _trace
 import sessions as _sessions
 import agent_memory as _memory
@@ -50,6 +52,7 @@ import orchestrator as _orchestrator
 from agent_runtime.verification import verification_message
 from agent_runtime.output_audit import audit_evidence
 from agent_runtime.context_router import ContextRouter
+from agent_runtime.run_budget import RunBudget
 from agent_runtime.local_runtime import effective_parallelism, local_llm_slot
 from agent_runtime.tools import Capability, SideEffect, coerce_tool_spec, execute_tool, upgrade_registry
 from agent_runtime import mcp_bridge as _mcp_bridge
@@ -63,24 +66,27 @@ TOOL_MODE = os.getenv("DOCMIND_TOOL_MODE", "react").strip().lower()
 _NATIVE_CAPABLE = {"qwen", "deepseek", "ollama", "llamacpp", "openai", "azure"}
 # 子代理最大递归深度（父=0）
 SUBAGENT_MAX_DEPTH = int(os.getenv("DOCMIND_SUBAGENT_MAX_DEPTH", "2"))
-# 0 means a child Agent follows the same no-fixed-ceiling policy as its parent.
+# 0 means the persisted user setting supplies the child Agent's step limit.
 SUBAGENT_MAX_STEPS = max(0, int(os.getenv("DOCMIND_SUBAGENT_MAX_STEPS", "0")))
 SUBAGENT_STEPS_HARD_CAP = max(0, int(os.getenv("DOCMIND_SUBAGENT_STEPS_HARD_CAP", "0")))
-# 子代理确定性安全兜底：上面的 0 只是"不显式设上限"，但子代理绝不允许无限空转
-# （产品契约：test_child_without_final_degrades_instead_of_empty）——未显式配置时
-# 用本兜底值收尾，产出"过程要点"降级结论。父代理的无上限策略不受影响。
-SUBAGENT_SAFETY_STEPS = max(1, int(os.getenv("DOCMIND_SUBAGENT_SAFETY_STEPS", "8")))
-
-
 def _resolve_child_max_steps(max_steps):
     """生效步数 = clamp(任务申请值或默认, 1, 硬顶)；非法值回退默认。"""
+    try:
+        from agent_runtime.capacity import get_settings
+        configured_steps = int(get_settings().get("child_max_steps", 24))
+    except Exception:
+        configured_steps = 24
     if max_steps in (None, ""):
         requested = SUBAGENT_MAX_STEPS
+        if requested <= 0:
+            requested = configured_steps
     else:
         try:
             requested = int(max_steps)
         except (TypeError, ValueError):
-            requested = SUBAGENT_MAX_STEPS
+            requested = SUBAGENT_MAX_STEPS or configured_steps
+        if SUBAGENT_MAX_STEPS <= 0 and configured_steps > 0:
+            requested = min(requested, configured_steps)
     if SUBAGENT_STEPS_HARD_CAP <= 0:
         return max(0, requested)
     return max(1, min(requested, SUBAGENT_STEPS_HARD_CAP))
@@ -148,6 +154,12 @@ def _step_budget(question):
     场景/配置，给它独立上限，避免一次无效目录调用就把证据链截断。
     """
     base = max(0, int(MAX_AGENT_STEPS))
+    if base == 0:
+        try:
+            from agent_runtime.capacity import get_settings
+            base = max(0, int(get_settings().get("main_max_steps", 8)))
+        except Exception:
+            base = 8
     value = _user_question(question)
     if _is_project_audit_question(value):
         return max(base, int(AUDIT_MAX_AGENT_STEPS))
@@ -260,7 +272,7 @@ _SYSTEM_PROMPT_FULL = """你是一个严谨的多工具问答 Agent，可以调�
 - self_verify(scope?, files?): 写后自验证工具（闭环收尾门）。系统会在你成功执行 apply_edit/create_file 后自动调用它，按改动文件类型做轻量校验（后端 py_compile+对应单测、前端 npm run typecheck、场景子系统自检）并把结果回填给你；若返回「未通过」，请基于失败信息修复后重试，不要跳过校验直接声称完成。网页项目需要真实画面时显式使用 scope:visual，正式开发舱会启动临时浏览器并保存截图证据；引擎嵌入自检默认关闭（需真 Godot），你可显式用 scope:engine 或开 DOCMIND_SELF_VERIFY_ENGINE=1 触发。你也可以主动调用它复验某文件（scope 取 auto/backend/frontend/scene/engine/visual/all/skip）。
 - dev_serve(action?, cmd?, cwd?, port?, wait?, job_id?): 启动/停止【本机开发服务器】并等它真的能应答（vite、next、`python -m http.server` 等）。网页项目不是静态 HTML 时先用它：`cmd: npm run dev` + `cwd: frontend`，不给 port 就从服务自己的日志里认端口，就绪判定以实际连通为准（不会谎称就绪）。拿到 URL 后用 `preview_project` 的 `url:` 打它，才能看到真实画面与 console/失败请求。命令与 run_command 共用同一道黑名单，进程只在 code_root 或其子目录内启动；用完 `action: stop` + `job_id:` 回收（后台任务上限 8 个）。
 - dev_page_action(action?, page?, url?, entry?, selector?, text?, nth?, value?, key?, state?, mode?, settle?, screenshot?): 在本机网页里【真的做动作】——点、填、按键、等条件、读状态。preview_project 只能看画面，「点一下才复现」的 bug 就靠这个：`action: open` + `url: http://127.0.0.1:5173/`（只允许回环）拿到 page id，再 click/type/press/wait/read，最后 `action: close` 回收（同时最多 3 个会话）。每个动作都回报 effect：changed/navigated/reloaded/error_seen/no_change，并附 DOM 变更与新报错计数。**no_change 不是成功**，error_seen 要按报错修；隐藏、禁用、命中多个却没给 nth 的元素一律拒绝并回候选清单。不接受任意 JS、组合键；页面上的按钮可能真的会改项目或发请求。
-- dev_media(action?, script?, video?, out?, wait?, tail?): 合成媒体夹具——把「对着麦克风说话/对着摄像头」换成确定性的 WAV/Y4M，喂进【真实浏览器】的采集链路，再用回环 WS 探针按 R0 线上协议逐包判定。要验语音/摄像头回路却没有真设备时用它，而不是在聊天里声称「真机验过了」：`action: run` 跑完整回环并回判定（片形 16k mono 100ms、内容对得上夹具、说完仍推 ≥10 片静音尾、静音尾让服务端收口、音频包先于视频包）；`script: sil:0.3 talk:0.7 sil:1.3`（sil=精确静音 quiet=低于门限 talk=440Hz）；`video: 6` 同时伪造摄像头。`action: build` 只出夹具文件与假设备启动参数，逐行放进 preview_project 的 `flags:` 就能让项目自己的页面在假设备上跑。判定边界要说清：能量 VAD 门限本身不在这条回路里跑，浏览器不可用就是未通过，不许报通过。
+- dev_media(action?, script?, video?, out?, wait?, tail?): 合成媒体夹具——把「对着麦克风说话/对着摄像头」换成确定性的 WAV/Y4M，喂进【真实浏览器】的采集链路，再用回环 WS 探针按 R0 线上协议逐包判定。要验语音/摄像头回路却没有真设备时用它，而不是在聊天里声称「真机验过了」。三种 action：`run` 跑采集→线上回环（片形 16k mono 100ms、内容对得上夹具、说完仍推 ≥10 片静音尾、静音尾让服务端收口、音频包先于视频包）；`voice` 跑**接线行为**——用前端自带的 esbuild 把生产模块编成 ESM 给页面 import（不是抄逻辑）+ 假麦克风 + 真点击，断言静音期不发包、说完推完静音尾后【真的停下来】、AI 说话时开口发出 cancel；`build` 只出夹具与假设备参数，逐行放进 preview_project 的 `flags:`。边界要说清：run 那条不接能量门（门限行为看 voice），能量门限逻辑本身归前端 node:test 用例，`.vue` 接线不是 import 出来的，浏览器不可用就是未通过，不许报通过。
 - preview_project(entry?, url?, width?, height?, timeout?, flags?): 正式开发舱网页项目的真实浏览器视觉验收。修改网页后必须再次调用：默认在项目内起一个临时静态站并截取真实画面，给 `url: http://127.0.0.1:5173/`（只允许回环地址）时直接打 dev_serve 起来的、已经在跑的本机服务——Vue/React 这类必须跑 dev server 的前端走这条路。`flags:` 后面每行一条 `--开关` 形式的浏览器启动参数（用 dev_media action: build 返回的那几条可以把麦克风/摄像头换成合成夹具）；`--user-data-dir`、`--load-extension` 之类会改写浏览器行为的参数一律拒绝。截图送入视觉通道并登记工作流预览证据，同时回传运行时异常、console 错误与失败请求；无法启动浏览器或项目不是网页时必须如实报告，改用 game_screenshot 或领域 MCP。
 - dev_desktop_capture(target?): 桌面自动化视觉技能的安全观察入口，捕获当前项目嵌入窗口或前台窗口并作为 native 预览证据返回。它只观察，不点击、不输入、不修改软件状态；状态修改必须通过已批准的应用 MCP、插件或专用工具完成。当用户或开发舱明确要求“浏览当前界面/查看当前画面/观察现在的 UI”时，必须先调用它（网页预览优先使用 preview_project 或前端附带的实时截图），再基于真实画面回答，不能凭描述猜测。
 - dev_desktop_action(action, target?, x?, y?, to_x?, to_y?, text?, key?): 在用户确认后，对当前项目嵌入窗口或前台窗口执行一个单步 click/type/drag/key/save。动作前必须先获取最新 dev_desktop_capture；首次调用会进入 desktop_action 审批门，动作结果必须再次截图或读取应用状态复核。禁止终端、Windows Run、任意 HWND、窗口枚举以及密码、验证码等敏感输入。
@@ -729,9 +741,111 @@ _TOTAL_FAIL_LIMIT = 5
 # 可能是真实网络请求，故限频；但仍要足够密，让长回合的进度条能跟着工具往返上浮。
 _CTX_EMIT_INTERVAL = 1.0
 # 回答被截断 / 为空 / 不合格式时的「自动续写纠偏」次数上限（不额外消耗工具步数）
-_MAX_NUDGES = 8
+_MAX_NUDGES = 8  # legacy fallback; user setting is read per run
 # 仅在 provider 明确报告单次输出达到长度上限时接续最终正文；与格式纠偏分开计数。
 _MAX_FINAL_CONTINUATIONS = max(1, int(os.getenv("DOCMIND_MAX_FINAL_CONTINUATIONS", "12")))
+
+
+def _capacity_settings():
+    try:
+        from agent_runtime.capacity import get_settings
+        return get_settings()
+    except Exception:  # noqa: BLE001 - capacity settings must never block a run
+        return {}
+
+
+def _task_token_budget():
+    settings = _capacity_settings()
+    try:
+        return max(0, int(settings.get("task_token_budget", 50000)))
+    except (TypeError, ValueError):
+        return 50000
+
+
+# 额度/能力咨询必须能在费用预算或任务预算耗尽后继续回答，因此这类问题
+# 走本地配置读取，不进入 LLM。匹配保持收窄，避免把普通开发任务误判成帮助页。
+_CAPACITY_HELP_RE = re.compile(
+    r"(?is)(?:"
+    r"(?:token|令牌|额度|预算|上限|步数|agent\s*(?:数|数量)?|代理\s*(?:数|数量)?|并发|显存)"
+    r".{0,80}(?:怎么|如何|提高|增加|调高|调大|设置|调整|不限|解除|剩余|耗尽|用完|多少|区别|查看|上限)"
+    r"|(?:怎么|如何|提高|增加|调高|调大|设置|调整|不限|解除|查看)"
+    r".{0,80}(?:token|令牌|额度|预算|上限|步数|agent|代理|并发|显存)"
+    r"|(?:token|令牌|任务预算|费用预算|全局预算|会话预算).{0,30}(?:已达|耗尽|用完|超限|不足|上限)"
+    r")"
+)
+
+
+def _capacity_help_response(question, session_id="", llm=None, run_budget=None):
+    """Return a zero-token answer for explicit capacity/limit questions."""
+    user_question = _user_question(question)
+    if not _CAPACITY_HELP_RE.search(user_question):
+        return None
+
+    settings = _capacity_settings()
+    def _int_setting(name, fallback):
+        try:
+            return max(0, int(settings.get(name, fallback)))
+        except (TypeError, ValueError):
+            return fallback
+
+    task_limit = _int_setting("task_token_budget", 50000)
+    max_agents = _int_setting("max_agents", 8)
+    main_steps = _int_setting("main_max_steps", 8)
+    child_steps = _int_setting("child_max_steps", 24)
+    try:
+        cost_status = _pricing.status()
+    except Exception:  # noqa: BLE001 - help must work even if budget state is unavailable
+        cost_status = {}
+
+    provider = str(getattr(llm, "provider", "") or "").strip() or "未识别"
+    model = str(getattr(llm, "model", "") or "").strip() or "默认模型"
+    capability = getattr(llm, "capability", None) or {}
+    try:
+        context_window = int(capability.get("context_window") or 0)
+    except (TypeError, ValueError):
+        context_window = 0
+    try:
+        prompt_budget = int(getattr(llm, "prompt_budget", 0) or 0)
+    except (TypeError, ValueError):
+        prompt_budget = 0
+
+    task_text = "不限" if task_limit == 0 else f"{task_limit:,} tokens"
+    global_limit = float(cost_status.get("global_limit", 0) or 0)
+    global_spent = float(cost_status.get("global_spent", 0) or 0)
+    global_text = ("不限" if global_limit <= 0 else
+                   f"¥{global_spent:.4f} / ¥{global_limit:.4f}")
+    session = (cost_status.get("sessions") or {}).get(str(session_id), {})
+    session_limit = float(session.get("limit", 0) or 0)
+    session_spent = float(session.get("spent", 0) or 0)
+    session_text = ("不限" if session_limit <= 0 else
+                    f"¥{session_spent:.4f} / ¥{session_limit:.4f}")
+    rate_calls = float(cost_status.get("per_minute_calls_limit", 0) or 0)
+    rate_text = "不限" if rate_calls <= 0 else (
+        f"{int(cost_status.get('minute_calls', 0) or 0)}/{int(rate_calls)} 次")
+
+    budget_snapshot = run_budget.snapshot() if run_budget is not None else None
+    if budget_snapshot and budget_snapshot.get("limit", 0):
+        task_usage = (f"已用 {int(budget_snapshot.get('total_tokens', 0)):,}，"
+                      f"剩余 {int(budget_snapshot.get('remaining', 0) or 0):,}")
+    else:
+        task_usage = "本回合运行时统计"
+    context_text = f"{context_window:,} tokens" if context_window > 0 else "由模型端点决定"
+    prompt_text = f"单次提示词预算约 {prompt_budget:,} tokens" if prompt_budget > 0 else "单次提示词预算按模型画像计算"
+
+    return (
+        "这是本地能力说明，不会消耗模型 Token。\n"
+        f"当前任务 Token 上限：{task_text}（{task_usage}）。\n"
+        "调整路径：工作台 → 设置 → 智能体 → 任务 Token 上限；填 0 表示不限，"
+        "但可能明显增加 Token 消耗、运行时间和本地显存压力。"
+        f"同一页还可调整 Agent 数（当前 {max_agents}）、主 Agent 步数（{main_steps}）"
+        f"和子 Agent 步数（{child_steps}）。\n"
+        f"费用预算是另一套限制：全局 {global_text}，当前会话 {session_text}；"
+        f"每分钟调用次数上限：{rate_text}。费用预算耗尽时，在设置 → 用量与费用中提高累计预算上限或清零。\n"
+        f"当前模型：{provider} / {model}；上下文窗口约 {context_text}，{prompt_text}。"
+        "提高任务 Token 上限不能突破模型自身上下文窗口、服务商端点限制，"
+        "远程模型的服务端显存也无法由本机显卡判断。\n"
+        "如果上一回合已经因 Token 上限中止，需要重新发送任务；新回合会重新建立任务预算。"
+    )
 # 工具失败文案白名单：工具观察里命中以下任一子串即判为失败（触发反思 / trace ok=False）。
 # 与各工具失败文案字面保持一致；新增工具失败文案时请同步补这里并更新 test_failure_markers。
 _FAILURE_MARKERS = (
@@ -743,27 +857,6 @@ _FAILURE_MARKERS = (
 )
 
 _WEB_ACTIONS = {"web_search", "web_search_batch", "web_transport", "web_research"}
-_WEB_QUERY_STOPWORDS = {
-    "请", "帮我", "找一下", "目前", "现在", "比较", "适合", "开发", "推荐", "有哪些",
-    "the", "and", "for", "with", "from", "best", "current", "latest", "popular",
-}
-
-
-def _web_query_terms(query):
-    """提取用于低相关性防护的少量关键词，不做语义判断。"""
-    raw = re.sub(r"\b(?:query|q|keyword|site|platform)\s*[:：][^\s]+", " ", str(query or ""), flags=re.I)
-    terms = []
-    for word in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", raw.lower()):
-        if word in _WEB_QUERY_STOPWORDS:
-            continue
-        if re.fullmatch(r"[\u4e00-\u9fff]+", word):
-            # 长中文短语拆成双字词，避免只命中一个泛词就误判相关。
-            terms.extend(word[i:i + 2] for i in range(len(word) - 1))
-        else:
-            terms.append(word)
-    return list(dict.fromkeys(terms))
-
-
 def _web_query_family(query):
     """去掉日期、站点和策略词，识别只是换写法的同一检索意图。"""
     value = re.sub(r"\b(?:site|platform|after|before):\S+", " ", str(query or ""), flags=re.I)
@@ -781,12 +874,7 @@ def _web_result_relevant(action, query, observation):
     if action == "web_research":
         # web_research 会回显“研究主题”，不能用它本身作为相关性证据。
         body = re.sub(r"研究主题：.*?(?:\n|$)", "", body, count=1)
-    terms = _web_query_terms(query)
-    if not terms:
-        return True
-    matched = sum(1 for term in terms if term in body)
-    needed = 1 if len(terms) <= 2 else max(2, int(len(terms) * 0.2))
-    return matched >= needed
+    return _query_relevant(query, body)
 
 # 历史回放「整段计数」时的轮间分隔符：仅用于把候选轮拼成 1 条文本、只发 1 次
 # count_tokens（替代过去逐轮 O(N) 次网络往返）；分隔符本身计入的少量 token 可忽略。
@@ -1334,9 +1422,10 @@ _SUBAGENT_ROLES = {
         "hint": "你是【评审专员】：只读代码，指出问题与风险并附具体 文件:行号；禁止修改任何文件。",
     },
     "tester": {
-        "tools": ["read_file", "grep", "python_exec", "game_screenshot", "preview_project",
-                  "dev_route_connector", "dev_list_connector_tools", "dev_mcp_call"],
-        "hint": "你是【验证专员】：运行受控命令/测试；网页项目修改后必须调用 preview_project 获取真实浏览器画面，游戏/EDA 使用对应领域截图或 MCP；回报真实输出与结论，不要臆测。",
+        "tools": ["read_file", "grep", "python_exec", "run_command", "dev_job_logs", "dev_job_cancel",
+                  "game_playtest", "game_screenshot", "preview_project", "dev_route_connector",
+                  "dev_list_connector_tools", "dev_mcp_call"],
+        "hint": "你是【验证专员】：使用受控 run_command 执行项目测试/构建，长任务用 dev_job_logs 跟踪、必要时用 dev_job_cancel 终止；网页项目修改后必须调用 preview_project 获取真实浏览器画面；游戏运行验收优先调用 game_playtest，需要视觉证据时再用 game_screenshot；EDA 使用对应 MCP 工具；回报真实输出与结论，不要臆测。",
     },
     "schematic": {
         "tools": ["read_file", "grep",
@@ -1404,7 +1493,7 @@ def _child_trace(traj, thoughts, reflections=None, turn_record=None, used=None,
     }
 
 
-def _reflection_result(child_llm, *, role, task, conclusion, traj, context):
+def _reflection_result(child_llm, *, role, task, conclusion, traj, context, budget=None):
     """Run a bounded post-task reflection and retain a deterministic fallback."""
     failed_steps = sum(1 for step in (traj or []) if isinstance(step, dict)
                        and step.get("ok") is False)
@@ -1425,8 +1514,13 @@ def _reflection_result(child_llm, *, role, task, conclusion, traj, context):
         f"上游上下文键：{', '.join(str(key) for key in (context or {})) or '无'}"
     )
     try:
+        if budget is not None and not budget.preflight(len(prompt), 512):
+            return fallback
         raw = child_llm.chat([{"role": "user", "content": prompt}],
                              stream=False, temperature=0.0)
+        if budget is not None:
+            budget.record(getattr(child_llm, "last_usage", None),
+                          prompt_chars=len(prompt), output_chars=len(raw or ""))
         obj, err = _load_json_arg(raw or "")
         if not err and isinstance(obj, dict) and isinstance(obj.get("ok"), bool):
             return {
@@ -1512,7 +1606,8 @@ def _extract_plan(text):
 class Agent:
     def __init__(self, llm=None, session_id=None, tool_mode=None, plan_mode=False,
                  depth=0, tool_allowlist=None, project_id=None, tool_registry=None,
-                 application_id="developer", system_prompt=None, capability_lease=None):
+                 application_id="developer", system_prompt=None, capability_lease=None,
+                 run_budget=None):
         self.llm = llm or LLMClient()
         # session_id 为空 = 纯内存会话（测试/临时，行为与旧版一致）；
         # 非空则按会话落盘、跨重启恢复，并启用超阈值摘要压缩。
@@ -1569,6 +1664,9 @@ class Agent:
         self.tool_mode = (tool_mode or TOOL_MODE or "react")
         self.plan_mode = bool(plan_mode)
         self.depth = int(depth or 0)
+        # A top-level turn creates this budget; child agents inherit the same
+        # object so their calls, reflections, synthesis and replanning share it.
+        self.run_budget = run_budget
         self.tool_allowlist = list(tool_allowlist) if tool_allowlist else None
         # 工作流可临时授予一组能力。它只收窄当前 Agent 的工具执行范围，
         # 不替代用户审批、工具白名单或 execute_tool 的副作用保护。
@@ -1595,6 +1693,33 @@ class Agent:
         # after the generator finishes; it must never become user history.
         self.ingested_sources = ()
         self._request_system_context = ()
+
+    def _execution_policy(self):
+        settings = _capacity_settings()
+        try:
+            nudges = max(0, min(20, int(settings.get("max_nudges", 2))))
+        except (TypeError, ValueError):
+            nudges = 2
+        try:
+            continuations = max(0, min(20, int(settings.get("max_final_continuations", 2))))
+        except (TypeError, ValueError):
+            continuations = 2
+        return nudges, continuations
+
+    def _budget_allows(self, messages, output_tokens=0):
+        if self.run_budget is None:
+            return True
+        prompt_chars = sum(len(str(item.get("content") or ""))
+                           for item in (messages or []) if isinstance(item, dict))
+        return self.run_budget.preflight(prompt_chars, output_tokens)
+
+    def _record_budget_usage(self, messages, output=""):
+        if self.run_budget is None:
+            return
+        usage = getattr(self.llm, "last_usage", None)
+        prompt_chars = sum(len(str(item.get("content") or ""))
+                           for item in (messages or []) if isinstance(item, dict))
+        self.run_budget.record(usage, prompt_chars=prompt_chars, output_chars=len(str(output or "")))
 
     def _web_blocked(self, action_name) -> bool:
         """联网关闭时，外网工具一律拒绝（文本通道与原生通道共用此判定）。"""
@@ -2072,6 +2197,10 @@ class Agent:
         ② 把更新后的会话历史落盘并按阈值做摘要压缩。
         客户端断连（生成器被 close）走 aborted 分支，仍留一条可观测记录。
         """
+        # Every top-level request gets a fresh task budget.  Child Agents keep
+        # the inherited object instead of creating a separate allowance.
+        if self.depth == 0 or self.run_budget is None:
+            self.run_budget = RunBudget(_task_token_budget())
         turn = _trace.Turn(
             session_id=self.session_id or "ephemeral",
             provider=getattr(self.llm, "provider", ""),
@@ -2080,6 +2209,16 @@ class Agent:
         )
         if TURN_DEADLINE_S > 0 and deadline is None:
             deadline = time.monotonic() + TURN_DEADLINE_S
+
+        # Explicit capacity questions are answered from local settings before
+        # any provider/billing gate. This remains available after a hard stop.
+        help_text = _capacity_help_response(
+            question, self.session_id or "", llm=self.llm, run_budget=self.run_budget)
+        if help_text:
+            turn.finish("capability_help", final_text=help_text)
+            _trace.record(turn.to_record())
+            yield {"type": "final", "text": help_text, "offline": True}
+            return
 
         # ① 预算熔断：已超限直接拒绝本轮，不发起任何模型调用
         try:
@@ -2286,6 +2425,8 @@ class Agent:
                 error=error,
                 aborted=aborted,
             )
+            if self.run_budget is not None:
+                turn.task_budget = self.run_budget.snapshot()
             # ③ 按 provider 计价 + 预算累计（本地 provider 恒为 0，不影响离线演示）
             try:
                 turn.cost_cny = _pricing.cost_cny(
@@ -2338,6 +2479,7 @@ class Agent:
 
         failures = 0
         nudges = 0
+        max_nudges, max_final_continuations = self._execution_policy()
         pending_final = None
         final_continuations = 0
         tool_steps = 0
@@ -2424,7 +2566,7 @@ class Agent:
                 return
             # 免费目录导航额外占用迭代轮次（不占工具步数），硬顶同步放宽，
             # 否则免费 list_dir 会先撞迭代上限，预算形同虚设。
-            if tool_step_limit > 0 and iterations > tool_step_limit + _MAX_NUDGES + _MAX_FINAL_CONTINUATIONS + _MAX_FORCED_FINALS + 4 + NAV_FREE_STEPS:
+            if tool_step_limit > 0 and iterations > tool_step_limit + max_nudges + max_final_continuations + _MAX_FORCED_FINALS + 4 + NAV_FREE_STEPS:
                 if turn is not None:
                     turn.outcome = "max_steps"
                 yield {
@@ -2519,6 +2661,11 @@ class Agent:
                 acc = f"Action: {_nm}\nAction Input: {_nin}"
                 finish_reason = "tool_calls"
             else:
+                if not self._budget_allows(messages, lookup_output_limit or LLM_MAX_TOKENS):
+                    if turn is not None:
+                        turn.outcome = "token_budget"
+                    yield _evidence_final("（已达到本任务 Token 上限，已停止继续调用模型。）")
+                    return
                 _t_llm = time.monotonic()
                 if stream:
                     # 思考流（reasoning_content / thinking）与正文分开收集，
@@ -2595,6 +2742,7 @@ class Agent:
                 if turn is not None:
                     turn.llm_step((time.monotonic() - _t_llm) * 1000, finish_reason)
                     turn.add_usage(getattr(self.llm, "last_usage", None))
+                self._record_budget_usage(messages, acc)
                 # 关思考只作用于被截断后的那一次续写重试；用完即复位，避免影响后续正常轮次
                 self._suppress_thinking_once = False
                 calls = (getattr(self.llm, "last_tool_calls", None) or []) if use_tools else []
@@ -2616,7 +2764,7 @@ class Agent:
             if pending_final is not None:
                 # 这是上一段 Final Answer 的续写，不再把正文解释成新的工具动作。
                 pending_final = _join_final_continuation(pending_final, acc)
-                if finish_reason == "length" and final_continuations < _MAX_FINAL_CONTINUATIONS:
+                if finish_reason == "length" and final_continuations < max_final_continuations:
                     final_continuations += 1
                     trail.append({"role": "assistant", "content": acc[-TRAIL_ASSISTANT_CHARS:]})
                     trail.append({"role": "user", "content": (
@@ -3181,7 +3329,7 @@ class Agent:
 
             # 没有有效动作也没有合格 Final：可能是输出被长度截断 / 只有思考没有正文 /
             # 格式没写完。自动「续写纠偏」最多 _MAX_NUDGES 次，绝不把残句静默当答案。
-            if nudges < _MAX_NUDGES and (truncated or not acc.strip() or not has_real_final):
+            if nudges < max_nudges and (truncated or not acc.strip() or not has_real_final):
                 nudges += 1
                 if truncated:
                     self._suppress_thinking_once = True   # 重试关思考，避免再烧预算
@@ -3476,8 +3624,6 @@ class Agent:
             allowed = list(dict.fromkeys(allowed + mcp_tools))
         allowed = [name for name in allowed if name in self.tools]
         cap = _resolve_child_max_steps(max_steps)
-        if cap <= 0:
-            cap = SUBAGENT_SAFETY_STEPS
         child = Agent(
             llm=child_llm,
             session_id=None,
@@ -3490,6 +3636,7 @@ class Agent:
             application_id=self.application_id,
             system_prompt=self.system_prompt,
             capability_lease=self.capability_lease,
+            run_budget=self.run_budget,
         )
         # 子代理继承父代理的「联网 / 深度思考」开关：否则父代理已开联网时，
         # 子代理 web_enabled 仍为 False，researcher 等子任务的 web_* 会被 _web_blocked 全拦截。
@@ -3504,9 +3651,8 @@ class Agent:
         if context:
             ctx = "\n".join(f"- {k}：{_clip(str(v), 600)}" for k, v in context.items())
             question += "\n\n【上游子任务结论（供参考，勿重复劳动）】\n" + ctx
-        # 仅当任务申请步数高于该问题自身的动态预算时才抬高子代理循环上限；
-        # 申请值更小时由外层 cap 截断（保持「耗尽步数未收尾 → 过程要点降级」语义）。
-        if cap > _step_budget(question):
+        # 工作流设置是子代理真实上限，不能被动态问题预算覆盖。
+        if cap > 0:
             child.tool_step_override = cap
         final_text, used = "", 0
         final_degraded = False     # 安全网兜底 final（非模型 Final Answer）→ 结论须标记降级
@@ -3519,6 +3665,7 @@ class Agent:
             with _hooks.workflow_event_scope(record_hook):
                 with local_llm_slot(getattr(child_llm, "provider", ""),
                                     getattr(child_llm, "model", ""),
+                                    base_url=getattr(child_llm, "base_url", ""),
                                     purpose=f"subagent:{role}"):
                     for ev in child.run(question, stream=False):
                         et = ev.get("type")
@@ -3547,7 +3694,9 @@ class Agent:
                             if pending is not None and not pending["obs"]:
                                 pending["obs"] = _clip(last_obs, ORCH_TRACE_OBS_CHARS)
                             emit_sink("observation", last_obs)
-                        if used > cap:
+                        # The action event precedes tool execution; stop only after its
+                        # observation so the final allowed call is not silently skipped.
+                        if cap > 0 and used > cap:
                             break
         except Exception as e:  # noqa: BLE001 —— 子代理失败不应炸掉父回合
             failed = {"status": "failed", "conclusion": "", "steps": used,
@@ -3580,7 +3729,7 @@ class Agent:
         degraded = degraded or final_degraded
         reflection = (_reflection_result(
             child_llm, role=role, task=task, conclusion=conclusion,
-            traj=traj, context=context) if reflect else {
+            traj=traj, context=context, budget=self.run_budget) if reflect else {
                 "ok": True, "source": "disabled", "issues": [],
                 "next_step": "交给主 Agent 复核"})
         status = "ok" if reflection.get("ok") else "failed"
@@ -3609,6 +3758,16 @@ class Agent:
         if not task:
             return ("[delegate 参数错误] 需要 `role:` 与 `task:` 两行。"
                     "示例：role: researcher / task: 找出 _ready 定义在哪些文件")
+        try:
+            from agent_runtime.capacity import get_settings
+            limit = int(get_settings().get("max_agents", 8))
+        except Exception:
+            limit = 8
+        dispatched = int(getattr(turn, "subagents_dispatched", 0)) if turn is not None else 0
+        if limit > 0 and dispatched >= limit:
+            return f"[delegate 已达本轮 Agent 数上限 {limit}] 请使用已有子任务结论完成回答。"
+        if turn is not None:
+            turn.subagents_dispatched = dispatched + 1
         out = self._run_child(role, task, turn=turn)
         if out["status"] != "ok":
             err = out["error"]
@@ -3652,9 +3811,14 @@ class Agent:
             "4) 不要编造未出现在下面的信息。用中文、分点、简洁。\n\n" + "\n\n".join(parts)
         )
         llm = self._child_llm()
+        if self.run_budget is not None and not self.run_budget.preflight(len(prompt), 1024):
+            return "（已达到本任务 Token 上限，未执行合成；以下是各子任务原始结论）\n\n" + "\n\n".join(parts)
         try:
             out = llm.chat([{"role": "user", "content": _clip(prompt, 12000)}],
                            stream=False, temperature=0.2)
+            if self.run_budget is not None:
+                self.run_budget.record(getattr(llm, "last_usage", None),
+                                       prompt_chars=len(_clip(prompt, 12000)), output_chars=len(out or ""))
         except Exception:  # noqa: BLE001
             out = ""
         if turn is not None:
@@ -3718,9 +3882,14 @@ class Agent:
         )
         # 开发舱 auto 模式：失败重规划属于高难度回合，调用方可传入升级模型
         llm = llm if llm is not None else self._child_llm()
+        if self.run_budget is not None and not self.run_budget.preflight(len(prompt), 1024):
+            return []
         try:
             out = llm.chat([{"role": "user", "content": _clip(prompt, 6000)}],
                            stream=False, temperature=0.2)
+            if self.run_budget is not None:
+                self.run_budget.record(getattr(llm, "last_usage", None),
+                                       prompt_chars=len(_clip(prompt, 6000)), output_chars=len(out or ""))
         except Exception:  # noqa: BLE001
             return []
         if turn is not None:
@@ -3743,30 +3912,53 @@ class Agent:
         最多 `max_replans`（默认 `DOCMIND_ORCH_MAX_REPLANS`）次。
         """
         try:
-            tasks = _orchestrator.parse_plan(plan)
+            from agent_runtime.capacity import get_settings, remaining_agent_capacity
+            capacity = get_settings()
+            configured_limit = int(capacity.get("max_agents", 8))
+            dispatched = int(getattr(turn, "subagents_dispatched", 0)) if turn is not None else 0
+            remaining_capacity = remaining_agent_capacity(configured_limit, dispatched)
+            if remaining_capacity == 0:
+                return {"ok": False,
+                        "error": f"已达到本轮 Agent 数上限 {configured_limit}，无法继续派发任务。",
+                        "tasks": [], "results": {}, "waves": [], "order": [],
+                        "blocked": [], "merged": "", "replans": 0,
+                        "n_tasks": 0, "n_ok": 0, "n_failed": 0, "elapsed_ms": 0}
+            task_limit = remaining_capacity or 0
+            tasks = _orchestrator.parse_plan(plan, max_tasks=task_limit)
         except _orchestrator.PlanError as e:
             return {"ok": False, "error": f"任务图不合法：{e}", "tasks": [],
                     "results": {}, "waves": [], "order": [], "blocked": [],
                     "merged": "", "replans": 0, "n_tasks": 0, "n_ok": 0,
                     "n_failed": 0, "elapsed_ms": 0}
-        requested_mp = PARALLEL_MAX if max_parallel is None else max(1, int(max_parallel))
+        requested_mp = ((len(tasks) if task_limit <= 0 else min(task_limit, len(tasks)))
+                         if max_parallel is None else
+                         (len(tasks) if int(max_parallel) <= 0 else int(max_parallel)))
+        requested_mp = max(1, requested_mp)
         mp = effective_parallelism(getattr(self.llm, "provider", ""),
-                                   getattr(self.llm, "model", ""), requested_mp)
+                                   getattr(self.llm, "model", ""), requested_mp,
+                                   base_url=getattr(self.llm, "base_url", ""))
         synth_runner = (lambda ts, rs: self._synth(ts, rs, turn=turn)) if synth else None
         rp = None
         if replan:
             rp = lambda fs, rs, att, ctx=None: self._replanner(fs, rs, att, turn=turn)  # noqa: E731
-        return _orchestrator.run_plan(
+        if turn is not None:
+            turn.subagents_dispatched = dispatched + len(tasks)
+        report = _orchestrator.run_plan(
             tasks,
             lambda t, ctx: self._task_runner(t, ctx, turn=turn),
             synth_runner=synth_runner,
             max_parallel=mp,
             replanner=rp,
             max_replans=(ORCH_MAX_REPLANS if max_replans is None else int(max_replans)),
+            max_tasks=task_limit,
             budget_session=self.session_id or "",
             vram_provider=(lambda: (_gpu.memory_info() or {}).get("free_mb") if _gpu else None),
             cost_aware=True,
         )
+        final_task_count = len(report.get("tasks") or tasks)
+        if turn is not None:
+            turn.subagents_dispatched += max(0, final_task_count - len(tasks))
+        return report
 
     def _orchestrate_tool(self, arg, turn=None):
         """orchestrate 工具实现：解析 JSON → 跑任务图 → 渲染成 Observation 文本。"""
@@ -3775,14 +3967,14 @@ class Agent:
             return ("[orchestrate 参数错误] " + err +
                     "。需要 JSON：{\"tasks\":[{\"id\":\"a\",\"role\":\"researcher\","
                     "\"task\":\"...\"}],\"synth\":true}")
-        synth, replan, mp, mrp = True, True, PARALLEL_MAX, None
+        synth, replan, mp, mrp = True, True, None, None
         if isinstance(raw, dict):
             synth = bool(raw.get("synth", True))
             replan = bool(raw.get("replan", True))
             try:
-                mp = int(raw.get("max_parallel", PARALLEL_MAX))
+                mp = int(raw.get("max_parallel", 0)) if "max_parallel" in raw else None
             except (TypeError, ValueError):
-                mp = PARALLEL_MAX
+                mp = None
             if raw.get("max_replans") is not None:
                 try:
                     mrp = int(raw["max_replans"])
