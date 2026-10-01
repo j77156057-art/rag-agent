@@ -129,6 +129,29 @@ class TestTree(WbTestBase):
         self.assertIsNone(find(res["nodes"], "a/b/c/d/e.py"))
         self.assertIsNotNone(find(res["nodes"], "a/b"))
 
+    def test_tree_resilient_to_vanishing_file(self):
+        # 回归：遍历过程中文件被并发写入者删除（本工程常态：两并发写入者）时，
+        # 不应抛出未捕获异常 -> 上层 HTTP 500；应把该节点记为无大小并继续完成遍历。
+        self.write("a.py")
+        self.write("b.txt", "hello")
+        orig = os.path.getsize
+
+        def fake(p):
+            if os.path.basename(p).lower() == "a.py":
+                raise FileNotFoundError(p)
+            return orig(p)
+
+        os.path.getsize = fake
+        try:
+            res = wb.build_tree(self.root)
+        finally:
+            os.path.getsize = orig
+        self.assertTrue(res["ok"])
+        node = find(res["nodes"], "a.py")
+        self.assertIsNotNone(node)
+        self.assertIsNone(node["size"])
+        self.assertIsNotNone(find(res["nodes"], "b.txt"))
+
     @unittest.skipUnless(have_git(), "无 git")
     def test_git_status_fields(self):
         self.enable_regions()

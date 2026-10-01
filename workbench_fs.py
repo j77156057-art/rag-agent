@@ -260,7 +260,12 @@ def build_tree(root, depth: int = 4) -> dict:
         if counter["n"] > TREE_MAX_NODES:
             counter["truncated"] = True
             return None
-        is_dir = os.path.isdir(dir_abs)
+        # 文件/目录可能在遍历过程中被并发写入者增删（本工程常态：两并发写入者），
+        # 这里整体防住，避免 listdir 之后 stat 之前目标消失导致未捕获异常 -> HTTP 500。
+        try:
+            is_dir = os.path.isdir(dir_abs)
+        except OSError:
+            return None
         rmeta = _region_of(rel_n, rdirs) if rel_n else None
         node = {
             "path": rel_n,
@@ -273,7 +278,11 @@ def build_tree(root, depth: int = 4) -> dict:
             "children": [],
         }
         if not is_dir:
-            node["size"] = os.path.getsize(dir_abs)
+            try:
+                node["size"] = os.path.getsize(dir_abs)
+            except OSError:
+                # 文件在 listdir 之后、stat 之前被并发写入者删除：记为无大小而非 500。
+                node["size"] = None
             try:
                 tracked, dirty = _git_fields(dir_abs, rel_n, snap)
             except Exception:  # noqa: BLE001
